@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bookstack-mcp"
+version = "0.1.0"
+description = "MCP server for BookStack wiki with OAuth 2.1/OIDC authentication"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=1.0.0",
+    "httpx>=0.27.0",
+    "starlette>=0.38.0",
+    "uvicorn[standard]>=0.30.0",
+    "pydantic-settings>=2.0.0",
+    "PyJWT[crypto]>=2.8.0",
+    "cryptography>=42.0.0",
+]
+
+[project.scripts]
+bookstack-mcp = "bookstack_mcp.transport:main"

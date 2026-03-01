@@ -158,3 +158,15 @@ class BookStackClient:
 
     async def get_attachment(self, attachment_id: int) -> dict:
         return await self._request("GET", f"attachments/{attachment_id}")
+
+    async def create_attachment(self, name: str, uploaded_to: int, link: str = "") -> dict:
+        payload: dict[str, Any] = {"name": name, "uploaded_to": uploaded_to}
+        if link:
+            payload["link"] = link
+        return await self._request("POST", "attachments", json=payload)
+
+    async def update_attachment(self, attachment_id: int, **kwargs) -> dict:
+        return await self._request("PUT", f"attachments/{attachment_id}", json=kwargs)
+
+    async def delete_attachment(self, attachment_id: int) -> None:
+        await self._request("DELETE", f"attachments/{attachment_id}")

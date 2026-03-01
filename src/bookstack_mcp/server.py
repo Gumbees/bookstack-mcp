@@ -112,6 +112,12 @@ async def delete_book(book_id: int) -> str:
 
 
 @mcp.tool()
+async def list_chapters(count: int = 50, offset: int = 0) -> str:
+    """List all chapters across all books."""
+    return _format_response(await _client().list_chapters(count, offset))
+
+
+@mcp.tool()
 async def get_chapter(chapter_id: int) -> str:
     """Get a chapter by ID, including its pages."""
     return _format_response(await _client().get_chapter(chapter_id))
@@ -140,6 +146,12 @@ async def delete_chapter(chapter_id: int) -> str:
 
 
 # --- Pages ---
+
+
+@mcp.tool()
+async def list_pages(count: int = 50, offset: int = 0) -> str:
+    """List all pages across all books."""
+    return _format_response(await _client().list_pages(count, offset))
 
 
 @mcp.tool()
@@ -180,6 +192,51 @@ async def delete_page(page_id: int) -> str:
     """Delete a page (moves to recycle bin)."""
     await _client().delete_page(page_id)
     return f"Page {page_id} deleted."
+
+
+# --- Attachments ---
+
+
+@mcp.tool()
+async def list_attachments() -> str:
+    """List all attachments."""
+    return _format_response(await _client().list_attachments())
+
+
+@mcp.tool()
+async def get_attachment(attachment_id: int) -> str:
+    """Get an attachment by ID, including its content or download link."""
+    return _format_response(await _client().get_attachment(attachment_id))
+
+
+@mcp.tool()
+async def create_attachment(
+    name: str,
+    uploaded_to: int,
+    link: str = "",
+) -> str:
+    """Create a link attachment on a page. uploaded_to is the page ID."""
+    return _format_response(
+        await _client().create_attachment(name, uploaded_to, link)
+    )
+
+
+@mcp.tool()
+async def update_attachment(
+    attachment_id: int,
+    name: str | None = None,
+    link: str | None = None,
+) -> str:
+    """Update an attachment."""
+    kwargs = _filter_none(name=name, link=link)
+    return _format_response(await _client().update_attachment(attachment_id, **kwargs))
+
+
+@mcp.tool()
+async def delete_attachment(attachment_id: int) -> str:
+    """Delete an attachment."""
+    await _client().delete_attachment(attachment_id)
+    return f"Attachment {attachment_id} deleted."
 
 
 # --- Helpers ---

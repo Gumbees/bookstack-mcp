@@ -4,16 +4,7 @@ services:
     container_name: bookstack-mcp
     restart: unless-stopped
     environment:
-      BSMCP_BOOKSTACK_URL: https://docs.beesroadhouse.com
-      BSMCP_BOOKSTACK_ADMIN_TOKEN_ID: ${BS_ADMIN_TOKEN_ID}
-      BSMCP_BOOKSTACK_ADMIN_TOKEN_SECRET: ${BS_ADMIN_TOKEN_SECRET}
-      BSMCP_OIDC_ISSUER: https://auth.beesroadhouse.com/application/o/bookstack-mcp
-      BSMCP_OIDC_CLIENT_ID: ${OIDC_CLIENT_ID}
-      BSMCP_OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET}
-      BSMCP_BASE_URL: https://bookstack-mcp.beesroadhouse.com
-      BSMCP_TOKEN_DB_PATH: /data/tokens.db
-    volumes:
-      - ./data:/data
+      BSMCP_BOOKSTACK_URL: ${BSMCP_BOOKSTACK_URL:-https://docs.beesroadhouse.com}
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.bookstack-mcp.rule=Host(`bookstack-mcp.beesroadhouse.com`)"

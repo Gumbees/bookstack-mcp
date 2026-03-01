@@ -31,22 +31,14 @@ class BookStackClient:
             resp.raise_for_status()
             return resp.json() if resp.content else None
 
-    # --- User management (admin) ---
+    # --- Auth validation ---
 
-    async def find_user_by_email(self, email: str) -> dict | None:
-        data = await self._request("GET", "users", params={"filter[email]": email})
-        users = data.get("data", [])
-        return users[0] if users else None
-
-    async def create_api_token(self, user_id: int, name: str) -> dict:
-        return await self._request(
-            "POST",
-            f"users/{user_id}/api-tokens",
-            json={"name": name, "expires_at": None},
-        )
-
-    async def delete_api_token(self, user_id: int, token_id: int) -> None:
-        await self._request("DELETE", f"users/{user_id}/api-tokens/{token_id}")
+    async def get_current_user(self) -> dict:
+        """Get the user associated with the current API token. Used to validate credentials."""
+        # BookStack doesn't have a /me endpoint, but listing users with no filter
+        # and checking the response works. A simpler approach: just hit any
+        # lightweight endpoint and see if it 401s.
+        return await self._request("GET", "books", params={"count": 1})
 
     # --- Shelves ---
 

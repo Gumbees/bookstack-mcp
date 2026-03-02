@@ -59,16 +59,16 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Res
         // Search
         "search_content" => {
             let query = arg_str(args, "query")?;
-            let page = arg_i64(args, "page", 1);
-            let count = arg_i64(args, "count", 20);
+            let page = arg_i64(args, "page", 1).max(1);
+            let count = arg_count(args, 20);
             let result = client.search(&query, page, count).await?;
             Ok(format_search_results(&result))
         }
 
         // Shelves
         "list_shelves" => {
-            let count = arg_i64(args, "count", 50);
-            let offset = arg_i64(args, "offset", 0);
+            let count = arg_count(args, 50);
+            let offset = arg_offset(args);
             format_json(&client.list_shelves(count, offset).await?)
         }
         "get_shelf" => {
@@ -93,8 +93,8 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Res
 
         // Books
         "list_books" => {
-            let count = arg_i64(args, "count", 50);
-            let offset = arg_i64(args, "offset", 0);
+            let count = arg_count(args, 50);
+            let offset = arg_offset(args);
             format_json(&client.list_books(count, offset).await?)
         }
         "get_book" => {
@@ -119,8 +119,8 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Res
 
         // Chapters
         "list_chapters" => {
-            let count = arg_i64(args, "count", 50);
-            let offset = arg_i64(args, "offset", 0);
+            let count = arg_count(args, 50);
+            let offset = arg_offset(args);
             format_json(&client.list_chapters(count, offset).await?)
         }
         "get_chapter" => {
@@ -146,8 +146,8 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Res
 
         // Pages
         "list_pages" => {
-            let count = arg_i64(args, "count", 50);
-            let offset = arg_i64(args, "offset", 0);
+            let count = arg_count(args, 50);
+            let offset = arg_offset(args);
             format_json(&client.list_pages(count, offset).await?)
         }
         "get_page" => {
@@ -267,8 +267,8 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Res
 
         // Recycle Bin
         "list_recycle_bin" => {
-            let count = arg_i64(args, "count", 50);
-            let offset = arg_i64(args, "offset", 0);
+            let count = arg_count(args, 50);
+            let offset = arg_offset(args);
             format_json(&client.list_recycle_bin(count, offset).await?)
         }
         "restore_recycle_bin_item" => {
@@ -283,8 +283,8 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Res
 
         // Users
         "list_users" => {
-            let count = arg_i64(args, "count", 50);
-            let offset = arg_i64(args, "offset", 0);
+            let count = arg_count(args, 50);
+            let offset = arg_offset(args);
             format_json(&client.list_users(count, offset).await?)
         }
         "get_user" => {
@@ -294,8 +294,8 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Res
 
         // Audit Log
         "list_audit_log" => {
-            let count = arg_i64(args, "count", 50);
-            let offset = arg_i64(args, "offset", 0);
+            let count = arg_count(args, 50);
+            let offset = arg_offset(args);
             format_json(&client.list_audit_log(count, offset).await?)
         }
 
@@ -306,8 +306,8 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Res
 
         // Image Gallery
         "list_images" => {
-            let count = arg_i64(args, "count", 50);
-            let offset = arg_i64(args, "offset", 0);
+            let count = arg_count(args, 50);
+            let offset = arg_offset(args);
             let mut filter: Vec<(&str, &str)> = vec![];
             let type_str;
             if let Some(v) = args.get("type").and_then(|v| v.as_str()) {
@@ -353,8 +353,8 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Res
 
         // Roles
         "list_roles" => {
-            let count = arg_i64(args, "count", 50);
-            let offset = arg_i64(args, "offset", 0);
+            let count = arg_count(args, 50);
+            let offset = arg_offset(args);
             format_json(&client.list_roles(count, offset).await?)
         }
         "get_role" => {
@@ -384,6 +384,14 @@ fn arg_str_default(args: &Value, key: &str, default: &str) -> String {
 
 fn arg_i64(args: &Value, key: &str, default: i64) -> i64 {
     args.get(key).and_then(|v| v.as_i64()).unwrap_or(default)
+}
+
+fn arg_count(args: &Value, default: i64) -> i64 {
+    arg_i64(args, "count", default).clamp(1, 500)
+}
+
+fn arg_offset(args: &Value) -> i64 {
+    arg_i64(args, "offset", 0).max(0)
 }
 
 fn arg_i64_required(args: &Value, key: &str) -> Result<i64, String> {

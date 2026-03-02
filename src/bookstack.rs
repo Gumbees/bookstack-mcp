@@ -1,6 +1,8 @@
 use reqwest::Client;
 use serde_json::Value;
 
+const MAX_RESPONSE_SIZE: usize = 50 * 1024 * 1024; // 50MB
+
 #[derive(Clone)]
 pub struct BookStackClient {
     client: Client,
@@ -23,6 +25,15 @@ impl BookStackClient {
         format!("Token {}:{}", self.token_id, self.token_secret)
     }
 
+    fn check_response_size(resp: &reqwest::Response) -> Result<(), String> {
+        if let Some(len) = resp.content_length() {
+            if len as usize > MAX_RESPONSE_SIZE {
+                return Err(format!("Response too large: {len} bytes"));
+            }
+        }
+        Ok(())
+    }
+
     async fn get(&self, path: &str, query: &[(&str, &str)]) -> Result<Value, String> {
         let resp = self.client
             .get(format!("{}/api/{}", self.base_url, path))
@@ -39,6 +50,7 @@ impl BookStackClient {
             return Err(format!("BookStack API error: {status}"));
         }
 
+        Self::check_response_size(&resp)?;
         resp.json().await.map_err(|e| { eprintln!("JSON parse error: {e}"); "Invalid response from BookStack".to_string() })
     }
 
@@ -58,6 +70,7 @@ impl BookStackClient {
             return Err(format!("BookStack API error: {status}"));
         }
 
+        Self::check_response_size(&resp)?;
         resp.json().await.map_err(|e| { eprintln!("JSON parse error: {e}"); "Invalid response from BookStack".to_string() })
     }
 
@@ -77,6 +90,7 @@ impl BookStackClient {
             return Err(format!("BookStack API error: {status}"));
         }
 
+        Self::check_response_size(&resp)?;
         resp.json().await.map_err(|e| { eprintln!("JSON parse error: {e}"); "Invalid response from BookStack".to_string() })
     }
 
@@ -94,6 +108,7 @@ impl BookStackClient {
             return Err(format!("BookStack API error: {status}"));
         }
 
+        Self::check_response_size(&resp)?;
         resp.text().await.map_err(|e| { eprintln!("Response read error: {e}"); "Failed to read response".to_string() })
     }
 

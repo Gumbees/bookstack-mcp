@@ -28,6 +28,7 @@ struct Session {
     tx: mpsc::Sender<Result<Event, Infallible>>,
     client: BookStackClient,
     token_id: String,
+    token_secret: String,
     created_at: Instant,
 }
 
@@ -79,19 +80,6 @@ pub async fn handle_sse(
         Err((status, body)) => return (status, body).into_response(),
     };
 
-    // Check session limit per token before validating (prevent BookStack API amplification)
-    {
-        let sessions = state.sessions.read().await;
-        let count = sessions.values().filter(|s| s.token_id == token_id).count();
-        if count >= MAX_SESSIONS_PER_TOKEN {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({"error": "Too many sessions for this token"})),
-            )
-                .into_response();
-        }
-    }
-
     let client = BookStackClient::new(&state.bookstack_url, &token_id, &token_secret);
 
     // Validate credentials against BookStack
@@ -104,6 +92,7 @@ pub async fn handle_sse(
             .into_response();
     }
 
+    // Atomically check session limit and insert under write lock (fixes TOCTOU)
     let session_id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(32);
 
@@ -113,16 +102,27 @@ pub async fn handle_sse(
         .send(Ok(Event::default().event("endpoint").data(endpoint_url)))
         .await;
 
-    // Store session
-    state.sessions.write().await.insert(
-        session_id.clone(),
-        Session {
-            tx,
-            client,
-            token_id: token_id.clone(),
-            created_at: Instant::now(),
-        },
-    );
+    {
+        let mut sessions = state.sessions.write().await;
+        let count = sessions.values().filter(|s| s.token_id == token_id).count();
+        if count >= MAX_SESSIONS_PER_TOKEN {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "Too many sessions for this token"})),
+            )
+                .into_response();
+        }
+        sessions.insert(
+            session_id.clone(),
+            Session {
+                tx,
+                client,
+                token_id: token_id.clone(),
+                token_secret: token_secret.clone(),
+                created_at: Instant::now(),
+            },
+        );
+    }
 
     // Clean up on disconnect or TTL expiry
     let sessions = state.sessions.clone();
@@ -157,8 +157,8 @@ pub async fn handle_message(
     Query(params): Query<HashMap<String, String>>,
     body: String,
 ) -> Response {
-    // Authenticate the request
-    let (token_id, _token_secret) = match extract_credentials(&headers) {
+    // Authenticate the request (both token_id and token_secret)
+    let (token_id, token_secret) = match extract_credentials(&headers) {
         Ok(creds) => creds,
         Err((status, body)) => return (status, body).into_response(),
     };
@@ -188,8 +188,8 @@ pub async fn handle_message(
             }
         };
 
-        // Verify the token matches the session owner
-        if session.token_id != token_id {
+        // Verify the full token (id AND secret) matches the session owner
+        if session.token_id != token_id || session.token_secret != token_secret {
             return (
                 StatusCode::FORBIDDEN,
                 Json(serde_json::json!({"error": "token does not match session"})),

@@ -1,6 +1,7 @@
 use reqwest::Client;
 use serde_json::Value;
 
+#[derive(Clone)]
 pub struct BookStackClient {
     client: Client,
     base_url: String,
@@ -29,13 +30,16 @@ impl BookStackClient {
             .query(query)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| { eprintln!("BookStack request error: {e}"); "Request failed".to_string() })?;
 
         if !resp.status().is_success() {
-            return Err(format!("BookStack API error: {}", resp.status()));
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            eprintln!("BookStack API error {status}: {body}");
+            return Err(format!("BookStack API error: {status}"));
         }
 
-        resp.json().await.map_err(|e| e.to_string())
+        resp.json().await.map_err(|e| { eprintln!("JSON parse error: {e}"); "Invalid response from BookStack".to_string() })
     }
 
     async fn post(&self, path: &str, body: &Value) -> Result<Value, String> {
@@ -45,13 +49,16 @@ impl BookStackClient {
             .json(body)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| { eprintln!("BookStack request error: {e}"); "Request failed".to_string() })?;
 
         if !resp.status().is_success() {
-            return Err(format!("BookStack API error: {}", resp.status()));
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            eprintln!("BookStack API error {status}: {body}");
+            return Err(format!("BookStack API error: {status}"));
         }
 
-        resp.json().await.map_err(|e| e.to_string())
+        resp.json().await.map_err(|e| { eprintln!("JSON parse error: {e}"); "Invalid response from BookStack".to_string() })
     }
 
     async fn put(&self, path: &str, body: &Value) -> Result<Value, String> {
@@ -61,13 +68,16 @@ impl BookStackClient {
             .json(body)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| { eprintln!("BookStack request error: {e}"); "Request failed".to_string() })?;
 
         if !resp.status().is_success() {
-            return Err(format!("BookStack API error: {}", resp.status()));
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            eprintln!("BookStack API error {status}: {body}");
+            return Err(format!("BookStack API error: {status}"));
         }
 
-        resp.json().await.map_err(|e| e.to_string())
+        resp.json().await.map_err(|e| { eprintln!("JSON parse error: {e}"); "Invalid response from BookStack".to_string() })
     }
 
     async fn get_text(&self, path: &str) -> Result<String, String> {
@@ -76,13 +86,15 @@ impl BookStackClient {
             .header("Authorization", self.auth_header())
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| { eprintln!("BookStack request error: {e}"); "Request failed".to_string() })?;
 
         if !resp.status().is_success() {
-            return Err(format!("BookStack API error: {}", resp.status()));
+            let status = resp.status();
+            eprintln!("BookStack API error {status}");
+            return Err(format!("BookStack API error: {status}"));
         }
 
-        resp.text().await.map_err(|e| e.to_string())
+        resp.text().await.map_err(|e| { eprintln!("Response read error: {e}"); "Failed to read response".to_string() })
     }
 
     async fn delete(&self, path: &str) -> Result<(), String> {
@@ -91,10 +103,13 @@ impl BookStackClient {
             .header("Authorization", self.auth_header())
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| { eprintln!("BookStack request error: {e}"); "Request failed".to_string() })?;
 
         if !resp.status().is_success() {
-            return Err(format!("BookStack API error: {}", resp.status()));
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            eprintln!("BookStack API error {status}: {body}");
+            return Err(format!("BookStack API error: {status}"));
         }
 
         Ok(())

@@ -4,7 +4,7 @@ use crate::bookstack::BookStackClient;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
-pub fn handle_request(request: &Value, client: &BookStackClient) -> Option<Value> {
+pub async fn handle_request(request: &Value, client: &BookStackClient) -> Option<Value> {
     let method = request["method"].as_str().unwrap_or("");
     let id = request.get("id");
     let params = request.get("params").cloned().unwrap_or(json!({}));
@@ -23,9 +23,7 @@ pub fn handle_request(request: &Value, client: &BookStackClient) -> Option<Value
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(execute_tool(name, &args, client))
-            });
+            let result = execute_tool(name, &args, client).await;
             match result {
                 Ok(text) => Some(json_rpc_result(id, json!({
                     "content": [{ "type": "text", "text": text }],
@@ -214,16 +212,19 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Res
         "export_page" => {
             let id = arg_i64_required(args, "page_id")?;
             let fmt = arg_str_default(args, "format", "markdown");
+            validate_enum(&fmt, &["markdown", "plaintext", "html"], "format")?;
             client.export_page(id, &fmt).await
         }
         "export_chapter" => {
             let id = arg_i64_required(args, "chapter_id")?;
             let fmt = arg_str_default(args, "format", "markdown");
+            validate_enum(&fmt, &["markdown", "plaintext", "html"], "format")?;
             client.export_chapter(id, &fmt).await
         }
         "export_book" => {
             let id = arg_i64_required(args, "book_id")?;
             let fmt = arg_str_default(args, "format", "markdown");
+            validate_enum(&fmt, &["markdown", "plaintext", "html"], "format")?;
             client.export_book(id, &fmt).await
         }
 
@@ -338,11 +339,13 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Res
         // Content Permissions
         "get_content_permissions" => {
             let content_type = arg_str(args, "content_type")?;
+            validate_enum(&content_type, &["page", "chapter", "book", "shelf"], "content_type")?;
             let content_id = arg_i64_required(args, "content_id")?;
             format_json(&client.get_content_permissions(&content_type, content_id).await?)
         }
         "update_content_permissions" => {
             let content_type = arg_str(args, "content_type")?;
+            validate_enum(&content_type, &["page", "chapter", "book", "shelf"], "content_type")?;
             let content_id = arg_i64_required(args, "content_id")?;
             let data = filter_update_fields(args, &["owner_id", "role_permissions", "fallback_permissions"]);
             format_json(&client.update_content_permissions(&content_type, content_id, &data).await?)
@@ -387,6 +390,14 @@ fn arg_i64_required(args: &Value, key: &str) -> Result<i64, String> {
     args.get(key)
         .and_then(|v| v.as_i64())
         .ok_or_else(|| format!("Missing required argument: {key}"))
+}
+
+fn validate_enum(value: &str, allowed: &[&str], name: &str) -> Result<(), String> {
+    if allowed.contains(&value) {
+        Ok(())
+    } else {
+        Err(format!("Invalid {name}: '{value}'. Must be one of: {}", allowed.join(", ")))
+    }
 }
 
 fn filter_update_fields(args: &Value, fields: &[&str]) -> Value {

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -15,6 +15,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::bookstack::BookStackClient;
 use crate::mcp;
 
+const MAX_SESSIONS_PER_TOKEN: usize = 5;
+const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
+
 #[derive(Clone)]
 pub struct AppState {
     bookstack_url: String,
@@ -24,6 +27,8 @@ pub struct AppState {
 struct Session {
     tx: mpsc::Sender<Result<Event, Infallible>>,
     client: BookStackClient,
+    token_id: String,
+    created_at: Instant,
 }
 
 impl AppState {
@@ -74,13 +79,27 @@ pub async fn handle_sse(
         Err((status, body)) => return (status, body).into_response(),
     };
 
+    // Check session limit per token before validating (prevent BookStack API amplification)
+    {
+        let sessions = state.sessions.read().await;
+        let count = sessions.values().filter(|s| s.token_id == token_id).count();
+        if count >= MAX_SESSIONS_PER_TOKEN {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "Too many sessions for this token"})),
+            )
+                .into_response();
+        }
+    }
+
     let client = BookStackClient::new(&state.bookstack_url, &token_id, &token_secret);
 
     // Validate credentials against BookStack
     if let Err(e) = client.validate().await {
+        eprintln!("Credential validation failed: {e}");
         return (
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error": format!("Invalid BookStack credentials: {e}")})),
+            Json(serde_json::json!({"error": "Invalid BookStack credentials"})),
         )
             .into_response();
     }
@@ -95,13 +114,17 @@ pub async fn handle_sse(
         .await;
 
     // Store session
-    state
-        .sessions
-        .write()
-        .await
-        .insert(session_id.clone(), Session { tx, client });
+    state.sessions.write().await.insert(
+        session_id.clone(),
+        Session {
+            tx,
+            client,
+            token_id: token_id.clone(),
+            created_at: Instant::now(),
+        },
+    );
 
-    // Clean up on disconnect
+    // Clean up on disconnect or TTL expiry
     let sessions = state.sessions.clone();
     let sid = session_id.clone();
     tokio::spawn(async move {
@@ -111,7 +134,7 @@ pub async fn handle_sse(
                 let sessions = sessions.read().await;
                 sessions
                     .get(&sid)
-                    .map(|s| s.tx.is_closed())
+                    .map(|s| s.tx.is_closed() || s.created_at.elapsed() > SESSION_TTL)
                     .unwrap_or(true)
             };
             if should_remove {
@@ -130,9 +153,16 @@ pub async fn handle_sse(
 
 pub async fn handle_message(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
     body: String,
 ) -> Response {
+    // Authenticate the request
+    let (token_id, _token_secret) = match extract_credentials(&headers) {
+        Ok(creds) => creds,
+        Err((status, body)) => return (status, body).into_response(),
+    };
+
     let session_id = match params.get("sessionId") {
         Some(id) => id,
         None => {
@@ -144,35 +174,57 @@ pub async fn handle_message(
         }
     };
 
-    let sessions = state.sessions.read().await;
-    let session = match sessions.get(session_id) {
-        Some(s) => s,
-        None => {
+    // Clone what we need out of the session, then release the lock
+    let (tx, client) = {
+        let sessions = state.sessions.read().await;
+        let session = match sessions.get(session_id) {
+            Some(s) => s,
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "unknown session"})),
+                )
+                    .into_response()
+            }
+        };
+
+        // Verify the token matches the session owner
+        if session.token_id != token_id {
             return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "unknown session"})),
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "token does not match session"})),
             )
-                .into_response()
+                .into_response();
         }
-    };
+
+        // Check TTL
+        if session.created_at.elapsed() > SESSION_TTL {
+            return (
+                StatusCode::GONE,
+                Json(serde_json::json!({"error": "session expired"})),
+            )
+                .into_response();
+        }
+
+        (session.tx.clone(), session.client.clone())
+    }; // RwLock released here
 
     let request: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
-        Err(e) => {
+        Err(_) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("invalid JSON: {e}")})),
+                Json(serde_json::json!({"error": "invalid JSON"})),
             )
                 .into_response()
         }
     };
 
-    let response = mcp::handle_request(&request, &session.client);
+    let response = mcp::handle_request(&request, &client).await;
 
     if let Some(response) = response {
         let data = serde_json::to_string(&response).unwrap_or_default();
-        let _ = session
-            .tx
+        let _ = tx
             .send(Ok(Event::default().event("message").data(data)))
             .await;
     }

@@ -10,9 +10,13 @@ RUN cargo build --release
 
 FROM alpine:3.21
 
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates \
+ && addgroup -S appgroup \
+ && adduser -S appuser -G appgroup
 
 COPY --from=builder /app/target/release/bookstack-mcp /usr/local/bin/bookstack-mcp
+
+USER appuser
 
 EXPOSE 8080
 

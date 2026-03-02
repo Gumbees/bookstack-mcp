@@ -313,6 +313,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Res
             let mut filter: Vec<(&str, &str)> = vec![];
             let type_str;
             if let Some(v) = args.get("type").and_then(|v| v.as_str()) {
+                validate_enum(v, &["gallery", "drawio"], "type")?;
                 type_str = v.to_string();
                 filter.push(("filter[type]", &type_str));
             }

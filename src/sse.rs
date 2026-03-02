@@ -56,6 +56,20 @@ impl AppState {
     }
 }
 
+/// Constant-time string comparison to prevent timing side-channel attacks.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut result = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        result |= x ^ y;
+    }
+    result == 0
+}
+
 fn extract_credentials(headers: &HeaderMap) -> Result<(String, String), (StatusCode, Json<Value>)> {
     let auth = headers
         .get("authorization")
@@ -111,12 +125,8 @@ pub async fn handle_sse(
     let session_id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(32);
 
-    // Send endpoint event
-    let endpoint_url = format!("/mcp/messages/?sessionId={session_id}");
-    let _ = tx
-        .send(Ok(Event::default().event("endpoint").data(endpoint_url)))
-        .await;
-
+    // Insert session BEFORE sending endpoint event (prevents race where
+    // client receives endpoint URL and sends a message before session exists)
     {
         let mut sessions = state.sessions.write().await;
         let count = sessions.values().filter(|s| s.token_id == token_id).count();
@@ -130,7 +140,7 @@ pub async fn handle_sse(
         sessions.insert(
             session_id.clone(),
             Session {
-                tx,
+                tx: tx.clone(),
                 client,
                 token_id: token_id.clone(),
                 token_secret: token_secret.clone(),
@@ -142,6 +152,12 @@ pub async fn handle_sse(
             },
         );
     }
+
+    // Send endpoint event after session is stored
+    let endpoint_url = format!("/mcp/messages/?sessionId={session_id}");
+    let _ = tx
+        .send(Ok(Event::default().event("endpoint").data(endpoint_url)))
+        .await;
 
     // Clean up on disconnect or TTL expiry
     let sessions = state.sessions.clone();
@@ -208,7 +224,8 @@ pub async fn handle_message(
         };
 
         // Verify the full token (id AND secret) matches the session owner
-        if session.token_id != token_id || session.token_secret != token_secret {
+        // Uses constant-time comparison to prevent timing side-channel attacks
+        if !constant_time_eq(&session.token_id, &token_id) || !constant_time_eq(&session.token_secret, &token_secret) {
             return (
                 StatusCode::FORBIDDEN,
                 Json(serde_json::json!({"error": "token does not match session"})),
@@ -261,7 +278,9 @@ pub async fn handle_message(
     if let Some(response) = response {
         let data = serde_json::to_string(&response).unwrap_or_default();
         // try_send to avoid blocking if the SSE client is slow
-        let _ = tx.try_send(Ok(Event::default().event("message").data(data)));
+        if let Err(e) = tx.try_send(Ok(Event::default().event("message").data(data))) {
+            eprintln!("SSE send failed for session {session_id}: {e}");
+        }
     }
 
     StatusCode::ACCEPTED.into_response()

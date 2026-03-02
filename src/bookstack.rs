@@ -3,7 +3,11 @@ use serde_json::Value;
 use zeroize::Zeroize;
 
 const MAX_RESPONSE_SIZE: usize = 50 * 1024 * 1024; // 50MB
+const MAX_ERROR_BODY_SIZE: usize = 4096; // 4KB for error messages
 
+/// Note: Zeroize on Drop clears the current String allocation. Intermediate copies
+/// (e.g. from Clone, format!) may remain in freed memory until overwritten by the allocator.
+/// This is a best-effort defense-in-depth measure, not a guarantee against memory forensics.
 #[derive(Clone)]
 pub struct BookStackClient {
     client: Client,
@@ -33,13 +37,49 @@ impl BookStackClient {
         format!("Token {}:{}", self.token_id, self.token_secret)
     }
 
-    fn check_response_size(resp: &reqwest::Response) -> Result<(), String> {
+    /// Fast-reject via Content-Length header before downloading the body.
+    fn check_content_length(resp: &reqwest::Response, limit: usize) -> Result<(), String> {
         if let Some(len) = resp.content_length() {
-            if len as usize > MAX_RESPONSE_SIZE {
+            if len as usize > limit {
                 return Err(format!("Response too large: {len} bytes"));
             }
         }
         Ok(())
+    }
+
+    /// Read response as JSON, enforcing size limit even for chunked responses.
+    async fn read_json(resp: reqwest::Response) -> Result<Value, String> {
+        Self::check_content_length(&resp, MAX_RESPONSE_SIZE)?;
+        let bytes = resp.bytes().await
+            .map_err(|e| { eprintln!("Response read error: {e}"); "Failed to read response".to_string() })?;
+        if bytes.len() > MAX_RESPONSE_SIZE {
+            return Err(format!("Response too large: {} bytes", bytes.len()));
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|e| { eprintln!("JSON parse error: {e}"); "Invalid response from BookStack".to_string() })
+    }
+
+    /// Read response as text, enforcing size limit even for chunked responses.
+    async fn read_text(resp: reqwest::Response) -> Result<String, String> {
+        Self::check_content_length(&resp, MAX_RESPONSE_SIZE)?;
+        let bytes = resp.bytes().await
+            .map_err(|e| { eprintln!("Response read error: {e}"); "Failed to read response".to_string() })?;
+        if bytes.len() > MAX_RESPONSE_SIZE {
+            return Err(format!("Response too large: {} bytes", bytes.len()));
+        }
+        String::from_utf8(bytes.to_vec())
+            .map_err(|e| { eprintln!("UTF-8 decode error: {e}"); "Invalid response encoding".to_string() })
+    }
+
+    /// Read error body with a size limit to prevent memory exhaustion from error responses.
+    async fn read_error_body(resp: reqwest::Response) -> String {
+        match resp.bytes().await {
+            Ok(bytes) => {
+                let len = bytes.len().min(MAX_ERROR_BODY_SIZE);
+                String::from_utf8_lossy(&bytes[..len]).into_owned()
+            }
+            Err(_) => String::new(),
+        }
     }
 
     async fn get(&self, path: &str, query: &[(&str, &str)]) -> Result<Value, String> {
@@ -53,13 +93,12 @@ impl BookStackClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = Self::read_error_body(resp).await;
             eprintln!("BookStack API error {status}: {body}");
             return Err(format!("BookStack API error: {status}"));
         }
 
-        Self::check_response_size(&resp)?;
-        resp.json().await.map_err(|e| { eprintln!("JSON parse error: {e}"); "Invalid response from BookStack".to_string() })
+        Self::read_json(resp).await
     }
 
     async fn post(&self, path: &str, body: &Value) -> Result<Value, String> {
@@ -73,13 +112,12 @@ impl BookStackClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = Self::read_error_body(resp).await;
             eprintln!("BookStack API error {status}: {body}");
             return Err(format!("BookStack API error: {status}"));
         }
 
-        Self::check_response_size(&resp)?;
-        resp.json().await.map_err(|e| { eprintln!("JSON parse error: {e}"); "Invalid response from BookStack".to_string() })
+        Self::read_json(resp).await
     }
 
     async fn put(&self, path: &str, body: &Value) -> Result<Value, String> {
@@ -93,13 +131,12 @@ impl BookStackClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = Self::read_error_body(resp).await;
             eprintln!("BookStack API error {status}: {body}");
             return Err(format!("BookStack API error: {status}"));
         }
 
-        Self::check_response_size(&resp)?;
-        resp.json().await.map_err(|e| { eprintln!("JSON parse error: {e}"); "Invalid response from BookStack".to_string() })
+        Self::read_json(resp).await
     }
 
     async fn get_text(&self, path: &str) -> Result<String, String> {
@@ -112,12 +149,12 @@ impl BookStackClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            eprintln!("BookStack API error {status}");
+            let body = Self::read_error_body(resp).await;
+            eprintln!("BookStack API error {status}: {body}");
             return Err(format!("BookStack API error: {status}"));
         }
 
-        Self::check_response_size(&resp)?;
-        resp.text().await.map_err(|e| { eprintln!("Response read error: {e}"); "Failed to read response".to_string() })
+        Self::read_text(resp).await
     }
 
     async fn delete(&self, path: &str) -> Result<(), String> {
@@ -130,7 +167,7 @@ impl BookStackClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = Self::read_error_body(resp).await;
             eprintln!("BookStack API error {status}: {body}");
             return Err(format!("BookStack API error: {status}"));
         }

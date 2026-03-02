@@ -28,7 +28,7 @@ src/
 | `BSMCP_HOST` | No | `0.0.0.0` | Bind address |
 | `BSMCP_PORT` | No | `8080` | Bind port |
 
-## What's Implemented (26 tools)
+## Implemented Tools (49)
 
 - **search_content** - Full-text search with BookStack query operators
 - **Shelves** - list, get, create, update, delete (5)
@@ -36,28 +36,22 @@ src/
 - **Chapters** - list, get, create, update, delete (5)
 - **Pages** - list, get, create, update, delete (5)
 - **Attachments** - list, get, create, update, delete (5) - link attachments only
+- **Exports** - export_page, export_chapter, export_book (3) - markdown, plaintext, or html
+- **Comments** - list, get, create, update, delete (5)
+- **Recycle Bin** - list, restore, destroy (3)
+- **Users** - list, get (2) - read-only
+- **Audit Log** - list (1)
+- **System** - get_system_info (1)
+- **Image Gallery** - list, get, update, delete (4) - no upload (requires multipart)
+- **Content Permissions** - get, update (2)
+- **Roles** - list, get (2) - read-only
 
-## What's Missing (BookStack API endpoints not yet implemented)
+## Not Implemented
 
-### Priority 1 - High value for MCP usage
-- **Page/Chapter/Book Export** - `GET /api/pages/{id}/export/{html,plaintext,markdown}` - Get clean exported content. Markdown export is especially useful since `get_page` returns raw HTML in the `html` field.
-- **Comments CRUD** - `GET/POST/PUT/DELETE /api/comments` - Read and write comments on pages.
-- **Recycle Bin** - `GET /api/recycle-bin`, `PUT /api/recycle-bin/{id}` (restore), `DELETE /api/recycle-bin/{id}` (permanent delete) - Recover deleted items.
-
-### Priority 2 - Useful for admin/context
-- **Users** - `GET /api/users`, `GET /api/users/{id}` - List and read users (read-only is fine).
-- **Audit Log** - `GET /api/audit-log` - Activity history with filters.
-- **System Info** - `GET /api/system` - Instance version and info.
-
-### Priority 3 - Specialized
-- **Image Gallery** - `GET/POST/PUT/DELETE /api/image-gallery` - List, read, update, delete images. Upload requires multipart form (not just JSON).
-- **Content Permissions** - `GET/PUT /api/content-permissions/{type}/{id}` - Read/update permissions on content.
-- **Roles** - `GET /api/roles`, `GET /api/roles/{id}` - List and read roles.
-
-### Not planned
 - **Imports** - ZIP file handling doesn't work well over MCP text protocol.
 - **User/Role CRUD** - Creating/deleting users/roles is admin-level; read-only is sufficient.
 - **PDF/ZIP export** - Binary formats can't be returned as MCP text content.
+- **Image upload** - Requires multipart form data, not JSON.
 
 ## Adding a New Tool
 

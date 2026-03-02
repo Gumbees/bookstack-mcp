@@ -70,6 +70,21 @@ impl BookStackClient {
         resp.json().await.map_err(|e| e.to_string())
     }
 
+    async fn get_text(&self, path: &str) -> Result<String, String> {
+        let resp = self.client
+            .get(format!("{}/api/{}", self.base_url, path))
+            .header("Authorization", self.auth_header())
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if !resp.status().is_success() {
+            return Err(format!("BookStack API error: {}", resp.status()));
+        }
+
+        resp.text().await.map_err(|e| e.to_string())
+    }
+
     async fn delete(&self, path: &str) -> Result<(), String> {
         let resp = self.client
             .delete(format!("{}/api/{}", self.base_url, path))
@@ -227,5 +242,133 @@ impl BookStackClient {
 
     pub async fn delete_attachment(&self, id: i64) -> Result<(), String> {
         self.delete(&format!("attachments/{id}")).await
+    }
+
+    // --- Exports ---
+
+    pub async fn export_page(&self, id: i64, format: &str) -> Result<String, String> {
+        self.get_text(&format!("pages/{id}/export/{format}")).await
+    }
+
+    pub async fn export_chapter(&self, id: i64, format: &str) -> Result<String, String> {
+        self.get_text(&format!("chapters/{id}/export/{format}")).await
+    }
+
+    pub async fn export_book(&self, id: i64, format: &str) -> Result<String, String> {
+        self.get_text(&format!("books/{id}/export/{format}")).await
+    }
+
+    // --- Comments ---
+
+    pub async fn list_comments(&self, query: &[(&str, &str)]) -> Result<Value, String> {
+        self.get("comments", query).await
+    }
+
+    pub async fn get_comment(&self, id: i64) -> Result<Value, String> {
+        self.get(&format!("comments/{id}"), &[]).await
+    }
+
+    pub async fn create_comment(&self, data: &Value) -> Result<Value, String> {
+        self.post("comments", data).await
+    }
+
+    pub async fn update_comment(&self, id: i64, data: &Value) -> Result<Value, String> {
+        self.put(&format!("comments/{id}"), data).await
+    }
+
+    pub async fn delete_comment(&self, id: i64) -> Result<(), String> {
+        self.delete(&format!("comments/{id}")).await
+    }
+
+    // --- Recycle Bin ---
+
+    pub async fn list_recycle_bin(&self, count: i64, offset: i64) -> Result<Value, String> {
+        self.get("recycle-bin", &[
+            ("count", &count.to_string()),
+            ("offset", &offset.to_string()),
+        ]).await
+    }
+
+    pub async fn restore_recycle_bin_item(&self, id: i64) -> Result<Value, String> {
+        self.put(&format!("recycle-bin/{id}"), &serde_json::json!({})).await
+    }
+
+    pub async fn destroy_recycle_bin_item(&self, id: i64) -> Result<(), String> {
+        self.delete(&format!("recycle-bin/{id}")).await
+    }
+
+    // --- Users ---
+
+    pub async fn list_users(&self, count: i64, offset: i64) -> Result<Value, String> {
+        self.get("users", &[
+            ("count", &count.to_string()),
+            ("offset", &offset.to_string()),
+        ]).await
+    }
+
+    pub async fn get_user(&self, id: i64) -> Result<Value, String> {
+        self.get(&format!("users/{id}"), &[]).await
+    }
+
+    // --- Audit Log ---
+
+    pub async fn list_audit_log(&self, count: i64, offset: i64) -> Result<Value, String> {
+        self.get("audit-log", &[
+            ("count", &count.to_string()),
+            ("offset", &offset.to_string()),
+        ]).await
+    }
+
+    // --- System ---
+
+    pub async fn get_system_info(&self) -> Result<Value, String> {
+        self.get("system", &[]).await
+    }
+
+    // --- Image Gallery ---
+
+    pub async fn list_images(&self, count: i64, offset: i64, filter: &[(&str, &str)]) -> Result<Value, String> {
+        let mut query: Vec<(&str, &str)> = vec![];
+        let count_str = count.to_string();
+        let offset_str = offset.to_string();
+        query.push(("count", &count_str));
+        query.push(("offset", &offset_str));
+        query.extend_from_slice(filter);
+        self.get("image-gallery", &query).await
+    }
+
+    pub async fn get_image(&self, id: i64) -> Result<Value, String> {
+        self.get(&format!("image-gallery/{id}"), &[]).await
+    }
+
+    pub async fn update_image(&self, id: i64, data: &Value) -> Result<Value, String> {
+        self.put(&format!("image-gallery/{id}"), data).await
+    }
+
+    pub async fn delete_image(&self, id: i64) -> Result<(), String> {
+        self.delete(&format!("image-gallery/{id}")).await
+    }
+
+    // --- Content Permissions ---
+
+    pub async fn get_content_permissions(&self, content_type: &str, content_id: i64) -> Result<Value, String> {
+        self.get(&format!("content-permissions/{content_type}/{content_id}"), &[]).await
+    }
+
+    pub async fn update_content_permissions(&self, content_type: &str, content_id: i64, data: &Value) -> Result<Value, String> {
+        self.put(&format!("content-permissions/{content_type}/{content_id}"), data).await
+    }
+
+    // --- Roles ---
+
+    pub async fn list_roles(&self, count: i64, offset: i64) -> Result<Value, String> {
+        self.get("roles", &[
+            ("count", &count.to_string()),
+            ("offset", &offset.to_string()),
+        ]).await
+    }
+
+    pub async fn get_role(&self, id: i64) -> Result<Value, String> {
+        self.get(&format!("roles/{id}"), &[]).await
     }
 }

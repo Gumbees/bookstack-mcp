@@ -10,7 +10,7 @@ An MCP (Model Context Protocol) server that gives Claude full access to a [BookS
 - SSE transport (MCP protocol version `2024-11-05`)
 - ~10MB Docker image (Alpine + static Rust binary)
 
-## Available Tools (26)
+## Available Tools (49)
 
 | Category | Tools |
 |----------|-------|
@@ -20,6 +20,15 @@ An MCP (Model Context Protocol) server that gives Claude full access to a [BookS
 | **Chapters** | `list_chapters`, `get_chapter`, `create_chapter`, `update_chapter`, `delete_chapter` |
 | **Pages** | `list_pages`, `get_page`, `create_page`, `update_page`, `delete_page` |
 | **Attachments** | `list_attachments`, `get_attachment`, `create_attachment`, `update_attachment`, `delete_attachment` |
+| **Exports** | `export_page`, `export_chapter`, `export_book` (markdown, plaintext, html) |
+| **Comments** | `list_comments`, `get_comment`, `create_comment`, `update_comment`, `delete_comment` |
+| **Recycle Bin** | `list_recycle_bin`, `restore_recycle_bin_item`, `destroy_recycle_bin_item` |
+| **Users** | `list_users`, `get_user` |
+| **Audit Log** | `list_audit_log` |
+| **System** | `get_system_info` |
+| **Images** | `list_images`, `get_image`, `update_image`, `delete_image` |
+| **Permissions** | `get_content_permissions`, `update_content_permissions` |
+| **Roles** | `list_roles`, `get_role` |
 
 ## Setup
 

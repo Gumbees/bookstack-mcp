@@ -210,6 +210,155 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Res
             Ok(format!("Attachment {id} deleted."))
         }
 
+        // Exports
+        "export_page" => {
+            let id = arg_i64_required(args, "page_id")?;
+            let fmt = arg_str_default(args, "format", "markdown");
+            client.export_page(id, &fmt).await
+        }
+        "export_chapter" => {
+            let id = arg_i64_required(args, "chapter_id")?;
+            let fmt = arg_str_default(args, "format", "markdown");
+            client.export_chapter(id, &fmt).await
+        }
+        "export_book" => {
+            let id = arg_i64_required(args, "book_id")?;
+            let fmt = arg_str_default(args, "format", "markdown");
+            client.export_book(id, &fmt).await
+        }
+
+        // Comments
+        "list_comments" => {
+            let mut query: Vec<(&str, &str)> = vec![];
+            let page_id_str;
+            if let Some(v) = args.get("page_id").and_then(|v| v.as_i64()) {
+                page_id_str = v.to_string();
+                query.push(("filter[page_id]", &page_id_str));
+            }
+            format_json(&client.list_comments(&query).await?)
+        }
+        "get_comment" => {
+            let id = arg_i64_required(args, "comment_id")?;
+            format_json(&client.get_comment(id).await?)
+        }
+        "create_comment" => {
+            let mut data = json!({
+                "page_id": arg_i64_required(args, "page_id")?,
+            });
+            if let Some(v) = args.get("html").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                data["html"] = json!(v);
+            }
+            if let Some(v) = args.get("parent_id").and_then(|v| v.as_i64()) {
+                data["parent_id"] = json!(v);
+            }
+            format_json(&client.create_comment(&data).await?)
+        }
+        "update_comment" => {
+            let id = arg_i64_required(args, "comment_id")?;
+            let data = filter_update_fields(args, &["html"]);
+            format_json(&client.update_comment(id, &data).await?)
+        }
+        "delete_comment" => {
+            let id = arg_i64_required(args, "comment_id")?;
+            client.delete_comment(id).await?;
+            Ok(format!("Comment {id} deleted."))
+        }
+
+        // Recycle Bin
+        "list_recycle_bin" => {
+            let count = arg_i64(args, "count", 50);
+            let offset = arg_i64(args, "offset", 0);
+            format_json(&client.list_recycle_bin(count, offset).await?)
+        }
+        "restore_recycle_bin_item" => {
+            let id = arg_i64_required(args, "deletion_id")?;
+            format_json(&client.restore_recycle_bin_item(id).await?)
+        }
+        "destroy_recycle_bin_item" => {
+            let id = arg_i64_required(args, "deletion_id")?;
+            client.destroy_recycle_bin_item(id).await?;
+            Ok(format!("Recycle bin item {id} permanently deleted."))
+        }
+
+        // Users
+        "list_users" => {
+            let count = arg_i64(args, "count", 50);
+            let offset = arg_i64(args, "offset", 0);
+            format_json(&client.list_users(count, offset).await?)
+        }
+        "get_user" => {
+            let id = arg_i64_required(args, "user_id")?;
+            format_json(&client.get_user(id).await?)
+        }
+
+        // Audit Log
+        "list_audit_log" => {
+            let count = arg_i64(args, "count", 50);
+            let offset = arg_i64(args, "offset", 0);
+            format_json(&client.list_audit_log(count, offset).await?)
+        }
+
+        // System
+        "get_system_info" => {
+            format_json(&client.get_system_info().await?)
+        }
+
+        // Image Gallery
+        "list_images" => {
+            let count = arg_i64(args, "count", 50);
+            let offset = arg_i64(args, "offset", 0);
+            let mut filter: Vec<(&str, &str)> = vec![];
+            let type_str;
+            if let Some(v) = args.get("type").and_then(|v| v.as_str()) {
+                type_str = v.to_string();
+                filter.push(("filter[type]", &type_str));
+            }
+            let uploaded_to_str;
+            if let Some(v) = args.get("uploaded_to").and_then(|v| v.as_i64()) {
+                uploaded_to_str = v.to_string();
+                filter.push(("filter[uploaded_to]", &uploaded_to_str));
+            }
+            format_json(&client.list_images(count, offset, &filter).await?)
+        }
+        "get_image" => {
+            let id = arg_i64_required(args, "image_id")?;
+            format_json(&client.get_image(id).await?)
+        }
+        "update_image" => {
+            let id = arg_i64_required(args, "image_id")?;
+            let data = filter_update_fields(args, &["name"]);
+            format_json(&client.update_image(id, &data).await?)
+        }
+        "delete_image" => {
+            let id = arg_i64_required(args, "image_id")?;
+            client.delete_image(id).await?;
+            Ok(format!("Image {id} deleted."))
+        }
+
+        // Content Permissions
+        "get_content_permissions" => {
+            let content_type = arg_str(args, "content_type")?;
+            let content_id = arg_i64_required(args, "content_id")?;
+            format_json(&client.get_content_permissions(&content_type, content_id).await?)
+        }
+        "update_content_permissions" => {
+            let content_type = arg_str(args, "content_type")?;
+            let content_id = arg_i64_required(args, "content_id")?;
+            let data = filter_update_fields(args, &["owner_id", "role_permissions", "fallback_permissions"]);
+            format_json(&client.update_content_permissions(&content_type, content_id, &data).await?)
+        }
+
+        // Roles
+        "list_roles" => {
+            let count = arg_i64(args, "count", 50);
+            let offset = arg_i64(args, "offset", 0);
+            format_json(&client.list_roles(count, offset).await?)
+        }
+        "get_role" => {
+            let id = arg_i64_required(args, "role_id")?;
+            format_json(&client.get_role(id).await?)
+        }
+
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -404,6 +553,134 @@ pub fn tool_definitions() -> Vec<Value> {
             update_schema("attachment_id", &["name", "link"])),
         tool("delete_attachment", "Delete an attachment.",
             id_schema("attachment_id")),
+
+        // Exports
+        tool("export_page", "Export a page as markdown, plaintext, or html. Returns the raw exported content.", json!({
+            "type": "object",
+            "properties": {
+                "page_id": { "type": "integer", "description": "Page ID to export" },
+                "format": { "type": "string", "enum": ["markdown", "plaintext", "html"], "description": "Export format", "default": "markdown" }
+            },
+            "required": ["page_id"]
+        })),
+        tool("export_chapter", "Export a chapter as markdown, plaintext, or html. Returns all pages in the chapter.", json!({
+            "type": "object",
+            "properties": {
+                "chapter_id": { "type": "integer", "description": "Chapter ID to export" },
+                "format": { "type": "string", "enum": ["markdown", "plaintext", "html"], "description": "Export format", "default": "markdown" }
+            },
+            "required": ["chapter_id"]
+        })),
+        tool("export_book", "Export a book as markdown, plaintext, or html. Returns all chapters and pages.", json!({
+            "type": "object",
+            "properties": {
+                "book_id": { "type": "integer", "description": "Book ID to export" },
+                "format": { "type": "string", "enum": ["markdown", "plaintext", "html"], "description": "Export format", "default": "markdown" }
+            },
+            "required": ["book_id"]
+        })),
+
+        // Comments
+        tool("list_comments", "List comments, optionally filtered by page.", json!({
+            "type": "object",
+            "properties": {
+                "page_id": { "type": "integer", "description": "Filter comments by page ID" }
+            }
+        })),
+        tool("get_comment", "Get a comment by ID.",
+            id_schema("comment_id")),
+        tool("create_comment", "Create a comment on a page.", json!({
+            "type": "object",
+            "properties": {
+                "page_id": { "type": "integer", "description": "Page ID to comment on" },
+                "html": { "type": "string", "description": "Comment content in HTML" },
+                "parent_id": { "type": "integer", "description": "Parent comment ID for replies" }
+            },
+            "required": ["page_id", "html"]
+        })),
+        tool("update_comment", "Update a comment.", json!({
+            "type": "object",
+            "properties": {
+                "comment_id": { "type": "integer", "description": "The comment_id" },
+                "html": { "type": "string", "description": "New comment content in HTML" }
+            },
+            "required": ["comment_id"]
+        })),
+        tool("delete_comment", "Delete a comment.",
+            id_schema("comment_id")),
+
+        // Recycle Bin
+        tool("list_recycle_bin", "List items in the recycle bin.",
+            paginated_schema()),
+        tool("restore_recycle_bin_item", "Restore an item from the recycle bin.",
+            id_schema("deletion_id")),
+        tool("destroy_recycle_bin_item", "Permanently delete an item from the recycle bin. Cannot be undone.",
+            id_schema("deletion_id")),
+
+        // Users
+        tool("list_users", "List all users.",
+            paginated_schema()),
+        tool("get_user", "Get a user by ID.",
+            id_schema("user_id")),
+
+        // Audit Log
+        tool("list_audit_log", "List audit log entries showing recent activity.",
+            paginated_schema()),
+
+        // System
+        tool("get_system_info", "Get BookStack instance information (version, etc.).", json!({
+            "type": "object", "properties": {}
+        })),
+
+        // Image Gallery
+        tool("list_images", "List images in the gallery.", json!({
+            "type": "object",
+            "properties": {
+                "count": { "type": "integer", "description": "Number of results", "default": 50 },
+                "offset": { "type": "integer", "description": "Number to skip", "default": 0 },
+                "type": { "type": "string", "enum": ["gallery", "drawio"], "description": "Filter by image type" },
+                "uploaded_to": { "type": "integer", "description": "Filter by page ID the image was uploaded to" }
+            }
+        })),
+        tool("get_image", "Get image details by ID. Returns metadata and URLs.",
+            id_schema("image_id")),
+        tool("update_image", "Update image metadata (name).", json!({
+            "type": "object",
+            "properties": {
+                "image_id": { "type": "integer", "description": "The image_id" },
+                "name": { "type": "string", "description": "New image name" }
+            },
+            "required": ["image_id"]
+        })),
+        tool("delete_image", "Delete an image from the gallery.",
+            id_schema("image_id")),
+
+        // Content Permissions
+        tool("get_content_permissions", "Get permissions for a content item.", json!({
+            "type": "object",
+            "properties": {
+                "content_type": { "type": "string", "enum": ["page", "chapter", "book", "shelf"], "description": "Content type" },
+                "content_id": { "type": "integer", "description": "Content item ID" }
+            },
+            "required": ["content_type", "content_id"]
+        })),
+        tool("update_content_permissions", "Update permissions for a content item.", json!({
+            "type": "object",
+            "properties": {
+                "content_type": { "type": "string", "enum": ["page", "chapter", "book", "shelf"], "description": "Content type" },
+                "content_id": { "type": "integer", "description": "Content item ID" },
+                "owner_id": { "type": "integer", "description": "New owner user ID" },
+                "role_permissions": { "type": "array", "description": "Array of role permission objects" },
+                "fallback_permissions": { "type": "object", "description": "Fallback permission settings" }
+            },
+            "required": ["content_type", "content_id"]
+        })),
+
+        // Roles
+        tool("list_roles", "List all roles.",
+            paginated_schema()),
+        tool("get_role", "Get a role by ID, including its permissions.",
+            id_schema("role_id")),
     ]
 }
 

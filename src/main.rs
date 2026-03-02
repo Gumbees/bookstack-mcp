@@ -16,10 +16,6 @@ async fn main() {
     let bookstack_url = env::var("BSMCP_BOOKSTACK_URL")
         .expect("BSMCP_BOOKSTACK_URL is required");
 
-    if !bookstack_url.starts_with("https://") {
-        eprintln!("WARNING: BSMCP_BOOKSTACK_URL is not HTTPS. Ensure BookStack is on an isolated network.");
-    }
-
     let host = env::var("BSMCP_HOST").unwrap_or_else(|_| "0.0.0.0".into());
     let port: u16 = env::var("BSMCP_PORT")
         .unwrap_or_else(|_| "8080".into())

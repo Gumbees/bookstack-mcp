@@ -11,12 +11,14 @@ use axum::Json;
 use serde_json::Value;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
+use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 
 use crate::bookstack::BookStackClient;
 use crate::mcp;
 
 const MAX_SESSIONS_PER_TOKEN: usize = 5;
+const MAX_TOTAL_SESSIONS: usize = 1000;
 const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 const MAX_REQUESTS_PER_MINUTE: u32 = 100;
 
@@ -54,20 +56,30 @@ impl AppState {
             sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
+
+    /// Spawn a single shared cleanup task that periodically removes expired/disconnected sessions.
+    pub fn spawn_cleanup(&self) {
+        let sessions = self.sessions.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let mut sessions = sessions.write().await;
+                sessions.retain(|sid, s| {
+                    let expired = s.tx.is_closed() || s.created_at.elapsed() > SESSION_TTL;
+                    if expired {
+                        eprintln!("Session {sid} cleaned up");
+                    }
+                    !expired
+                });
+            }
+        });
+    }
 }
 
 /// Constant-time string comparison to prevent timing side-channel attacks.
+/// Uses the `subtle` crate which handles length differences without leaking timing info.
 fn constant_time_eq(a: &str, b: &str) -> bool {
-    let a = a.as_bytes();
-    let b = b.as_bytes();
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut result = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        result |= x ^ y;
-    }
-    result == 0
+    a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
 fn extract_credentials(headers: &HeaderMap) -> Result<(String, String), (StatusCode, Json<Value>)> {
@@ -129,6 +141,17 @@ pub async fn handle_sse(
     // client receives endpoint URL and sends a message before session exists)
     {
         let mut sessions = state.sessions.write().await;
+
+        // Global session limit
+        if sessions.len() >= MAX_TOTAL_SESSIONS {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Server at session capacity"})),
+            )
+                .into_response();
+        }
+
+        // Per-token session limit
         let count = sessions.values().filter(|s| s.token_id == token_id).count();
         if count >= MAX_SESSIONS_PER_TOKEN {
             return (
@@ -159,26 +182,7 @@ pub async fn handle_sse(
         .send(Ok(Event::default().event("endpoint").data(endpoint_url)))
         .await;
 
-    // Clean up on disconnect or TTL expiry
-    let sessions = state.sessions.clone();
-    let sid = session_id.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            let should_remove = {
-                let sessions = sessions.read().await;
-                sessions
-                    .get(&sid)
-                    .map(|s| s.tx.is_closed() || s.created_at.elapsed() > SESSION_TTL)
-                    .unwrap_or(true)
-            };
-            if should_remove {
-                sessions.write().await.remove(&sid);
-                eprintln!("Session {sid} cleaned up");
-                break;
-            }
-        }
-    });
+    // Session cleanup is handled by the shared cleanup task (AppState::spawn_cleanup)
 
     let stream = ReceiverStream::new(rx);
     Sse::new(stream)

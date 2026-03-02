@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-use crate::bookstack::BookStackClient;
+use crate::bookstack::{BookStackClient, ContentType, ExportFormat};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
@@ -82,7 +82,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Res
         }
         "update_shelf" => {
             let id = arg_i64_required(args, "shelf_id")?;
-            let data = filter_update_fields(args, &["name", "description"]);
+            let data = filter_string_update_fields(args, &["name", "description"]);
             format_json(&client.update_shelf(id, &data).await?)
         }
         "delete_shelf" => {
@@ -108,7 +108,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Res
         }
         "update_book" => {
             let id = arg_i64_required(args, "book_id")?;
-            let data = filter_update_fields(args, &["name", "description"]);
+            let data = filter_string_update_fields(args, &["name", "description"]);
             format_json(&client.update_book(id, &data).await?)
         }
         "delete_book" => {
@@ -135,7 +135,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Res
         }
         "update_chapter" => {
             let id = arg_i64_required(args, "chapter_id")?;
-            let data = filter_update_fields(args, &["name", "description"]);
+            let data = filter_string_update_fields(args, &["name", "description"]);
             format_json(&client.update_chapter(id, &data).await?)
         }
         "delete_chapter" => {
@@ -172,7 +172,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Res
         }
         "update_page" => {
             let id = arg_i64_required(args, "page_id")?;
-            let data = filter_update_fields(args, &["name", "markdown", "html"]);
+            let data = filter_string_update_fields(args, &["name", "markdown", "html"]);
             format_json(&client.update_page(id, &data).await?)
         }
         "delete_page" => {
@@ -201,7 +201,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Res
         }
         "update_attachment" => {
             let id = arg_i64_required(args, "attachment_id")?;
-            let data = filter_update_fields(args, &["name", "link"]);
+            let data = filter_string_update_fields(args, &["name", "link"]);
             format_json(&client.update_attachment(id, &data).await?)
         }
         "delete_attachment" => {
@@ -213,21 +213,18 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Res
         // Exports
         "export_page" => {
             let id = arg_i64_required(args, "page_id")?;
-            let fmt = arg_str_default(args, "format", "markdown");
-            validate_enum(&fmt, &["markdown", "plaintext", "html"], "format")?;
-            client.export_page(id, &fmt).await
+            let fmt = ExportFormat::from_str(&arg_str_default(args, "format", "markdown"))?;
+            client.export_page(id, fmt).await
         }
         "export_chapter" => {
             let id = arg_i64_required(args, "chapter_id")?;
-            let fmt = arg_str_default(args, "format", "markdown");
-            validate_enum(&fmt, &["markdown", "plaintext", "html"], "format")?;
-            client.export_chapter(id, &fmt).await
+            let fmt = ExportFormat::from_str(&arg_str_default(args, "format", "markdown"))?;
+            client.export_chapter(id, fmt).await
         }
         "export_book" => {
             let id = arg_i64_required(args, "book_id")?;
-            let fmt = arg_str_default(args, "format", "markdown");
-            validate_enum(&fmt, &["markdown", "plaintext", "html"], "format")?;
-            client.export_book(id, &fmt).await
+            let fmt = ExportFormat::from_str(&arg_str_default(args, "format", "markdown"))?;
+            client.export_book(id, fmt).await
         }
 
         // Comments
@@ -258,7 +255,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Res
         }
         "update_comment" => {
             let id = arg_i64_required(args, "comment_id")?;
-            let data = filter_update_fields(args, &["html"]);
+            let data = filter_string_update_fields(args, &["html"]);
             format_json(&client.update_comment(id, &data).await?)
         }
         "delete_comment" => {
@@ -330,7 +327,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Res
         }
         "update_image" => {
             let id = arg_i64_required(args, "image_id")?;
-            let data = filter_update_fields(args, &["name"]);
+            let data = filter_string_update_fields(args, &["name"]);
             format_json(&client.update_image(id, &data).await?)
         }
         "delete_image" => {
@@ -341,17 +338,15 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Res
 
         // Content Permissions
         "get_content_permissions" => {
-            let content_type = arg_str(args, "content_type")?;
-            validate_enum(&content_type, &["page", "chapter", "book", "shelf"], "content_type")?;
+            let content_type = ContentType::from_str(&arg_str(args, "content_type")?)?;
             let content_id = arg_i64_required(args, "content_id")?;
-            format_json(&client.get_content_permissions(&content_type, content_id).await?)
+            format_json(&client.get_content_permissions(content_type, content_id).await?)
         }
         "update_content_permissions" => {
-            let content_type = arg_str(args, "content_type")?;
-            validate_enum(&content_type, &["page", "chapter", "book", "shelf"], "content_type")?;
+            let content_type = ContentType::from_str(&arg_str(args, "content_type")?)?;
             let content_id = arg_i64_required(args, "content_id")?;
             let data = filter_update_fields(args, &["owner_id", "role_permissions", "fallback_permissions"]);
-            format_json(&client.update_content_permissions(&content_type, content_id, &data).await?)
+            format_json(&client.update_content_permissions(content_type, content_id, &data).await?)
         }
 
         // Roles
@@ -411,11 +406,25 @@ fn validate_enum(value: &str, allowed: &[&str], name: &str) -> Result<(), String
     }
 }
 
+/// Filter update fields, accepting any JSON value type (for mixed-type updates like permissions).
 fn filter_update_fields(args: &Value, fields: &[&str]) -> Value {
     let mut data = json!({});
     for &field in fields {
         if let Some(v) = args.get(field) {
             if !v.is_null() {
+                data[field] = v.clone();
+            }
+        }
+    }
+    data
+}
+
+/// Filter update fields, only accepting string values (rejects type mismatches).
+fn filter_string_update_fields(args: &Value, fields: &[&str]) -> Value {
+    let mut data = json!({});
+    for &field in fields {
+        if let Some(v) = args.get(field) {
+            if v.is_string() {
                 data[field] = v.clone();
             }
         }

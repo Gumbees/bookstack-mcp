@@ -1,6 +1,63 @@
+use std::time::Duration;
+
 use reqwest::Client;
 use serde_json::Value;
 use zeroize::Zeroize;
+
+// --- Type-safe enums for URL path parameters (defense-in-depth) ---
+
+pub enum ExportFormat {
+    Markdown,
+    Plaintext,
+    Html,
+}
+
+impl ExportFormat {
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "markdown" => Ok(Self::Markdown),
+            "plaintext" => Ok(Self::Plaintext),
+            "html" => Ok(Self::Html),
+            _ => Err(format!("Invalid export format: '{s}'. Must be one of: markdown, plaintext, html")),
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Markdown => "markdown",
+            Self::Plaintext => "plaintext",
+            Self::Html => "html",
+        }
+    }
+}
+
+pub enum ContentType {
+    Page,
+    Chapter,
+    Book,
+    Shelf,
+}
+
+impl ContentType {
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "page" => Ok(Self::Page),
+            "chapter" => Ok(Self::Chapter),
+            "book" => Ok(Self::Book),
+            "shelf" => Ok(Self::Shelf),
+            _ => Err(format!("Invalid content type: '{s}'. Must be one of: page, chapter, book, shelf")),
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Page => "page",
+            Self::Chapter => "chapter",
+            Self::Book => "book",
+            Self::Shelf => "shelf",
+        }
+    }
+}
 
 const MAX_RESPONSE_SIZE: usize = 50 * 1024 * 1024; // 50MB
 const MAX_ERROR_BODY_SIZE: usize = 4096; // 4KB for error messages
@@ -26,7 +83,11 @@ impl Drop for BookStackClient {
 impl BookStackClient {
     pub fn new(base_url: &str, token_id: &str, token_secret: &str) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(60))
+                .build()
+                .expect("Failed to build HTTP client"),
             base_url: base_url.trim_end_matches('/').to_string(),
             token_id: token_id.to_string(),
             token_secret: token_secret.to_string(),
@@ -72,14 +133,23 @@ impl BookStackClient {
     }
 
     /// Read error body with a size limit to prevent memory exhaustion from error responses.
-    async fn read_error_body(resp: reqwest::Response) -> String {
-        match resp.bytes().await {
-            Ok(bytes) => {
-                let len = bytes.len().min(MAX_ERROR_BODY_SIZE);
-                String::from_utf8_lossy(&bytes[..len]).into_owned()
-            }
-            Err(_) => String::new(),
+    /// Streams chunks to avoid buffering arbitrarily large error responses.
+    async fn read_error_body(mut resp: reqwest::Response) -> String {
+        // Fast-reject if Content-Length exceeds limit
+        if resp.content_length().map_or(false, |len| len as usize > MAX_ERROR_BODY_SIZE) {
+            return "[error body too large]".to_string();
         }
+        let mut buf = Vec::with_capacity(MAX_ERROR_BODY_SIZE.min(4096));
+        while buf.len() < MAX_ERROR_BODY_SIZE {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    let remaining = MAX_ERROR_BODY_SIZE - buf.len();
+                    buf.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                }
+                _ => break,
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
     }
 
     async fn get(&self, path: &str, query: &[(&str, &str)]) -> Result<Value, String> {
@@ -321,16 +391,19 @@ impl BookStackClient {
 
     // --- Exports ---
 
-    pub async fn export_page(&self, id: i64, format: &str) -> Result<String, String> {
-        self.get_text(&format!("pages/{id}/export/{format}")).await
+    pub async fn export_page(&self, id: i64, format: ExportFormat) -> Result<String, String> {
+        let fmt = format.as_str();
+        self.get_text(&format!("pages/{id}/export/{fmt}")).await
     }
 
-    pub async fn export_chapter(&self, id: i64, format: &str) -> Result<String, String> {
-        self.get_text(&format!("chapters/{id}/export/{format}")).await
+    pub async fn export_chapter(&self, id: i64, format: ExportFormat) -> Result<String, String> {
+        let fmt = format.as_str();
+        self.get_text(&format!("chapters/{id}/export/{fmt}")).await
     }
 
-    pub async fn export_book(&self, id: i64, format: &str) -> Result<String, String> {
-        self.get_text(&format!("books/{id}/export/{format}")).await
+    pub async fn export_book(&self, id: i64, format: ExportFormat) -> Result<String, String> {
+        let fmt = format.as_str();
+        self.get_text(&format!("books/{id}/export/{fmt}")).await
     }
 
     // --- Comments ---
@@ -426,12 +499,14 @@ impl BookStackClient {
 
     // --- Content Permissions ---
 
-    pub async fn get_content_permissions(&self, content_type: &str, content_id: i64) -> Result<Value, String> {
-        self.get(&format!("content-permissions/{content_type}/{content_id}"), &[]).await
+    pub async fn get_content_permissions(&self, content_type: ContentType, content_id: i64) -> Result<Value, String> {
+        let ct = content_type.as_str();
+        self.get(&format!("content-permissions/{ct}/{content_id}"), &[]).await
     }
 
-    pub async fn update_content_permissions(&self, content_type: &str, content_id: i64, data: &Value) -> Result<Value, String> {
-        self.put(&format!("content-permissions/{content_type}/{content_id}"), data).await
+    pub async fn update_content_permissions(&self, content_type: ContentType, content_id: i64, data: &Value) -> Result<Value, String> {
+        let ct = content_type.as_str();
+        self.put(&format!("content-permissions/{ct}/{content_id}"), data).await
     }
 
     // --- Roles ---

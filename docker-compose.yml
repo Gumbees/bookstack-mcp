@@ -3,6 +3,11 @@ services:
     build: .
     container_name: bookstack-mcp
     restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
     environment:
       BSMCP_BOOKSTACK_URL: ${BSMCP_BOOKSTACK_URL:-https://docs.beesroadhouse.com}
     labels:

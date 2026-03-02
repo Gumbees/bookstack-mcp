@@ -9,19 +9,26 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::Value;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
+use zeroize::Zeroize;
 
 use crate::bookstack::BookStackClient;
 use crate::mcp;
 
 const MAX_SESSIONS_PER_TOKEN: usize = 5;
 const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
+const MAX_REQUESTS_PER_MINUTE: u32 = 100;
 
 #[derive(Clone)]
 pub struct AppState {
     bookstack_url: String,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
+}
+
+struct RateLimit {
+    count: u32,
+    window_start: Instant,
 }
 
 struct Session {
@@ -30,6 +37,14 @@ struct Session {
     token_id: String,
     token_secret: String,
     created_at: Instant,
+    rate_limit: Arc<Mutex<RateLimit>>,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.token_id.zeroize();
+        self.token_secret.zeroize();
+    }
 }
 
 impl AppState {
@@ -120,6 +135,10 @@ pub async fn handle_sse(
                 token_id: token_id.clone(),
                 token_secret: token_secret.clone(),
                 created_at: Instant::now(),
+                rate_limit: Arc::new(Mutex::new(RateLimit {
+                    count: 0,
+                    window_start: Instant::now(),
+                })),
             },
         );
     }
@@ -175,7 +194,7 @@ pub async fn handle_message(
     };
 
     // Clone what we need out of the session, then release the lock
-    let (tx, client) = {
+    let (tx, client, rate_limit) = {
         let sessions = state.sessions.read().await;
         let session = match sessions.get(session_id) {
             Some(s) => s,
@@ -206,8 +225,25 @@ pub async fn handle_message(
                 .into_response();
         }
 
-        (session.tx.clone(), session.client.clone())
+        (session.tx.clone(), session.client.clone(), session.rate_limit.clone())
     }; // RwLock released here
+
+    // Rate limit check
+    {
+        let mut rl = rate_limit.lock().await;
+        if rl.window_start.elapsed() > Duration::from_secs(60) {
+            rl.count = 0;
+            rl.window_start = Instant::now();
+        }
+        if rl.count >= MAX_REQUESTS_PER_MINUTE {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "Rate limit exceeded"})),
+            )
+                .into_response();
+        }
+        rl.count += 1;
+    }
 
     let request: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
@@ -224,9 +260,8 @@ pub async fn handle_message(
 
     if let Some(response) = response {
         let data = serde_json::to_string(&response).unwrap_or_default();
-        let _ = tx
-            .send(Ok(Event::default().event("message").data(data)))
-            .await;
+        // try_send to avoid blocking if the SSE client is slow
+        let _ = tx.try_send(Ok(Event::default().event("message").data(data)));
     }
 
     StatusCode::ACCEPTED.into_response()

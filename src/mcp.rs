@@ -160,6 +160,8 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Res
                 data["chapter_id"] = json!(v);
             } else if let Some(v) = args.get("book_id").and_then(|v| v.as_i64()) {
                 data["book_id"] = json!(v);
+            } else {
+                return Err("Either book_id or chapter_id is required".to_string());
             }
             if let Some(v) = args.get("markdown").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                 data["markdown"] = json!(v);

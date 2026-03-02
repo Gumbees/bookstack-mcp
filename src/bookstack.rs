@@ -1,5 +1,6 @@
 use reqwest::Client;
 use serde_json::Value;
+use zeroize::Zeroize;
 
 const MAX_RESPONSE_SIZE: usize = 50 * 1024 * 1024; // 50MB
 
@@ -9,6 +10,13 @@ pub struct BookStackClient {
     base_url: String,
     token_id: String,
     token_secret: String,
+}
+
+impl Drop for BookStackClient {
+    fn drop(&mut self) {
+        self.token_id.zeroize();
+        self.token_secret.zeroize();
+    }
 }
 
 impl BookStackClient {

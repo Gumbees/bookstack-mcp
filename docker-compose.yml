@@ -1,6 +1,6 @@
 services:
   bookstack-mcp:
-    build: .
+    image: ghcr.io/gumbees/bookstack-mcp:latest
     container_name: bookstack-mcp
     restart: unless-stopped
     read_only: true

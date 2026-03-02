@@ -16,13 +16,8 @@ async fn main() {
     let bookstack_url = env::var("BSMCP_BOOKSTACK_URL")
         .expect("BSMCP_BOOKSTACK_URL is required");
 
-    // Enforce HTTPS to prevent credential leakage over plaintext
     if !bookstack_url.starts_with("https://") {
-        if env::var("BSMCP_ALLOW_HTTP").is_ok() {
-            eprintln!("WARNING: BSMCP_BOOKSTACK_URL is not HTTPS. Credentials will be sent in cleartext.");
-        } else {
-            panic!("BSMCP_BOOKSTACK_URL must use HTTPS. Set BSMCP_ALLOW_HTTP=1 to override for development.");
-        }
+        eprintln!("WARNING: BSMCP_BOOKSTACK_URL is not HTTPS. Ensure BookStack is on an isolated network.");
     }
 
     let host = env::var("BSMCP_HOST").unwrap_or_else(|_| "0.0.0.0".into());

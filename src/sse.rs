@@ -124,6 +124,7 @@ fn resolve_credentials(
         .unwrap_or("");
 
     if !auth.starts_with("Bearer ") {
+        eprintln!("Auth: no Bearer token in request");
         return Err(unauthorized("Bearer token required", headers));
     }
 
@@ -131,14 +132,18 @@ fn resolve_credentials(
 
     // Legacy format: token_id:token_secret
     if let Some((id, secret)) = token.split_once(':') {
+        eprintln!("Auth: legacy token format (token_id:secret)");
         return Ok((id.to_string(), secret.to_string()));
     }
 
     // OAuth access token (from SQLite)
+    let token_count = db.count_tokens();
     if let Some((token_id, token_secret)) = db.get_access_token(token) {
+        eprintln!("Auth: OAuth token resolved (db has {token_count} tokens)");
         return Ok((token_id, token_secret));
     }
 
+    eprintln!("Auth: token not found in db ({token_count} tokens stored, token_len={})", token.len());
     Err(unauthorized("Invalid or expired token", headers))
 }
 
@@ -146,6 +151,7 @@ pub async fn handle_sse(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
+    eprintln!("GET /mcp/sse — SSE connection attempt");
     let (token_id, token_secret) = match resolve_credentials(&headers, &state.db) {
         Ok(creds) => creds,
         Err(resp) => return resp,
@@ -235,6 +241,7 @@ pub async fn handle_message(
     Query(params): Query<HashMap<String, String>>,
     body: String,
 ) -> Response {
+    eprintln!("POST /mcp/messages/ — message request");
     // Authenticate the request (both token_id and token_secret)
     let (token_id, token_secret) = match resolve_credentials(&headers, &state.db) {
         Ok(creds) => creds,
@@ -337,6 +344,7 @@ pub async fn handle_streamable(
     headers: HeaderMap,
     body: String,
 ) -> Response {
+    eprintln!("POST /mcp/sse — Streamable HTTP request");
     let (token_id, token_secret) = match resolve_credentials(&headers, &state.db) {
         Ok(creds) => creds,
         Err(resp) => return resp,

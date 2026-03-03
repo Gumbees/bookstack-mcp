@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 
 use crate::bookstack::{BookStackClient, ContentType, ExportFormat};
 
-const PROTOCOL_VERSION: &str = "2024-11-05";
+const PROTOCOL_VERSION: &str = "2025-03-26";
 
 pub async fn handle_request(request: &Value, client: &BookStackClient) -> Option<Value> {
     let method = request["method"].as_str().unwrap_or("");

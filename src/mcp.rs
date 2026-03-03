@@ -6,10 +6,11 @@ use serde_json::{json, Value};
 use pulldown_cmark::{html, Options, Parser};
 
 use crate::bookstack::{BookStackClient, ContentType, ExportFormat};
+use crate::semantic::SemanticState;
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
 
-pub async fn handle_request(request: &Value, client: &BookStackClient) -> Option<Value> {
+pub async fn handle_request(request: &Value, client: &BookStackClient, semantic: Option<&SemanticState>) -> Option<Value> {
     let id = request.get("id");
 
     // L5: Validate JSON-RPC 2.0 protocol field
@@ -25,7 +26,7 @@ pub async fn handle_request(request: &Value, client: &BookStackClient) -> Option
 
     match method {
         "initialize" => {
-            let instructions = build_instructions(client).await;
+            let instructions = build_instructions(client, semantic.is_some()).await;
             Some(json_rpc_result(id, json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": { "tools": {} },
@@ -37,11 +38,11 @@ pub async fn handle_request(request: &Value, client: &BookStackClient) -> Option
             })))
         }
         "notifications/initialized" => None,
-        "tools/list" => Some(json_rpc_result(id, json!({ "tools": tool_definitions() }))),
+        "tools/list" => Some(json_rpc_result(id, json!({ "tools": tool_definitions(semantic.is_some()) }))),
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let result = execute_tool(name, &args, client).await;
+            let result = execute_tool(name, &args, client, semantic).await;
             match result {
                 Ok(text) => Some(json_rpc_result(id, json!({
                     "content": [{ "type": "text", "text": text }],
@@ -72,8 +73,28 @@ fn json_rpc_error(id: Option<&Value>, code: i64, message: &str) -> Value {
     })
 }
 
-async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Result<String, String> {
+async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semantic: Option<&SemanticState>) -> Result<String, String> {
     match name {
+        // Semantic Search (conditional)
+        "semantic_search" => {
+            let sem = semantic.ok_or("Semantic search is not enabled")?;
+            let query = arg_str(args, "query")?;
+            let limit = arg_i64(args, "limit", 10).clamp(1, 50) as usize;
+            let threshold = args.get("threshold").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32;
+            let result = sem.search(&query, limit, threshold).await?;
+            format_json(&result)
+        }
+        "reembed" => {
+            let sem = semantic.ok_or("Semantic search is not enabled")?;
+            let scope = arg_str_default(args, "scope", "all");
+            let result = sem.trigger_reembed(&scope).await?;
+            format_json(&result)
+        }
+        "embedding_status" => {
+            let sem = semantic.ok_or("Semantic search is not enabled")?;
+            format_json(&sem.embedding_status())
+        }
+
         // Search
         "search_content" => {
             let query = arg_str(args, "query")?;
@@ -534,7 +555,7 @@ fn markdown_to_html(md: &str) -> String {
 
 // --- Dynamic instructions (sent on initialize) ---
 
-async fn build_instructions(client: &BookStackClient) -> String {
+async fn build_instructions(client: &BookStackClient, semantic_enabled: bool) -> String {
     let instance_name = env::var("BSMCP_INSTANCE_NAME").unwrap_or_default();
     let instance_desc = env::var("BSMCP_INSTANCE_DESC").unwrap_or_default();
 
@@ -569,6 +590,16 @@ async fn build_instructions(client: &BookStackClient) -> String {
             instructions
                 .push_str("Use list_shelves and list_books to explore the structure.");
         }
+    }
+
+    if semantic_enabled {
+        instructions.push_str(
+            "\n\nSemantic search is available. Use the 'semantic_search' tool to find \
+             conceptually related content without exact keyword matches. Results include \
+             a Markov blanket of contextually related pages (linked_from, links_to, \
+             co_linked, siblings). Use 'reembed' to re-index content and 'embedding_status' \
+             to check indexing progress.",
+        );
     }
 
     instructions
@@ -641,8 +672,8 @@ async fn build_structure(client: &BookStackClient) -> Option<String> {
 
 // --- Tool definitions ---
 
-pub fn tool_definitions() -> Vec<Value> {
-    vec![
+pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
+    let mut tools = vec![
         tool("search_content",
             "Search across all BookStack content (pages, chapters, books, shelves). Supports operators: {type:page}, [tag_name=value], {in_name:term}, {created_by:me}, exact match with quotes.",
             json!({
@@ -865,7 +896,37 @@ pub fn tool_definitions() -> Vec<Value> {
             paginated_schema()),
         tool("get_role", "Get a role by ID, including its permissions.",
             id_schema("role_id")),
-    ]
+    ];
+
+    if semantic_enabled {
+        tools.push(tool("semantic_search",
+            "Search content by meaning using vector embeddings. Finds conceptually related pages without exact keyword matches. Returns matching chunks with relevance scores and a Markov blanket of contextually related pages.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Natural language search query" },
+                    "limit": { "type": "integer", "description": "Max number of page results to return", "default": 10 },
+                    "threshold": { "type": "number", "description": "Minimum cosine similarity score (0.0-1.0)", "default": 0.5 }
+                },
+                "required": ["query"]
+            })));
+        tools.push(tool("reembed",
+            "Trigger re-embedding of page content. Runs in the background. Use 'all' to re-embed everything, 'book:ID' for a specific book, or 'page:ID' for a single page.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "scope": { "type": "string", "description": "Scope: 'all', 'book:ID', or 'page:ID'", "default": "all" }
+                }
+            })));
+        tools.push(tool("embedding_status",
+            "Get the current status of the semantic search index, including total indexed pages, chunks, and latest embedding job progress.",
+            json!({
+                "type": "object",
+                "properties": {}
+            })));
+    }
+
+    tools
 }
 
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {

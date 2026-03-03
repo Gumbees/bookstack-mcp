@@ -20,6 +20,7 @@ use crate::bookstack::BookStackClient;
 use crate::db::Db;
 use crate::mcp;
 use crate::oauth::{AuthCode, AUTH_CODE_TTL};
+use crate::semantic::SemanticState;
 
 const MAX_SESSIONS_PER_TOKEN: usize = 5;
 const MAX_TOTAL_SESSIONS: usize = 1000;
@@ -40,6 +41,7 @@ pub struct AppState {
     streamable_sessions: Arc<RwLock<HashMap<String, Instant>>>,
     backup_interval_hours: Option<u64>,
     backup_path: PathBuf,
+    pub semantic: Option<Arc<SemanticState>>,
 }
 
 pub(crate) struct RateLimit {
@@ -94,6 +96,7 @@ impl AppState {
         known_urls: Vec<String>,
         backup_interval_hours: Option<u64>,
         backup_path: PathBuf,
+        semantic: Option<Arc<SemanticState>>,
     ) -> Self {
         let http_client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -113,6 +116,7 @@ impl AppState {
             streamable_sessions: Arc::new(RwLock::new(HashMap::new())),
             backup_interval_hours,
             backup_path,
+            semantic,
         }
     }
 
@@ -417,7 +421,8 @@ pub async fn handle_message(
         }
     };
 
-    let response = mcp::handle_request(&request, &client).await;
+    let semantic = state.semantic.as_deref();
+    let response = mcp::handle_request(&request, &client, semantic).await;
 
     if let Some(response) = response {
         let data = serde_json::to_string(&response).unwrap_or_default();
@@ -500,7 +505,8 @@ pub async fn handle_streamable(
         return StatusCode::ACCEPTED.into_response();
     }
 
-    let response = mcp::handle_request(&request, &client).await;
+    let semantic = state.semantic.as_deref();
+    let response = mcp::handle_request(&request, &client, semantic).await;
 
     match response {
         Some(resp) => {

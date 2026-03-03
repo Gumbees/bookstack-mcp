@@ -181,6 +181,323 @@ impl Db {
         Ok(())
     }
 
+    // --- Semantic Search Tables ---
+
+    /// Initialize semantic search tables. Only called when semantic search is enabled.
+    pub fn init_semantic_tables(&self) {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS pages (
+                page_id INTEGER PRIMARY KEY,
+                book_id INTEGER NOT NULL,
+                chapter_id INTEGER,
+                name TEXT NOT NULL,
+                slug TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                embedded_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                page_id INTEGER NOT NULL REFERENCES pages(page_id) ON DELETE CASCADE,
+                chunk_index INTEGER NOT NULL,
+                heading_path TEXT NOT NULL,
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                embedding BLOB NOT NULL,
+                UNIQUE(page_id, chunk_index)
+            );
+            CREATE TABLE IF NOT EXISTS relationships (
+                source_page_id INTEGER NOT NULL,
+                target_page_id INTEGER NOT NULL,
+                link_type TEXT NOT NULL DEFAULT 'link',
+                PRIMARY KEY (source_page_id, target_page_id, link_type)
+            );
+            CREATE TABLE IF NOT EXISTS embed_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scope TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                total_pages INTEGER DEFAULT 0,
+                done_pages INTEGER DEFAULT 0,
+                started_at INTEGER,
+                finished_at INTEGER,
+                error TEXT
+            );",
+        )
+        .expect("Failed to initialize semantic search tables");
+        eprintln!("Semantic: tables initialized");
+    }
+
+    // --- Page metadata ---
+
+    pub fn upsert_page(&self, page_id: i64, book_id: i64, chapter_id: Option<i64>, name: &str, slug: &str, content_hash: &str) {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO pages (page_id, book_id, chapter_id, name, slug, content_hash, embedded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(page_id) DO UPDATE SET
+                book_id = excluded.book_id,
+                chapter_id = excluded.chapter_id,
+                name = excluded.name,
+                slug = excluded.slug,
+                content_hash = excluded.content_hash,
+                embedded_at = excluded.embedded_at",
+            params![page_id, book_id, chapter_id, name, slug, content_hash, Self::now_secs()],
+        ).ok();
+    }
+
+    pub fn delete_page_and_chunks(&self, page_id: i64) {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM chunks WHERE page_id = ?1", params![page_id]).ok();
+        conn.execute("DELETE FROM relationships WHERE source_page_id = ?1 OR target_page_id = ?1", params![page_id]).ok();
+        conn.execute("DELETE FROM pages WHERE page_id = ?1", params![page_id]).ok();
+    }
+
+    pub fn get_page_content_hash(&self, page_id: i64) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT content_hash FROM pages WHERE page_id = ?1",
+            params![page_id],
+            |row| row.get(0),
+        ).ok()
+    }
+
+    // --- Chunks ---
+
+    pub fn insert_chunks(&self, page_id: i64, chunks: &[(usize, &str, &str, &str, &[u8])]) {
+        let conn = self.conn.lock().unwrap();
+        // Delete existing chunks for this page
+        conn.execute("DELETE FROM chunks WHERE page_id = ?1", params![page_id]).ok();
+        for &(index, heading_path, content, content_hash, embedding) in chunks {
+            conn.execute(
+                "INSERT INTO chunks (page_id, chunk_index, heading_path, content, content_hash, embedding)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![page_id, index as i64, heading_path, content, content_hash, embedding],
+            ).ok();
+        }
+    }
+
+    /// Load all embeddings for brute-force search: (chunk_id, page_id, embedding_blob)
+    pub fn load_all_embeddings(&self) -> Vec<(i64, i64, Vec<u8>)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, page_id, embedding FROM chunks")
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
+    }
+
+    /// Get chunk details by IDs for search result formatting.
+    pub fn get_chunk_details(&self, chunk_ids: &[i64]) -> Vec<(i64, i64, String, String, String)> {
+        if chunk_ids.is_empty() {
+            return Vec::new();
+        }
+        let conn = self.conn.lock().unwrap();
+        let placeholders: Vec<String> = (0..chunk_ids.len()).map(|i| format!("?{}", i + 1)).collect();
+        let sql = format!(
+            "SELECT c.id, c.page_id, c.heading_path, c.content, p.name
+             FROM chunks c JOIN pages p ON c.page_id = p.page_id
+             WHERE c.id IN ({})",
+            placeholders.join(",")
+        );
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let params: Vec<&dyn rusqlite::types::ToSql> = chunk_ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+        })
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
+    }
+
+    // --- Relationships ---
+
+    pub fn replace_relationships(&self, source_page_id: i64, targets: &[(i64, &str)]) {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM relationships WHERE source_page_id = ?1",
+            params![source_page_id],
+        ).ok();
+        for &(target_id, link_type) in targets {
+            conn.execute(
+                "INSERT OR IGNORE INTO relationships (source_page_id, target_page_id, link_type)
+                 VALUES (?1, ?2, ?3)",
+                params![source_page_id, target_id, link_type],
+            ).ok();
+        }
+    }
+
+    /// Get Markov blanket for a page: (linked_from, links_to, co_linked, siblings)
+    #[allow(clippy::type_complexity)]
+    pub fn get_markov_blanket(&self, page_id: i64) -> (
+        Vec<(i64, String)>,  // linked_from (parents)
+        Vec<(i64, String)>,  // links_to (children)
+        Vec<(i64, String)>,  // co_linked
+        Vec<(i64, String)>,  // siblings
+    ) {
+        let conn = self.conn.lock().unwrap();
+
+        // Parents: pages linking TO this page
+        let linked_from = conn
+            .prepare(
+                "SELECT r.source_page_id, p.name FROM relationships r
+                 JOIN pages p ON r.source_page_id = p.page_id
+                 WHERE r.target_page_id = ?1 LIMIT 20"
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map(params![page_id], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default();
+
+        // Children: pages this links TO
+        let links_to = conn
+            .prepare(
+                "SELECT r.target_page_id, p.name FROM relationships r
+                 JOIN pages p ON r.target_page_id = p.page_id
+                 WHERE r.source_page_id = ?1 LIMIT 20"
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map(params![page_id], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default();
+
+        // Co-linked: pages sharing a common link target
+        let co_linked = conn
+            .prepare(
+                "SELECT DISTINCT r2.source_page_id, p.name FROM relationships r1
+                 JOIN relationships r2 ON r1.target_page_id = r2.target_page_id
+                 JOIN pages p ON r2.source_page_id = p.page_id
+                 WHERE r1.source_page_id = ?1 AND r2.source_page_id != ?1
+                 LIMIT 10"
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map(params![page_id], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default();
+
+        // Siblings: same chapter or same book
+        let siblings = self.get_hierarchical_siblings_inner(&conn, page_id);
+
+        (linked_from, links_to, co_linked, siblings)
+    }
+
+    fn get_hierarchical_siblings_inner(&self, conn: &Connection, page_id: i64) -> Vec<(i64, String)> {
+        // Try chapter siblings first
+        let chapter_id: Option<i64> = conn
+            .query_row("SELECT chapter_id FROM pages WHERE page_id = ?1", params![page_id], |row| row.get(0))
+            .ok()
+            .flatten();
+
+        if let Some(cid) = chapter_id {
+            let result: Vec<(i64, String)> = conn
+                .prepare("SELECT page_id, name FROM pages WHERE chapter_id = ?1 AND page_id != ?2 LIMIT 20")
+                .and_then(|mut stmt| {
+                    stmt.query_map(params![cid, page_id], |row| Ok((row.get(0)?, row.get(1)?)))
+                        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                })
+                .unwrap_or_default();
+            if !result.is_empty() {
+                return result;
+            }
+        }
+
+        // Fall back to book siblings
+        let book_id: Option<i64> = conn
+            .query_row("SELECT book_id FROM pages WHERE page_id = ?1", params![page_id], |row| row.get(0))
+            .ok();
+
+        if let Some(bid) = book_id {
+            conn.prepare("SELECT page_id, name FROM pages WHERE book_id = ?1 AND page_id != ?2 LIMIT 20")
+                .and_then(|mut stmt| {
+                    stmt.query_map(params![bid, page_id], |row| Ok((row.get(0)?, row.get(1)?)))
+                        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    }
+
+    // --- Embed Jobs ---
+
+    pub fn create_embed_job(&self, scope: &str) -> i64 {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO embed_jobs (scope, status, started_at) VALUES (?1, 'running', ?2)",
+            params![scope, Self::now_secs()],
+        ).ok();
+        conn.last_insert_rowid()
+    }
+
+    pub fn update_embed_job_progress(&self, job_id: i64, done_pages: i64, total_pages: i64) {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE embed_jobs SET done_pages = ?1, total_pages = ?2 WHERE id = ?3",
+            params![done_pages, total_pages, job_id],
+        ).ok();
+    }
+
+    pub fn complete_embed_job(&self, job_id: i64, error: Option<&str>) {
+        let conn = self.conn.lock().unwrap();
+        let status = if error.is_some() { "error" } else { "completed" };
+        conn.execute(
+            "UPDATE embed_jobs SET status = ?1, finished_at = ?2, error = ?3 WHERE id = ?4",
+            params![status, Self::now_secs(), error, job_id],
+        ).ok();
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn get_latest_embed_job(&self) -> Option<(i64, String, String, i64, i64, Option<i64>, Option<i64>, Option<String>)> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, scope, status, total_pages, done_pages, started_at, finished_at, error
+             FROM embed_jobs ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((
+                row.get(0)?, row.get(1)?, row.get(2)?,
+                row.get(3)?, row.get(4)?, row.get(5)?,
+                row.get(6)?, row.get(7)?,
+            )),
+        ).ok()
+    }
+
+    pub fn get_embedding_stats(&self) -> (i64, i64) {
+        let conn = self.conn.lock().unwrap();
+        let total_pages: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pages", [], |row| row.get(0))
+            .unwrap_or(0);
+        let total_chunks: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
+            .unwrap_or(0);
+        (total_pages, total_chunks)
+    }
+
+    /// Resolve a BookStack page slug to a page_id from the local pages table.
+    pub fn resolve_page_slug(&self, slug: &str) -> Option<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT page_id FROM pages WHERE slug = ?1",
+            params![slug],
+            |row| row.get(0),
+        ).ok()
+    }
+
+    /// Get page metadata by ID from the local pages table.
+    pub fn get_page_meta(&self, page_id: i64) -> Option<(i64, Option<i64>, String, String)> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT book_id, chapter_id, name, slug FROM pages WHERE page_id = ?1",
+            params![page_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).ok()
+    }
+
     fn cleanup_old_backups(&self, backup_dir: &Path) {
         let mut backups: Vec<_> = std::fs::read_dir(backup_dir)
             .into_iter()

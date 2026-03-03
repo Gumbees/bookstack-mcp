@@ -1,0 +1,290 @@
+//! Heading-based HTML chunking for semantic search.
+//! Splits page HTML into chunks by heading tags, with merge/split post-processing.
+
+use sha2::{Sha256, Digest};
+
+pub struct Chunk {
+    pub index: usize,
+    pub heading_path: String,
+    pub content: String,
+    pub content_hash: String,
+}
+
+/// Chunk HTML content by heading tags (h1-h3).
+/// Each heading starts a new chunk; heading stack tracks nesting.
+/// Post-processing merges tiny chunks and splits oversized ones.
+pub fn chunk_html(html: &str) -> Vec<Chunk> {
+    let mut raw_chunks: Vec<(Vec<String>, String)> = Vec::new(); // (heading_stack, content)
+    let mut heading_stack: Vec<(u8, String)> = Vec::new(); // (level, text)
+    let mut current_content = String::new();
+    let mut in_tag = false;
+    let mut tag_buf = String::new();
+    let mut collecting_heading: Option<u8> = None;
+    let mut heading_text = String::new();
+
+    for ch in html.chars() {
+        if ch == '<' {
+            in_tag = true;
+            tag_buf.clear();
+            continue;
+        }
+        if ch == '>' {
+            in_tag = false;
+            let tag = tag_buf.trim().to_lowercase();
+
+            // Check for heading open tags
+            let heading_level = match tag.as_str() {
+                "h1" => Some(1u8),
+                "h2" => Some(2),
+                "h3" => Some(3),
+                _ => None,
+            };
+            if let Some(level) = heading_level {
+                // Save current chunk before starting new heading
+                if !current_content.trim().is_empty() || !raw_chunks.is_empty() {
+                    let path: Vec<String> = heading_stack.iter().map(|(_, t)| t.clone()).collect();
+                    raw_chunks.push((path, std::mem::take(&mut current_content)));
+                }
+                collecting_heading = Some(level);
+                heading_text.clear();
+                continue;
+            }
+
+            // Check for heading close tags
+            let is_closing_heading = matches!(
+                tag.as_str(),
+                "/h1" | "/h2" | "/h3"
+            );
+            if is_closing_heading {
+                if let Some(level) = collecting_heading.take() {
+                    let text = heading_text.trim().to_string();
+                    // Pop headings at same or deeper level
+                    while heading_stack.last().is_some_and(|(l, _)| *l >= level) {
+                        heading_stack.pop();
+                    }
+                    heading_stack.push((level, text));
+                }
+                continue;
+            }
+
+            // Other closing/self-closing tags — add space for word separation
+            if tag.starts_with('/') || tag.ends_with('/') {
+                if collecting_heading.is_some() {
+                    heading_text.push(' ');
+                } else {
+                    current_content.push(' ');
+                }
+            }
+            continue;
+        }
+        if in_tag {
+            tag_buf.push(ch);
+            continue;
+        }
+
+        // Collecting text
+        if collecting_heading.is_some() {
+            heading_text.push(ch);
+        } else {
+            current_content.push(ch);
+        }
+    }
+
+    // Push final chunk
+    let path: Vec<String> = heading_stack.iter().map(|(_, t)| t.clone()).collect();
+    raw_chunks.push((path, current_content));
+
+    // Post-process: merge tiny chunks, split oversized ones
+    let mut merged: Vec<(String, String)> = Vec::new(); // (heading_path, content_text)
+    for (path, content) in raw_chunks {
+        let heading_path = path.join(" > ");
+        let text = normalize_whitespace(content.trim());
+        if text.is_empty() {
+            continue;
+        }
+        // Merge tiny chunks into previous
+        if text.len() < 50 && !merged.is_empty() {
+            let last = merged.last_mut().unwrap();
+            last.1.push_str("\n\n");
+            last.1.push_str(&text);
+        } else {
+            merged.push((heading_path, text));
+        }
+    }
+
+    // Split oversized chunks
+    let mut final_chunks: Vec<Chunk> = Vec::new();
+    for (heading_path, text) in merged {
+        if text.len() > 2000 {
+            let parts = split_at_paragraphs(&text, 2000);
+            for part in parts {
+                let full = if heading_path.is_empty() {
+                    part.clone()
+                } else {
+                    format!("{heading_path}\n\n{part}")
+                };
+                let hash = sha256_hex(&full);
+                final_chunks.push(Chunk {
+                    index: final_chunks.len(),
+                    heading_path: heading_path.clone(),
+                    content: full,
+                    content_hash: hash,
+                });
+            }
+        } else {
+            let full = if heading_path.is_empty() {
+                text
+            } else {
+                format!("{heading_path}\n\n{text}")
+            };
+            let hash = sha256_hex(&full);
+            final_chunks.push(Chunk {
+                index: final_chunks.len(),
+                heading_path: heading_path.clone(),
+                content: full,
+                content_hash: hash,
+            });
+        }
+    }
+
+    final_chunks
+}
+
+/// Extract internal BookStack links from HTML.
+/// Matches href="/books/{slug}/page/{slug}" and href="/link/{id}" patterns.
+pub fn extract_links(html: &str) -> Vec<String> {
+    let mut links = Vec::new();
+    let mut pos = 0;
+    while pos < html.len() {
+        if let Some(href_start) = html[pos..].find("href=\"") {
+            let abs_start = pos + href_start + 6; // after href="
+            if let Some(href_end) = html[abs_start..].find('"') {
+                let href = &html[abs_start..abs_start + href_end];
+                // Match internal BookStack links: /books/*/page/* or /link/{id}
+                if (href.starts_with("/books/") && href.contains("/page/"))
+                    || href.starts_with("/link/")
+                {
+                    links.push(href.to_string());
+                }
+                pos = abs_start + href_end + 1;
+            } else {
+                pos = abs_start;
+            }
+        } else {
+            break;
+        }
+    }
+    links
+}
+
+fn normalize_whitespace(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut prev_was_space = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !prev_was_space {
+                result.push(if ch == '\n' { '\n' } else { ' ' });
+            }
+            prev_was_space = true;
+        } else {
+            result.push(ch);
+            prev_was_space = false;
+        }
+    }
+    result
+}
+
+fn split_at_paragraphs(text: &str, max_len: usize) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    for paragraph in text.split("\n\n") {
+        if current.len() + paragraph.len() + 2 > max_len && !current.is_empty() {
+            parts.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push_str("\n\n");
+        }
+        current.push_str(paragraph);
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    // If a single paragraph is still too long, just keep it (don't split mid-word)
+    parts
+}
+
+fn sha256_hex(s: &str) -> String {
+    let hash = Sha256::digest(s.as_bytes());
+    hex_encode(&hash)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_basic_heading_chunking() {
+        let html = "<h1>Title</h1><p>Intro text here.</p><h2>Section A</h2><p>Content for section A with enough text to be a real chunk.</p><h2>Section B</h2><p>Content for section B with enough text to be a real chunk.</p>";
+        let chunks = chunk_html(html);
+        assert!(chunks.len() >= 2);
+        assert!(chunks[0].content.contains("Title"));
+    }
+
+    #[test]
+    fn test_merge_tiny_chunks() {
+        let html = "<h1>Title</h1><p>Hi</p><h2>Real Section</h2><p>This is a real section with enough content to stand on its own as a chunk.</p>";
+        let chunks = chunk_html(html);
+        // "Hi" is tiny (<50 chars) and should be merged
+        assert!(!chunks.is_empty());
+    }
+
+    #[test]
+    fn test_heading_path_nesting() {
+        let html = "<h1>Top</h1><h2>Mid</h2><h3>Deep</h3><p>Content at the deepest level with enough text for a chunk.</p>";
+        let chunks = chunk_html(html);
+        let last = chunks.last().unwrap();
+        assert!(last.heading_path.contains("Top"));
+        assert!(last.heading_path.contains("Mid"));
+        assert!(last.heading_path.contains("Deep"));
+    }
+
+    #[test]
+    fn test_extract_links() {
+        let html = r#"<a href="/books/tech/page/docker-setup">Docker</a> and <a href="/link/42">link</a> and <a href="https://external.com">ext</a>"#;
+        let links = extract_links(html);
+        assert_eq!(links.len(), 2);
+        assert!(links[0].contains("/books/tech/page/docker-setup"));
+        assert!(links[1].contains("/link/42"));
+    }
+
+    #[test]
+    fn test_split_oversized() {
+        let para = "A".repeat(800);
+        let text = format!("{para}\n\n{para}\n\n{para}");
+        let parts = split_at_paragraphs(&text, 2000);
+        assert!(parts.len() >= 2);
+        for part in &parts {
+            // Each part should be at most one paragraph over the limit
+            assert!(part.len() <= 2000 + 800);
+        }
+    }
+
+    #[test]
+    fn test_content_hash_deterministic() {
+        let html = "<h1>Test</h1><p>Some content for hashing that is long enough to not be merged away.</p>";
+        let chunks1 = chunk_html(html);
+        let chunks2 = chunk_html(html);
+        assert_eq!(chunks1.len(), chunks2.len());
+        for (a, b) in chunks1.iter().zip(chunks2.iter()) {
+            assert_eq!(a.content_hash, b.content_hash);
+        }
+    }
+}

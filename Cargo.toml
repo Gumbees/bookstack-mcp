@@ -21,6 +21,7 @@ urlencoding = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 aes-gcm = "0.10"
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+fastembed = "5"
 
 [profile.release]
 lto = true

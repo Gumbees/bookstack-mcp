@@ -22,10 +22,8 @@ impl Db {
                  token_secret TEXT NOT NULL,
                  created_at INTEGER NOT NULL
              );
-             CREATE TABLE IF NOT EXISTS registrations (
-                 client_id TEXT PRIMARY KEY,
-                 created_at INTEGER NOT NULL
-             );",
+             CREATE INDEX IF NOT EXISTS idx_tokens_created ON access_tokens(created_at);
+             DROP TABLE IF EXISTS registrations;",
         )
         .expect("Failed to initialize database schema");
         Self {
@@ -46,8 +44,17 @@ impl Db {
 
     // --- Access Tokens ---
 
-    pub fn insert_access_token(&self, token: &str, token_id: &str, token_secret: &str) {
+    /// Atomically check token count and insert if under limit.
+    /// Cleans up expired tokens if count is high, then inserts.
+    pub fn insert_access_token_if_under_limit(&self, token: &str, token_id: &str, token_secret: &str) {
         let conn = self.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM access_tokens", [], |row| row.get(0))
+            .unwrap_or(0);
+        if count >= 10000 {
+            let cutoff = Self::cutoff_secs(ACCESS_TOKEN_TTL);
+            conn.execute("DELETE FROM access_tokens WHERE created_at <= ?1", params![cutoff]).ok();
+        }
         conn.execute(
             "INSERT OR REPLACE INTO access_tokens (token, token_id, token_secret, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![token, token_id, token_secret, Self::now_secs()],
@@ -70,11 +77,5 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         let cutoff = Self::cutoff_secs(ACCESS_TOKEN_TTL);
         conn.execute("DELETE FROM access_tokens WHERE created_at <= ?1", params![cutoff]).ok();
-    }
-
-    pub fn count_tokens(&self) -> usize {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row("SELECT COUNT(*) FROM access_tokens", [], |row| row.get::<_, i64>(0))
-            .unwrap_or(0) as usize
     }
 }

@@ -49,6 +49,7 @@ An MCP (Model Context Protocol) server that gives Claude full access to a [BookS
 | `BSMCP_PORT` | No | `8080` | Bind port |
 | `BSMCP_INSTANCE_NAME` | No | - | Instance name shown to AI (e.g. "Personal KB") |
 | `BSMCP_INSTANCE_DESC` | No | - | Instance description shown to AI |
+| `BSMCP_PUBLIC_URL` | No | - | Public URL of this server (e.g. `https://mcp.example.com`). Prevents Host header attacks in OAuth redirects |
 | `BSMCP_DB_PATH` | No | `/data/bookstack-mcp.db` | SQLite database path for OAuth token persistence |
 
 ```bash

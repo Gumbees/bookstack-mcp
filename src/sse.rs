@@ -8,6 +8,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use reqwest::Client;
 use serde_json::Value;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
@@ -27,14 +28,43 @@ const MAX_REQUESTS_PER_MINUTE: u32 = 100;
 #[derive(Clone)]
 pub struct AppState {
     pub bookstack_url: String,
+    pub http_client: Client,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     pub auth_codes: Arc<RwLock<HashMap<String, AuthCode>>>,
     pub db: Arc<Db>,
+    pub authorize_rate_limit: Arc<Mutex<RateLimit>>,
+    pub register_rate_limit: Arc<Mutex<RateLimit>>,
+    streamable_rate_limits: Arc<RwLock<HashMap<String, Arc<Mutex<RateLimit>>>>>,
+    streamable_sessions: Arc<RwLock<HashMap<String, Instant>>>,
 }
 
-struct RateLimit {
+pub(crate) struct RateLimit {
     count: u32,
+    max: u32,
     window_start: Instant,
+}
+
+impl RateLimit {
+    pub(crate) fn new(max: u32) -> Self {
+        Self {
+            count: 0,
+            max,
+            window_start: Instant::now(),
+        }
+    }
+
+    /// Returns Ok(()) if under limit, Err(()) if rate limited.
+    pub(crate) fn check(&mut self) -> Result<(), ()> {
+        if self.window_start.elapsed() > Duration::from_secs(60) {
+            self.count = 0;
+            self.window_start = Instant::now();
+        }
+        if self.count >= self.max {
+            return Err(());
+        }
+        self.count += 1;
+        Ok(())
+    }
 }
 
 struct Session {
@@ -55,11 +85,21 @@ impl Drop for Session {
 
 impl AppState {
     pub fn new(bookstack_url: String, db: Arc<Db>) -> Self {
+        let http_client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("Failed to build HTTP client");
         Self {
             bookstack_url: bookstack_url.trim_end_matches('/').to_string(),
+            http_client,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             auth_codes: Arc::new(RwLock::new(HashMap::new())),
             db,
+            authorize_rate_limit: Arc::new(Mutex::new(RateLimit::new(20))),
+            register_rate_limit: Arc::new(Mutex::new(RateLimit::new(10))),
+            streamable_rate_limits: Arc::new(RwLock::new(HashMap::new())),
+            streamable_sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -69,6 +109,8 @@ impl AppState {
         let sessions = self.sessions.clone();
         let auth_codes = self.auth_codes.clone();
         let db = self.db.clone();
+        let streamable_rate_limits = self.streamable_rate_limits.clone();
+        let streamable_sessions = self.streamable_sessions.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
@@ -86,6 +128,20 @@ impl AppState {
                     let mut codes = auth_codes.write().await;
                     codes.retain(|_, c| c.created_at.elapsed() < AUTH_CODE_TTL);
                 }
+                {
+                    let mut srl = streamable_rate_limits.write().await;
+                    srl.retain(|_, rl| {
+                        let rl = rl.try_lock();
+                        match rl {
+                            Ok(rl) => rl.window_start.elapsed() < Duration::from_secs(120),
+                            Err(_) => true, // in use, keep it
+                        }
+                    });
+                }
+                {
+                    let mut ss = streamable_sessions.write().await;
+                    ss.retain(|_, created| created.elapsed() < SESSION_TTL);
+                }
                 db.cleanup_expired_tokens();
             }
         });
@@ -93,9 +149,20 @@ impl AppState {
 }
 
 /// Constant-time string comparison to prevent timing side-channel attacks.
-/// Uses the `subtle` crate which handles length differences without leaking timing info.
+/// Pads the shorter input with different sentinel bytes to ensure constant-time
+/// comparison regardless of length difference.
 fn constant_time_eq(a: &str, b: &str) -> bool {
-    a.as_bytes().ct_eq(b.as_bytes()).into()
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    let len = a.len().max(b.len());
+    // Pad with different sentinels so mismatched-length strings never compare equal
+    let mut a_padded = vec![0xAAu8; len];
+    let mut b_padded = vec![0xBBu8; len];
+    a_padded[..a.len()].copy_from_slice(a);
+    b_padded[..b.len()].copy_from_slice(b);
+    let result: bool = a_padded.ct_eq(&b_padded).into();
+    // Also require same length (belt-and-suspenders, sentinels already handle this)
+    result && a.len() == b.len()
 }
 
 /// Build a 401 response with WWW-Authenticate header for OAuth discovery.
@@ -137,13 +204,12 @@ fn resolve_credentials(
     }
 
     // OAuth access token (from SQLite)
-    let token_count = db.count_tokens();
     if let Some((token_id, token_secret)) = db.get_access_token(token) {
-        eprintln!("Auth: OAuth token resolved (db has {token_count} tokens)");
+        eprintln!("Auth: OAuth token resolved");
         return Ok((token_id, token_secret));
     }
 
-    eprintln!("Auth: token not found in db ({token_count} tokens stored, token_len={})", token.len());
+    eprintln!("Auth: token not recognized");
     Err(unauthorized("Invalid or expired token", headers))
 }
 
@@ -157,7 +223,7 @@ pub async fn handle_sse(
         Err(resp) => return resp,
     };
 
-    let client = BookStackClient::new(&state.bookstack_url, &token_id, &token_secret);
+    let client = BookStackClient::new(&state.bookstack_url, &token_id, &token_secret, state.http_client.clone());
 
     // Validate credentials against BookStack
     if let Err(e) = client.validate().await {
@@ -204,10 +270,7 @@ pub async fn handle_sse(
                 token_id: token_id.clone(),
                 token_secret: token_secret.clone(),
                 created_at: Instant::now(),
-                rate_limit: Arc::new(Mutex::new(RateLimit {
-                    count: 0,
-                    window_start: Instant::now(),
-                })),
+                rate_limit: Arc::new(Mutex::new(RateLimit::new(MAX_REQUESTS_PER_MINUTE))),
             },
         );
     }
@@ -298,18 +361,13 @@ pub async fn handle_message(
     // Rate limit check
     {
         let mut rl = rate_limit.lock().await;
-        if rl.window_start.elapsed() > Duration::from_secs(60) {
-            rl.count = 0;
-            rl.window_start = Instant::now();
-        }
-        if rl.count >= MAX_REQUESTS_PER_MINUTE {
+        if rl.check().is_err() {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(serde_json::json!({"error": "Rate limit exceeded"})),
             )
                 .into_response();
         }
-        rl.count += 1;
     }
 
     let request: Value = match serde_json::from_str(&body) {
@@ -350,7 +408,30 @@ pub async fn handle_streamable(
         Err(resp) => return resp,
     };
 
-    let client = BookStackClient::new(&state.bookstack_url, &token_id, &token_secret);
+    // Per-token rate limiting for streamable transport
+    {
+        let rate_limits = state.streamable_rate_limits.read().await;
+        if let Some(rl) = rate_limits.get(&token_id) {
+            let mut rl = rl.lock().await;
+            if rl.check().is_err() {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({"error": "Rate limit exceeded"})),
+                )
+                    .into_response();
+            }
+        } else {
+            drop(rate_limits);
+            let mut rate_limits = state.streamable_rate_limits.write().await;
+            let rl = rate_limits
+                .entry(token_id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(RateLimit::new(MAX_REQUESTS_PER_MINUTE))));
+            let mut rl = rl.lock().await;
+            let _ = rl.check(); // first request always succeeds
+        }
+    }
+
+    let client = BookStackClient::new(&state.bookstack_url, &token_id, &token_secret, state.http_client.clone());
 
     let request: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
@@ -386,26 +467,34 @@ pub async fn handle_streamable(
 
     match response {
         Some(resp) => {
-            let session_id = headers
+            let incoming_session_id = headers
                 .get("mcp-session-id")
                 .and_then(|v| v.to_str().ok())
-                .unwrap_or("none");
+                .map(|s| s.to_string());
 
             let mut http_resp = Json(resp).into_response();
 
-            // On initialize, issue a new session ID
+            // On initialize, issue a new session ID and track it
             if method == "initialize" {
                 let new_session_id = uuid::Uuid::new_v4().to_string();
                 eprintln!("Streamable session {new_session_id} created");
+                {
+                    let mut ss = state.streamable_sessions.write().await;
+                    ss.insert(new_session_id.clone(), Instant::now());
+                }
                 http_resp.headers_mut().insert(
                     "Mcp-Session-Id",
                     new_session_id.parse().unwrap(),
                 );
-            } else if session_id != "none" {
-                http_resp.headers_mut().insert(
-                    "Mcp-Session-Id",
-                    session_id.parse().unwrap(),
-                );
+            } else if let Some(ref sid) = incoming_session_id {
+                // Only echo back session IDs we issued
+                let ss = state.streamable_sessions.read().await;
+                if ss.contains_key(sid) {
+                    http_resp.headers_mut().insert(
+                        "Mcp-Session-Id",
+                        sid.parse().unwrap(),
+                    );
+                }
             }
 
             http_resp

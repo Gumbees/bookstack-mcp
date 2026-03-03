@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use reqwest::Client;
 use serde_json::Value;
 use zeroize::Zeroize;
@@ -63,7 +61,8 @@ const MAX_RESPONSE_SIZE: usize = 50 * 1024 * 1024; // 50MB
 const MAX_ERROR_BODY_SIZE: usize = 4096; // 4KB for error messages
 
 /// Note: Zeroize on Drop clears the current String allocation. Intermediate copies
-/// (e.g. from Clone, format!) may remain in freed memory until overwritten by the allocator.
+/// (e.g. from Clone, format!, auth_header()) and reqwest HeaderValue copies may remain
+/// in freed memory until overwritten by the allocator.
 /// This is a best-effort defense-in-depth measure, not a guarantee against memory forensics.
 #[derive(Clone)]
 pub struct BookStackClient {
@@ -81,13 +80,9 @@ impl Drop for BookStackClient {
 }
 
 impl BookStackClient {
-    pub fn new(base_url: &str, token_id: &str, token_secret: &str) -> Self {
+    pub fn new(base_url: &str, token_id: &str, token_secret: &str, client: Client) -> Self {
         Self {
-            client: Client::builder()
-                .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(60))
-                .build()
-                .expect("Failed to build HTTP client"),
+            client,
             base_url: base_url.trim_end_matches('/').to_string(),
             token_id: token_id.to_string(),
             token_secret: token_secret.to_string(),

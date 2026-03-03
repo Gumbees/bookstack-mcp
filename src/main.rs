@@ -52,9 +52,13 @@ async fn main() {
         .route("/register", axum::routing::post(oauth::handle_register))
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
         .layer(DefaultBodyLimit::max(1024 * 1024)) // 1MB
+        // CORS: mirror_request() reflects the Origin header back as Access-Control-Allow-Origin.
+        // This is safe because the Bearer token in the Authorization header is the actual
+        // security boundary — browsers cannot forge it via CSRF. The MCP protocol requires
+        // browser-based OAuth flows that need permissive CORS.
         .layer(
             CorsLayer::new()
-                .allow_origin(AllowOrigin::any())
+                .allow_origin(AllowOrigin::mirror_request())
                 .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
                 .allow_headers([
                     HeaderName::from_static("authorization"),

@@ -63,6 +63,13 @@ pub struct AuthorizeFormSubmit {
     code_challenge_method: Option<String>,
 }
 
+impl Drop for AuthorizeFormSubmit {
+    fn drop(&mut self) {
+        self.token_id.zeroize();
+        self.token_secret.zeroize();
+    }
+}
+
 #[derive(Deserialize)]
 pub struct TokenForm {
     grant_type: String,
@@ -73,10 +80,26 @@ pub struct TokenForm {
     redirect_uri: Option<String>,
 }
 
+impl Drop for TokenForm {
+    fn drop(&mut self) {
+        if let Some(ref mut s) = self.client_secret {
+            s.zeroize();
+        }
+        if let Some(ref mut v) = self.code_verifier {
+            v.zeroize();
+        }
+    }
+}
+
 pub fn derive_base_url(headers: &HeaderMap) -> String {
+    // Prefer explicit public URL over header-derived URL to prevent Host header attacks
+    if let Ok(url) = env::var("BSMCP_PUBLIC_URL") {
+        return url.trim_end_matches('/').to_string();
+    }
     let scheme = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
+        .filter(|s| *s == "http" || *s == "https")
         .unwrap_or("https");
     let host = headers
         .get("host")
@@ -231,6 +254,14 @@ pub async fn handle_authorize(
             Some("Only response_type=code is supported"),
         );
     }
+    // H3: PKCE is required
+    if params.code_challenge.is_none() {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            Some("code_challenge is required (PKCE)"),
+        );
+    }
     Html(render_login_form(&params, &state.bookstack_url, None)).into_response()
 }
 
@@ -239,6 +270,18 @@ pub async fn handle_authorize_submit(
     State(state): State<AppState>,
     Form(form): Form<AuthorizeFormSubmit>,
 ) -> Response {
+    // H5: Global rate limit on authorize submissions
+    {
+        let mut rl = state.authorize_rate_limit.lock().await;
+        if rl.check().is_err() {
+            return oauth_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "invalid_request",
+                Some("Too many authorization attempts, try again later"),
+            );
+        }
+    }
+
     if form.response_type != "code" {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -248,16 +291,16 @@ pub async fn handle_authorize_submit(
     }
 
     // Validate credentials against BookStack
-    let bs_client = BookStackClient::new(&state.bookstack_url, &form.token_id, &form.token_secret);
+    let bs_client = BookStackClient::new(&state.bookstack_url, &form.token_id, &form.token_secret, state.http_client.clone());
     if let Err(e) = bs_client.validate().await {
         eprintln!("OAuth: credential validation failed: {e}");
         let params = AuthorizeParams {
-            response_type: form.response_type,
-            client_id: form.client_id,
-            redirect_uri: form.redirect_uri,
-            state: form.state,
-            code_challenge: form.code_challenge,
-            code_challenge_method: form.code_challenge_method,
+            response_type: form.response_type.clone(),
+            client_id: form.client_id.clone(),
+            redirect_uri: form.redirect_uri.clone(),
+            state: form.state.clone(),
+            code_challenge: form.code_challenge.clone(),
+            code_challenge_method: form.code_challenge_method.clone(),
         };
         return Html(render_login_form(
             &params,
@@ -268,33 +311,35 @@ pub async fn handle_authorize_submit(
     }
 
     let code = uuid::Uuid::new_v4().to_string();
+    let redirect_uri = form.redirect_uri.clone();
+    let form_state = form.state.clone();
 
     {
         let mut codes = state.auth_codes.write().await;
-        if codes.len() >= 10000 {
+        if codes.len() >= 100 {
             codes.retain(|_, c| c.created_at.elapsed() < AUTH_CODE_TTL);
         }
         codes.insert(
             code.clone(),
             AuthCode {
-                client_id: form.client_id,
-                code_challenge: form.code_challenge,
-                code_challenge_method: form.code_challenge_method,
-                redirect_uri: form.redirect_uri.clone(),
-                token_id: Some(form.token_id),
-                token_secret: Some(form.token_secret),
+                client_id: form.client_id.clone(),
+                code_challenge: form.code_challenge.clone(),
+                code_challenge_method: form.code_challenge_method.clone(),
+                redirect_uri: redirect_uri.clone(),
+                token_id: Some(form.token_id.clone()),
+                token_secret: Some(form.token_secret.clone()),
                 created_at: Instant::now(),
             },
         );
     }
 
     let code_encoded = urlencoding::encode(&code);
-    let mut redirect_url = if form.redirect_uri.contains('?') {
-        format!("{}&code={code_encoded}", form.redirect_uri)
+    let mut redirect_url = if redirect_uri.contains('?') {
+        format!("{}&code={code_encoded}", redirect_uri)
     } else {
-        format!("{}?code={code_encoded}", form.redirect_uri)
+        format!("{}?code={code_encoded}", redirect_uri)
     };
-    if let Some(ref state_param) = form.state {
+    if let Some(ref state_param) = form_state {
         let state_encoded = urlencoding::encode(state_param);
         redirect_url.push_str(&format!("&state={state_encoded}"));
     }
@@ -347,15 +392,32 @@ pub async fn handle_token(
         }
     };
 
-    // Verify redirect_uri matches
-    if let Some(ref redirect_uri) = form.redirect_uri {
-        if *redirect_uri != auth_code.redirect_uri {
+    // H4: redirect_uri is required in token request
+    match &form.redirect_uri {
+        Some(redirect_uri) if *redirect_uri == auth_code.redirect_uri => {}
+        Some(_) => {
             return oauth_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_grant",
                 Some("Redirect URI mismatch"),
             );
         }
+        None => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                Some("redirect_uri is required"),
+            );
+        }
+    }
+
+    // H3: Belt-and-suspenders — PKCE must have been present on the authorize request
+    if auth_code.code_challenge.is_none() {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            Some("Authorization was not issued with PKCE"),
+        );
     }
 
     // Verify PKCE
@@ -422,7 +484,7 @@ pub async fn handle_token(
 
         // Validate against BookStack
         let bs_client =
-            BookStackClient::new(&state.bookstack_url, &client_id, &client_secret);
+            BookStackClient::new(&state.bookstack_url, &client_id, &client_secret, state.http_client.clone());
         if let Err(e) = bs_client.validate().await {
             eprintln!("OAuth: BookStack credential validation failed: {e}");
             return oauth_error(
@@ -440,11 +502,8 @@ pub async fn handle_token(
     let access_token = uuid::Uuid::new_v4().to_string();
     let expires_in = ACCESS_TOKEN_TTL.as_secs();
 
-    // Persist to SQLite
-    if state.db.count_tokens() >= 10000 {
-        state.db.cleanup_expired_tokens();
-    }
-    state.db.insert_access_token(&access_token, &token_id, &token_secret);
+    // Persist to SQLite (atomic count check + insert)
+    state.db.insert_access_token_if_under_limit(&access_token, &token_id, &token_secret);
 
     eprintln!("OAuth: issued access token");
 
@@ -453,6 +512,7 @@ pub async fn handle_token(
         [
             (header::CONTENT_TYPE, "application/json"),
             (header::CACHE_CONTROL, "no-store"),
+            (header::PRAGMA, "no-cache"),
         ],
         Json(json!({
             "access_token": access_token,
@@ -504,7 +564,19 @@ fn compute_s256_challenge(verifier: &str) -> String {
 /// Returns a generated client_id for each registration request.
 /// Actual authentication happens through the browser form, so the client_id
 /// is just an opaque identifier passed through the OAuth flow.
-pub async fn handle_register(body: String) -> Response {
+pub async fn handle_register(State(state): State<AppState>, body: String) -> Response {
+    // M6: Rate limit registration requests
+    {
+        let mut rl = state.register_rate_limit.lock().await;
+        if rl.check().is_err() {
+            return oauth_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "invalid_request",
+                Some("Too many registration attempts, try again later"),
+            );
+        }
+    }
+
     let request: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
         Err(_) => {
@@ -516,7 +588,8 @@ pub async fn handle_register(body: String) -> Response {
         }
     };
 
-    eprintln!("OAuth: registration request: {}", serde_json::to_string(&request).unwrap_or_default());
+    let client_name = request.get("client_name").and_then(|v| v.as_str()).unwrap_or("<unnamed>");
+    eprintln!("OAuth: registration request from client: {client_name}");
 
     let client_id = uuid::Uuid::new_v4().to_string();
 

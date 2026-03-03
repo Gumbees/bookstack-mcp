@@ -8,8 +8,17 @@ use crate::bookstack::{BookStackClient, ContentType, ExportFormat};
 const PROTOCOL_VERSION: &str = "2025-03-26";
 
 pub async fn handle_request(request: &Value, client: &BookStackClient) -> Option<Value> {
-    let method = request["method"].as_str().unwrap_or("");
     let id = request.get("id");
+
+    // L5: Validate JSON-RPC 2.0 protocol field
+    match request.get("jsonrpc").and_then(|v| v.as_str()) {
+        Some("2.0") => {}
+        _ => {
+            return Some(json_rpc_error(id, -32600, "Invalid Request: missing or wrong jsonrpc version (must be \"2.0\")"));
+        }
+    }
+
+    let method = request["method"].as_str().unwrap_or("");
     let params = request.get("params").cloned().unwrap_or(json!({}));
 
     match method {
@@ -20,7 +29,7 @@ pub async fn handle_request(request: &Value, client: &BookStackClient) -> Option
                 "capabilities": { "tools": {} },
                 "serverInfo": {
                     "name": "BookStack MCP",
-                    "version": "0.1.0",
+                    "version": "0.1.2",
                 },
                 "instructions": instructions,
             })))

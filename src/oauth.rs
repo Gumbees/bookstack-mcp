@@ -39,18 +39,7 @@ impl Drop for AuthCode {
     }
 }
 
-pub struct OAuthAccessToken {
-    pub token_id: String,
-    pub token_secret: String,
-    pub created_at: Instant,
-}
-
-impl Drop for OAuthAccessToken {
-    fn drop(&mut self) {
-        self.token_id.zeroize();
-        self.token_secret.zeroize();
-    }
-}
+// OAuthAccessToken is now persisted in SQLite (see db.rs)
 
 #[derive(Deserialize)]
 pub struct AuthorizeParams {
@@ -84,7 +73,7 @@ pub struct TokenForm {
     redirect_uri: Option<String>,
 }
 
-fn derive_base_url(headers: &HeaderMap) -> String {
+pub fn derive_base_url(headers: &HeaderMap) -> String {
     let scheme = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
@@ -188,9 +177,10 @@ button:hover {{ background: #3498db; }}
   <div class="steps">
     <strong>How to create an API token:</strong>
     <ol>
-      <li>Go to <a href="{bs_url}/my-account/auth" target="_blank">My Account &rarr; Authentication</a> in BookStack</li>
-      <li>Scroll to <strong>API Tokens</strong> and click <strong>Create Token</strong></li>
-      <li>Give it a name (e.g. "Claude") and save</li>
+      <li>Click your profile avatar (top-right) and select <a href="{bs_url}/my-account" target="_blank"><strong>My Account</strong></a></li>
+      <li>Click <strong>Access &amp; Security</strong> in the left sidebar</li>
+      <li>Scroll down to <strong>API Tokens</strong> and click <strong>Create Token</strong></li>
+      <li>Give it a name (e.g. &ldquo;Claude&rdquo;) and save</li>
       <li>Copy the <strong>Token ID</strong> and <strong>Token Secret</strong> into the fields above</li>
     </ol>
   </div>
@@ -211,6 +201,7 @@ pub async fn handle_metadata(headers: HeaderMap) -> Json<Value> {
         "issuer": base,
         "authorization_endpoint": format!("{base}/authorize"),
         "token_endpoint": format!("{base}/token"),
+        "registration_endpoint": format!("{base}/register"),
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
         "code_challenge_methods_supported": ["S256"],
@@ -449,20 +440,11 @@ pub async fn handle_token(
     let access_token = uuid::Uuid::new_v4().to_string();
     let expires_in = ACCESS_TOKEN_TTL.as_secs();
 
-    {
-        let mut tokens = state.access_tokens.write().await;
-        if tokens.len() >= 10000 {
-            tokens.retain(|_, t| t.created_at.elapsed() < ACCESS_TOKEN_TTL);
-        }
-        tokens.insert(
-            access_token.clone(),
-            OAuthAccessToken {
-                token_id,
-                token_secret,
-                created_at: Instant::now(),
-            },
-        );
+    // Persist to SQLite
+    if state.db.count_tokens() >= 10000 {
+        state.db.cleanup_expired_tokens();
     }
+    state.db.insert_access_token(&access_token, &token_id, &token_secret);
 
     eprintln!("OAuth: issued access token");
 
@@ -516,6 +498,61 @@ fn compute_s256_challenge(verifier: &str) -> String {
     use sha2::Digest;
     let hash = sha2::Sha256::digest(verifier.as_bytes());
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash)
+}
+
+/// Dynamic Client Registration (RFC 7591) — required by MCP spec.
+/// Returns a generated client_id for each registration request.
+/// Actual authentication happens through the browser form, so the client_id
+/// is just an opaque identifier passed through the OAuth flow.
+pub async fn handle_register(body: String) -> Response {
+    let request: Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_client_metadata",
+                Some("Invalid JSON"),
+            )
+        }
+    };
+
+    eprintln!("OAuth: registration request: {}", serde_json::to_string(&request).unwrap_or_default());
+
+    let client_id = uuid::Uuid::new_v4().to_string();
+
+    // Echo back client-requested fields per RFC 7591
+    let mut response = json!({
+        "client_id": client_id,
+        "client_id_issued_at": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        "token_endpoint_auth_method": "none",
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+    });
+
+    // Echo redirect_uris if provided
+    if let Some(uris) = request.get("redirect_uris") {
+        response["redirect_uris"] = uris.clone();
+    }
+    // Echo client_name if provided
+    if let Some(name) = request.get("client_name") {
+        response["client_name"] = name.clone();
+    }
+    // Echo scope if provided
+    if let Some(scope) = request.get("scope") {
+        response["scope"] = scope.clone();
+    }
+
+    eprintln!("OAuth: registered dynamic client {client_id}");
+
+    (
+        StatusCode::CREATED,
+        [(header::CONTENT_TYPE, "application/json")],
+        Json(response),
+    )
+        .into_response()
 }
 
 fn oauth_error(status: StatusCode, error: &str, description: Option<&str>) -> Response {

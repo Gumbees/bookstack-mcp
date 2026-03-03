@@ -1,10 +1,13 @@
 mod bookstack;
+mod db;
 mod mcp;
 mod oauth;
 mod sse;
 
 use std::env;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use axum::extract::DefaultBodyLimit;
 use axum::{Router, routing::get};
@@ -23,7 +26,19 @@ async fn main() {
         .parse()
         .expect("BSMCP_PORT must be a valid port number");
 
-    let state = sse::AppState::new(bookstack_url);
+    let db_path = env::var("BSMCP_DB_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/data/bookstack-mcp.db"));
+
+    // Ensure parent directory exists
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+
+    let db = Arc::new(db::Db::open(&db_path));
+    eprintln!("Database: {}", db_path.display());
+
+    let state = sse::AppState::new(bookstack_url, db);
     state.spawn_cleanup();
 
     let app = Router::new()
@@ -33,6 +48,7 @@ async fn main() {
         .route("/.well-known/oauth-protected-resource", get(oauth::handle_resource_metadata))
         .route("/authorize", get(oauth::handle_authorize).post(oauth::handle_authorize_submit))
         .route("/token", axum::routing::post(oauth::handle_token))
+        .route("/register", axum::routing::post(oauth::handle_register))
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
         .layer(DefaultBodyLimit::max(1024 * 1024)) // 1MB
         .layer(CorsLayer::new()) // deny all origins by default

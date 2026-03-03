@@ -8,6 +8,8 @@ services:
       - no-new-privileges:true
     tmpfs:
       - /tmp
+    volumes:
+      - mcp-data:/data
     environment:
       BSMCP_BOOKSTACK_URL: ${BSMCP_BOOKSTACK_URL:-https://docs.beesroadhouse.com}
       BSMCP_INSTANCE_NAME: ${BSMCP_INSTANCE_NAME:-}
@@ -19,6 +21,9 @@ services:
       - "traefik.http.services.bookstack-mcp.loadbalancer.server.port=8080"
     networks:
       - traefik
+
+volumes:
+  mcp-data:
 
 networks:
   traefik:

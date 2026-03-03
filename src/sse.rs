@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -15,8 +15,9 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 
 use crate::bookstack::BookStackClient;
+use crate::db::Db;
 use crate::mcp;
-use crate::oauth::{AuthCode, OAuthAccessToken, ACCESS_TOKEN_TTL, AUTH_CODE_TTL};
+use crate::oauth::{AuthCode, AUTH_CODE_TTL};
 
 const MAX_SESSIONS_PER_TOKEN: usize = 5;
 const MAX_TOTAL_SESSIONS: usize = 1000;
@@ -28,7 +29,7 @@ pub struct AppState {
     pub bookstack_url: String,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     pub auth_codes: Arc<RwLock<HashMap<String, AuthCode>>>,
-    pub access_tokens: Arc<RwLock<HashMap<String, OAuthAccessToken>>>,
+    pub db: Arc<Db>,
 }
 
 struct RateLimit {
@@ -53,12 +54,12 @@ impl Drop for Session {
 }
 
 impl AppState {
-    pub fn new(bookstack_url: String) -> Self {
+    pub fn new(bookstack_url: String, db: Arc<Db>) -> Self {
         Self {
             bookstack_url: bookstack_url.trim_end_matches('/').to_string(),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             auth_codes: Arc::new(RwLock::new(HashMap::new())),
-            access_tokens: Arc::new(RwLock::new(HashMap::new())),
+            db,
         }
     }
 
@@ -67,7 +68,7 @@ impl AppState {
     pub fn spawn_cleanup(&self) {
         let sessions = self.sessions.clone();
         let auth_codes = self.auth_codes.clone();
-        let access_tokens = self.access_tokens.clone();
+        let db = self.db.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
@@ -85,10 +86,7 @@ impl AppState {
                     let mut codes = auth_codes.write().await;
                     codes.retain(|_, c| c.created_at.elapsed() < AUTH_CODE_TTL);
                 }
-                {
-                    let mut tokens = access_tokens.write().await;
-                    tokens.retain(|_, t| t.created_at.elapsed() < ACCESS_TOKEN_TTL);
-                }
+                db.cleanup_expired_tokens();
             }
         });
     }
@@ -101,19 +99,24 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 }
 
 /// Build a 401 response with WWW-Authenticate header for OAuth discovery.
-fn unauthorized(hint: &str) -> Response {
+/// Includes resource_metadata URL per MCP 2025-06-18 / RFC 9728.
+fn unauthorized(hint: &str, headers: &HeaderMap) -> Response {
+    let base = crate::oauth::derive_base_url(headers);
     let body = serde_json::json!({"error": "unauthorized", "hint": hint});
     let mut resp = (StatusCode::UNAUTHORIZED, Json(body)).into_response();
+    let www_auth = format!(
+        "Bearer resource_metadata=\"{base}/.well-known/oauth-protected-resource\""
+    );
     resp.headers_mut()
-        .insert("WWW-Authenticate", "Bearer".parse().unwrap());
+        .insert("WWW-Authenticate", www_auth.parse().unwrap());
     resp
 }
 
 /// Resolve Bearer token to BookStack credentials.
-/// Supports both legacy `token_id:token_secret` format and OAuth access tokens.
-async fn resolve_credentials(
+/// Supports both legacy `token_id:token_secret` format and OAuth access tokens (from SQLite).
+fn resolve_credentials(
     headers: &HeaderMap,
-    access_tokens: &RwLock<HashMap<String, OAuthAccessToken>>,
+    db: &Db,
 ) -> Result<(String, String), Response> {
     let auth = headers
         .get("authorization")
@@ -121,7 +124,7 @@ async fn resolve_credentials(
         .unwrap_or("");
 
     if !auth.starts_with("Bearer ") {
-        return Err(unauthorized("Bearer token required"));
+        return Err(unauthorized("Bearer token required", headers));
     }
 
     let token = auth.trim_start_matches("Bearer ").trim();
@@ -131,22 +134,19 @@ async fn resolve_credentials(
         return Ok((id.to_string(), secret.to_string()));
     }
 
-    // OAuth access token
-    let tokens = access_tokens.read().await;
-    if let Some(at) = tokens.get(token) {
-        if at.created_at.elapsed() < ACCESS_TOKEN_TTL {
-            return Ok((at.token_id.clone(), at.token_secret.clone()));
-        }
+    // OAuth access token (from SQLite)
+    if let Some((token_id, token_secret)) = db.get_access_token(token) {
+        return Ok((token_id, token_secret));
     }
 
-    Err(unauthorized("Invalid or expired token"))
+    Err(unauthorized("Invalid or expired token", headers))
 }
 
 pub async fn handle_sse(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
-    let (token_id, token_secret) = match resolve_credentials(&headers, &state.access_tokens).await {
+    let (token_id, token_secret) = match resolve_credentials(&headers, &state.db) {
         Ok(creds) => creds,
         Err(resp) => return resp,
     };
@@ -206,6 +206,8 @@ pub async fn handle_sse(
         );
     }
 
+    eprintln!("SSE session {session_id} created");
+
     // Send endpoint event after session is stored
     let endpoint_url = format!("/mcp/messages/?sessionId={session_id}");
     let _ = tx
@@ -215,9 +217,16 @@ pub async fn handle_sse(
     // Session cleanup is handled by the shared cleanup task (AppState::spawn_cleanup)
 
     let stream = ReceiverStream::new(rx);
-    Sse::new(stream)
+    let mut resp = Sse::new(stream)
         .keep_alive(KeepAlive::default().interval(Duration::from_secs(15)))
-        .into_response()
+        .into_response();
+
+    // Prevent Cloudflare and reverse proxies from buffering SSE
+    let hdrs = resp.headers_mut();
+    hdrs.insert(header::CACHE_CONTROL, "no-cache, no-store".parse().unwrap());
+    hdrs.insert("X-Accel-Buffering", "no".parse().unwrap());
+
+    resp
 }
 
 pub async fn handle_message(
@@ -227,7 +236,7 @@ pub async fn handle_message(
     body: String,
 ) -> Response {
     // Authenticate the request (both token_id and token_secret)
-    let (token_id, token_secret) = match resolve_credentials(&headers, &state.access_tokens).await {
+    let (token_id, token_secret) = match resolve_credentials(&headers, &state.db) {
         Ok(creds) => creds,
         Err(resp) => return resp,
     };

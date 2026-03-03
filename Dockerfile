@@ -16,6 +16,9 @@ RUN apk add --no-cache ca-certificates \
 
 COPY --from=builder /app/target/release/bookstack-mcp /usr/local/bin/bookstack-mcp
 
+RUN mkdir -p /data && chown appuser:appgroup /data
+VOLUME /data
+
 USER appuser
 
 EXPOSE 8080

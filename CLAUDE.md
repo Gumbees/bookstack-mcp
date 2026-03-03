@@ -10,6 +10,8 @@ src/
   sse.rs         - SSE session management, multi-user auth, message routing
   mcp.rs         - MCP protocol handler, tool definitions, tool execution
   bookstack.rs   - BookStack REST API client (reqwest)
+  oauth.rs       - OAuth 2.1, login form, token exchange
+  web_auth.rs    - BookStack web UI scraping (login + auto-create API token)
 ```
 
 **Flow:** Client connects SSE with `Bearer <token_id>:<token_secret>` -> validates against BookStack -> creates session -> client sends JSON-RPC to `/mcp/messages/?sessionId=<id>` -> dispatches to tool -> responds via SSE event.
@@ -70,22 +72,25 @@ The server implements OAuth 2.1 (authorization code + PKCE) with a browser-based
 **How to configure in Claude Desktop:**
 1. Add custom connector with URL: `https://bookstack-mcp.beesroadhouse.com/mcp/sse`
 2. For Client ID / Client Secret, enter any value (e.g. "unused") — real auth happens in the browser
-3. When connecting, a login form opens where you enter your BookStack API Token ID and Secret
+3. When connecting, a login form opens — sign in with BookStack email/password or API token
 
 **OAuth endpoints:**
 - `GET /.well-known/oauth-authorization-server` — RFC 8414 metadata (MCP 2025-03-26)
 - `GET /.well-known/oauth-protected-resource` — RFC 9728 metadata (MCP 2025-06-18)
-- `GET /authorize` — Serves login form for BookStack API token entry
-- `POST /authorize` — Validates credentials against BookStack, issues auth code, redirects
+- `GET /authorize` — Serves login form (email/password or API token)
+- `POST /authorize` — Authenticates and issues auth code
 - `POST /token` — Token exchange (retrieves stored credentials, issues access token)
 
-**Two auth flows:**
-1. **Form-based (primary):** Claude opens /authorize → user enters BookStack API token in browser form → server validates → stores credentials with auth code → redirects → code exchange issues access token. Token endpoint auth method = "none".
-2. **Legacy client credentials:** Client sends BookStack token_id as client_id and token_secret as client_secret in the /token request. Still works for backward compatibility.
+**Three auth flows:**
+1. **Web login (primary):** User enters BookStack email/password → `web_auth.rs` logs into BookStack web UI, auto-creates an API token via form scraping → stores credentials with auth code → redirects. The scraped URLs are `/login`, `/my-account/auth`, `/api-tokens/{userId}/create`.
+2. **Direct API token:** User toggles to "Use API token instead" → enters token_id/token_secret → server validates via API → stores credentials.
+3. **Legacy client credentials:** Client sends BookStack token_id as client_id and token_secret as client_secret in the /token request. Still works for backward compatibility.
 
 **Also supported:** Legacy `Bearer token_id:token_secret` format on SSE/messages endpoints (Claude Code direct connection).
 
-**Architecture:** OAuth types live in `oauth.rs`. Auth codes store BookStack credentials from the form. Auth codes and access tokens stored in `AppState` (in-memory, cleaned up every 30s). Auth codes expire in 5 minutes, access tokens in 24 hours.
+**Architecture:** OAuth types live in `oauth.rs`, web scraping in `web_auth.rs`. Auth codes store BookStack credentials. Auth codes and access tokens stored in `AppState` (in-memory, cleaned up every 30s). Auth codes expire in 5 minutes, access tokens in 24 hours.
+
+**Web scraping fragility:** The `web_auth.rs` module scrapes BookStack's HTML (CSRF tokens, user ID from `/api-tokens/{id}/create` links, token credentials from readonly inputs). This can break if BookStack changes their templates. The direct API token fallback always works.
 
 ## Building
 

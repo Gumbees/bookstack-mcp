@@ -65,8 +65,14 @@ pub struct AuthorizeParams {
 
 #[derive(Deserialize)]
 pub struct AuthorizeFormSubmit {
-    token_id: String,
-    token_secret: String,
+    auth_mode: String,
+    // Login mode
+    email: Option<String>,
+    password: Option<String>,
+    // Token mode
+    token_id: Option<String>,
+    token_secret: Option<String>,
+    // OAuth params
     response_type: String,
     client_id: String,
     redirect_uri: String,
@@ -105,7 +111,7 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#x27;")
 }
 
-fn render_login_form(params: &AuthorizeParams, error: Option<&str>) -> String {
+fn render_login_form(params: &AuthorizeParams, error: Option<&str>, mode: &str) -> String {
     let instance_name = env::var("BSMCP_INSTANCE_NAME").unwrap_or_default();
     let title = if instance_name.is_empty() {
         "BookStack MCP".to_string()
@@ -142,6 +148,12 @@ fn render_login_form(params: &AuthorizeParams, error: Option<&str>) -> String {
         hidden_fields.push(hidden("code_challenge_method", m));
     }
 
+    let (login_display, token_display) = if mode == "token" {
+        ("none", "block")
+    } else {
+        ("block", "none")
+    };
+
     format!(
         r##"<!DOCTYPE html>
 <html lang="en">
@@ -157,32 +169,82 @@ h1 {{ font-size: 1.4rem; margin-bottom: 0.3rem; color: #fff; }}
 .subtitle {{ color: #888; font-size: 0.9rem; margin-bottom: 1.5rem; }}
 .error {{ background: #3d1f1f; border: 1px solid #c0392b; color: #e74c3c; padding: 0.75rem; border-radius: 6px; margin-bottom: 1rem; font-size: 0.9rem; }}
 label {{ display: block; font-size: 0.85rem; color: #aaa; margin-bottom: 0.3rem; }}
-input[type="text"], input[type="password"] {{ width: 100%; padding: 0.7rem; border: 1px solid #2a3a5c; border-radius: 6px; background: #0f1a30; color: #e0e0e0; font-size: 0.95rem; margin-bottom: 1rem; }}
-input[type="text"]:focus, input[type="password"]:focus {{ outline: none; border-color: #3498db; }}
+input[type="text"], input[type="password"], input[type="email"] {{ width: 100%; padding: 0.7rem; border: 1px solid #2a3a5c; border-radius: 6px; background: #0f1a30; color: #e0e0e0; font-size: 0.95rem; margin-bottom: 1rem; }}
+input:focus {{ outline: none; border-color: #3498db; }}
 button {{ width: 100%; padding: 0.75rem; background: #2980b9; color: #fff; border: none; border-radius: 6px; font-size: 1rem; cursor: pointer; }}
 button:hover {{ background: #3498db; }}
-.help {{ margin-top: 1.2rem; font-size: 0.8rem; color: #666; line-height: 1.4; }}
+.toggle {{ margin-top: 1rem; text-align: center; }}
+.toggle a {{ color: #3498db; font-size: 0.85rem; text-decoration: none; }}
+.toggle a:hover {{ text-decoration: underline; }}
+.help {{ margin-top: 0.8rem; font-size: 0.8rem; color: #555; line-height: 1.4; text-align: center; }}
 </style>
 </head>
 <body>
 <div class="card">
   <h1>{title}</h1>
-  <p class="subtitle">Enter your BookStack API token to connect.</p>
+  <p class="subtitle" id="subtitle">Sign in to connect Claude to BookStack.</p>
   {error_html}
   <form method="POST" action="/authorize">
+    <input type="hidden" name="auth_mode" id="auth_mode" value="{mode}">
     {hidden_fields}
-    <label for="token_id">Token ID</label>
-    <input type="text" id="token_id" name="token_id" required autocomplete="username">
-    <label for="token_secret">Token Secret</label>
-    <input type="password" id="token_secret" name="token_secret" required autocomplete="current-password">
+
+    <div id="login-fields" style="display:{login_display}">
+      <label for="email">Email</label>
+      <input type="email" id="email" name="email" autocomplete="email">
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" autocomplete="current-password">
+    </div>
+
+    <div id="token-fields" style="display:{token_display}">
+      <label for="token_id">Token ID</label>
+      <input type="text" id="token_id" name="token_id" autocomplete="off">
+      <label for="token_secret">Token Secret</label>
+      <input type="password" id="token_secret" name="token_secret" autocomplete="off">
+    </div>
+
     <button type="submit">Connect</button>
   </form>
-  <p class="help">Create an API token in your BookStack profile under <strong>API Tokens</strong>.</p>
+  <div class="toggle">
+    <a href="#" id="toggle-mode">Use API token instead</a>
+  </div>
+  <p class="help" id="help-text">An API token will be created automatically in your BookStack account.</p>
 </div>
+<script>
+document.getElementById('toggle-mode').addEventListener('click', function(e) {{
+  e.preventDefault();
+  var lf = document.getElementById('login-fields');
+  var tf = document.getElementById('token-fields');
+  var am = document.getElementById('auth_mode');
+  var sub = document.getElementById('subtitle');
+  var help = document.getElementById('help-text');
+  if (am.value === 'login') {{
+    lf.style.display = 'none';
+    tf.style.display = 'block';
+    am.value = 'token';
+    this.textContent = 'Use BookStack login instead';
+    sub.textContent = 'Enter your BookStack API token to connect.';
+    help.textContent = 'Create an API token in BookStack under My Account > API Tokens.';
+    document.getElementById('email').removeAttribute('required');
+    document.getElementById('password').removeAttribute('required');
+  }} else {{
+    lf.style.display = 'block';
+    tf.style.display = 'none';
+    am.value = 'login';
+    this.textContent = 'Use API token instead';
+    sub.textContent = 'Sign in to connect Claude to BookStack.';
+    help.textContent = 'An API token will be created automatically in your BookStack account.';
+    document.getElementById('token_id').removeAttribute('required');
+    document.getElementById('token_secret').removeAttribute('required');
+  }}
+}});
+</script>
 </body>
 </html>"##,
         title = title,
         error_html = error_html,
+        mode = mode,
+        login_display = login_display,
+        token_display = token_display,
         hidden_fields = hidden_fields.join("\n    "),
     )
 }
@@ -220,10 +282,13 @@ pub async fn handle_authorize(Query(params): Query<AuthorizeParams>) -> Response
             Some("Only response_type=code is supported"),
         );
     }
-    Html(render_login_form(&params, None)).into_response()
+    Html(render_login_form(&params, None, "login")).into_response()
 }
 
 /// Authorization endpoint POST - validates BookStack credentials and redirects with auth code.
+/// Supports two modes:
+/// - "login": email/password → scrapes BookStack web UI to create an API token
+/// - "token": direct API token entry
 pub async fn handle_authorize_submit(
     State(state): State<AppState>,
     Form(form): Form<AuthorizeFormSubmit>,
@@ -236,20 +301,55 @@ pub async fn handle_authorize_submit(
         );
     }
 
-    // Validate credentials against BookStack
-    let bs_client = BookStackClient::new(&state.bookstack_url, &form.token_id, &form.token_secret);
-    if let Err(e) = bs_client.validate().await {
-        eprintln!("OAuth: login form credential validation failed: {e}");
-        let params = AuthorizeParams {
-            response_type: form.response_type,
-            client_id: form.client_id,
-            redirect_uri: form.redirect_uri,
-            state: form.state,
-            code_challenge: form.code_challenge,
-            code_challenge_method: form.code_challenge_method,
-        };
-        return Html(render_login_form(&params, Some("Invalid API token. Check your Token ID and Secret."))).into_response();
-    }
+    let params = AuthorizeParams {
+        response_type: form.response_type.clone(),
+        client_id: form.client_id.clone(),
+        redirect_uri: form.redirect_uri.clone(),
+        state: form.state.clone(),
+        code_challenge: form.code_challenge.clone(),
+        code_challenge_method: form.code_challenge_method.clone(),
+    };
+
+    let (token_id, token_secret) = match form.auth_mode.as_str() {
+        "login" => {
+            let email = match &form.email {
+                Some(e) if !e.is_empty() => e.as_str(),
+                _ => return Html(render_login_form(&params, Some("Email is required."), "login")).into_response(),
+            };
+            let password = match &form.password {
+                Some(p) if !p.is_empty() => p.as_str(),
+                _ => return Html(render_login_form(&params, Some("Password is required."), "login")).into_response(),
+            };
+
+            match crate::web_auth::login_and_create_token(&state.bookstack_url, email, password).await {
+                Ok(creds) => creds,
+                Err(e) => {
+                    eprintln!("OAuth: web login failed: {e}");
+                    return Html(render_login_form(&params, Some(&e), "login")).into_response();
+                }
+            }
+        }
+        _ => {
+            // "token" mode or fallback
+            let tid = match &form.token_id {
+                Some(t) if !t.is_empty() => t.clone(),
+                _ => return Html(render_login_form(&params, Some("Token ID is required."), "token")).into_response(),
+            };
+            let tsec = match &form.token_secret {
+                Some(t) if !t.is_empty() => t.clone(),
+                _ => return Html(render_login_form(&params, Some("Token Secret is required."), "token")).into_response(),
+            };
+
+            // Validate against BookStack API
+            let bs_client = BookStackClient::new(&state.bookstack_url, &tid, &tsec);
+            if let Err(e) = bs_client.validate().await {
+                eprintln!("OAuth: token validation failed: {e}");
+                return Html(render_login_form(&params, Some("Invalid API token. Check your Token ID and Secret."), "token")).into_response();
+            }
+
+            (tid, tsec)
+        }
+    };
 
     let code = uuid::Uuid::new_v4().to_string();
 
@@ -265,8 +365,8 @@ pub async fn handle_authorize_submit(
                 code_challenge: form.code_challenge,
                 code_challenge_method: form.code_challenge_method,
                 redirect_uri: form.redirect_uri.clone(),
-                token_id: Some(form.token_id),
-                token_secret: Some(form.token_secret),
+                token_id: Some(token_id),
+                token_secret: Some(token_secret),
                 created_at: Instant::now(),
             },
         );
@@ -283,7 +383,7 @@ pub async fn handle_authorize_submit(
         redirect_url.push_str(&format!("&state={state_encoded}"));
     }
 
-    eprintln!("OAuth: login form authenticated, issued auth code");
+    eprintln!("OAuth: authenticated via {}, issued auth code", form.auth_mode);
     (StatusCode::FOUND, [(header::LOCATION, redirect_url)]).into_response()
 }
 

@@ -328,3 +328,80 @@ pub async fn handle_message(
 
     StatusCode::ACCEPTED.into_response()
 }
+
+/// Streamable HTTP transport (MCP 2025-03-26).
+/// Client POSTs JSON-RPC directly to the endpoint and gets JSON responses.
+/// No persistent SSE connection needed.
+pub async fn handle_streamable(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    let (token_id, token_secret) = match resolve_credentials(&headers, &state.db) {
+        Ok(creds) => creds,
+        Err(resp) => return resp,
+    };
+
+    let client = BookStackClient::new(&state.bookstack_url, &token_id, &token_secret);
+
+    let request: Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid JSON"})),
+            )
+                .into_response()
+        }
+    };
+
+    let method = request["method"].as_str().unwrap_or("");
+
+    // For initialize, validate credentials against BookStack
+    if method == "initialize" {
+        if let Err(e) = client.validate().await {
+            eprintln!("Streamable: credential validation failed: {e}");
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "Invalid BookStack credentials"})),
+            )
+                .into_response();
+        }
+    }
+
+    // Notifications have no response
+    if request.get("id").is_none() {
+        return StatusCode::ACCEPTED.into_response();
+    }
+
+    let response = mcp::handle_request(&request, &client).await;
+
+    match response {
+        Some(resp) => {
+            let session_id = headers
+                .get("mcp-session-id")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("none");
+
+            let mut http_resp = Json(resp).into_response();
+
+            // On initialize, issue a new session ID
+            if method == "initialize" {
+                let new_session_id = uuid::Uuid::new_v4().to_string();
+                eprintln!("Streamable session {new_session_id} created");
+                http_resp.headers_mut().insert(
+                    "Mcp-Session-Id",
+                    new_session_id.parse().unwrap(),
+                );
+            } else if session_id != "none" {
+                http_resp.headers_mut().insert(
+                    "Mcp-Session-Id",
+                    session_id.parse().unwrap(),
+                );
+            }
+
+            http_resp
+        }
+        None => StatusCode::ACCEPTED.into_response(),
+    }
+}

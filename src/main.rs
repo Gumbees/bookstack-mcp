@@ -42,7 +42,7 @@ async fn main() {
     state.spawn_cleanup();
 
     let app = Router::new()
-        .route("/mcp/sse", get(sse::handle_sse))
+        .route("/mcp/sse", get(sse::handle_sse).post(sse::handle_streamable))
         .route("/mcp/messages/", axum::routing::post(sse::handle_message))
         .route("/.well-known/oauth-authorization-server", get(oauth::handle_metadata))
         .route("/.well-known/oauth-protected-resource", get(oauth::handle_resource_metadata))

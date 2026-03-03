@@ -88,7 +88,7 @@ async fn main() {
         .unwrap_or(false);
 
     let semantic = if semantic_enabled {
-        let model_path = env::var("BSMCP_MODEL_PATH").unwrap_or_else(|_| "/models".into());
+        let model_path = env::var("BSMCP_MODEL_PATH").unwrap_or_else(|_| "/data/models".into());
         let webhook_secret = env::var("BSMCP_WEBHOOK_SECRET")
             .expect("BSMCP_WEBHOOK_SECRET is required when semantic search is enabled");
         let embed_token_id = env::var("BSMCP_EMBED_TOKEN_ID")

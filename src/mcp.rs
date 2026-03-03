@@ -594,10 +594,13 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool) ->
 
     if semantic_enabled {
         instructions.push_str(
-            "\n\nSemantic search is available. Use the 'semantic_search' tool to find \
-             conceptually related content without exact keyword matches. Results include \
-             a Markov blanket of contextually related pages (linked_from, links_to, \
-             co_linked, siblings). Use 'reembed' to re-index content and 'embedding_status' \
+            "\n\nSemantic vector search is available and should be your PRIMARY search method. \
+             Prefer 'semantic_search' over 'search_content' for most queries — it finds \
+             conceptually related content by meaning, not just keyword matches, and returns \
+             richer context including a Markov blanket of related pages (linked_from, links_to, \
+             co_linked, siblings). Only fall back to 'search_content' when you need exact \
+             keyword/tag matches or when semantic_search returns no results. \
+             Use 'reembed' to re-index content after bulk changes and 'embedding_status' \
              to check indexing progress.",
         );
     }

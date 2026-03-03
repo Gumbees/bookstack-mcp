@@ -20,10 +20,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /app/target/release/bookstack-mcp /usr/local/bin/bookstack-mcp
 
-RUN mkdir -p /data && chown appuser:appgroup /data
-RUN mkdir -p /models && chown appuser:appgroup /models
+RUN mkdir -p /data/models && chown -R appuser:appgroup /data
 VOLUME /data
-VOLUME /models
 
 USER appuser
 

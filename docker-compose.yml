@@ -10,7 +10,6 @@ services:
       - /tmp
     volumes:
       - bsmcp-data:/data
-      - bsmcp-models:/models
     environment:
       # Required
       BSMCP_BOOKSTACK_URL: ${BSMCP_BOOKSTACK_URL}
@@ -24,7 +23,7 @@ services:
       # BSMCP_BACKUP_PATH: ${BSMCP_BACKUP_PATH:-/data/backups}
       # Semantic search (optional)
       # BSMCP_SEMANTIC_SEARCH: ${BSMCP_SEMANTIC_SEARCH:-false}
-      # BSMCP_MODEL_PATH: /models
+      # BSMCP_MODEL_PATH: /data/models
       # BSMCP_WEBHOOK_SECRET: ${BSMCP_WEBHOOK_SECRET:-}
       # BSMCP_EMBED_TOKEN_ID: ${BSMCP_EMBED_TOKEN_ID:-}
       # BSMCP_EMBED_TOKEN_SECRET: ${BSMCP_EMBED_TOKEN_SECRET:-}
@@ -38,7 +37,6 @@ services:
 
 volumes:
   bsmcp-data:
-  bsmcp-models:
 
 networks:
   traefik:

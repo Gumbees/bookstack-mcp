@@ -262,11 +262,13 @@ pub async fn handle_sse(
     // Validate credentials against BookStack
     if let Err(e) = client.validate().await {
         eprintln!("Credential validation failed: {e}");
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error": "Invalid BookStack credentials"})),
-        )
-            .into_response();
+        // Return 401 (not 403) so Claude Desktop triggers OAuth re-authentication
+        // instead of treating this as a permanent rejection
+        return unauthorized(
+            "BookStack credentials are invalid or expired — please re-authenticate",
+            &headers,
+            &state.known_urls,
+        );
     }
 
     // Atomically check session limit and insert under write lock (fixes TOCTOU)
@@ -484,11 +486,12 @@ pub async fn handle_streamable(
     if method == "initialize" {
         if let Err(e) = client.validate().await {
             eprintln!("Streamable: credential validation failed: {e}");
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error": "Invalid BookStack credentials"})),
-            )
-                .into_response();
+            // Return 401 (not 403) so Claude Desktop triggers OAuth re-authentication
+            return unauthorized(
+                "BookStack credentials are invalid or expired — please re-authenticate",
+                &headers,
+                &state.known_urls,
+            );
         }
     }
 

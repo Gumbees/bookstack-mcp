@@ -2,7 +2,6 @@ mod bookstack;
 mod mcp;
 mod oauth;
 mod sse;
-mod web_auth;
 
 use std::env;
 use std::net::SocketAddr;

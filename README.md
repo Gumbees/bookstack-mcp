@@ -74,11 +74,10 @@ cargo run --release
 The server implements OAuth 2.1 (authorization code + PKCE) with a browser-based login form:
 
 1. Add a custom connector in Claude Desktop with URL: `https://your-host/mcp/sse`
-2. When connecting, a login form opens in your browser
-3. Sign in with your BookStack **email and password** — an API token is created automatically
-4. Or toggle to "Use API token instead" to enter a token directly
+2. When connecting, a login form opens in your browser with instructions
+3. Enter your BookStack API **Token ID** and **Token Secret**
 
-No API keys in config files — authentication happens entirely through the browser.
+No config files needed — authentication happens entirely through the browser.
 
 ### Bearer Token (Claude Code / Direct)
 

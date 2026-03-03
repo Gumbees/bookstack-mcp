@@ -18,8 +18,8 @@ FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libssl3t64 \
  && rm -rf /var/lib/apt/lists/* \
- && groupadd -g 1000 appgroup \
- && useradd -u 1000 -g appgroup appuser
+ && groupadd -f -g 1000 appgroup \
+ && useradd -u 1000 -g 1000 -o appuser
 
 COPY --from=builder /app/target/release/bookstack-mcp /usr/local/bin/bookstack-mcp
 

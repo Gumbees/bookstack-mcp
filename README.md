@@ -45,12 +45,16 @@ An MCP (Model Context Protocol) server that gives Claude full access to a [BookS
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `BSMCP_BOOKSTACK_URL` | Yes | - | Your BookStack instance URL |
+| `BSMCP_ENCRYPTION_KEY` | Yes | - | 32+ char key for AES-256-GCM encryption of OAuth tokens at rest |
 | `BSMCP_HOST` | No | `0.0.0.0` | Bind address |
 | `BSMCP_PORT` | No | `8080` | Bind port |
 | `BSMCP_INSTANCE_NAME` | No | - | Instance name shown to AI (e.g. "Personal KB") |
 | `BSMCP_INSTANCE_DESC` | No | - | Instance description shown to AI |
-| `BSMCP_PUBLIC_URL` | No | - | Public URL of this server (e.g. `https://mcp.example.com`). Prevents Host header attacks in OAuth redirects |
+| `BSMCP_PUBLIC_DOMAIN` | No | - | Public domain this server is reachable at (e.g. `mcp.example.com`). Derives `https://{domain}` for OAuth redirects |
+| `BSMCP_INTERNAL_DOMAIN` | No | - | Internal/Docker-network domain (e.g. `bookstack-mcp`). Derives `http://{domain}` for host verification |
 | `BSMCP_DB_PATH` | No | `/data/bookstack-mcp.db` | SQLite database path for OAuth token persistence |
+| `BSMCP_BACKUP_INTERVAL` | No | - | Hours between SQLite backups (integer). If unset, backups disabled |
+| `BSMCP_BACKUP_PATH` | No | `/data/backups` | Directory for backup files |
 
 ```bash
 cp .env.example .env

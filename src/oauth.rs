@@ -91,11 +91,30 @@ impl Drop for TokenForm {
     }
 }
 
-pub fn derive_base_url(headers: &HeaderMap) -> String {
-    // Prefer explicit public URL over header-derived URL to prevent Host header attacks
-    if let Ok(url) = env::var("BSMCP_PUBLIC_URL") {
-        return url.trim_end_matches('/').to_string();
+/// Derive the base URL for OAuth redirects and metadata.
+/// Matches the incoming Host header against all configured known URLs.
+/// Falls back to the first known URL, or constructs from headers if none configured.
+pub fn derive_base_url(headers: &HeaderMap, known_urls: &[String]) -> String {
+    if !known_urls.is_empty() {
+        let incoming_host = headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        // Try to match incoming Host against known URLs
+        for url in known_urls {
+            if let Some(url_host) = extract_host_from_url(url) {
+                if url_host == incoming_host {
+                    return url.clone();
+                }
+            }
+        }
+
+        // No match — fall back to first known URL
+        return known_urls[0].clone();
     }
+
+    // No known URLs configured — derive from headers (legacy behavior)
     let scheme = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
@@ -106,6 +125,15 @@ pub fn derive_base_url(headers: &HeaderMap) -> String {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("localhost");
     format!("{scheme}://{host}")
+}
+
+/// Extract host:port from a URL string (e.g. "https://mcp.example.com:8443" -> "mcp.example.com:8443").
+fn extract_host_from_url(url: &str) -> Option<&str> {
+    // Strip scheme
+    let after_scheme = url.strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    // Take everything before the first '/' (path)
+    Some(after_scheme.split('/').next().unwrap_or(after_scheme))
 }
 
 fn html_escape(s: &str) -> String {
@@ -218,8 +246,11 @@ button:hover {{ background: #3498db; }}
 }
 
 /// RFC 8414 Authorization Server Metadata (MCP 2025-03-26 spec)
-pub async fn handle_metadata(headers: HeaderMap) -> Json<Value> {
-    let base = derive_base_url(&headers);
+pub async fn handle_metadata(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Json<Value> {
+    let base = derive_base_url(&headers, &state.known_urls);
     Json(json!({
         "issuer": base,
         "authorization_endpoint": format!("{base}/authorize"),
@@ -233,8 +264,11 @@ pub async fn handle_metadata(headers: HeaderMap) -> Json<Value> {
 }
 
 /// RFC 9728 Protected Resource Metadata (MCP 2025-06-18 spec)
-pub async fn handle_resource_metadata(headers: HeaderMap) -> Json<Value> {
-    let base = derive_base_url(&headers);
+pub async fn handle_resource_metadata(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Json<Value> {
+    let base = derive_base_url(&headers, &state.known_urls);
     Json(json!({
         "resource": base,
         "authorization_servers": [base],

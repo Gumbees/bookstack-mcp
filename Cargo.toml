@@ -1,6 +1,6 @@
 [package]
 name = "bookstack-mcp"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 
 [dependencies]
@@ -19,6 +19,8 @@ sha2 = "0.10"
 base64 = "0.22"
 urlencoding = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
+aes-gcm = "0.10"
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
 
 [profile.release]
 lto = true

@@ -36,11 +36,58 @@ async fn main() {
         std::fs::create_dir_all(parent).ok();
     }
 
-    let db = Arc::new(db::Db::open(&db_path));
+    let encryption_key = env::var("BSMCP_ENCRYPTION_KEY")
+        .expect("BSMCP_ENCRYPTION_KEY is required (32+ character key for AES-256-GCM token encryption)");
+    if encryption_key.len() < 32 {
+        panic!("BSMCP_ENCRYPTION_KEY must be at least 32 characters");
+    }
+    eprintln!("Encryption: enabled (AES-256-GCM)");
+
+    let db = Arc::new(db::Db::open(&db_path, &encryption_key));
     eprintln!("Database: {}", db_path.display());
 
-    let state = sse::AppState::new(bookstack_url, db);
+    // Build known_urls from BSMCP_PUBLIC_DOMAIN and BSMCP_INTERNAL_DOMAIN
+    let known_urls = {
+        let mut urls: Vec<String> = Vec::new();
+
+        if let Ok(domain) = env::var("BSMCP_PUBLIC_DOMAIN") {
+            let domain = domain.trim().trim_end_matches('/');
+            if !domain.is_empty() {
+                urls.push(format!("https://{domain}"));
+            }
+        }
+        if let Ok(domain) = env::var("BSMCP_INTERNAL_DOMAIN") {
+            let domain = domain.trim().trim_end_matches('/');
+            if !domain.is_empty() {
+                urls.push(format!("http://{domain}"));
+            }
+        }
+
+        if !urls.is_empty() {
+            eprintln!("Known URLs: {}", urls.join(", "));
+        }
+        urls
+    };
+
+    // Backup configuration
+    let backup_interval_hours: Option<u64> = env::var("BSMCP_BACKUP_INTERVAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&h| h > 0);
+
+    let backup_path = env::var("BSMCP_BACKUP_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/data/backups"));
+
+    let state = sse::AppState::new(
+        bookstack_url,
+        db,
+        known_urls,
+        backup_interval_hours,
+        backup_path,
+    );
     state.spawn_cleanup();
+    state.spawn_backup();
 
     let app = Router::new()
         .route("/mcp/sse", get(sse::handle_sse).post(sse::handle_streamable))

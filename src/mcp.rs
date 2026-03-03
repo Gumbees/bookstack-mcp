@@ -3,6 +3,8 @@ use std::env;
 
 use serde_json::{json, Value};
 
+use pulldown_cmark::{html, Options, Parser};
+
 use crate::bookstack::{BookStackClient, ContentType, ExportFormat};
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
@@ -29,7 +31,7 @@ pub async fn handle_request(request: &Value, client: &BookStackClient) -> Option
                 "capabilities": { "tools": {} },
                 "serverInfo": {
                     "name": "BookStack MCP",
-                    "version": "0.1.2",
+                    "version": "0.1.3",
                 },
                 "instructions": instructions,
             })))
@@ -179,8 +181,8 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Res
             } else {
                 return Err("Either book_id or chapter_id is required".to_string());
             }
-            if let Some(v) = args.get("markdown").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-                data["markdown"] = json!(v);
+            if let Some(md) = args.get("markdown").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                data["html"] = json!(markdown_to_html(md));
             } else if let Some(v) = args.get("html").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                 data["html"] = json!(v);
             }
@@ -188,7 +190,15 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Res
         }
         "update_page" => {
             let id = arg_i64_required(args, "page_id")?;
-            let data = filter_string_update_fields(args, &["name", "markdown", "html"]);
+            let mut data = json!({});
+            if let Some(v) = args.get("name").and_then(|v| v.as_str()) {
+                data["name"] = json!(v);
+            }
+            if let Some(md) = args.get("markdown").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                data["html"] = json!(markdown_to_html(md));
+            } else if let Some(v) = args.get("html").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                data["html"] = json!(v);
+            }
             format_json(&client.update_page(id, &data).await?)
         }
         "delete_page" => {
@@ -261,7 +271,9 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Res
             let mut data = json!({
                 "page_id": arg_i64_required(args, "page_id")?,
             });
-            if let Some(v) = args.get("html").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            if let Some(md) = args.get("markdown").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                data["html"] = json!(markdown_to_html(md));
+            } else if let Some(v) = args.get("html").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                 data["html"] = json!(v);
             }
             if let Some(v) = args.get("parent_id").and_then(|v| v.as_i64()) {
@@ -271,7 +283,12 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient) -> Res
         }
         "update_comment" => {
             let id = arg_i64_required(args, "comment_id")?;
-            let data = filter_string_update_fields(args, &["html"]);
+            let mut data = json!({});
+            if let Some(md) = args.get("markdown").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                data["html"] = json!(markdown_to_html(md));
+            } else if let Some(v) = args.get("html").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                data["html"] = json!(v);
+            }
             format_json(&client.update_comment(id, &data).await?)
         }
         "delete_comment" => {
@@ -504,6 +521,17 @@ fn strip_html_tags(input: &str) -> String {
     result
 }
 
+fn markdown_to_html(md: &str) -> String {
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_TABLES);
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_TASKLISTS);
+    let parser = Parser::new_ext(md, opts);
+    let mut out = String::new();
+    html::push_html(&mut out, parser);
+    out
+}
+
 // --- Dynamic instructions (sent on initialize) ---
 
 async fn build_instructions(client: &BookStackClient) -> String {
@@ -521,7 +549,15 @@ async fn build_instructions(client: &BookStackClient) -> String {
     instructions.push_str(
         "BookStack knowledge management server. Content is organized as: \
          Shelves > Books > Chapters > Pages. Use search_content to find content, \
-         or navigate the hierarchy using the IDs below.\n\n",
+         or navigate the hierarchy using the IDs below.\n\n\
+         IMPORTANT: Before creating or updating any page, first retrieve an existing page \
+         from the same book or chapter using get_page to identify the writing style, \
+         formatting conventions, heading structure, and markdown patterns already in use. \
+         Match the established style of the surrounding content.\n\n\
+         Markdown content is automatically converted to HTML server-side. \
+         You can send markdown via the 'markdown' parameter for pages and comments — \
+         the server handles conversion reliably, avoiding JSON escaping issues with \
+         complex markdown. Use 'html' only when you need precise HTML control.\n\n",
     );
 
     match build_structure(client).await {
@@ -664,18 +700,18 @@ pub fn tool_definitions() -> Vec<Value> {
         tool("list_pages", "List all pages across all books.", paginated_schema()),
         tool("get_page", "Get a page by ID, including full content.",
             id_schema("page_id")),
-        tool("create_page", "Create a new page. Must provide either book_id or chapter_id. Provide content as markdown (preferred) or html.", json!({
+        tool("create_page", "Create a new page. Must provide either book_id or chapter_id. Provide content as markdown (preferred) or html. Markdown is converted to HTML server-side for reliable formatting.", json!({
             "type": "object",
             "properties": {
                 "name": { "type": "string", "description": "Page name" },
                 "book_id": { "type": "integer", "description": "Book ID (if not in a chapter)" },
                 "chapter_id": { "type": "integer", "description": "Chapter ID (preferred over book_id)" },
-                "markdown": { "type": "string", "description": "Page content in markdown", "default": "" },
-                "html": { "type": "string", "description": "Page content in HTML (use markdown instead)", "default": "" }
+                "markdown": { "type": "string", "description": "Page content in markdown (converted to HTML server-side)", "default": "" },
+                "html": { "type": "string", "description": "Page content in HTML (use if you need precise HTML control)", "default": "" }
             },
             "required": ["name"]
         })),
-        tool("update_page", "Update a page. Provide content as markdown (preferred) or html.",
+        tool("update_page", "Update a page. Provide content as markdown (preferred) or html. Markdown is converted to HTML server-side.",
             update_schema("page_id", &["name", "markdown", "html"])),
         tool("delete_page", "Delete a page (moves to recycle bin).",
             id_schema("page_id")),
@@ -735,19 +771,21 @@ pub fn tool_definitions() -> Vec<Value> {
         })),
         tool("get_comment", "Get a comment by ID.",
             id_schema("comment_id")),
-        tool("create_comment", "Create a comment on a page.", json!({
+        tool("create_comment", "Create a comment on a page. Provide content as markdown (preferred) or html.", json!({
             "type": "object",
             "properties": {
                 "page_id": { "type": "integer", "description": "Page ID to comment on" },
+                "markdown": { "type": "string", "description": "Comment content in markdown (converted to HTML server-side)" },
                 "html": { "type": "string", "description": "Comment content in HTML" },
                 "parent_id": { "type": "integer", "description": "Parent comment ID for replies" }
             },
-            "required": ["page_id", "html"]
+            "required": ["page_id"]
         })),
-        tool("update_comment", "Update a comment.", json!({
+        tool("update_comment", "Update a comment. Provide content as markdown (preferred) or html.", json!({
             "type": "object",
             "properties": {
                 "comment_id": { "type": "integer", "description": "The comment_id" },
+                "markdown": { "type": "string", "description": "New comment content in markdown (converted to HTML server-side)" },
                 "html": { "type": "string", "description": "New comment content in HTML" }
             },
             "required": ["comment_id"]

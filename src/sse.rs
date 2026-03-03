@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -32,10 +33,13 @@ pub struct AppState {
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     pub auth_codes: Arc<RwLock<HashMap<String, AuthCode>>>,
     pub db: Arc<Db>,
+    pub known_urls: Vec<String>,
     pub authorize_rate_limit: Arc<Mutex<RateLimit>>,
     pub register_rate_limit: Arc<Mutex<RateLimit>>,
     streamable_rate_limits: Arc<RwLock<HashMap<String, Arc<Mutex<RateLimit>>>>>,
     streamable_sessions: Arc<RwLock<HashMap<String, Instant>>>,
+    backup_interval_hours: Option<u64>,
+    backup_path: PathBuf,
 }
 
 pub(crate) struct RateLimit {
@@ -84,7 +88,13 @@ impl Drop for Session {
 }
 
 impl AppState {
-    pub fn new(bookstack_url: String, db: Arc<Db>) -> Self {
+    pub fn new(
+        bookstack_url: String,
+        db: Arc<Db>,
+        known_urls: Vec<String>,
+        backup_interval_hours: Option<u64>,
+        backup_path: PathBuf,
+    ) -> Self {
         let http_client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(60))
@@ -96,10 +106,13 @@ impl AppState {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             auth_codes: Arc::new(RwLock::new(HashMap::new())),
             db,
+            known_urls,
             authorize_rate_limit: Arc::new(Mutex::new(RateLimit::new(20))),
             register_rate_limit: Arc::new(Mutex::new(RateLimit::new(10))),
             streamable_rate_limits: Arc::new(RwLock::new(HashMap::new())),
             streamable_sessions: Arc::new(RwLock::new(HashMap::new())),
+            backup_interval_hours,
+            backup_path,
         }
     }
 
@@ -146,6 +159,26 @@ impl AppState {
             }
         });
     }
+
+    /// Spawn a periodic backup task if backup interval is configured.
+    pub fn spawn_backup(&self) {
+        let Some(interval_hours) = self.backup_interval_hours else {
+            return;
+        };
+        let db = self.db.clone();
+        let backup_path = self.backup_path.clone();
+        let interval = Duration::from_secs(interval_hours * 3600);
+        eprintln!("Backup: enabled every {interval_hours}h to {}", backup_path.display());
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                match db.backup(&backup_path) {
+                    Ok(()) => eprintln!("Backup: completed successfully"),
+                    Err(e) => eprintln!("Backup: failed — {e}"),
+                }
+            }
+        });
+    }
 }
 
 /// Constant-time string comparison to prevent timing side-channel attacks.
@@ -167,8 +200,8 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 
 /// Build a 401 response with WWW-Authenticate header for OAuth discovery.
 /// Includes resource_metadata URL per MCP 2025-06-18 / RFC 9728.
-fn unauthorized(hint: &str, headers: &HeaderMap) -> Response {
-    let base = crate::oauth::derive_base_url(headers);
+fn unauthorized(hint: &str, headers: &HeaderMap, known_urls: &[String]) -> Response {
+    let base = crate::oauth::derive_base_url(headers, known_urls);
     let body = serde_json::json!({"error": "unauthorized", "hint": hint});
     let mut resp = (StatusCode::UNAUTHORIZED, Json(body)).into_response();
     let www_auth = format!(
@@ -184,6 +217,7 @@ fn unauthorized(hint: &str, headers: &HeaderMap) -> Response {
 fn resolve_credentials(
     headers: &HeaderMap,
     db: &Db,
+    known_urls: &[String],
 ) -> Result<(String, String), Response> {
     let auth = headers
         .get("authorization")
@@ -192,7 +226,7 @@ fn resolve_credentials(
 
     if !auth.starts_with("Bearer ") {
         eprintln!("Auth: no Bearer token in request");
-        return Err(unauthorized("Bearer token required", headers));
+        return Err(unauthorized("Bearer token required", headers, known_urls));
     }
 
     let token = auth.trim_start_matches("Bearer ").trim();
@@ -210,7 +244,7 @@ fn resolve_credentials(
     }
 
     eprintln!("Auth: token not recognized");
-    Err(unauthorized("Invalid or expired token", headers))
+    Err(unauthorized("Invalid or expired token", headers, known_urls))
 }
 
 pub async fn handle_sse(
@@ -218,7 +252,7 @@ pub async fn handle_sse(
     headers: HeaderMap,
 ) -> Response {
     eprintln!("GET /mcp/sse — SSE connection attempt");
-    let (token_id, token_secret) = match resolve_credentials(&headers, &state.db) {
+    let (token_id, token_secret) = match resolve_credentials(&headers, &state.db, &state.known_urls) {
         Ok(creds) => creds,
         Err(resp) => return resp,
     };
@@ -306,7 +340,7 @@ pub async fn handle_message(
 ) -> Response {
     eprintln!("POST /mcp/messages/ — message request");
     // Authenticate the request (both token_id and token_secret)
-    let (token_id, token_secret) = match resolve_credentials(&headers, &state.db) {
+    let (token_id, token_secret) = match resolve_credentials(&headers, &state.db, &state.known_urls) {
         Ok(creds) => creds,
         Err(resp) => return resp,
     };
@@ -403,7 +437,7 @@ pub async fn handle_streamable(
     body: String,
 ) -> Response {
     eprintln!("POST /mcp/sse — Streamable HTTP request");
-    let (token_id, token_secret) = match resolve_credentials(&headers, &state.db) {
+    let (token_id, token_secret) = match resolve_credentials(&headers, &state.db, &state.known_urls) {
         Ok(creds) => creds,
         Err(resp) => return resp,
     };

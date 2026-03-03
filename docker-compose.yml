@@ -9,21 +9,28 @@ services:
     tmpfs:
       - /tmp
     volumes:
-      - mcp-data:/data
+      - bsmcp-data:/data
     environment:
-      BSMCP_BOOKSTACK_URL: ${BSMCP_BOOKSTACK_URL:-https://docs.beesroadhouse.com}
-      BSMCP_INSTANCE_NAME: ${BSMCP_INSTANCE_NAME:-}
-      BSMCP_INSTANCE_DESC: ${BSMCP_INSTANCE_DESC:-}
+      # Required
+      BSMCP_BOOKSTACK_URL: ${BSMCP_BOOKSTACK_URL}
+      BSMCP_ENCRYPTION_KEY: ${BSMCP_ENCRYPTION_KEY}
+      BSMCP_PUBLIC_DOMAIN: ${BSMCP_PUBLIC_DOMAIN}
+      # Optional
+      BSMCP_INTERNAL_DOMAIN: ${BSMCP_INTERNAL_DOMAIN:-bookstack-mcp}
+      # BSMCP_INSTANCE_NAME: ${BSMCP_INSTANCE_NAME:-}
+      # BSMCP_INSTANCE_DESC: ${BSMCP_INSTANCE_DESC:-}
+      # BSMCP_BACKUP_INTERVAL: ${BSMCP_BACKUP_INTERVAL:-}
+      # BSMCP_BACKUP_PATH: ${BSMCP_BACKUP_PATH:-/data/backups}
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.bookstack-mcp.rule=Host(`bookstack-mcp.beesroadhouse.com`)"
+      - "traefik.http.routers.bookstack-mcp.rule=Host(`${BSMCP_PUBLIC_DOMAIN}`)"
       - "traefik.http.routers.bookstack-mcp.tls.certresolver=letsencrypt"
       - "traefik.http.services.bookstack-mcp.loadbalancer.server.port=8080"
     networks:
       - traefik
 
 volumes:
-  mcp-data:
+  bsmcp-data:
 
 networks:
   traefik:

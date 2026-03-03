@@ -134,6 +134,67 @@ The token ID and secret come from your BookStack API token (created under **My A
 | `POST` | `/token` | OAuth token exchange |
 | `POST` | `/register` | Dynamic client registration (RFC 7591) |
 
+## Upgrading to v0.1.3
+
+v0.1.3 introduces encrypted token storage, PKCE enforcement, and server-side markdown conversion. There are several breaking changes that require action before upgrading.
+
+### 1. New required env var: `BSMCP_ENCRYPTION_KEY`
+
+OAuth tokens are now encrypted at rest with AES-256-GCM. You must set a 32+ character encryption key before starting the new version. Without it, the server will refuse to start.
+
+```bash
+# Add to your .env
+BSMCP_ENCRYPTION_KEY=your-secret-key-at-least-32-characters-long
+```
+
+Generate a key: `openssl rand -base64 48`
+
+Existing plaintext tokens in the database are automatically encrypted on first access (transparent migration). If you change the encryption key later, all previously stored OAuth tokens become invalid and users must re-authenticate.
+
+### 2. Renamed env var: `BSMCP_PUBLIC_URL` → `BSMCP_PUBLIC_DOMAIN`
+
+The `BSMCP_PUBLIC_URL` variable (which took a full URL like `https://mcp.example.com`) has been replaced by `BSMCP_PUBLIC_DOMAIN` (just the domain — the server prepends `https://`).
+
+```bash
+# Old (no longer recognized)
+BSMCP_PUBLIC_URL=https://mcp.example.com
+
+# New
+BSMCP_PUBLIC_DOMAIN=mcp.example.com
+```
+
+If you had `BSMCP_PUBLIC_URL` set, **remove it** and add `BSMCP_PUBLIC_DOMAIN` instead. The old variable is silently ignored.
+
+You can also now set `BSMCP_INTERNAL_DOMAIN` for Docker-network host matching (derives `http://{domain}`).
+
+### 3. Docker volume renamed: `mcp-data` → `bsmcp-data`
+
+The docker-compose volume was renamed. If you pull the new compose file and run `docker compose up`, Docker will create a new empty volume and your existing SQLite database (OAuth tokens) will be orphaned in the old volume.
+
+**To preserve your data:**
+
+```bash
+# Stop the running container
+docker compose down
+
+# Copy data from old volume to new
+docker volume create bsmcp-data
+docker run --rm \
+  -v mcp-data:/source:ro \
+  -v bsmcp-data:/dest \
+  alpine cp -a /source/. /dest/
+
+# Start with new compose
+docker compose up -d
+
+# Once verified working, remove old volume
+docker volume rm mcp-data
+```
+
+### 4. PKCE now required for OAuth
+
+The OAuth authorization endpoint now enforces PKCE (S256). All current Claude clients (Claude.ai, Claude Desktop, Claude Code) support PKCE, so this should be transparent. Custom OAuth clients that don't send `code_challenge` will receive a `400 invalid_request` error.
+
 ## Search Operators
 
 The `search_content` tool supports BookStack's search operators:

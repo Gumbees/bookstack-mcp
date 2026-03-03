@@ -6,7 +6,9 @@ An MCP (Model Context Protocol) server that gives Claude full access to a [BookS
 
 - Full CRUD on all core BookStack resources (shelves, books, chapters, pages, attachments)
 - Full-text search with BookStack query operators
+- **Server-side markdown→HTML conversion** — send markdown content, server converts to HTML before sending to BookStack (avoids JSON escaping issues with complex markdown)
 - **OAuth 2.1 support** — use as a Claude.ai or Claude Desktop custom connector without config files
+- **Encrypted token storage** — OAuth tokens encrypted at rest with AES-256-GCM
 - **Dual transport** — SSE (MCP 2024-11-05) and Streamable HTTP (MCP 2025-03-26)
 - **Dynamic structure discovery** — AI automatically learns your BookStack hierarchy on connect
 - Multi-user support via per-session BookStack API tokens

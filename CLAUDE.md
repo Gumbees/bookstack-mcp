@@ -27,6 +27,8 @@ src/
 | `BSMCP_BOOKSTACK_URL` | Yes | - | BookStack instance URL |
 | `BSMCP_HOST` | No | `0.0.0.0` | Bind address |
 | `BSMCP_PORT` | No | `8080` | Bind port |
+| `BSMCP_INSTANCE_NAME` | No | - | Instance name shown to AI (e.g. "Nate's Personal KB") |
+| `BSMCP_INSTANCE_DESC` | No | - | Instance description shown to AI (e.g. "Personal knowledge base for home and projects") |
 
 ## Implemented Tools (49)
 

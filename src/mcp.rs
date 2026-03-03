@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::env;
+
 use serde_json::{json, Value};
 
 use crate::bookstack::{BookStackClient, ContentType, ExportFormat};
@@ -10,14 +13,18 @@ pub async fn handle_request(request: &Value, client: &BookStackClient) -> Option
     let params = request.get("params").cloned().unwrap_or(json!({}));
 
     match method {
-        "initialize" => Some(json_rpc_result(id, json!({
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": { "tools": {} },
-            "serverInfo": {
-                "name": "BookStack MCP",
-                "version": "0.1.0",
-            },
-        }))),
+        "initialize" => {
+            let instructions = build_instructions(client).await;
+            Some(json_rpc_result(id, json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": { "tools": {} },
+                "serverInfo": {
+                    "name": "BookStack MCP",
+                    "version": "0.1.0",
+                },
+                "instructions": instructions,
+            })))
+        }
         "notifications/initialized" => None,
         "tools/list" => Some(json_rpc_result(id, json!({ "tools": tool_definitions() }))),
         "tools/call" => {
@@ -486,6 +493,105 @@ fn strip_html_tags(input: &str) -> String {
         }
     }
     result
+}
+
+// --- Dynamic instructions (sent on initialize) ---
+
+async fn build_instructions(client: &BookStackClient) -> String {
+    let instance_name = env::var("BSMCP_INSTANCE_NAME").unwrap_or_default();
+    let instance_desc = env::var("BSMCP_INSTANCE_DESC").unwrap_or_default();
+
+    let mut instructions = String::new();
+    if !instance_name.is_empty() {
+        instructions.push_str(&format!("{instance_name}"));
+        if !instance_desc.is_empty() {
+            instructions.push_str(&format!(" - {instance_desc}"));
+        }
+        instructions.push_str("\n\n");
+    }
+    instructions.push_str(
+        "BookStack knowledge management server. Content is organized as: \
+         Shelves > Books > Chapters > Pages. Use search_content to find content, \
+         or navigate the hierarchy using the IDs below.\n\n",
+    );
+
+    match build_structure(client).await {
+        Some(structure) => {
+            instructions.push_str("Current structure:\n\n");
+            instructions.push_str(&structure);
+        }
+        None => {
+            instructions
+                .push_str("Use list_shelves and list_books to explore the structure.");
+        }
+    }
+
+    instructions
+}
+
+async fn build_structure(client: &BookStackClient) -> Option<String> {
+    let shelves = client.list_shelves(500, 0).await.ok()?;
+    let shelf_list = shelves["data"].as_array()?;
+
+    // Fetch each shelf's details (includes books) in parallel
+    let shelf_futures: Vec<_> = shelf_list
+        .iter()
+        .filter_map(|s| s["id"].as_i64())
+        .map(|id| client.get_shelf(id))
+        .collect();
+    let shelf_details = futures::future::join_all(shelf_futures).await;
+
+    // Fetch all chapters to map them to books
+    let chapters = client
+        .list_chapters(500, 0)
+        .await
+        .ok()
+        .and_then(|v| v["data"].as_array().cloned())
+        .unwrap_or_default();
+
+    let mut chapters_by_book: HashMap<i64, Vec<(i64, String)>> = HashMap::new();
+    for ch in &chapters {
+        if let (Some(book_id), Some(id), Some(name)) = (
+            ch["book_id"].as_i64(),
+            ch["id"].as_i64(),
+            ch["name"].as_str(),
+        ) {
+            chapters_by_book
+                .entry(book_id)
+                .or_default()
+                .push((id, name.to_string()));
+        }
+    }
+
+    let mut output = String::new();
+    for result in &shelf_details {
+        if let Ok(shelf) = result {
+            let name = shelf["name"].as_str().unwrap_or("?");
+            let id = shelf["id"].as_i64().unwrap_or(0);
+            output.push_str(&format!("Shelf: {name} (ID: {id})\n"));
+
+            if let Some(books) = shelf["books"].as_array() {
+                for book in books {
+                    let bname = book["name"].as_str().unwrap_or("?");
+                    let bid = book["id"].as_i64().unwrap_or(0);
+                    output.push_str(&format!("  Book: {bname} (ID: {bid})\n"));
+
+                    if let Some(chs) = chapters_by_book.get(&bid) {
+                        for (cid, cname) in chs {
+                            output.push_str(&format!("    Chapter: {cname} (ID: {cid})\n"));
+                        }
+                    }
+                }
+            }
+            output.push('\n');
+        }
+    }
+
+    if output.is_empty() {
+        None
+    } else {
+        Some(output)
+    }
 }
 
 // --- Tool definitions ---

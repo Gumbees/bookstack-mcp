@@ -10,6 +10,8 @@ services:
       - /tmp
     environment:
       BSMCP_BOOKSTACK_URL: ${BSMCP_BOOKSTACK_URL:-https://docs.beesroadhouse.com}
+      BSMCP_INSTANCE_NAME: ${BSMCP_INSTANCE_NAME:-}
+      BSMCP_INSTANCE_DESC: ${BSMCP_INSTANCE_DESC:-}
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.bookstack-mcp.rule=Host(`bookstack-mcp.beesroadhouse.com`)"

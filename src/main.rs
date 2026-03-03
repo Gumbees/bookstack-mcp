@@ -13,7 +13,8 @@ use axum::extract::DefaultBodyLimit;
 use axum::{Router, routing::get};
 use axum::response::Json;
 use serde_json::json;
-use tower_http::cors::CorsLayer;
+use axum::http::{HeaderName, Method};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 #[tokio::main]
 async fn main() {
@@ -51,7 +52,22 @@ async fn main() {
         .route("/register", axum::routing::post(oauth::handle_register))
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
         .layer(DefaultBodyLimit::max(1024 * 1024)) // 1MB
-        .layer(CorsLayer::new()) // deny all origins by default
+        .layer(
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::any())
+                .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+                .allow_headers([
+                    HeaderName::from_static("authorization"),
+                    HeaderName::from_static("content-type"),
+                    HeaderName::from_static("accept"),
+                    HeaderName::from_static("mcp-session-id"),
+                    HeaderName::from_static("mcp-protocol-version"),
+                    HeaderName::from_static("last-event-id"),
+                ])
+                .expose_headers([
+                    HeaderName::from_static("mcp-session-id"),
+                ])
+        )
         .with_state(state);
 
     let addr: SocketAddr = format!("{host}:{port}").parse().unwrap();

@@ -1,8 +1,9 @@
+use std::env;
 use std::time::{Duration, Instant};
 
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::Form;
 use axum::Json;
 use base64::Engine;
@@ -17,16 +18,25 @@ pub const AUTH_CODE_TTL: Duration = Duration::from_secs(300); // 5 minutes
 pub const ACCESS_TOKEN_TTL: Duration = Duration::from_secs(86400); // 24 hours
 
 pub struct AuthCode {
-    pub client_id: String,
     pub code_challenge: Option<String>,
     pub code_challenge_method: Option<String>,
     pub redirect_uri: String,
+    pub client_id: String,
+    /// BookStack credentials from the login form (new flow)
+    pub token_id: Option<String>,
+    pub token_secret: Option<String>,
     pub created_at: Instant,
 }
 
 impl Drop for AuthCode {
     fn drop(&mut self) {
         self.client_id.zeroize();
+        if let Some(ref mut t) = self.token_id {
+            t.zeroize();
+        }
+        if let Some(ref mut t) = self.token_secret {
+            t.zeroize();
+        }
     }
 }
 
@@ -45,6 +55,18 @@ impl Drop for OAuthAccessToken {
 
 #[derive(Deserialize)]
 pub struct AuthorizeParams {
+    response_type: String,
+    client_id: String,
+    redirect_uri: String,
+    state: Option<String>,
+    code_challenge: Option<String>,
+    code_challenge_method: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct AuthorizeFormSubmit {
+    token_id: String,
+    token_secret: String,
     response_type: String,
     client_id: String,
     redirect_uri: String,
@@ -75,6 +97,96 @@ fn derive_base_url(headers: &HeaderMap) -> String {
     format!("{scheme}://{host}")
 }
 
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
+fn render_login_form(params: &AuthorizeParams, error: Option<&str>) -> String {
+    let instance_name = env::var("BSMCP_INSTANCE_NAME").unwrap_or_default();
+    let title = if instance_name.is_empty() {
+        "BookStack MCP".to_string()
+    } else {
+        html_escape(&instance_name)
+    };
+
+    let error_html = if let Some(msg) = error {
+        format!(r#"<div class="error">{}</div>"#, html_escape(msg))
+    } else {
+        String::new()
+    };
+
+    let hidden = |name: &str, value: &str| -> String {
+        format!(
+            r#"<input type="hidden" name="{}" value="{}">"#,
+            html_escape(name),
+            html_escape(value)
+        )
+    };
+
+    let mut hidden_fields = vec![
+        hidden("response_type", &params.response_type),
+        hidden("client_id", &params.client_id),
+        hidden("redirect_uri", &params.redirect_uri),
+    ];
+    if let Some(ref s) = params.state {
+        hidden_fields.push(hidden("state", s));
+    }
+    if let Some(ref c) = params.code_challenge {
+        hidden_fields.push(hidden("code_challenge", c));
+    }
+    if let Some(ref m) = params.code_challenge_method {
+        hidden_fields.push(hidden("code_challenge_method", m));
+    }
+
+    format!(
+        r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in — {title}</title>
+<style>
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
+body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #1a1a2e; color: #e0e0e0; min-height: 100vh; display: flex; align-items: center; justify-content: center; }}
+.card {{ background: #16213e; border-radius: 12px; padding: 2.5rem; width: 100%; max-width: 400px; box-shadow: 0 8px 32px rgba(0,0,0,0.3); }}
+h1 {{ font-size: 1.4rem; margin-bottom: 0.3rem; color: #fff; }}
+.subtitle {{ color: #888; font-size: 0.9rem; margin-bottom: 1.5rem; }}
+.error {{ background: #3d1f1f; border: 1px solid #c0392b; color: #e74c3c; padding: 0.75rem; border-radius: 6px; margin-bottom: 1rem; font-size: 0.9rem; }}
+label {{ display: block; font-size: 0.85rem; color: #aaa; margin-bottom: 0.3rem; }}
+input[type="text"], input[type="password"] {{ width: 100%; padding: 0.7rem; border: 1px solid #2a3a5c; border-radius: 6px; background: #0f1a30; color: #e0e0e0; font-size: 0.95rem; margin-bottom: 1rem; }}
+input[type="text"]:focus, input[type="password"]:focus {{ outline: none; border-color: #3498db; }}
+button {{ width: 100%; padding: 0.75rem; background: #2980b9; color: #fff; border: none; border-radius: 6px; font-size: 1rem; cursor: pointer; }}
+button:hover {{ background: #3498db; }}
+.help {{ margin-top: 1.2rem; font-size: 0.8rem; color: #666; line-height: 1.4; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>{title}</h1>
+  <p class="subtitle">Enter your BookStack API token to connect.</p>
+  {error_html}
+  <form method="POST" action="/authorize">
+    {hidden_fields}
+    <label for="token_id">Token ID</label>
+    <input type="text" id="token_id" name="token_id" required autocomplete="username">
+    <label for="token_secret">Token Secret</label>
+    <input type="password" id="token_secret" name="token_secret" required autocomplete="current-password">
+    <button type="submit">Connect</button>
+  </form>
+  <p class="help">Create an API token in your BookStack profile under <strong>API Tokens</strong>.</p>
+</div>
+</body>
+</html>"##,
+        title = title,
+        error_html = error_html,
+        hidden_fields = hidden_fields.join("\n    "),
+    )
+}
+
 /// RFC 8414 Authorization Server Metadata (MCP 2025-03-26 spec)
 pub async fn handle_metadata(headers: HeaderMap) -> Json<Value> {
     let base = derive_base_url(&headers);
@@ -85,7 +197,7 @@ pub async fn handle_metadata(headers: HeaderMap) -> Json<Value> {
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
         "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
+        "token_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
     }))
 }
 
@@ -99,19 +211,44 @@ pub async fn handle_resource_metadata(headers: HeaderMap) -> Json<Value> {
     }))
 }
 
-/// Authorization endpoint - generates auth code and redirects.
-/// No consent UI needed: the user already "authorized" by providing their
-/// BookStack API credentials as the OAuth client credentials.
-pub async fn handle_authorize(
-    State(state): State<AppState>,
-    Query(params): Query<AuthorizeParams>,
-) -> Response {
+/// Authorization endpoint GET - serves the login form.
+pub async fn handle_authorize(Query(params): Query<AuthorizeParams>) -> Response {
     if params.response_type != "code" {
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "unsupported_response_type",
             Some("Only response_type=code is supported"),
         );
+    }
+    Html(render_login_form(&params, None)).into_response()
+}
+
+/// Authorization endpoint POST - validates BookStack credentials and redirects with auth code.
+pub async fn handle_authorize_submit(
+    State(state): State<AppState>,
+    Form(form): Form<AuthorizeFormSubmit>,
+) -> Response {
+    if form.response_type != "code" {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_response_type",
+            Some("Only response_type=code is supported"),
+        );
+    }
+
+    // Validate credentials against BookStack
+    let bs_client = BookStackClient::new(&state.bookstack_url, &form.token_id, &form.token_secret);
+    if let Err(e) = bs_client.validate().await {
+        eprintln!("OAuth: login form credential validation failed: {e}");
+        let params = AuthorizeParams {
+            response_type: form.response_type,
+            client_id: form.client_id,
+            redirect_uri: form.redirect_uri,
+            state: form.state,
+            code_challenge: form.code_challenge,
+            code_challenge_method: form.code_challenge_method,
+        };
+        return Html(render_login_form(&params, Some("Invalid API token. Check your Token ID and Secret."))).into_response();
     }
 
     let code = uuid::Uuid::new_v4().to_string();
@@ -124,32 +261,35 @@ pub async fn handle_authorize(
         codes.insert(
             code.clone(),
             AuthCode {
-                client_id: params.client_id,
-                code_challenge: params.code_challenge,
-                code_challenge_method: params.code_challenge_method,
-                redirect_uri: params.redirect_uri.clone(),
+                client_id: form.client_id,
+                code_challenge: form.code_challenge,
+                code_challenge_method: form.code_challenge_method,
+                redirect_uri: form.redirect_uri.clone(),
+                token_id: Some(form.token_id),
+                token_secret: Some(form.token_secret),
                 created_at: Instant::now(),
             },
         );
     }
 
     let code_encoded = urlencoding::encode(&code);
-    let mut redirect_url = if params.redirect_uri.contains('?') {
-        format!("{}&code={code_encoded}", params.redirect_uri)
+    let mut redirect_url = if form.redirect_uri.contains('?') {
+        format!("{}&code={code_encoded}", form.redirect_uri)
     } else {
-        format!("{}?code={code_encoded}", params.redirect_uri)
+        format!("{}?code={code_encoded}", form.redirect_uri)
     };
-    if let Some(ref state_param) = params.state {
+    if let Some(ref state_param) = form.state {
         let state_encoded = urlencoding::encode(state_param);
         redirect_url.push_str(&format!("&state={state_encoded}"));
     }
 
-    eprintln!("OAuth: issued auth code, redirecting");
+    eprintln!("OAuth: login form authenticated, issued auth code");
     (StatusCode::FOUND, [(header::LOCATION, redirect_url)]).into_response()
 }
 
 /// Token endpoint - exchanges authorization code for access token.
-/// Validates BookStack credentials (client_id:client_secret) and PKCE.
+/// Supports both form-based auth (credentials stored in auth code) and
+/// legacy client_secret auth (credentials in token request).
 pub async fn handle_token(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -174,11 +314,6 @@ pub async fn handle_token(
         }
     };
 
-    let (client_id, client_secret) = match extract_client_credentials(&headers, &form) {
-        Some(creds) => creds,
-        None => return oauth_error(StatusCode::UNAUTHORIZED, "invalid_client", None),
-    };
-
     // Consume auth code (single-use)
     let auth_code = {
         let mut codes = state.auth_codes.write().await;
@@ -196,14 +331,7 @@ pub async fn handle_token(
         }
     };
 
-    if auth_code.client_id != client_id {
-        return oauth_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_grant",
-            Some("Client ID mismatch"),
-        );
-    }
-
+    // Verify redirect_uri matches
     if let Some(ref redirect_uri) = form.redirect_uri {
         if *redirect_uri != auth_code.redirect_uri {
             return oauth_error(
@@ -248,16 +376,49 @@ pub async fn handle_token(
         }
     }
 
-    // Validate credentials against BookStack
-    let bs_client = BookStackClient::new(&state.bookstack_url, &client_id, &client_secret);
-    if let Err(e) = bs_client.validate().await {
-        eprintln!("OAuth: BookStack credential validation failed: {e}");
-        return oauth_error(
-            StatusCode::UNAUTHORIZED,
-            "invalid_client",
-            Some("Invalid BookStack credentials"),
-        );
-    }
+    // Resolve BookStack credentials: prefer form-stored creds, fall back to client credentials
+    let (token_id, token_secret) = if let (Some(tid), Some(tsec)) =
+        (auth_code.token_id.clone(), auth_code.token_secret.clone())
+    {
+        // New flow: credentials came from the login form, already validated
+        eprintln!("OAuth: using form-authenticated credentials");
+        (tid, tsec)
+    } else {
+        // Legacy flow: credentials come from client_id/client_secret
+        let (client_id, client_secret) = match extract_client_credentials(&headers, &form) {
+            Some(creds) => creds,
+            None => {
+                return oauth_error(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_client",
+                    Some("No credentials available"),
+                )
+            }
+        };
+
+        if auth_code.client_id != client_id {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                Some("Client ID mismatch"),
+            );
+        }
+
+        // Validate against BookStack
+        let bs_client =
+            BookStackClient::new(&state.bookstack_url, &client_id, &client_secret);
+        if let Err(e) = bs_client.validate().await {
+            eprintln!("OAuth: BookStack credential validation failed: {e}");
+            return oauth_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_client",
+                Some("Invalid BookStack credentials"),
+            );
+        }
+
+        eprintln!("OAuth: using legacy client credential flow");
+        (client_id, client_secret)
+    };
 
     // Issue access token
     let access_token = uuid::Uuid::new_v4().to_string();
@@ -271,8 +432,8 @@ pub async fn handle_token(
         tokens.insert(
             access_token.clone(),
             OAuthAccessToken {
-                token_id: client_id,
-                token_secret: client_secret,
+                token_id,
+                token_secret,
                 created_at: Instant::now(),
             },
         );

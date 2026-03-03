@@ -71,13 +71,14 @@ cargo run --release
 
 ### OAuth 2.1 (Claude Desktop Custom Connector)
 
-The server implements OAuth 2.1 (authorization code + PKCE) for use as a Claude Desktop custom connector:
+The server implements OAuth 2.1 (authorization code + PKCE) with a browser-based login form:
 
 1. Add a custom connector in Claude Desktop with URL: `https://your-host/mcp/sse`
-2. Enter your BookStack API **Token ID** as the OAuth Client ID
-3. Enter your BookStack API **Token Secret** as the OAuth Client Secret
+2. When connecting, a login form opens in your browser
+3. Enter your BookStack API **Token ID** and **Token Secret**
+4. The server validates your credentials and connects automatically
 
-Claude handles the rest automatically — no config files needed.
+No API keys in config files — authentication happens entirely through the browser.
 
 ### Bearer Token (Claude Code / Direct)
 
@@ -121,7 +122,8 @@ Add to your MCP server configuration:
 | `GET` | `/health` | Health check |
 | `GET` | `/.well-known/oauth-authorization-server` | OAuth metadata (RFC 8414) |
 | `GET` | `/.well-known/oauth-protected-resource` | Protected resource metadata (RFC 9728) |
-| `GET` | `/authorize` | OAuth authorization endpoint |
+| `GET` | `/authorize` | Login form for BookStack API token |
+| `POST` | `/authorize` | Validate credentials and issue auth code |
 | `POST` | `/token` | OAuth token exchange |
 
 ## Search Operators

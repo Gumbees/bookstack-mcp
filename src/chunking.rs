@@ -32,8 +32,9 @@ pub fn chunk_html(html: &str) -> Vec<Chunk> {
             in_tag = false;
             let tag = tag_buf.trim().to_lowercase();
 
-            // Check for heading open tags
-            let heading_level = match tag.as_str() {
+            // Check for heading open tags (extract tag name before any attributes)
+            let tag_name = tag.split_whitespace().next().unwrap_or("");
+            let heading_level = match tag_name {
                 "h1" => Some(1u8),
                 "h2" => Some(2),
                 "h3" => Some(3),

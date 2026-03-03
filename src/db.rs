@@ -24,6 +24,7 @@ impl Db {
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
+             PRAGMA foreign_keys=ON;
              CREATE TABLE IF NOT EXISTS access_tokens (
                  token TEXT PRIMARY KEY,
                  token_id TEXT NOT NULL,
@@ -247,9 +248,19 @@ impl Db {
 
     pub fn delete_page_and_chunks(&self, page_id: i64) {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM chunks WHERE page_id = ?1", params![page_id]).ok();
-        conn.execute("DELETE FROM relationships WHERE source_page_id = ?1 OR target_page_id = ?1", params![page_id]).ok();
-        conn.execute("DELETE FROM pages WHERE page_id = ?1", params![page_id]).ok();
+        let tx = conn.unchecked_transaction().expect("Failed to begin transaction");
+        if let Err(e) = tx.execute("DELETE FROM chunks WHERE page_id = ?1", params![page_id]) {
+            eprintln!("DB: delete chunks for page {page_id}: {e}");
+        }
+        if let Err(e) = tx.execute("DELETE FROM relationships WHERE source_page_id = ?1 OR target_page_id = ?1", params![page_id]) {
+            eprintln!("DB: delete relationships for page {page_id}: {e}");
+        }
+        if let Err(e) = tx.execute("DELETE FROM pages WHERE page_id = ?1", params![page_id]) {
+            eprintln!("DB: delete page {page_id}: {e}");
+        }
+        if let Err(e) = tx.commit() {
+            eprintln!("DB: commit delete_page_and_chunks for page {page_id}: {e}");
+        }
     }
 
     pub fn get_page_content_hash(&self, page_id: i64) -> Option<String> {
@@ -265,14 +276,21 @@ impl Db {
 
     pub fn insert_chunks(&self, page_id: i64, chunks: &[(usize, &str, &str, &str, &[u8])]) {
         let conn = self.conn.lock().unwrap();
-        // Delete existing chunks for this page
-        conn.execute("DELETE FROM chunks WHERE page_id = ?1", params![page_id]).ok();
+        let tx = conn.unchecked_transaction().expect("Failed to begin transaction");
+        if let Err(e) = tx.execute("DELETE FROM chunks WHERE page_id = ?1", params![page_id]) {
+            eprintln!("DB: delete old chunks for page {page_id}: {e}");
+        }
         for &(index, heading_path, content, content_hash, embedding) in chunks {
-            conn.execute(
+            if let Err(e) = tx.execute(
                 "INSERT INTO chunks (page_id, chunk_index, heading_path, content, content_hash, embedding)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![page_id, index as i64, heading_path, content, content_hash, embedding],
-            ).ok();
+            ) {
+                eprintln!("DB: insert chunk {index} for page {page_id}: {e}");
+            }
+        }
+        if let Err(e) = tx.commit() {
+            eprintln!("DB: commit insert_chunks for page {page_id}: {e}");
         }
     }
 
@@ -317,16 +335,24 @@ impl Db {
 
     pub fn replace_relationships(&self, source_page_id: i64, targets: &[(i64, &str)]) {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let tx = conn.unchecked_transaction().expect("Failed to begin transaction");
+        if let Err(e) = tx.execute(
             "DELETE FROM relationships WHERE source_page_id = ?1",
             params![source_page_id],
-        ).ok();
+        ) {
+            eprintln!("DB: delete relationships for page {source_page_id}: {e}");
+        }
         for &(target_id, link_type) in targets {
-            conn.execute(
+            if let Err(e) = tx.execute(
                 "INSERT OR IGNORE INTO relationships (source_page_id, target_page_id, link_type)
                  VALUES (?1, ?2, ?3)",
                 params![source_page_id, target_id, link_type],
-            ).ok();
+            ) {
+                eprintln!("DB: insert relationship {source_page_id}->{target_id}: {e}");
+            }
+        }
+        if let Err(e) = tx.commit() {
+            eprintln!("DB: commit replace_relationships for page {source_page_id}: {e}");
         }
     }
 
@@ -431,7 +457,7 @@ impl Db {
         conn.execute(
             "INSERT INTO embed_jobs (scope, status, started_at) VALUES (?1, 'running', ?2)",
             params![scope, Self::now_secs()],
-        ).ok();
+        ).expect("Failed to create embed job");
         conn.last_insert_rowid()
     }
 

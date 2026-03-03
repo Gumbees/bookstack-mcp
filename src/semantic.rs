@@ -393,14 +393,16 @@ async fn embed_single_page(
     let links = chunking::extract_links(html);
     let mut targets: Vec<(i64, &str)> = Vec::new();
     for link in &links {
-        // Try to resolve slug to page_id
-        if let Some(slug_part) = link.rsplit("/page/").next() {
-            if let Some(target_id) = db.resolve_page_slug(slug_part) {
-                targets.push((target_id, "link"));
+        if link.contains("/page/") {
+            // /books/{book_slug}/page/{page_slug} — resolve slug to page_id
+            if let Some(slug_part) = link.rsplit("/page/").next() {
+                if let Some(target_id) = db.resolve_page_slug(slug_part) {
+                    targets.push((target_id, "link"));
+                }
             }
         } else if let Some(link_id_str) = link.strip_prefix("/link/") {
+            // /link/{id} — BookStack's internal redirect IDs, which map to page_ids
             if let Ok(link_id) = link_id_str.parse::<i64>() {
-                // /link/ IDs are BookStack's internal redirect IDs, which map to page_ids
                 targets.push((link_id, "link"));
             }
         }

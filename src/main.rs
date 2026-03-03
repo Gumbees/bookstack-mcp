@@ -196,7 +196,7 @@ async fn handle_webhook(
     // Constant-time secret verification
     let provided_secret = params.get("secret").map(|s| s.as_str()).unwrap_or("");
     let expected_secret = semantic.webhook_secret();
-    if !constant_time_eq(provided_secret, expected_secret) {
+    if !sse::constant_time_eq(provided_secret, expected_secret) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -212,16 +212,3 @@ async fn handle_webhook(
     StatusCode::ACCEPTED.into_response()
 }
 
-/// Constant-time string comparison for webhook secret verification.
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    use subtle::ConstantTimeEq;
-    let a = a.as_bytes();
-    let b = b.as_bytes();
-    let len = a.len().max(b.len());
-    let mut a_padded = vec![0xAAu8; len];
-    let mut b_padded = vec![0xBBu8; len];
-    a_padded[..a.len()].copy_from_slice(a);
-    b_padded[..b.len()].copy_from_slice(b);
-    let result: bool = a_padded.ct_eq(&b_padded).into();
-    result && a.len() == b.len()
-}

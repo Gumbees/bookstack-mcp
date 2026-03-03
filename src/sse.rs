@@ -188,7 +188,7 @@ impl AppState {
 /// Constant-time string comparison to prevent timing side-channel attacks.
 /// Pads the shorter input with different sentinel bytes to ensure constant-time
 /// comparison regardless of length difference.
-fn constant_time_eq(a: &str, b: &str) -> bool {
+pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
     let b = b.as_bytes();
     let len = a.len().max(b.len());

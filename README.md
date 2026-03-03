@@ -6,8 +6,11 @@ An MCP (Model Context Protocol) server that gives Claude full access to a [BookS
 
 - Full CRUD on all core BookStack resources (shelves, books, chapters, pages, attachments)
 - Full-text search with BookStack query operators
+- **OAuth 2.1 support** — use as a Claude Desktop custom connector without config files
+- **Dynamic structure discovery** — AI automatically learns your BookStack hierarchy on connect
 - Multi-user support via per-session BookStack API tokens
 - SSE transport (MCP protocol version `2024-11-05`)
+- Multi-arch Docker images (amd64 + arm64)
 - ~10MB Docker image (Alpine + static Rust binary)
 
 ## Available Tools (49)
@@ -44,6 +47,8 @@ An MCP (Model Context Protocol) server that gives Claude full access to a [BookS
 | `BSMCP_BOOKSTACK_URL` | Yes | - | Your BookStack instance URL |
 | `BSMCP_HOST` | No | `0.0.0.0` | Bind address |
 | `BSMCP_PORT` | No | `8080` | Bind port |
+| `BSMCP_INSTANCE_NAME` | No | - | Instance name shown to AI (e.g. "Personal KB") |
+| `BSMCP_INSTANCE_DESC` | No | - | Instance description shown to AI |
 
 ```bash
 cp .env.example .env
@@ -64,7 +69,19 @@ cargo run --release
 
 ## Authentication
 
-Clients authenticate via the SSE connection using a Bearer token:
+### OAuth 2.1 (Claude Desktop Custom Connector)
+
+The server implements OAuth 2.1 (authorization code + PKCE) for use as a Claude Desktop custom connector:
+
+1. Add a custom connector in Claude Desktop with URL: `https://your-host/mcp/sse`
+2. Enter your BookStack API **Token ID** as the OAuth Client ID
+3. Enter your BookStack API **Token Secret** as the OAuth Client Secret
+
+Claude handles the rest automatically — no config files needed.
+
+### Bearer Token (Claude Code / Direct)
+
+For Claude Code or direct SSE connections, authenticate with a Bearer token:
 
 ```
 Authorization: Bearer <token_id>:<token_secret>
@@ -74,7 +91,11 @@ The token ID and secret come from your BookStack API token. Each SSE connection 
 
 ## MCP Client Configuration
 
-### Claude Desktop / Claude Code
+### Claude Desktop
+
+Use the OAuth custom connector method above — no JSON config required.
+
+### Claude Code
 
 Add to your MCP server configuration:
 
@@ -95,9 +116,13 @@ Add to your MCP server configuration:
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/mcp/sse` | SSE connection (requires Bearer auth) |
+| `GET` | `/mcp/sse` | SSE connection (requires Bearer auth or OAuth) |
 | `POST` | `/mcp/messages/?sessionId=<id>` | Send MCP JSON-RPC messages |
 | `GET` | `/health` | Health check |
+| `GET` | `/.well-known/oauth-authorization-server` | OAuth metadata (RFC 8414) |
+| `GET` | `/.well-known/oauth-protected-resource` | Protected resource metadata (RFC 9728) |
+| `GET` | `/authorize` | OAuth authorization endpoint |
+| `POST` | `/token` | OAuth token exchange |
 
 ## Search Operators
 

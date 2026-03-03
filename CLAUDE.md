@@ -1,20 +1,22 @@
 # BookStack MCP Server
 
-Rust MCP server that bridges Claude to a BookStack instance via SSE transport.
+Rust MCP server that bridges Claude to a BookStack instance via SSE and Streamable HTTP transports.
 
 ## Architecture
 
 ```
 src/
-  main.rs        - Axum server, routes, env config
-  sse.rs         - SSE session management, multi-user auth, message routing
+  main.rs        - Axum server, routes, env config, CORS
+  sse.rs         - SSE session management, Streamable HTTP, multi-user auth, message routing
   mcp.rs         - MCP protocol handler, tool definitions, tool execution
   bookstack.rs   - BookStack REST API client (reqwest)
   oauth.rs       - OAuth 2.1, login form, token exchange, dynamic registration
   db.rs          - SQLite persistence for OAuth access tokens
 ```
 
-**Flow:** Client connects SSE with `Bearer <token_id>:<token_secret>` -> validates against BookStack -> creates session -> client sends JSON-RPC to `/mcp/messages/?sessionId=<id>` -> dispatches to tool -> responds via SSE event.
+**Two transports:**
+1. **SSE (MCP 2024-11-05):** Client connects GET `/mcp/sse` with Bearer token -> validates -> creates session -> client sends JSON-RPC to `/mcp/messages/?sessionId=<id>` -> response via SSE event.
+2. **Streamable HTTP (MCP 2025-03-26):** Client POSTs JSON-RPC to `/mcp/sse` with Bearer token -> validates -> returns JSON response directly. Used by claude.ai.
 
 **Key patterns:**
 - `mcp.rs` uses `block_in_place` + `block_on` to call async BookStack client from sync `handle_request`
@@ -70,10 +72,11 @@ For GET endpoints that need a raw text response (like export), add a `get_text()
 
 The server implements OAuth 2.1 (authorization code + PKCE) with a browser-based login form for BookStack API token authentication.
 
-**How to configure in Claude Desktop:**
-1. Add custom connector with URL: `https://bookstack-mcp.beesroadhouse.com/mcp/sse`
-2. For Client ID / Client Secret, enter any value (e.g. "unused") — real auth happens in the browser
-3. When connecting, a login form opens — enter your BookStack API Token ID and Secret
+**MCP endpoint URL:** `https://your-host/mcp/sse` (must include the `/mcp/sse` path)
+
+**How to configure in Claude.ai or Claude Desktop:**
+1. Add custom connector / MCP integration with URL: `https://your-host/mcp/sse`
+2. When connecting, a login form opens — enter your BookStack API Token ID and Secret
 
 **OAuth endpoints:**
 - `GET /.well-known/oauth-authorization-server` — RFC 8414 metadata (MCP 2025-03-26)
@@ -87,6 +90,8 @@ The server implements OAuth 2.1 (authorization code + PKCE) with a browser-based
 2. **Legacy client credentials:** Client sends BookStack token_id as client_id and token_secret as client_secret in the /token request. Still works for backward compatibility.
 
 **Also supported:** Legacy `Bearer token_id:token_secret` format on SSE/messages endpoints (Claude Code direct connection).
+
+**CORS:** Configured with `AllowOrigin::any()` to allow cross-origin requests from claude.ai and other browser-based MCP clients. Exposes `mcp-session-id` header.
 
 **Architecture:** OAuth types live in `oauth.rs`. Auth codes are in-memory (expire in 5 minutes). Access tokens are persisted in SQLite (`db.rs`) so they survive container restarts (expire in 24 hours). Cleanup runs every 30s.
 
@@ -104,4 +109,4 @@ docker compose build     # Alpine multi-stage, ~10MB image
 
 ## Deployment
 
-Docker Compose with Traefik reverse proxy. Domain: `bookstack-mcp.beesroadhouse.com`. TLS via Let's Encrypt.
+Docker Compose with Traefik reverse proxy. TLS via Let's Encrypt or Cloudflare.

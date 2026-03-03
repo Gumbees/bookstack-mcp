@@ -6,10 +6,10 @@ An MCP (Model Context Protocol) server that gives Claude full access to a [BookS
 
 - Full CRUD on all core BookStack resources (shelves, books, chapters, pages, attachments)
 - Full-text search with BookStack query operators
-- **OAuth 2.1 support** — use as a Claude Desktop custom connector without config files
+- **OAuth 2.1 support** — use as a Claude.ai or Claude Desktop custom connector without config files
+- **Dual transport** — SSE (MCP 2024-11-05) and Streamable HTTP (MCP 2025-03-26)
 - **Dynamic structure discovery** — AI automatically learns your BookStack hierarchy on connect
 - Multi-user support via per-session BookStack API tokens
-- SSE transport (MCP protocol version `2024-11-05`)
 - Multi-arch Docker images (amd64 + arm64)
 - ~10MB Docker image (Alpine + static Rust binary)
 
@@ -68,35 +68,32 @@ docker compose up -d
 cargo run --release
 ```
 
-## Authentication
+## Connecting
 
-### OAuth 2.1 (Claude Desktop Custom Connector)
+The MCP endpoint URL is:
 
-The server implements OAuth 2.1 (authorization code + PKCE) with a browser-based login form:
+```
+https://your-host/mcp/sse
+```
 
-1. Add a custom connector in Claude Desktop with URL: `https://your-host/mcp/sse`
+> **Important:** Use the full path including `/mcp/sse` — not just the base domain.
+
+### Claude.ai (Custom Connector)
+
+1. Go to **Settings > Integrations > Add custom MCP** in Claude.ai
+2. Enter the MCP endpoint URL: `https://your-host/mcp/sse`
+3. A login form opens in your browser — enter your BookStack API **Token ID** and **Token Secret**
+4. Once authorized, BookStack tools appear automatically in your conversations
+
+### Claude Desktop (Custom Connector)
+
+1. Add a custom connector with URL: `https://your-host/mcp/sse`
 2. When connecting, a login form opens in your browser with instructions
 3. Enter your BookStack API **Token ID** and **Token Secret**
 
-No config files needed — authentication happens entirely through the browser.
+No config files needed — authentication happens entirely through the browser via OAuth 2.1.
 
-### Bearer Token (Claude Code / Direct)
-
-For Claude Code or direct SSE connections, authenticate with a Bearer token:
-
-```
-Authorization: Bearer <token_id>:<token_secret>
-```
-
-The token ID and secret come from your BookStack API token. Each SSE connection creates an isolated session authenticated with that token's permissions.
-
-## MCP Client Configuration
-
-### Claude Desktop
-
-Use the OAuth custom connector method above — no JSON config required.
-
-### Claude Code
+### Claude Code (Direct Bearer Token)
 
 Add to your MCP server configuration:
 
@@ -104,7 +101,7 @@ Add to your MCP server configuration:
 {
   "mcpServers": {
     "bookstack": {
-      "url": "https://your-bookstack-mcp-host/mcp/sse",
+      "url": "https://your-host/mcp/sse",
       "headers": {
         "Authorization": "Bearer YOUR_TOKEN_ID:YOUR_TOKEN_SECRET"
       }
@@ -113,12 +110,15 @@ Add to your MCP server configuration:
 }
 ```
 
+The token ID and secret come from your BookStack API token (created under **My Account > Access & Security > API Tokens**).
+
 ## API Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/mcp/sse` | SSE connection (requires Bearer auth or OAuth) |
-| `POST` | `/mcp/messages/?sessionId=<id>` | Send MCP JSON-RPC messages |
+| `GET` | `/mcp/sse` | SSE connection (MCP 2024-11-05, requires Bearer auth or OAuth) |
+| `POST` | `/mcp/sse` | Streamable HTTP (MCP 2025-03-26, requires Bearer auth or OAuth) |
+| `POST` | `/mcp/messages/?sessionId=<id>` | Send MCP JSON-RPC messages (SSE transport) |
 | `GET` | `/health` | Health check |
 | `GET` | `/.well-known/oauth-authorization-server` | OAuth metadata (RFC 8414) |
 | `GET` | `/.well-known/oauth-protected-resource` | Protected resource metadata (RFC 9728) |

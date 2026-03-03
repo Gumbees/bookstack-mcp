@@ -61,6 +61,27 @@ src/
 
 For GET endpoints that need a raw text response (like export), add a `get_text()` method to `BookStackClient` that returns `String` instead of `Value`.
 
+## OAuth / Claude Desktop Custom Connector
+
+The server implements OAuth 2.1 (authorization code + PKCE) so it can be used as a Claude Desktop custom connector without putting API keys in config files.
+
+**How to configure in Claude Desktop:**
+1. Add custom connector with URL: `https://bookstack-mcp.beesroadhouse.com/mcp/sse`
+2. Enter BookStack API **Token ID** as the OAuth Client ID
+3. Enter BookStack API **Token Secret** as the OAuth Client Secret
+
+**OAuth endpoints:**
+- `GET /.well-known/oauth-authorization-server` — RFC 8414 metadata (MCP 2025-03-26)
+- `GET /.well-known/oauth-protected-resource` — RFC 9728 metadata (MCP 2025-06-18)
+- `GET /authorize` — Authorization endpoint (auto-redirects with auth code)
+- `POST /token` — Token exchange (validates credentials against BookStack, issues access token)
+
+**Flow:** Claude discovers metadata → opens /authorize → gets auth code → exchanges at /token (sending token_id as client_id, token_secret as client_secret) → server validates against BookStack → issues opaque access token → Claude uses Bearer token on SSE/messages.
+
+**Backward compatible:** Legacy `Bearer token_id:token_secret` format still works alongside OAuth tokens.
+
+**Architecture:** OAuth types live in `oauth.rs`. Auth codes and access tokens stored in `AppState` (in-memory, cleaned up every 30s). Auth codes expire in 5 minutes, access tokens in 24 hours.
+
 ## Building
 
 ```bash

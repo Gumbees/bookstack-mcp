@@ -16,6 +16,7 @@ use zeroize::Zeroize;
 
 use crate::bookstack::BookStackClient;
 use crate::mcp;
+use crate::oauth::{AuthCode, OAuthAccessToken, ACCESS_TOKEN_TTL, AUTH_CODE_TTL};
 
 const MAX_SESSIONS_PER_TOKEN: usize = 5;
 const MAX_TOTAL_SESSIONS: usize = 1000;
@@ -24,8 +25,10 @@ const MAX_REQUESTS_PER_MINUTE: u32 = 100;
 
 #[derive(Clone)]
 pub struct AppState {
-    bookstack_url: String,
+    pub bookstack_url: String,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
+    pub auth_codes: Arc<RwLock<HashMap<String, AuthCode>>>,
+    pub access_tokens: Arc<RwLock<HashMap<String, OAuthAccessToken>>>,
 }
 
 struct RateLimit {
@@ -54,23 +57,38 @@ impl AppState {
         Self {
             bookstack_url: bookstack_url.trim_end_matches('/').to_string(),
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            auth_codes: Arc::new(RwLock::new(HashMap::new())),
+            access_tokens: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    /// Spawn a single shared cleanup task that periodically removes expired/disconnected sessions.
+    /// Spawn a single shared cleanup task that periodically removes expired/disconnected sessions
+    /// and expired OAuth codes/tokens.
     pub fn spawn_cleanup(&self) {
         let sessions = self.sessions.clone();
+        let auth_codes = self.auth_codes.clone();
+        let access_tokens = self.access_tokens.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
-                let mut sessions = sessions.write().await;
-                sessions.retain(|sid, s| {
-                    let expired = s.tx.is_closed() || s.created_at.elapsed() > SESSION_TTL;
-                    if expired {
-                        eprintln!("Session {sid} cleaned up");
-                    }
-                    !expired
-                });
+                {
+                    let mut sessions = sessions.write().await;
+                    sessions.retain(|sid, s| {
+                        let expired = s.tx.is_closed() || s.created_at.elapsed() > SESSION_TTL;
+                        if expired {
+                            eprintln!("Session {sid} cleaned up");
+                        }
+                        !expired
+                    });
+                }
+                {
+                    let mut codes = auth_codes.write().await;
+                    codes.retain(|_, c| c.created_at.elapsed() < AUTH_CODE_TTL);
+                }
+                {
+                    let mut tokens = access_tokens.write().await;
+                    tokens.retain(|_, t| t.created_at.elapsed() < ACCESS_TOKEN_TTL);
+                }
             }
         });
     }
@@ -82,43 +100,55 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
-fn extract_credentials(headers: &HeaderMap) -> Result<(String, String), (StatusCode, Json<Value>)> {
+/// Build a 401 response with WWW-Authenticate header for OAuth discovery.
+fn unauthorized(hint: &str) -> Response {
+    let body = serde_json::json!({"error": "unauthorized", "hint": hint});
+    let mut resp = (StatusCode::UNAUTHORIZED, Json(body)).into_response();
+    resp.headers_mut()
+        .insert("WWW-Authenticate", "Bearer".parse().unwrap());
+    resp
+}
+
+/// Resolve Bearer token to BookStack credentials.
+/// Supports both legacy `token_id:token_secret` format and OAuth access tokens.
+async fn resolve_credentials(
+    headers: &HeaderMap,
+    access_tokens: &RwLock<HashMap<String, OAuthAccessToken>>,
+) -> Result<(String, String), Response> {
     let auth = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
     if !auth.starts_with("Bearer ") {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "error": "unauthorized",
-                "hint": "Bearer <token_id>:<token_secret>"
-            })),
-        ));
+        return Err(unauthorized("Bearer token required"));
     }
 
     let token = auth.trim_start_matches("Bearer ").trim();
-    let (id, secret) = token.split_once(':').ok_or_else(|| {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "error": "invalid token format",
-                "hint": "Expected <token_id>:<token_secret>"
-            })),
-        )
-    })?;
 
-    Ok((id.to_string(), secret.to_string()))
+    // Legacy format: token_id:token_secret
+    if let Some((id, secret)) = token.split_once(':') {
+        return Ok((id.to_string(), secret.to_string()));
+    }
+
+    // OAuth access token
+    let tokens = access_tokens.read().await;
+    if let Some(at) = tokens.get(token) {
+        if at.created_at.elapsed() < ACCESS_TOKEN_TTL {
+            return Ok((at.token_id.clone(), at.token_secret.clone()));
+        }
+    }
+
+    Err(unauthorized("Invalid or expired token"))
 }
 
 pub async fn handle_sse(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
-    let (token_id, token_secret) = match extract_credentials(&headers) {
+    let (token_id, token_secret) = match resolve_credentials(&headers, &state.access_tokens).await {
         Ok(creds) => creds,
-        Err((status, body)) => return (status, body).into_response(),
+        Err(resp) => return resp,
     };
 
     let client = BookStackClient::new(&state.bookstack_url, &token_id, &token_secret);
@@ -197,9 +227,9 @@ pub async fn handle_message(
     body: String,
 ) -> Response {
     // Authenticate the request (both token_id and token_secret)
-    let (token_id, token_secret) = match extract_credentials(&headers) {
+    let (token_id, token_secret) = match resolve_credentials(&headers, &state.access_tokens).await {
         Ok(creds) => creds,
-        Err((status, body)) => return (status, body).into_response(),
+        Err(resp) => return resp,
     };
 
     let session_id = match params.get("sessionId") {

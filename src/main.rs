@@ -1,5 +1,6 @@
 mod bookstack;
 mod mcp;
+mod oauth;
 mod sse;
 
 use std::env;
@@ -28,6 +29,10 @@ async fn main() {
     let app = Router::new()
         .route("/mcp/sse", get(sse::handle_sse))
         .route("/mcp/messages/", axum::routing::post(sse::handle_message))
+        .route("/.well-known/oauth-authorization-server", get(oauth::handle_metadata))
+        .route("/.well-known/oauth-protected-resource", get(oauth::handle_resource_metadata))
+        .route("/authorize", get(oauth::handle_authorize))
+        .route("/token", axum::routing::post(oauth::handle_token))
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
         .layer(DefaultBodyLimit::max(1024 * 1024)) // 1MB
         .layer(CorsLayer::new()) // deny all origins by default

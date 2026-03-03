@@ -49,6 +49,7 @@ An MCP (Model Context Protocol) server that gives Claude full access to a [BookS
 | `BSMCP_PORT` | No | `8080` | Bind port |
 | `BSMCP_INSTANCE_NAME` | No | - | Instance name shown to AI (e.g. "Personal KB") |
 | `BSMCP_INSTANCE_DESC` | No | - | Instance description shown to AI |
+| `BSMCP_DB_PATH` | No | `/data/bookstack-mcp.db` | SQLite database path for OAuth token persistence |
 
 ```bash
 cp .env.example .env
@@ -124,6 +125,7 @@ Add to your MCP server configuration:
 | `GET` | `/authorize` | Login form for BookStack API token |
 | `POST` | `/authorize` | Validate credentials and issue auth code |
 | `POST` | `/token` | OAuth token exchange |
+| `POST` | `/register` | Dynamic client registration (RFC 7591) |
 
 ## Search Operators
 

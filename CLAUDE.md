@@ -10,7 +10,8 @@ src/
   sse.rs         - SSE session management, multi-user auth, message routing
   mcp.rs         - MCP protocol handler, tool definitions, tool execution
   bookstack.rs   - BookStack REST API client (reqwest)
-  oauth.rs       - OAuth 2.1, login form, token exchange
+  oauth.rs       - OAuth 2.1, login form, token exchange, dynamic registration
+  db.rs          - SQLite persistence for OAuth access tokens
 ```
 
 **Flow:** Client connects SSE with `Bearer <token_id>:<token_secret>` -> validates against BookStack -> creates session -> client sends JSON-RPC to `/mcp/messages/?sessionId=<id>` -> dispatches to tool -> responds via SSE event.
@@ -30,6 +31,7 @@ src/
 | `BSMCP_PORT` | No | `8080` | Bind port |
 | `BSMCP_INSTANCE_NAME` | No | - | Instance name shown to AI (e.g. "Nate's Personal KB") |
 | `BSMCP_INSTANCE_DESC` | No | - | Instance description shown to AI (e.g. "Personal knowledge base for home and projects") |
+| `BSMCP_DB_PATH` | No | `/data/bookstack-mcp.db` | SQLite database path for OAuth token persistence |
 
 ## Implemented Tools (49)
 
@@ -86,7 +88,7 @@ The server implements OAuth 2.1 (authorization code + PKCE) with a browser-based
 
 **Also supported:** Legacy `Bearer token_id:token_secret` format on SSE/messages endpoints (Claude Code direct connection).
 
-**Architecture:** OAuth types live in `oauth.rs`. Auth codes store BookStack credentials from the form. Auth codes and access tokens stored in `AppState` (in-memory, cleaned up every 30s). Auth codes expire in 5 minutes, access tokens in 24 hours.
+**Architecture:** OAuth types live in `oauth.rs`. Auth codes are in-memory (expire in 5 minutes). Access tokens are persisted in SQLite (`db.rs`) so they survive container restarts (expire in 24 hours). Cleanup runs every 30s.
 
 ## Building
 

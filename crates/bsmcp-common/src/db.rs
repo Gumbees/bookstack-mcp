@@ -51,7 +51,12 @@ pub trait SemanticDb: Send + Sync + 'static {
     async fn create_embed_job(&self, scope: &str) -> Result<i64, String>;
 
     /// Atomically claim the next pending job (set status to 'running'). Returns None if queue is empty.
+    /// Also expires stale jobs that have been running for more than `stale_secs` seconds,
+    /// resetting them to 'pending' so they can be reclaimed.
     async fn claim_next_job(&self) -> Result<Option<EmbedJob>, String>;
+
+    /// Reset jobs stuck in 'running' for longer than the given duration back to 'pending'.
+    async fn expire_stale_jobs(&self, stale_secs: i64) -> Result<usize, String>;
 
     async fn update_job_progress(&self, job_id: i64, done: i64, total: i64) -> Result<(), String>;
     async fn complete_job(&self, job_id: i64, error: Option<&str>) -> Result<(), String>;

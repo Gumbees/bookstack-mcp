@@ -569,7 +569,30 @@ impl SemanticDb for SqliteDb {
         .map_err(|e| format!("Task failed: {e}"))?
     }
 
+    async fn expire_stale_jobs(&self, stale_secs: i64) -> Result<usize, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let cutoff = SqliteDb::now_secs() - stale_secs;
+            let count = conn.execute(
+                "UPDATE embed_jobs SET status = 'pending', started_at = NULL
+                 WHERE status = 'running' AND started_at < ?1",
+                params![cutoff],
+            ).map_err(|e| format!("expire_stale_jobs failed: {e}"))?;
+            Ok(count)
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
     async fn claim_next_job(&self) -> Result<Option<EmbedJob>, String> {
+        // Expire stale jobs first (1 hour timeout)
+        if let Ok(expired) = self.expire_stale_jobs(3600).await {
+            if expired > 0 {
+                eprintln!("SQLite: expired {expired} stale job(s)");
+            }
+        }
+
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();

@@ -473,6 +473,12 @@ impl SemanticDb for PostgresDb {
     }
 
     async fn claim_next_job(&self) -> Result<Option<EmbedJob>, String> {
+        // Expire stale jobs (running > 1 hour) before claiming
+        let expired = self.expire_stale_jobs(3600).await.unwrap_or(0);
+        if expired > 0 {
+            eprintln!("Job queue: expired {expired} stale job(s)");
+        }
+
         // FOR UPDATE SKIP LOCKED enables concurrent embedder workers
         let row = sqlx::query(
             "UPDATE embed_jobs SET status = 'running', started_at = $1
@@ -497,6 +503,19 @@ impl SemanticDb for PostgresDb {
             finished_at: r.get("finished_at"),
             error: r.get("error"),
         }))
+    }
+
+    async fn expire_stale_jobs(&self, stale_secs: i64) -> Result<usize, String> {
+        let cutoff = Self::now_secs() - stale_secs;
+        let result = sqlx::query(
+            "UPDATE embed_jobs SET status = 'pending', started_at = NULL
+             WHERE status = 'running' AND started_at < $1"
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("expire_stale_jobs failed: {e}"))?;
+        Ok(result.rows_affected() as usize)
     }
 
     async fn update_job_progress(&self, job_id: i64, done: i64, total: i64) -> Result<(), String> {

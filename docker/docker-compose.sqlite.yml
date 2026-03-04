@@ -4,9 +4,7 @@
 
 services:
   bookstack-mcp:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.server
+    image: ghcr.io/gumbees/bsmcp-server:0.3.0
     volumes:
       - bsmcp-data:/data
     environment:
@@ -31,9 +29,7 @@ services:
       - "${BSMCP_PORT:-8080}:${BSMCP_PORT:-8080}"
 
   bsmcp-embedder:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.embedder
+    image: ghcr.io/gumbees/bsmcp-embedder:0.3.0
     volumes:
       - bsmcp-data:/data
       - bsmcp-models:/data/models

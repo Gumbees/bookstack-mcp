@@ -253,12 +253,17 @@ impl SemanticState {
     /// Trigger re-embedding by inserting a job into the queue.
     /// The external embedder picks it up.
     pub async fn trigger_reembed(&self, scope: &str) -> Result<Value, String> {
-        let job_id = self.db.create_embed_job(scope).await?;
+        let (job_id, is_new) = self.db.create_embed_job(scope).await?;
+        let (status, message) = if is_new {
+            ("queued", "Embedding job queued. The embedder will pick it up shortly.")
+        } else {
+            ("already_active", "A job with this scope is already active. Returning existing job.")
+        };
         Ok(json!({
-            "status": "queued",
+            "status": status,
             "job_id": job_id,
             "scope": scope,
-            "message": "Embedding job queued. The embedder will pick it up shortly."
+            "message": message,
         }))
     }
 
@@ -298,8 +303,12 @@ impl SemanticState {
             "page_create" | "page_update" => {
                 if let Some(pid) = page_id {
                     let scope = format!("page:{pid}");
-                    self.db.create_embed_job(&scope).await?;
-                    eprintln!("Semantic: queued embed job for page {pid}");
+                    let (job_id, is_new) = self.db.create_embed_job(&scope).await?;
+                    if is_new {
+                        eprintln!("Semantic: queued embed job {job_id} for page {pid}");
+                    } else {
+                        eprintln!("Semantic: embed job {job_id} already active for page {pid}");
+                    }
                 }
             }
             "page_delete" => {

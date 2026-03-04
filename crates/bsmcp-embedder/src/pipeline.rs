@@ -166,9 +166,6 @@ async fn embed_single_page(
     .await
     .map_err(|e| format!("Embed task failed: {e}"))??;
 
-    // Store page metadata
-    db.upsert_page(&meta).await?;
-
     // Store chunks with embeddings
     let chunk_inserts: Vec<ChunkInsert> = chunks
         .iter()
@@ -201,6 +198,10 @@ async fn embed_single_page(
         }
     }
     db.replace_relationships(page_id, &targets).await?;
+
+    // Store page metadata LAST — content hash acts as commit marker.
+    // If we crash before this, the page will be re-embedded on recovery.
+    db.upsert_page(&meta).await?;
 
     Ok(())
 }

@@ -47,8 +47,11 @@ pub trait SemanticDb: Send + Sync + 'static {
 
     // --- Job queue ---
 
-    /// Create a pending embed job. Returns job ID.
-    async fn create_embed_job(&self, scope: &str) -> Result<i64, String>;
+    /// Create a pending embed job. Returns `(job_id, is_new)`.
+    /// If a pending job with the same scope exists, returns it (`is_new=false`).
+    /// If a running job with the same scope exists, returns it (`is_new=false`).
+    /// Only creates a new job if no active job with the same scope exists.
+    async fn create_embed_job(&self, scope: &str) -> Result<(i64, bool), String>;
 
     /// Atomically claim the next pending job (set status to 'running'). Returns None if queue is empty.
     /// Stamps the job with `worker_id` to identify which embedder owns it.

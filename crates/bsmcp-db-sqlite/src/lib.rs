@@ -561,37 +561,27 @@ impl SemanticDb for SqliteDb {
         .map_err(|e| format!("Task failed: {e}"))?
     }
 
-    async fn create_embed_job(&self, scope: &str) -> Result<i64, String> {
+    async fn create_embed_job(&self, scope: &str) -> Result<(i64, bool), String> {
         let conn = self.conn.clone();
         let scope = scope.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
 
-            // Check for existing running job with same scope — reject duplicate
-            let running: Option<i64> = conn.query_row(
-                "SELECT id FROM embed_jobs WHERE scope = ?1 AND status = 'running' ORDER BY id DESC LIMIT 1",
+            // Check for existing active job with same scope — return it instead of creating duplicate
+            let existing: Option<i64> = conn.query_row(
+                "SELECT id FROM embed_jobs WHERE scope = ?1 AND status IN ('pending', 'running') ORDER BY id DESC LIMIT 1",
                 params![scope],
                 |row| row.get(0),
             ).ok();
-            if let Some(id) = running {
-                return Err(format!("Job {id} with scope '{scope}' is already running"));
-            }
-
-            // Check for existing pending job with same scope — return it
-            let pending: Option<i64> = conn.query_row(
-                "SELECT id FROM embed_jobs WHERE scope = ?1 AND status = 'pending' ORDER BY id DESC LIMIT 1",
-                params![scope],
-                |row| row.get(0),
-            ).ok();
-            if let Some(id) = pending {
-                return Ok(id);
+            if let Some(id) = existing {
+                return Ok((id, false));
             }
 
             conn.execute(
                 "INSERT INTO embed_jobs (scope, status, started_at) VALUES (?1, 'pending', ?2)",
                 params![scope, SqliteDb::now_secs()],
             ).map_err(|e| format!("Failed to create embed job: {e}"))?;
-            Ok(conn.last_insert_rowid())
+            Ok((conn.last_insert_rowid(), true))
         })
         .await
         .map_err(|e| format!("Task failed: {e}"))?

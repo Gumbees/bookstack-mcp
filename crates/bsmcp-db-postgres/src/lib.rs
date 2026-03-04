@@ -464,32 +464,18 @@ impl SemanticDb for PostgresDb {
         Ok(MarkovBlanket { linked_from, links_to, co_linked, siblings })
     }
 
-    async fn create_embed_job(&self, scope: &str) -> Result<i64, String> {
-        // Check for existing running job with same scope — reject duplicate
-        let running = sqlx::query(
-            "SELECT id FROM embed_jobs WHERE scope = $1 AND status = 'running' ORDER BY id DESC LIMIT 1"
+    async fn create_embed_job(&self, scope: &str) -> Result<(i64, bool), String> {
+        // Check for existing active job with same scope — return it instead of creating duplicate
+        let existing = sqlx::query(
+            "SELECT id FROM embed_jobs WHERE scope = $1 AND status IN ('pending', 'running') ORDER BY id DESC LIMIT 1"
         )
         .bind(scope)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| format!("create_embed_job check failed: {e}"))?;
 
-        if let Some(row) = running {
-            let id: i64 = row.get("id");
-            return Err(format!("Job {id} with scope '{scope}' is already running"));
-        }
-
-        // Check for existing pending job with same scope — return it
-        let pending = sqlx::query(
-            "SELECT id FROM embed_jobs WHERE scope = $1 AND status = 'pending' ORDER BY id DESC LIMIT 1"
-        )
-        .bind(scope)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| format!("create_embed_job check failed: {e}"))?;
-
-        if let Some(row) = pending {
-            return Ok(row.get("id"));
+        if let Some(row) = existing {
+            return Ok((row.get("id"), false));
         }
 
         let row = sqlx::query(
@@ -501,7 +487,7 @@ impl SemanticDb for PostgresDb {
         .await
         .map_err(|e| format!("create_embed_job failed: {e}"))?;
 
-        Ok(row.get("id"))
+        Ok((row.get("id"), true))
     }
 
     async fn claim_next_job(&self, worker_id: &str) -> Result<Option<EmbedJob>, String> {

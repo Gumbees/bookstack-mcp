@@ -16,18 +16,20 @@ RUN cargo build --release
 FROM ubuntu:24.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates libssl3t64 \
- && rm -rf /var/lib/apt/lists/* \
- && groupadd -f -g 1000 appgroup \
- && useradd -u 1000 -g 1000 -o appuser
+    ca-certificates libssl3t64 gosu \
+ && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/bookstack-mcp /usr/local/bin/bookstack-mcp
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
-RUN mkdir -p /data/models && chown -R appuser:appgroup /data
+RUN mkdir -p /data/models
 VOLUME /data
 
-USER appuser
+ENV PUID=1000
+ENV PGID=1000
 
 EXPOSE 8080
 
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["bookstack-mcp"]

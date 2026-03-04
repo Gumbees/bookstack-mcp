@@ -3,7 +3,6 @@ services:
     image: ghcr.io/gumbees/bookstack-mcp:latest
     container_name: bookstack-mcp
     restart: unless-stopped
-    read_only: true
     security_opt:
       - no-new-privileges:true
     tmpfs:
@@ -11,6 +10,8 @@ services:
     volumes:
       - bsmcp-data:/data
     environment:
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
       # Required
       BSMCP_BOOKSTACK_URL: ${BSMCP_BOOKSTACK_URL}
       BSMCP_ENCRYPTION_KEY: ${BSMCP_ENCRYPTION_KEY}

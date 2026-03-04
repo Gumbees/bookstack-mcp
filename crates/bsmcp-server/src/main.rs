@@ -62,6 +62,31 @@ async fn main() {
             let database_url = env::var("BSMCP_DATABASE_URL")
                 .expect("BSMCP_DATABASE_URL is required when BSMCP_DB_BACKEND=postgres");
             eprintln!("Database: PostgreSQL");
+
+            // Auto-migrate from SQLite if a database file exists
+            let sqlite_path = env::var("BSMCP_DB_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/data/bookstack-mcp.db"));
+            if sqlite_path.exists() {
+                eprintln!("Auto-migration: found SQLite database at {}", sqlite_path.display());
+                match migrate::run(&sqlite_path, &database_url).await {
+                    Ok(()) => {
+                        // Rename to prevent re-migration on next startup
+                        let migrated_path = sqlite_path.with_extension("db.migrated");
+                        if let Err(e) = std::fs::rename(&sqlite_path, &migrated_path) {
+                            eprintln!("Auto-migration: warning — could not rename SQLite file: {e}");
+                            eprintln!("Auto-migration: manually remove {} to prevent re-migration", sqlite_path.display());
+                        } else {
+                            eprintln!("Auto-migration: renamed {} → {}", sqlite_path.display(), migrated_path.display());
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Auto-migration: failed — {e}");
+                        eprintln!("Auto-migration: continuing with empty PostgreSQL database");
+                    }
+                }
+            }
+
             let db = Arc::new(
                 bsmcp_db_postgres::PostgresDb::new(&database_url, &encryption_key)
                     .await

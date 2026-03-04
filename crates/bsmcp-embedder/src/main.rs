@@ -84,16 +84,6 @@ async fn main() {
     // Load embedding model
     let model_path = env::var("BSMCP_MODEL_PATH").unwrap_or_else(|_| "/data/models".into());
     let model_name = env::var("BSMCP_EMBED_MODEL").unwrap_or_else(|_| "BAAI/bge-large-en-v1.5".into());
-    let embed_threads: usize = env::var("BSMCP_EMBED_THREADS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-
-    // Set OMP_NUM_THREADS before model init to limit ONNX Runtime CPU usage
-    if embed_threads > 0 {
-        env::set_var("OMP_NUM_THREADS", embed_threads.to_string());
-        eprintln!("Embedder: thread limit set to {embed_threads}");
-    }
 
     eprintln!("Embedder: loading model {model_name} (cache={model_path})...");
 

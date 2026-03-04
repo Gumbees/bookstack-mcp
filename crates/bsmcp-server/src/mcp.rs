@@ -253,6 +253,80 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
             let data = json!({ "html": markdown_to_html(&updated) });
             format_json(&client.update_page(id, &data).await?)
         }
+        "append_to_page" => {
+            let id = arg_i64_required(args, "page_id")?;
+            let content = args.get("markdown").and_then(|v| v.as_str())
+                .ok_or("markdown is required")?;
+            let md = client.export_page(id, ExportFormat::Markdown).await?;
+            let updated = format!("{}\n\n{}", md.trim_end(), content);
+            let data = json!({ "html": markdown_to_html(&updated) });
+            format_json(&client.update_page(id, &data).await?)
+        }
+        "replace_section" => {
+            let id = arg_i64_required(args, "page_id")?;
+            let heading = args.get("heading").and_then(|v| v.as_str())
+                .ok_or("heading is required")?;
+            let content = args.get("markdown").and_then(|v| v.as_str())
+                .ok_or("markdown is required")?;
+
+            let md = client.export_page(id, ExportFormat::Markdown).await?;
+            let lines: Vec<&str> = md.lines().collect();
+
+            // Find the heading line
+            let heading_pattern = heading.trim_start_matches('#').trim();
+            let start = lines.iter().position(|line| {
+                let trimmed = line.trim_start_matches('#').trim();
+                trimmed.eq_ignore_ascii_case(heading_pattern)
+            }).ok_or(format!("Heading '{}' not found in page {id}", heading))?;
+
+            // Determine the heading level (count leading #)
+            let level = lines[start].chars().take_while(|c| *c == '#').count();
+
+            // Find end: next heading of same or higher level, or EOF
+            let end = lines[start + 1..].iter().position(|line| {
+                let l = line.chars().take_while(|c| *c == '#').count();
+                l > 0 && l <= level
+            }).map(|p| p + start + 1).unwrap_or(lines.len());
+
+            // Rebuild: before + heading + new content + after
+            let mut updated = lines[..=start].join("\n");
+            updated.push('\n');
+            updated.push_str(content);
+            updated.push('\n');
+            if end < lines.len() {
+                updated.push('\n');
+                updated.push_str(&lines[end..].join("\n"));
+            }
+
+            let data = json!({ "html": markdown_to_html(&updated) });
+            format_json(&client.update_page(id, &data).await?)
+        }
+        "insert_after" => {
+            let id = arg_i64_required(args, "page_id")?;
+            let after = args.get("after").and_then(|v| v.as_str())
+                .ok_or("after is required")?;
+            let content = args.get("markdown").and_then(|v| v.as_str())
+                .ok_or("markdown is required")?;
+
+            let md = client.export_page(id, ExportFormat::Markdown).await?;
+
+            // Find the anchor — match by line content (trimmed)
+            let lines: Vec<&str> = md.lines().collect();
+            let pos = lines.iter().position(|line| line.trim() == after.trim())
+                .ok_or(format!("Anchor '{}' not found in page {id}", after))?;
+
+            // Insert after the matched line
+            let mut updated = lines[..=pos].join("\n");
+            updated.push('\n');
+            updated.push_str(content);
+            updated.push('\n');
+            if pos + 1 < lines.len() {
+                updated.push_str(&lines[pos + 1..].join("\n"));
+            }
+
+            let data = json!({ "html": markdown_to_html(&updated) });
+            format_json(&client.update_page(id, &data).await?)
+        }
         "delete_page" => {
             let id = arg_i64_required(args, "page_id")?;
             client.delete_page(id).await?;
@@ -781,6 +855,32 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
                 "replace_all": { "type": "boolean", "description": "Replace all occurrences (default false)", "default": false }
             },
             "required": ["page_id", "old_text", "new_text"]
+        })),
+        tool("append_to_page", "Append markdown content to the end of a page. No need to read the page first.", json!({
+            "type": "object",
+            "properties": {
+                "page_id": { "type": "integer", "description": "The page_id" },
+                "markdown": { "type": "string", "description": "Markdown content to append" }
+            },
+            "required": ["page_id", "markdown"]
+        })),
+        tool("replace_section", "Replace all content under a heading (up to the next heading of same or higher level). Useful for updating a specific section without touching the rest. No need to read the page first.", json!({
+            "type": "object",
+            "properties": {
+                "page_id": { "type": "integer", "description": "The page_id" },
+                "heading": { "type": "string", "description": "The heading text to find (e.g. '## Related' or just 'Related')" },
+                "markdown": { "type": "string", "description": "New content for the section (replaces everything between this heading and the next)" }
+            },
+            "required": ["page_id", "heading", "markdown"]
+        })),
+        tool("insert_after", "Insert markdown content after a specific line in a page. The anchor is matched by exact line content (trimmed). No need to read the page first.", json!({
+            "type": "object",
+            "properties": {
+                "page_id": { "type": "integer", "description": "The page_id" },
+                "after": { "type": "string", "description": "The exact line content to insert after (e.g. a heading like '## Notes')" },
+                "markdown": { "type": "string", "description": "Markdown content to insert" }
+            },
+            "required": ["page_id", "after", "markdown"]
         })),
         tool("delete_page", "Delete a page (moves to recycle bin).",
             id_schema("page_id")),

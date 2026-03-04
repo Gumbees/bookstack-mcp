@@ -1,4 +1,5 @@
 mod mcp;
+mod migrate;
 mod oauth;
 mod semantic;
 mod sse;
@@ -20,6 +21,13 @@ use bsmcp_common::db::{DbBackend, SemanticDb};
 
 #[tokio::main]
 async fn main() {
+    // Check for migration subcommand
+    let args: Vec<String> = env::args().collect();
+    if args.len() >= 2 && args[1] == "migrate" {
+        run_migration(&args[2..]).await;
+        return;
+    }
+
     let bookstack_url = env::var("BSMCP_BOOKSTACK_URL")
         .expect("BSMCP_BOOKSTACK_URL is required");
 
@@ -212,4 +220,73 @@ async fn handle_webhook(
     }
 
     StatusCode::ACCEPTED.into_response()
+}
+
+async fn run_migration(args: &[String]) {
+    let usage = "Usage: bsmcp-server migrate --from-sqlite <PATH> --to-postgres <URL>";
+
+    let mut sqlite_path: Option<String> = None;
+    let mut postgres_url: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--from-sqlite" => {
+                i += 1;
+                sqlite_path = args.get(i).cloned();
+            }
+            "--to-postgres" => {
+                i += 1;
+                postgres_url = args.get(i).cloned();
+            }
+            "--help" | "-h" => {
+                eprintln!("{usage}");
+                eprintln!("\nMigrates all data from a SQLite database to PostgreSQL.");
+                eprintln!("Encrypted access tokens are copied as-is (same encryption key required).");
+                eprintln!("Chunk embeddings are converted from BLOB to pgvector format.");
+                return;
+            }
+            other => {
+                eprintln!("Unknown argument: {other}");
+                eprintln!("{usage}");
+                std::process::exit(1);
+            }
+        }
+        i += 1;
+    }
+
+    let sqlite_path = match sqlite_path {
+        Some(p) => PathBuf::from(p),
+        None => {
+            eprintln!("Error: --from-sqlite is required");
+            eprintln!("{usage}");
+            std::process::exit(1);
+        }
+    };
+
+    let postgres_url = match postgres_url {
+        Some(u) => u,
+        None => {
+            eprintln!("Error: --to-postgres is required");
+            eprintln!("{usage}");
+            std::process::exit(1);
+        }
+    };
+
+    if !sqlite_path.exists() {
+        eprintln!("Error: SQLite database not found: {}", sqlite_path.display());
+        std::process::exit(1);
+    }
+
+    match migrate::run(&sqlite_path, &postgres_url).await {
+        Ok(()) => {
+            eprintln!("\nMigration completed successfully.");
+            eprintln!("You can now switch to PostgreSQL by setting:");
+            eprintln!("  BSMCP_DB_BACKEND=postgres");
+            eprintln!("  BSMCP_DATABASE_URL={}", postgres_url);
+        }
+        Err(e) => {
+            eprintln!("\nMigration failed: {e}");
+            std::process::exit(1);
+        }
+    }
 }

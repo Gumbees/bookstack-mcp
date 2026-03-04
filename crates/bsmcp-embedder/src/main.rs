@@ -1,8 +1,9 @@
 mod pipeline;
 
 use std::env;
+use std::fs;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,6 +12,7 @@ use axum::response::{IntoResponse, Json};
 use axum::{Router, routing::get};
 use serde::Deserialize;
 use serde_json::json;
+use uuid::Uuid;
 
 use bsmcp_common::bookstack::BookStackClient;
 use bsmcp_common::config::DbBackendType;
@@ -21,6 +23,21 @@ use pipeline::EmbedModel;
 struct AppState {
     model: Arc<EmbedModel>,
     db: Arc<dyn SemanticDb>,
+}
+
+/// Load or generate a persistent worker UUID from a file in the data directory.
+fn load_or_create_worker_id(data_dir: &Path) -> String {
+    let id_file = data_dir.join("worker_id");
+    if let Ok(id) = fs::read_to_string(&id_file) {
+        let id = id.trim().to_string();
+        if !id.is_empty() {
+            return id;
+        }
+    }
+    let id = Uuid::new_v4().to_string();
+    fs::create_dir_all(data_dir).ok();
+    fs::write(&id_file, &id).ok();
+    id
 }
 
 #[derive(Deserialize)]
@@ -103,11 +120,25 @@ async fn main() {
 
     let addr: SocketAddr = format!("{host}:{port}").parse().unwrap();
 
+    // Worker identity — persistent UUID for job ownership
+    let worker_data_dir = PathBuf::from(
+        env::var("BSMCP_EMBED_DATA_DIR").unwrap_or_else(|_| model_path.clone())
+    );
+    let worker_id = load_or_create_worker_id(&worker_data_dir);
+    eprintln!("Embedder: worker_id={worker_id}");
+
+    // Recover any jobs from a previous crash of this worker
+    match db.recover_worker_jobs(&worker_id).await {
+        Ok(0) => {}
+        Ok(n) => eprintln!("Embedder: recovered {n} job(s) from previous crash"),
+        Err(e) => eprintln!("Embedder: failed to recover jobs: {e}"),
+    }
+
     // Spawn job queue worker
     let worker_db = db.clone();
     let worker_model = model.clone();
     tokio::spawn(async move {
-        job_queue_worker(worker_db, worker_model).await;
+        job_queue_worker(worker_db, worker_model, worker_id).await;
     });
 
     eprintln!("Embedder: HTTP server listening on {addr}");
@@ -186,7 +217,7 @@ async fn handle_health(
 }
 
 /// Background job queue worker. Polls for pending embed jobs and processes them.
-async fn job_queue_worker(db: Arc<dyn SemanticDb>, model: Arc<EmbedModel>) {
+async fn job_queue_worker(db: Arc<dyn SemanticDb>, model: Arc<EmbedModel>, worker_id: String) {
     let poll_interval: u64 = env::var("BSMCP_EMBED_POLL_INTERVAL")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -235,7 +266,7 @@ async fn job_queue_worker(db: Arc<dyn SemanticDb>, model: Arc<EmbedModel>) {
             }
         }
 
-        match db.claim_next_job().await {
+        match db.claim_next_job(&worker_id).await {
             Ok(Some(job)) => {
                 eprintln!("Embedder: claimed job {} (scope={})", job.id, job.scope);
                 let result = pipeline::run_pipeline(

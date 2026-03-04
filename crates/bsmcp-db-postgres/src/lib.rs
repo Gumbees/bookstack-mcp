@@ -210,7 +210,8 @@ impl SemanticDb for PostgresDb {
                 done_pages BIGINT DEFAULT 0,
                 started_at BIGINT,
                 finished_at BIGINT,
-                error TEXT
+                error TEXT,
+                worker_id TEXT
             )",
         ];
         for sql in statements {
@@ -224,6 +225,10 @@ impl SemanticDb for PostgresDb {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON chunks USING hnsw (embedding vector_cosine_ops)")
             .execute(&self.pool).await.ok();
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_embed_jobs_pending ON embed_jobs(status) WHERE status = 'pending'")
+            .execute(&self.pool).await.ok();
+
+        // Migration: add worker_id column if missing (existing databases)
+        sqlx::query("ALTER TABLE embed_jobs ADD COLUMN IF NOT EXISTS worker_id TEXT")
             .execute(&self.pool).await.ok();
 
         eprintln!("Semantic: PostgreSQL tables initialized");
@@ -460,16 +465,30 @@ impl SemanticDb for PostgresDb {
     }
 
     async fn create_embed_job(&self, scope: &str) -> Result<i64, String> {
-        // Dedup: if a pending or running job with the same scope exists, return it
-        let existing = sqlx::query(
-            "SELECT id FROM embed_jobs WHERE scope = $1 AND status IN ('pending', 'running') ORDER BY id DESC LIMIT 1"
+        // Check for existing running job with same scope — reject duplicate
+        let running = sqlx::query(
+            "SELECT id FROM embed_jobs WHERE scope = $1 AND status = 'running' ORDER BY id DESC LIMIT 1"
         )
         .bind(scope)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| format!("create_embed_job dedup check failed: {e}"))?;
+        .map_err(|e| format!("create_embed_job check failed: {e}"))?;
 
-        if let Some(row) = existing {
+        if let Some(row) = running {
+            let id: i64 = row.get("id");
+            return Err(format!("Job {id} with scope '{scope}' is already running"));
+        }
+
+        // Check for existing pending job with same scope — return it
+        let pending = sqlx::query(
+            "SELECT id FROM embed_jobs WHERE scope = $1 AND status = 'pending' ORDER BY id DESC LIMIT 1"
+        )
+        .bind(scope)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("create_embed_job check failed: {e}"))?;
+
+        if let Some(row) = pending {
             return Ok(row.get("id"));
         }
 
@@ -485,17 +504,18 @@ impl SemanticDb for PostgresDb {
         Ok(row.get("id"))
     }
 
-    async fn claim_next_job(&self) -> Result<Option<EmbedJob>, String> {
+    async fn claim_next_job(&self, worker_id: &str) -> Result<Option<EmbedJob>, String> {
         // FOR UPDATE SKIP LOCKED enables concurrent embedder workers
         let row = sqlx::query(
-            "UPDATE embed_jobs SET status = 'running', started_at = $1
+            "UPDATE embed_jobs SET status = 'running', started_at = $1, worker_id = $2
              WHERE id = (
                 SELECT id FROM embed_jobs WHERE status = 'pending'
                 ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED
              )
-             RETURNING id, scope, status, total_pages, done_pages, started_at, finished_at, error"
+             RETURNING id, scope, status, total_pages, done_pages, started_at, finished_at, error, worker_id"
         )
         .bind(Self::now_secs())
+        .bind(worker_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| format!("claim_next_job failed: {e}"))?;
@@ -509,7 +529,20 @@ impl SemanticDb for PostgresDb {
             started_at: r.get("started_at"),
             finished_at: r.get("finished_at"),
             error: r.get("error"),
+            worker_id: r.get("worker_id"),
         }))
+    }
+
+    async fn recover_worker_jobs(&self, worker_id: &str) -> Result<usize, String> {
+        let result = sqlx::query(
+            "UPDATE embed_jobs SET status = 'pending', started_at = NULL, worker_id = NULL
+             WHERE status = 'running' AND worker_id = $1"
+        )
+        .bind(worker_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("recover_worker_jobs failed: {e}"))?;
+        Ok(result.rows_affected() as usize)
     }
 
     async fn expire_stale_jobs(&self, stale_secs: i64) -> Result<usize, String> {
@@ -570,7 +603,7 @@ impl SemanticDb for PostgresDb {
 
     async fn get_latest_job(&self) -> Result<Option<EmbedJob>, String> {
         let row = sqlx::query(
-            "SELECT id, scope, status, total_pages, done_pages, started_at, finished_at, error
+            "SELECT id, scope, status, total_pages, done_pages, started_at, finished_at, error, worker_id
              FROM embed_jobs ORDER BY id DESC LIMIT 1"
         )
         .fetch_optional(&self.pool)
@@ -586,6 +619,7 @@ impl SemanticDb for PostgresDb {
             started_at: r.get("started_at"),
             finished_at: r.get("finished_at"),
             error: r.get("error"),
+            worker_id: r.get("worker_id"),
         }))
     }
 

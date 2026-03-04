@@ -57,6 +57,7 @@ pub struct EmbedJob {
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
     pub error: Option<String>,
+    pub worker_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]

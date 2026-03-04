@@ -273,10 +273,17 @@ impl SemanticDb for SqliteDb {
                     done_pages INTEGER DEFAULT 0,
                     started_at INTEGER,
                     finished_at INTEGER,
-                    error TEXT
+                    error TEXT,
+                    worker_id TEXT
                 );",
             )
             .map_err(|e| format!("Failed to initialize semantic tables: {e}"))?;
+
+            // Migration: add worker_id column if missing (existing databases)
+            conn.execute_batch(
+                "ALTER TABLE embed_jobs ADD COLUMN worker_id TEXT;"
+            ).ok(); // ignore error if column already exists
+
             eprintln!("Semantic: tables initialized");
             Ok(())
         })
@@ -560,13 +567,23 @@ impl SemanticDb for SqliteDb {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
 
-            // Dedup: if a pending or running job with the same scope exists, return it
-            let existing: Option<i64> = conn.query_row(
-                "SELECT id FROM embed_jobs WHERE scope = ?1 AND status IN ('pending', 'running') ORDER BY id DESC LIMIT 1",
+            // Check for existing running job with same scope — reject duplicate
+            let running: Option<i64> = conn.query_row(
+                "SELECT id FROM embed_jobs WHERE scope = ?1 AND status = 'running' ORDER BY id DESC LIMIT 1",
                 params![scope],
                 |row| row.get(0),
             ).ok();
-            if let Some(id) = existing {
+            if let Some(id) = running {
+                return Err(format!("Job {id} with scope '{scope}' is already running"));
+            }
+
+            // Check for existing pending job with same scope — return it
+            let pending: Option<i64> = conn.query_row(
+                "SELECT id FROM embed_jobs WHERE scope = ?1 AND status = 'pending' ORDER BY id DESC LIMIT 1",
+                params![scope],
+                |row| row.get(0),
+            ).ok();
+            if let Some(id) = pending {
                 return Ok(id);
             }
 
@@ -612,8 +629,9 @@ impl SemanticDb for SqliteDb {
         .map_err(|e| format!("Task failed: {e}"))?
     }
 
-    async fn claim_next_job(&self) -> Result<Option<EmbedJob>, String> {
+    async fn claim_next_job(&self, worker_id: &str) -> Result<Option<EmbedJob>, String> {
         let conn = self.conn.clone();
+        let worker_id = worker_id.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             // SQLite single-writer means no contention — simple update + query
@@ -626,12 +644,12 @@ impl SemanticDb for SqliteDb {
             let Some(id) = id else { return Ok(None); };
 
             conn.execute(
-                "UPDATE embed_jobs SET status = 'running', started_at = ?1 WHERE id = ?2",
-                params![SqliteDb::now_secs(), id],
+                "UPDATE embed_jobs SET status = 'running', started_at = ?1, worker_id = ?2 WHERE id = ?3",
+                params![SqliteDb::now_secs(), worker_id, id],
             ).ok();
 
             let job = conn.query_row(
-                "SELECT id, scope, status, total_pages, done_pages, started_at, finished_at, error
+                "SELECT id, scope, status, total_pages, done_pages, started_at, finished_at, error, worker_id
                  FROM embed_jobs WHERE id = ?1",
                 params![id],
                 |row| Ok(EmbedJob {
@@ -643,10 +661,27 @@ impl SemanticDb for SqliteDb {
                     started_at: row.get(5)?,
                     finished_at: row.get(6)?,
                     error: row.get(7)?,
+                    worker_id: row.get(8)?,
                 }),
             ).ok();
 
             Ok(job)
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn recover_worker_jobs(&self, worker_id: &str) -> Result<usize, String> {
+        let conn = self.conn.clone();
+        let worker_id = worker_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let count = conn.execute(
+                "UPDATE embed_jobs SET status = 'pending', started_at = NULL, worker_id = NULL
+                 WHERE status = 'running' AND worker_id = ?1",
+                params![worker_id],
+            ).map_err(|e| format!("recover_worker_jobs failed: {e}"))?;
+            Ok(count)
         })
         .await
         .map_err(|e| format!("Task failed: {e}"))?
@@ -687,7 +722,7 @@ impl SemanticDb for SqliteDb {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             Ok(conn.query_row(
-                "SELECT id, scope, status, total_pages, done_pages, started_at, finished_at, error
+                "SELECT id, scope, status, total_pages, done_pages, started_at, finished_at, error, worker_id
                  FROM embed_jobs ORDER BY id DESC LIMIT 1",
                 [],
                 |row| Ok(EmbedJob {
@@ -699,6 +734,7 @@ impl SemanticDb for SqliteDb {
                     started_at: row.get(5)?,
                     finished_at: row.get(6)?,
                     error: row.get(7)?,
+                    worker_id: row.get(8)?,
                 }),
             ).ok())
         })
@@ -717,7 +753,7 @@ impl SemanticDb for SqliteDb {
                 .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
                 .unwrap_or(0);
             let latest_job = conn.query_row(
-                "SELECT id, scope, status, total_pages, done_pages, started_at, finished_at, error
+                "SELECT id, scope, status, total_pages, done_pages, started_at, finished_at, error, worker_id
                  FROM embed_jobs ORDER BY id DESC LIMIT 1",
                 [],
                 |row| Ok(EmbedJob {
@@ -729,6 +765,7 @@ impl SemanticDb for SqliteDb {
                     started_at: row.get(5)?,
                     finished_at: row.get(6)?,
                     error: row.get(7)?,
+                    worker_id: row.get(8)?,
                 }),
             ).ok();
             Ok(EmbedStats { total_pages, total_chunks, latest_job })

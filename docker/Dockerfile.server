@@ -9,9 +9,9 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
-COPY src/ src/
+COPY crates/ crates/
 
-RUN cargo build --release
+RUN cargo build --release -p bsmcp-server
 
 FROM ubuntu:24.04
 
@@ -19,11 +19,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libssl3t64 gosu \
  && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/bookstack-mcp /usr/local/bin/bookstack-mcp
+COPY --from=builder /app/target/release/bsmcp-server /usr/local/bin/bsmcp-server
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-RUN mkdir -p /data/models
+RUN mkdir -p /data
 VOLUME /data
 
 ENV PUID=1000
@@ -32,4 +32,4 @@ ENV PGID=1000
 EXPOSE 8080
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["bookstack-mcp"]
+CMD ["bsmcp-server"]

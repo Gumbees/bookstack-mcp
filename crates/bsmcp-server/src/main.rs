@@ -1,11 +1,7 @@
-mod bookstack;
-mod chunking;
-mod db;
 mod mcp;
 mod oauth;
 mod semantic;
 mod sse;
-mod vector;
 
 use std::env;
 use std::net::SocketAddr;
@@ -19,6 +15,9 @@ use axum::{Router, routing::get};
 use serde_json::json;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
+use bsmcp_common::config::DbBackendType;
+use bsmcp_common::db::{DbBackend, SemanticDb};
+
 #[tokio::main]
 async fn main() {
     let bookstack_url = env::var("BSMCP_BOOKSTACK_URL")
@@ -30,15 +29,6 @@ async fn main() {
         .parse()
         .expect("BSMCP_PORT must be a valid port number");
 
-    let db_path = env::var("BSMCP_DB_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/data/bookstack-mcp.db"));
-
-    // Ensure parent directory exists
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-
     let encryption_key = env::var("BSMCP_ENCRYPTION_KEY")
         .expect("BSMCP_ENCRYPTION_KEY is required (32+ character key for AES-256-GCM token encryption)");
     if encryption_key.len() < 32 {
@@ -46,13 +36,36 @@ async fn main() {
     }
     eprintln!("Encryption: enabled (AES-256-GCM)");
 
-    let db = Arc::new(db::Db::open(&db_path, &encryption_key));
-    eprintln!("Database: {}", db_path.display());
+    // Select database backend
+    let backend_type = DbBackendType::from_env();
+    let (db, semantic_db): (Arc<dyn DbBackend>, Option<Arc<dyn SemanticDb>>) = match backend_type {
+        DbBackendType::Sqlite => {
+            let db_path = env::var("BSMCP_DB_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/data/bookstack-mcp.db"));
+            if let Some(parent) = db_path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            eprintln!("Database: SQLite ({})", db_path.display());
+            let db = Arc::new(bsmcp_db_sqlite::SqliteDb::open(&db_path, &encryption_key));
+            (db.clone(), Some(db as Arc<dyn SemanticDb>))
+        }
+        DbBackendType::Postgres => {
+            let database_url = env::var("BSMCP_DATABASE_URL")
+                .expect("BSMCP_DATABASE_URL is required when BSMCP_DB_BACKEND=postgres");
+            eprintln!("Database: PostgreSQL");
+            let db = Arc::new(
+                bsmcp_db_postgres::PostgresDb::new(&database_url, &encryption_key)
+                    .await
+                    .expect("Failed to connect to PostgreSQL"),
+            );
+            (db.clone(), Some(db as Arc<dyn SemanticDb>))
+        }
+    };
 
     // Build known_urls from BSMCP_PUBLIC_DOMAIN and BSMCP_INTERNAL_DOMAIN
     let known_urls = {
         let mut urls: Vec<String> = Vec::new();
-
         if let Ok(domain) = env::var("BSMCP_PUBLIC_DOMAIN") {
             let domain = domain.trim().trim_end_matches('/');
             if !domain.is_empty() {
@@ -65,7 +78,6 @@ async fn main() {
                 urls.push(format!("http://{domain}"));
             }
         }
-
         if !urls.is_empty() {
             eprintln!("Known URLs: {}", urls.join(", "));
         }
@@ -88,33 +100,28 @@ async fn main() {
         .unwrap_or(false);
 
     let semantic = if semantic_enabled {
-        let model_path = env::var("BSMCP_MODEL_PATH").unwrap_or_else(|_| "/data/models".into());
         let webhook_secret = env::var("BSMCP_WEBHOOK_SECRET")
             .expect("BSMCP_WEBHOOK_SECRET is required when semantic search is enabled");
-        let embed_token_id = env::var("BSMCP_EMBED_TOKEN_ID")
-            .expect("BSMCP_EMBED_TOKEN_ID is required when semantic search is enabled");
-        let embed_token_secret = env::var("BSMCP_EMBED_TOKEN_SECRET")
-            .expect("BSMCP_EMBED_TOKEN_SECRET is required when semantic search is enabled");
+        let embedder_url = env::var("BSMCP_EMBEDDER_URL")
+            .unwrap_or_else(|_| "http://bsmcp-embedder:8081".into());
 
-        let http_client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(120))
-            .build()
-            .expect("Failed to build embed HTTP client");
-
-        let embed_client = bookstack::BookStackClient::new(
-            &bookstack_url, &embed_token_id, &embed_token_secret, http_client,
-        );
-
-        eprintln!("Semantic: initializing (model_path={model_path})...");
-        match semantic::SemanticState::new(db.clone(), &model_path, embed_client, webhook_secret).await {
-            Ok(s) => {
-                eprintln!("Semantic: ready");
-                Some(Arc::new(s))
+        match &semantic_db {
+            Some(sdb) => {
+                if let Err(e) = sdb.init_semantic_tables().await {
+                    eprintln!("Semantic: failed to initialize tables — {e}");
+                    eprintln!("Semantic: continuing without semantic search");
+                    None
+                } else {
+                    eprintln!("Semantic: enabled (embedder_url={embedder_url})");
+                    Some(Arc::new(semantic::SemanticState::new(
+                        sdb.clone(),
+                        embedder_url,
+                        webhook_secret,
+                    )))
+                }
             }
-            Err(e) => {
-                eprintln!("Semantic: failed to initialize — {e}");
-                eprintln!("Semantic: continuing without semantic search");
+            None => {
+                eprintln!("Semantic: no semantic database available");
                 None
             }
         }
@@ -152,10 +159,6 @@ async fn main() {
 
     let app = app
         .layer(DefaultBodyLimit::max(1024 * 1024)) // 1MB
-        // CORS: mirror_request() reflects the Origin header back as Access-Control-Allow-Origin.
-        // This is safe because the Bearer token in the Authorization header is the actual
-        // security boundary — browsers cannot forge it via CSRF. The MCP protocol requires
-        // browser-based OAuth flows that need permissive CORS.
         .layer(
             CorsLayer::new()
                 .allow_origin(AllowOrigin::mirror_request())
@@ -182,7 +185,6 @@ async fn main() {
 }
 
 /// Webhook handler for BookStack page change events.
-/// Secret is passed as query parameter (BookStack doesn't support HMAC signing).
 async fn handle_webhook(
     State(state): State<sse::AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -211,4 +213,3 @@ async fn handle_webhook(
 
     StatusCode::ACCEPTED.into_response()
 }
-

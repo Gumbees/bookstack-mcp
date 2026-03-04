@@ -11,11 +11,12 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use zeroize::Zeroize;
 
-use crate::bookstack::BookStackClient;
+use bsmcp_common::bookstack::BookStackClient;
+use bsmcp_common::config::ACCESS_TOKEN_TTL;
+
 use crate::sse::AppState;
 
 pub const AUTH_CODE_TTL: Duration = Duration::from_secs(300); // 5 minutes
-pub const ACCESS_TOKEN_TTL: Duration = Duration::from_secs(86400); // 24 hours
 
 pub struct AuthCode {
     pub code_challenge: Option<String>,
@@ -38,8 +39,6 @@ impl Drop for AuthCode {
         }
     }
 }
-
-// OAuthAccessToken is now persisted in SQLite (see db.rs)
 
 #[derive(Deserialize)]
 pub struct AuthorizeParams {
@@ -91,9 +90,6 @@ impl Drop for TokenForm {
     }
 }
 
-/// Derive the base URL for OAuth redirects and metadata.
-/// Matches the incoming Host header against all configured known URLs.
-/// Falls back to the first known URL, or constructs from headers if none configured.
 pub fn derive_base_url(headers: &HeaderMap, known_urls: &[String]) -> String {
     if !known_urls.is_empty() {
         let incoming_host = headers
@@ -101,7 +97,6 @@ pub fn derive_base_url(headers: &HeaderMap, known_urls: &[String]) -> String {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
 
-        // Try to match incoming Host against known URLs
         for url in known_urls {
             if let Some(url_host) = extract_host_from_url(url) {
                 if url_host == incoming_host {
@@ -110,11 +105,9 @@ pub fn derive_base_url(headers: &HeaderMap, known_urls: &[String]) -> String {
             }
         }
 
-        // No match — fall back to first known URL
         return known_urls[0].clone();
     }
 
-    // No known URLs configured — derive from headers (legacy behavior)
     let scheme = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
@@ -127,12 +120,9 @@ pub fn derive_base_url(headers: &HeaderMap, known_urls: &[String]) -> String {
     format!("{scheme}://{host}")
 }
 
-/// Extract host:port from a URL string (e.g. "https://mcp.example.com:8443" -> "mcp.example.com:8443").
 fn extract_host_from_url(url: &str) -> Option<&str> {
-    // Strip scheme
     let after_scheme = url.strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;
-    // Take everything before the first '/' (path)
     Some(after_scheme.split('/').next().unwrap_or(after_scheme))
 }
 
@@ -245,7 +235,6 @@ button:hover {{ background: #3498db; }}
     )
 }
 
-/// RFC 8414 Authorization Server Metadata (MCP 2025-03-26 spec)
 pub async fn handle_metadata(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -263,7 +252,6 @@ pub async fn handle_metadata(
     }))
 }
 
-/// RFC 9728 Protected Resource Metadata (MCP 2025-06-18 spec)
 pub async fn handle_resource_metadata(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -276,7 +264,6 @@ pub async fn handle_resource_metadata(
     }))
 }
 
-/// Authorization endpoint GET - serves the login form.
 pub async fn handle_authorize(
     State(state): State<AppState>,
     Query(params): Query<AuthorizeParams>,
@@ -288,7 +275,6 @@ pub async fn handle_authorize(
             Some("Only response_type=code is supported"),
         );
     }
-    // H3: PKCE is required
     if params.code_challenge.is_none() {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -299,12 +285,10 @@ pub async fn handle_authorize(
     Html(render_login_form(&params, &state.bookstack_url, None)).into_response()
 }
 
-/// Authorization endpoint POST - validates BookStack API token and redirects with auth code.
 pub async fn handle_authorize_submit(
     State(state): State<AppState>,
     Form(form): Form<AuthorizeFormSubmit>,
 ) -> Response {
-    // H5: Global rate limit on authorize submissions
     {
         let mut rl = state.authorize_rate_limit.lock().await;
         if rl.check().is_err() {
@@ -324,7 +308,6 @@ pub async fn handle_authorize_submit(
         );
     }
 
-    // Validate credentials against BookStack
     let bs_client = BookStackClient::new(&state.bookstack_url, &form.token_id, &form.token_secret, state.http_client.clone());
     if let Err(e) = bs_client.validate().await {
         eprintln!("OAuth: credential validation failed: {e}");
@@ -382,9 +365,6 @@ pub async fn handle_authorize_submit(
     (StatusCode::FOUND, [(header::LOCATION, redirect_url)]).into_response()
 }
 
-/// Token endpoint - exchanges authorization code for access token.
-/// Supports both form-based auth (credentials stored in auth code) and
-/// legacy client_secret auth (credentials in token request).
 pub async fn handle_token(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -409,7 +389,6 @@ pub async fn handle_token(
         }
     };
 
-    // Consume auth code (single-use)
     let auth_code = {
         let mut codes = state.auth_codes.write().await;
         codes.remove(&code)
@@ -426,7 +405,6 @@ pub async fn handle_token(
         }
     };
 
-    // H4: redirect_uri is required in token request
     match &form.redirect_uri {
         Some(redirect_uri) if *redirect_uri == auth_code.redirect_uri => {}
         Some(_) => {
@@ -445,7 +423,6 @@ pub async fn handle_token(
         }
     }
 
-    // H3: Belt-and-suspenders — PKCE must have been present on the authorize request
     if auth_code.code_challenge.is_none() {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -454,7 +431,6 @@ pub async fn handle_token(
         );
     }
 
-    // Verify PKCE
     if let Some(ref challenge) = auth_code.code_challenge {
         let verifier = match &form.code_verifier {
             Some(v) => v,
@@ -488,15 +464,12 @@ pub async fn handle_token(
         }
     }
 
-    // Resolve BookStack credentials: prefer form-stored creds, fall back to client credentials
     let (token_id, token_secret) = if let (Some(tid), Some(tsec)) =
         (auth_code.token_id.clone(), auth_code.token_secret.clone())
     {
-        // Form flow: credentials came from the browser form, already validated
         eprintln!("OAuth: using form-authenticated credentials");
         (tid, tsec)
     } else {
-        // Legacy flow: credentials come from client_id/client_secret
         let (client_id, client_secret) = match extract_client_credentials(&headers, &form) {
             Some(creds) => creds,
             None => {
@@ -516,7 +489,6 @@ pub async fn handle_token(
             );
         }
 
-        // Validate against BookStack
         let bs_client =
             BookStackClient::new(&state.bookstack_url, &client_id, &client_secret, state.http_client.clone());
         if let Err(e) = bs_client.validate().await {
@@ -532,12 +504,17 @@ pub async fn handle_token(
         (client_id, client_secret)
     };
 
-    // Issue access token
     let access_token = uuid::Uuid::new_v4().to_string();
     let expires_in = ACCESS_TOKEN_TTL.as_secs();
 
-    // Persist to SQLite (atomic count check + insert)
-    state.db.insert_access_token_if_under_limit(&access_token, &token_id, &token_secret);
+    if let Err(e) = state.db.insert_access_token(&access_token, &token_id, &token_secret).await {
+        eprintln!("OAuth: failed to persist access token: {e}");
+        return oauth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            Some("Failed to persist access token"),
+        );
+    }
 
     eprintln!("OAuth: issued access token");
 
@@ -557,20 +534,16 @@ pub async fn handle_token(
         .into_response()
 }
 
-/// Extract client credentials from form body (client_secret_post) or
-/// Authorization header (client_secret_basic).
 fn extract_client_credentials(
     headers: &HeaderMap,
     form: &TokenForm,
 ) -> Option<(String, String)> {
-    // client_secret_post
     if let (Some(id), Some(secret)) = (&form.client_id, &form.client_secret) {
         if !id.is_empty() && !secret.is_empty() {
             return Some((id.clone(), secret.clone()));
         }
     }
 
-    // client_secret_basic
     if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
         if let Some(basic) = auth.strip_prefix("Basic ") {
             if let Ok(decoded) =
@@ -594,12 +567,7 @@ fn compute_s256_challenge(verifier: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash)
 }
 
-/// Dynamic Client Registration (RFC 7591) — required by MCP spec.
-/// Returns a generated client_id for each registration request.
-/// Actual authentication happens through the browser form, so the client_id
-/// is just an opaque identifier passed through the OAuth flow.
 pub async fn handle_register(State(state): State<AppState>, body: String) -> Response {
-    // M6: Rate limit registration requests
     {
         let mut rl = state.register_rate_limit.lock().await;
         if rl.check().is_err() {
@@ -627,7 +595,6 @@ pub async fn handle_register(State(state): State<AppState>, body: String) -> Res
 
     let client_id = uuid::Uuid::new_v4().to_string();
 
-    // Echo back client-requested fields per RFC 7591
     let mut response = json!({
         "client_id": client_id,
         "client_id_issued_at": std::time::SystemTime::now()
@@ -639,15 +606,12 @@ pub async fn handle_register(State(state): State<AppState>, body: String) -> Res
         "response_types": ["code"],
     });
 
-    // Echo redirect_uris if provided
     if let Some(uris) = request.get("redirect_uris") {
         response["redirect_uris"] = uris.clone();
     }
-    // Echo client_name if provided
     if let Some(name) = request.get("client_name") {
         response["client_name"] = name.clone();
     }
-    // Echo scope if provided
     if let Some(scope) = request.get("scope") {
         response["scope"] = scope.clone();
     }

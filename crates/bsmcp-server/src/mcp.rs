@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 
 use pulldown_cmark::{html, Options, Parser};
 
-use crate::bookstack::{BookStackClient, ContentType, ExportFormat};
+use bsmcp_common::bookstack::{BookStackClient, ContentType, ExportFormat};
 use crate::semantic::SemanticState;
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
@@ -13,7 +13,6 @@ const PROTOCOL_VERSION: &str = "2025-03-26";
 pub async fn handle_request(request: &Value, client: &BookStackClient, semantic: Option<&SemanticState>) -> Option<Value> {
     let id = request.get("id");
 
-    // L5: Validate JSON-RPC 2.0 protocol field
     match request.get("jsonrpc").and_then(|v| v.as_str()) {
         Some("2.0") => {}
         _ => {
@@ -32,7 +31,7 @@ pub async fn handle_request(request: &Value, client: &BookStackClient, semantic:
                 "capabilities": { "tools": {} },
                 "serverInfo": {
                     "name": "BookStack MCP",
-                    "version": "0.1.3",
+                    "version": "0.3.0",
                 },
                 "instructions": instructions,
             })))
@@ -81,7 +80,8 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
             let query = arg_str(args, "query")?;
             let limit = arg_i64(args, "limit", 10).clamp(1, 50) as usize;
             let threshold = args.get("threshold").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32;
-            let result = sem.search(&query, limit, threshold).await?;
+            // Pass the user's client for permission filtering
+            let result = sem.search(&query, limit, threshold, client).await?;
             format_json(&result)
         }
         "reembed" => {
@@ -92,7 +92,8 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
         }
         "embedding_status" => {
             let sem = semantic.ok_or("Semantic search is not enabled")?;
-            format_json(&sem.embedding_status())
+            let result = sem.embedding_status().await?;
+            format_json(&result)
         }
 
         // Search
@@ -260,17 +261,17 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
         // Exports
         "export_page" => {
             let id = arg_i64_required(args, "page_id")?;
-            let fmt = ExportFormat::from_str(&arg_str_default(args, "format", "markdown"))?;
+            let fmt = ExportFormat::parse_str(&arg_str_default(args, "format", "markdown"))?;
             client.export_page(id, fmt).await
         }
         "export_chapter" => {
             let id = arg_i64_required(args, "chapter_id")?;
-            let fmt = ExportFormat::from_str(&arg_str_default(args, "format", "markdown"))?;
+            let fmt = ExportFormat::parse_str(&arg_str_default(args, "format", "markdown"))?;
             client.export_chapter(id, fmt).await
         }
         "export_book" => {
             let id = arg_i64_required(args, "book_id")?;
-            let fmt = ExportFormat::from_str(&arg_str_default(args, "format", "markdown"))?;
+            let fmt = ExportFormat::parse_str(&arg_str_default(args, "format", "markdown"))?;
             client.export_book(id, fmt).await
         }
 
@@ -392,12 +393,12 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
 
         // Content Permissions
         "get_content_permissions" => {
-            let content_type = ContentType::from_str(&arg_str(args, "content_type")?)?;
+            let content_type = ContentType::parse_str(&arg_str(args, "content_type")?)?;
             let content_id = arg_i64_required(args, "content_id")?;
             format_json(&client.get_content_permissions(content_type, content_id).await?)
         }
         "update_content_permissions" => {
-            let content_type = ContentType::from_str(&arg_str(args, "content_type")?)?;
+            let content_type = ContentType::parse_str(&arg_str(args, "content_type")?)?;
             let content_id = arg_i64_required(args, "content_id")?;
             let data = filter_update_fields(args, &["owner_id", "role_permissions", "fallback_permissions"]);
             format_json(&client.update_content_permissions(content_type, content_id, &data).await?)
@@ -460,7 +461,6 @@ fn validate_enum(value: &str, allowed: &[&str], name: &str) -> Result<(), String
     }
 }
 
-/// Filter update fields, accepting any JSON value type (for mixed-type updates like permissions).
 fn filter_update_fields(args: &Value, fields: &[&str]) -> Value {
     let mut data = json!({});
     for &field in fields {
@@ -473,7 +473,6 @@ fn filter_update_fields(args: &Value, fields: &[&str]) -> Value {
     data
 }
 
-/// Filter update fields, only accepting string values (rejects type mismatches).
 fn filter_string_update_fields(args: &Value, fields: &[&str]) -> Value {
     let mut data = json!({});
     for &field in fields {
@@ -561,7 +560,7 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool) ->
 
     let mut instructions = String::new();
     if !instance_name.is_empty() {
-        instructions.push_str(&format!("{instance_name}"));
+        instructions.push_str(&instance_name);
         if !instance_desc.is_empty() {
             instructions.push_str(&format!(" - {instance_desc}"));
         }
@@ -612,7 +611,6 @@ async fn build_structure(client: &BookStackClient) -> Option<String> {
     let shelves = client.list_shelves(500, 0).await.ok()?;
     let shelf_list = shelves["data"].as_array()?;
 
-    // Fetch each shelf's details (includes books) in parallel
     let shelf_futures: Vec<_> = shelf_list
         .iter()
         .filter_map(|s| s["id"].as_i64())
@@ -620,7 +618,6 @@ async fn build_structure(client: &BookStackClient) -> Option<String> {
         .collect();
     let shelf_details = futures::future::join_all(shelf_futures).await;
 
-    // Fetch all chapters to map them to books
     let chapters = client
         .list_chapters(500, 0)
         .await
@@ -643,27 +640,25 @@ async fn build_structure(client: &BookStackClient) -> Option<String> {
     }
 
     let mut output = String::new();
-    for result in &shelf_details {
-        if let Ok(shelf) = result {
-            let name = shelf["name"].as_str().unwrap_or("?");
-            let id = shelf["id"].as_i64().unwrap_or(0);
-            output.push_str(&format!("Shelf: {name} (ID: {id})\n"));
+    for shelf in shelf_details.iter().flatten() {
+        let name = shelf["name"].as_str().unwrap_or("?");
+        let id = shelf["id"].as_i64().unwrap_or(0);
+        output.push_str(&format!("Shelf: {name} (ID: {id})\n"));
 
-            if let Some(books) = shelf["books"].as_array() {
-                for book in books {
-                    let bname = book["name"].as_str().unwrap_or("?");
-                    let bid = book["id"].as_i64().unwrap_or(0);
-                    output.push_str(&format!("  Book: {bname} (ID: {bid})\n"));
+        if let Some(books) = shelf["books"].as_array() {
+            for book in books {
+                let bname = book["name"].as_str().unwrap_or("?");
+                let bid = book["id"].as_i64().unwrap_or(0);
+                output.push_str(&format!("  Book: {bname} (ID: {bid})\n"));
 
-                    if let Some(chs) = chapters_by_book.get(&bid) {
-                        for (cid, cname) in chs {
-                            output.push_str(&format!("    Chapter: {cname} (ID: {cid})\n"));
-                        }
+                if let Some(chs) = chapters_by_book.get(&bid) {
+                    for (cid, cname) in chs {
+                        output.push_str(&format!("    Chapter: {cname} (ID: {cid})\n"));
                     }
                 }
             }
-            output.push('\n');
         }
+        output.push('\n');
     }
 
     if output.is_empty() {

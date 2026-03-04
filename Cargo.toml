@@ -1,27 +1,16 @@
-[package]
-name = "bookstack-mcp"
-version = "0.2.1"
-edition = "2021"
+[workspace]
+members = [
+    "crates/bsmcp-common",
+    "crates/bsmcp-db-sqlite",
+    "crates/bsmcp-db-postgres",
+    "crates/bsmcp-server",
+    "crates/bsmcp-embedder",
+]
+resolver = "2"
 
-[dependencies]
-tokio = { version = "1", features = ["full"] }
-axum = { version = "0.8", features = ["tokio"] }
-reqwest = { version = "0.12", features = ["json"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-uuid = { version = "1", features = ["v4"] }
-tokio-stream = "0.1"
-futures = "0.3"
-tower-http = { version = "0.6", features = ["cors"] }
-subtle = "2"
-zeroize = "1"
-sha2 = "0.10"
-base64 = "0.22"
-urlencoding = "2"
-rusqlite = { version = "0.32", features = ["bundled"] }
-aes-gcm = "0.10"
-pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
-fastembed = "5"
+[workspace.package]
+edition = "2021"
+version = "0.3.0"
 
 [profile.release]
 lto = true

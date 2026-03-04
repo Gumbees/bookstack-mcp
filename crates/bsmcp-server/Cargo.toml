@@ -1,0 +1,24 @@
+[package]
+name = "bsmcp-server"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+bsmcp-common = { path = "../bsmcp-common" }
+bsmcp-db-sqlite = { path = "../bsmcp-db-sqlite" }
+bsmcp-db-postgres = { path = "../bsmcp-db-postgres" }
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["tokio"] }
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+tokio-stream = "0.1"
+futures = "0.3"
+tower-http = { version = "0.6", features = ["cors"] }
+subtle = "2"
+zeroize = "1"
+sha2 = "0.10"
+base64 = "0.22"
+urlencoding = "2"
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }

@@ -1,0 +1,60 @@
+# Simple single-container SQLite deployment (server + embedder in separate containers sharing SQLite file)
+# For basic deployments where PostgreSQL is overkill.
+# Note: SQLite single-writer lock means only one embedder can run at a time.
+
+services:
+  bookstack-mcp:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.server
+    volumes:
+      - bsmcp-data:/data
+    environment:
+      BSMCP_DB_BACKEND: sqlite
+      BSMCP_DB_PATH: /data/bookstack-mcp.db
+      BSMCP_BOOKSTACK_URL: ${BSMCP_BOOKSTACK_URL}
+      BSMCP_ENCRYPTION_KEY: ${BSMCP_ENCRYPTION_KEY}
+      BSMCP_PUBLIC_DOMAIN: ${BSMCP_PUBLIC_DOMAIN}
+      BSMCP_INTERNAL_DOMAIN: ${BSMCP_INTERNAL_DOMAIN:-}
+      BSMCP_HOST: ${BSMCP_HOST:-0.0.0.0}
+      BSMCP_PORT: ${BSMCP_PORT:-8080}
+      BSMCP_INSTANCE_NAME: ${BSMCP_INSTANCE_NAME:-}
+      BSMCP_INSTANCE_DESC: ${BSMCP_INSTANCE_DESC:-}
+      BSMCP_SEMANTIC_SEARCH: ${BSMCP_SEMANTIC_SEARCH:-true}
+      BSMCP_EMBEDDER_URL: ${BSMCP_EMBEDDER_URL:-http://bsmcp-embedder:8081}
+      BSMCP_WEBHOOK_SECRET: ${BSMCP_WEBHOOK_SECRET}
+      BSMCP_BACKUP_INTERVAL: ${BSMCP_BACKUP_INTERVAL:-24}
+      BSMCP_BACKUP_PATH: /data/backups
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+    ports:
+      - "${BSMCP_PORT:-8080}:${BSMCP_PORT:-8080}"
+
+  bsmcp-embedder:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.embedder
+    volumes:
+      - bsmcp-data:/data
+      - bsmcp-models:/data/models
+    environment:
+      BSMCP_DB_BACKEND: sqlite
+      BSMCP_DB_PATH: /data/bookstack-mcp.db
+      BSMCP_ENCRYPTION_KEY: ${BSMCP_ENCRYPTION_KEY}
+      BSMCP_BOOKSTACK_URL: ${BSMCP_BOOKSTACK_URL}
+      BSMCP_EMBED_TOKEN_ID: ${BSMCP_EMBED_TOKEN_ID}
+      BSMCP_EMBED_TOKEN_SECRET: ${BSMCP_EMBED_TOKEN_SECRET}
+      BSMCP_MODEL_PATH: /data/models
+      BSMCP_EMBED_MODEL: ${BSMCP_EMBED_MODEL:-BAAI/bge-large-en-v1.5}
+      BSMCP_EMBED_THREADS: ${BSMCP_EMBED_THREADS:-0}
+      BSMCP_EMBED_BATCH_SIZE: ${BSMCP_EMBED_BATCH_SIZE:-32}
+      BSMCP_EMBED_DELAY_MS: ${BSMCP_EMBED_DELAY_MS:-50}
+      BSMCP_EMBED_POLL_INTERVAL: ${BSMCP_EMBED_POLL_INTERVAL:-5}
+      BSMCP_EMBED_HOST: ${BSMCP_EMBED_HOST:-0.0.0.0}
+      BSMCP_EMBED_PORT: ${BSMCP_EMBED_PORT:-8081}
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+
+volumes:
+  bsmcp-data:
+  bsmcp-models:

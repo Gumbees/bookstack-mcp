@@ -11,7 +11,7 @@ pub enum ExportFormat {
 }
 
 impl ExportFormat {
-    pub fn from_str(s: &str) -> Result<Self, String> {
+    pub fn parse_str(s: &str) -> Result<Self, String> {
         match s {
             "markdown" => Ok(Self::Markdown),
             "plaintext" => Ok(Self::Plaintext),
@@ -37,7 +37,7 @@ pub enum ContentType {
 }
 
 impl ContentType {
-    pub fn from_str(s: &str) -> Result<Self, String> {
+    pub fn parse_str(s: &str) -> Result<Self, String> {
         match s {
             "page" => Ok(Self::Page),
             "chapter" => Ok(Self::Chapter),
@@ -89,6 +89,11 @@ impl BookStackClient {
         }
     }
 
+    /// Get the token ID (for use as a cache key, not a secret).
+    pub fn token_id(&self) -> &str {
+        &self.token_id
+    }
+
     fn auth_header(&self) -> String {
         format!("Token {}:{}", self.token_id, self.token_secret)
     }
@@ -131,7 +136,7 @@ impl BookStackClient {
     /// Streams chunks to avoid buffering arbitrarily large error responses.
     async fn read_error_body(mut resp: reqwest::Response) -> String {
         // Fast-reject if Content-Length exceeds limit
-        if resp.content_length().map_or(false, |len| len as usize > MAX_ERROR_BODY_SIZE) {
+        if resp.content_length().is_some_and(|len| len as usize > MAX_ERROR_BODY_SIZE) {
             return "[error body too large]".to_string();
         }
         let mut buf = Vec::with_capacity(MAX_ERROR_BODY_SIZE.min(4096));
@@ -244,6 +249,30 @@ impl BookStackClient {
 
     pub async fn validate(&self) -> Result<Value, String> {
         self.get("books", &[("count", "1")]).await
+    }
+
+    // --- Batch access check ---
+
+    /// Check which page IDs the user can access. Returns the subset of accessible IDs.
+    /// Uses BookStack's filter[id:in] for a single API call.
+    pub async fn check_pages_access(&self, page_ids: &[i64]) -> Vec<i64> {
+        if page_ids.is_empty() {
+            return Vec::new();
+        }
+        let ids_str = page_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+        let count_str = page_ids.len().to_string();
+        match self.get("pages", &[
+            ("filter[id:in]", &ids_str),
+            ("count", &count_str),
+        ]).await {
+            Ok(resp) => {
+                resp.get("data")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|p| p.get("id").and_then(|v| v.as_i64())).collect())
+                    .unwrap_or_default()
+            }
+            Err(_) => Vec::new(),
+        }
     }
 
     // --- Shelves ---

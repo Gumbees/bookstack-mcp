@@ -16,8 +16,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 
-use crate::bookstack::BookStackClient;
-use crate::db::Db;
+use bsmcp_common::bookstack::BookStackClient;
+use bsmcp_common::db::DbBackend;
+
 use crate::mcp;
 use crate::oauth::{AuthCode, AUTH_CODE_TTL};
 use crate::semantic::SemanticState;
@@ -33,7 +34,7 @@ pub struct AppState {
     pub http_client: Client,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     pub auth_codes: Arc<RwLock<HashMap<String, AuthCode>>>,
-    pub db: Arc<Db>,
+    pub db: Arc<dyn DbBackend>,
     pub known_urls: Vec<String>,
     pub authorize_rate_limit: Arc<Mutex<RateLimit>>,
     pub register_rate_limit: Arc<Mutex<RateLimit>>,
@@ -59,7 +60,6 @@ impl RateLimit {
         }
     }
 
-    /// Returns Ok(()) if under limit, Err(()) if rate limited.
     pub(crate) fn check(&mut self) -> Result<(), ()> {
         if self.window_start.elapsed() > Duration::from_secs(60) {
             self.count = 0;
@@ -92,7 +92,7 @@ impl Drop for Session {
 impl AppState {
     pub fn new(
         bookstack_url: String,
-        db: Arc<Db>,
+        db: Arc<dyn DbBackend>,
         known_urls: Vec<String>,
         backup_interval_hours: Option<u64>,
         backup_path: PathBuf,
@@ -120,8 +120,6 @@ impl AppState {
         }
     }
 
-    /// Spawn a single shared cleanup task that periodically removes expired/disconnected sessions
-    /// and expired OAuth codes/tokens.
     pub fn spawn_cleanup(&self) {
         let sessions = self.sessions.clone();
         let auth_codes = self.auth_codes.clone();
@@ -151,7 +149,7 @@ impl AppState {
                         let rl = rl.try_lock();
                         match rl {
                             Ok(rl) => rl.window_start.elapsed() < Duration::from_secs(120),
-                            Err(_) => true, // in use, keep it
+                            Err(_) => true,
                         }
                     });
                 }
@@ -159,12 +157,13 @@ impl AppState {
                     let mut ss = streamable_sessions.write().await;
                     ss.retain(|_, created| created.elapsed() < SESSION_TTL);
                 }
-                db.cleanup_expired_tokens();
+                if let Err(e) = db.cleanup_expired_tokens().await {
+                    eprintln!("Token cleanup error: {e}");
+                }
             }
         });
     }
 
-    /// Spawn a periodic backup task if backup interval is configured.
     pub fn spawn_backup(&self) {
         let Some(interval_hours) = self.backup_interval_hours else {
             return;
@@ -176,7 +175,7 @@ impl AppState {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                match db.backup(&backup_path) {
+                match db.backup(&backup_path).await {
                     Ok(()) => eprintln!("Backup: completed successfully"),
                     Err(e) => eprintln!("Backup: failed — {e}"),
                 }
@@ -186,24 +185,18 @@ impl AppState {
 }
 
 /// Constant-time string comparison to prevent timing side-channel attacks.
-/// Pads the shorter input with different sentinel bytes to ensure constant-time
-/// comparison regardless of length difference.
 pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
     let b = b.as_bytes();
     let len = a.len().max(b.len());
-    // Pad with different sentinels so mismatched-length strings never compare equal
     let mut a_padded = vec![0xAAu8; len];
     let mut b_padded = vec![0xBBu8; len];
     a_padded[..a.len()].copy_from_slice(a);
     b_padded[..b.len()].copy_from_slice(b);
     let result: bool = a_padded.ct_eq(&b_padded).into();
-    // Also require same length (belt-and-suspenders, sentinels already handle this)
     result && a.len() == b.len()
 }
 
-/// Build a 401 response with WWW-Authenticate header for OAuth discovery.
-/// Includes resource_metadata URL per MCP 2025-06-18 / RFC 9728.
 fn unauthorized(hint: &str, headers: &HeaderMap, known_urls: &[String]) -> Response {
     let base = crate::oauth::derive_base_url(headers, known_urls);
     let body = serde_json::json!({"error": "unauthorized", "hint": hint});
@@ -216,11 +209,9 @@ fn unauthorized(hint: &str, headers: &HeaderMap, known_urls: &[String]) -> Respo
     resp
 }
 
-/// Resolve Bearer token to BookStack credentials.
-/// Supports both legacy `token_id:token_secret` format and OAuth access tokens (from SQLite).
-fn resolve_credentials(
+async fn resolve_credentials(
     headers: &HeaderMap,
-    db: &Db,
+    db: &dyn DbBackend,
     known_urls: &[String],
 ) -> Result<(String, String), Response> {
     let auth = headers
@@ -241,10 +232,16 @@ fn resolve_credentials(
         return Ok((id.to_string(), secret.to_string()));
     }
 
-    // OAuth access token (from SQLite)
-    if let Some((token_id, token_secret)) = db.get_access_token(token) {
-        eprintln!("Auth: OAuth token resolved");
-        return Ok((token_id, token_secret));
+    // OAuth access token (from database)
+    match db.get_access_token(token).await {
+        Ok(Some((token_id, token_secret))) => {
+            eprintln!("Auth: OAuth token resolved");
+            return Ok((token_id, token_secret));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("Auth: token lookup error: {e}");
+        }
     }
 
     eprintln!("Auth: token not recognized");
@@ -256,18 +253,15 @@ pub async fn handle_sse(
     headers: HeaderMap,
 ) -> Response {
     eprintln!("GET /mcp/sse — SSE connection attempt");
-    let (token_id, token_secret) = match resolve_credentials(&headers, &state.db, &state.known_urls) {
+    let (token_id, token_secret) = match resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await {
         Ok(creds) => creds,
         Err(resp) => return resp,
     };
 
     let client = BookStackClient::new(&state.bookstack_url, &token_id, &token_secret, state.http_client.clone());
 
-    // Validate credentials against BookStack
     if let Err(e) = client.validate().await {
         eprintln!("Credential validation failed: {e}");
-        // Return 401 (not 403) so Claude Desktop triggers OAuth re-authentication
-        // instead of treating this as a permanent rejection
         return unauthorized(
             "BookStack credentials are invalid or expired — please re-authenticate",
             &headers,
@@ -275,16 +269,12 @@ pub async fn handle_sse(
         );
     }
 
-    // Atomically check session limit and insert under write lock (fixes TOCTOU)
     let session_id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(32);
 
-    // Insert session BEFORE sending endpoint event (prevents race where
-    // client receives endpoint URL and sends a message before session exists)
     {
         let mut sessions = state.sessions.write().await;
 
-        // Global session limit
         if sessions.len() >= MAX_TOTAL_SESSIONS {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -293,7 +283,6 @@ pub async fn handle_sse(
                 .into_response();
         }
 
-        // Per-token session limit
         let count = sessions.values().filter(|s| s.token_id == token_id).count();
         if count >= MAX_SESSIONS_PER_TOKEN {
             return (
@@ -317,20 +306,16 @@ pub async fn handle_sse(
 
     eprintln!("SSE session {session_id} created");
 
-    // Send endpoint event after session is stored
     let endpoint_url = format!("/mcp/messages/?sessionId={session_id}");
     let _ = tx
         .send(Ok(Event::default().event("endpoint").data(endpoint_url)))
         .await;
-
-    // Session cleanup is handled by the shared cleanup task (AppState::spawn_cleanup)
 
     let stream = ReceiverStream::new(rx);
     let mut resp = Sse::new(stream)
         .keep_alive(KeepAlive::default().interval(Duration::from_secs(15)))
         .into_response();
 
-    // Prevent Cloudflare and reverse proxies from buffering SSE
     let hdrs = resp.headers_mut();
     hdrs.insert(header::CACHE_CONTROL, "no-cache, no-store".parse().unwrap());
     hdrs.insert("X-Accel-Buffering", "no".parse().unwrap());
@@ -345,8 +330,7 @@ pub async fn handle_message(
     body: String,
 ) -> Response {
     eprintln!("POST /mcp/messages/ — message request");
-    // Authenticate the request (both token_id and token_secret)
-    let (token_id, token_secret) = match resolve_credentials(&headers, &state.db, &state.known_urls) {
+    let (token_id, token_secret) = match resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await {
         Ok(creds) => creds,
         Err(resp) => return resp,
     };
@@ -362,7 +346,6 @@ pub async fn handle_message(
         }
     };
 
-    // Clone what we need out of the session, then release the lock
     let (tx, client, rate_limit) = {
         let sessions = state.sessions.read().await;
         let session = match sessions.get(session_id) {
@@ -376,8 +359,6 @@ pub async fn handle_message(
             }
         };
 
-        // Verify the full token (id AND secret) matches the session owner
-        // Uses constant-time comparison to prevent timing side-channel attacks
         if !constant_time_eq(&session.token_id, &token_id) || !constant_time_eq(&session.token_secret, &token_secret) {
             return (
                 StatusCode::FORBIDDEN,
@@ -386,7 +367,6 @@ pub async fn handle_message(
                 .into_response();
         }
 
-        // Check TTL
         if session.created_at.elapsed() > SESSION_TTL {
             return (
                 StatusCode::GONE,
@@ -396,9 +376,8 @@ pub async fn handle_message(
         }
 
         (session.tx.clone(), session.client.clone(), session.rate_limit.clone())
-    }; // RwLock released here
+    };
 
-    // Rate limit check
     {
         let mut rl = rate_limit.lock().await;
         if rl.check().is_err() {
@@ -426,7 +405,6 @@ pub async fn handle_message(
 
     if let Some(response) = response {
         let data = serde_json::to_string(&response).unwrap_or_default();
-        // try_send to avoid blocking if the SSE client is slow
         if let Err(e) = tx.try_send(Ok(Event::default().event("message").data(data))) {
             eprintln!("SSE send failed for session {session_id}: {e}");
         }
@@ -435,21 +413,17 @@ pub async fn handle_message(
     StatusCode::ACCEPTED.into_response()
 }
 
-/// Streamable HTTP transport (MCP 2025-03-26).
-/// Client POSTs JSON-RPC directly to the endpoint and gets JSON responses.
-/// No persistent SSE connection needed.
 pub async fn handle_streamable(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: String,
 ) -> Response {
     eprintln!("POST /mcp/sse — Streamable HTTP request");
-    let (token_id, token_secret) = match resolve_credentials(&headers, &state.db, &state.known_urls) {
+    let (token_id, token_secret) = match resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await {
         Ok(creds) => creds,
         Err(resp) => return resp,
     };
 
-    // Per-token rate limiting for streamable transport
     {
         let rate_limits = state.streamable_rate_limits.read().await;
         if let Some(rl) = rate_limits.get(&token_id) {
@@ -468,7 +442,7 @@ pub async fn handle_streamable(
                 .entry(token_id.clone())
                 .or_insert_with(|| Arc::new(Mutex::new(RateLimit::new(MAX_REQUESTS_PER_MINUTE))));
             let mut rl = rl.lock().await;
-            let _ = rl.check(); // first request always succeeds
+            let _ = rl.check();
         }
     }
 
@@ -487,11 +461,9 @@ pub async fn handle_streamable(
 
     let method = request["method"].as_str().unwrap_or("");
 
-    // For initialize, validate credentials against BookStack
     if method == "initialize" {
         if let Err(e) = client.validate().await {
             eprintln!("Streamable: credential validation failed: {e}");
-            // Return 401 (not 403) so Claude Desktop triggers OAuth re-authentication
             return unauthorized(
                 "BookStack credentials are invalid or expired — please re-authenticate",
                 &headers,
@@ -500,7 +472,6 @@ pub async fn handle_streamable(
         }
     }
 
-    // Notifications have no response
     if request.get("id").is_none() {
         return StatusCode::ACCEPTED.into_response();
     }
@@ -517,7 +488,6 @@ pub async fn handle_streamable(
 
             let mut http_resp = Json(resp).into_response();
 
-            // On initialize, issue a new session ID and track it
             if method == "initialize" {
                 let new_session_id = uuid::Uuid::new_v4().to_string();
                 eprintln!("Streamable session {new_session_id} created");
@@ -530,7 +500,6 @@ pub async fn handle_streamable(
                     new_session_id.parse().unwrap(),
                 );
             } else if let Some(ref sid) = incoming_session_id {
-                // Only echo back session IDs we issued
                 let ss = state.streamable_sessions.read().await;
                 if ss.contains_key(sid) {
                     http_resp.headers_mut().insert(

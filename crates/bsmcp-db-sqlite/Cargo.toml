@@ -1,0 +1,13 @@
+[package]
+name = "bsmcp-db-sqlite"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+bsmcp-common = { path = "../bsmcp-common" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+tokio = { version = "1", features = ["rt", "sync"] }
+aes-gcm = "0.10"
+base64 = "0.22"
+sha2 = "0.10"
+async-trait = "0.1"

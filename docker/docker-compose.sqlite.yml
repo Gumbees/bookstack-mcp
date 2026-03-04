@@ -1,9 +1,9 @@
-# Simple single-container SQLite deployment (server + embedder in separate containers sharing SQLite file)
+# SQLite deployment (server + embedder sharing a SQLite file)
 # For basic deployments where PostgreSQL is overkill.
 # Note: SQLite single-writer lock means only one embedder can run at a time.
 
 services:
-  bookstack-mcp:
+  bsmcp-server:
     image: ghcr.io/gumbees/bsmcp-server:0.3.0
     volumes:
       - bsmcp-data:/data

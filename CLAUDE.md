@@ -1,17 +1,42 @@
 # BookStack MCP Server
 
-Rust MCP server that bridges Claude to a BookStack instance via SSE and Streamable HTTP transports.
+Rust MCP server that bridges Claude to a BookStack instance via SSE and Streamable HTTP transports. Organized as a Cargo workspace with pluggable database backends and a separate embedder service.
 
 ## Architecture
 
 ```
-src/
-  main.rs        - Axum server, routes, env config, CORS
-  sse.rs         - SSE session management, Streamable HTTP, multi-user auth, message routing
-  mcp.rs         - MCP protocol handler, tool definitions, tool execution
-  bookstack.rs   - BookStack REST API client (reqwest)
-  oauth.rs       - OAuth 2.1, login form, token exchange, dynamic registration
-  db.rs          - SQLite persistence for OAuth access tokens
+crates/
+  bsmcp-common/          Shared types, traits, config
+    src/lib.rs           Re-exports
+    src/config.rs        Env var parsing, DbBackendType
+    src/db.rs            DbBackend + SemanticDb traits (async)
+    src/types.rs         PageMeta, ChunkData, EmbedJob, MarkovBlanket, SearchHit, etc.
+    src/chunking.rs      Markdown chunking (heading-aware, ~500 token chunks)
+    src/vector.rs        BLOB↔embedding conversion, cosine similarity
+
+  bsmcp-db-sqlite/       SQLite backend
+    src/lib.rs           impl DbBackend + SemanticDb for SqliteDb
+                         rusqlite wrapped in spawn_blocking for async
+                         Brute-force cosine scan for vector search
+
+  bsmcp-db-postgres/     PostgreSQL + pgvector backend
+    src/lib.rs           impl DbBackend + SemanticDb for PostgresDb
+                         sqlx async driver
+                         HNSW index for vector search (embedding <=> operator)
+                         FOR UPDATE SKIP LOCKED for concurrent job queue
+
+  bsmcp-server/          MCP server binary
+    src/main.rs          Axum server, routes, env config, CORS, db backend selection, auto-migration
+    src/sse.rs           SSE session management, Streamable HTTP, multi-user auth
+    src/mcp.rs           MCP protocol handler, tool definitions, tool execution
+    src/bookstack.rs     BookStack REST API client (reqwest)
+    src/oauth.rs         OAuth 2.1, login form, token exchange, dynamic registration
+    src/semantic.rs      Semantic search (calls embedder /embed, queries db), webhook handler
+    src/migrate.rs       SQLite → PostgreSQL migration tool
+
+  bsmcp-embedder/        Embedder binary (fastembed + ONNX Runtime)
+    src/main.rs          Job queue worker + HTTP /embed endpoint
+    src/pipeline.rs      Embedding pipeline (fetch pages, chunk, embed, store)
 ```
 
 **Two transports:**
@@ -23,21 +48,48 @@ src/
 - Tool definitions use helper fns: `tool()`, `paginated_schema()`, `id_schema()`, `name_desc_schema()`, `update_schema()`
 - `bookstack.rs` has 4 HTTP methods (`get`, `post`, `put`, `delete`) that all follow the same pattern
 - Sessions stored in `Arc<RwLock<HashMap<String, Session>>>` with 30s cleanup loop
+- Database operations go through `dyn DbBackend` / `dyn SemanticDb` trait objects
+- Server selects backend at startup via `BSMCP_DB_BACKEND` env var
+
+**Semantic search flow:**
+1. Server receives `semantic_search` tool call
+2. Server POSTs query text to embedder's `/embed` endpoint → gets query embedding
+3. Server calls `db.vector_search()` → SQLite does brute-force cosine, PostgreSQL uses pgvector HNSW
+4. Server calls `db.get_markov_blanket()` for contextual relationships
+5. Returns ranked results with content snippets and relationship context
+
+**Embedding flow:**
+1. `reembed` tool or webhook inserts a job into `embed_jobs` table
+2. Embedder polls `embed_jobs` for pending jobs
+3. Embedder fetches pages from BookStack API, chunks content, generates embeddings
+4. Embedder stores chunks + embeddings in database, updates job progress
 
 ## Environment Variables
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `BSMCP_BOOKSTACK_URL` | Yes | - | BookStack instance URL |
-| `BSMCP_HOST` | No | `0.0.0.0` | Bind address |
-| `BSMCP_PORT` | No | `8080` | Bind port |
-| `BSMCP_INSTANCE_NAME` | No | - | Instance name shown to AI (e.g. "Nate's Personal KB") |
-| `BSMCP_INSTANCE_DESC` | No | - | Instance description shown to AI (e.g. "Personal knowledge base for home and projects") |
-| `BSMCP_DB_PATH` | No | `/data/bookstack-mcp.db` | SQLite database path for OAuth token persistence |
+All prefixed `BSMCP_`. See `.env.example` for full list. Key ones:
+
+**Server:**
+- `BSMCP_BOOKSTACK_URL` (required)
+- `BSMCP_ENCRYPTION_KEY` (required, 32+ chars)
+- `BSMCP_DB_BACKEND` — `sqlite` (default) or `postgres`
+- `BSMCP_DATABASE_URL` — PostgreSQL connection string (required if postgres)
+- `BSMCP_DB_PATH` — SQLite path (default: `/data/bookstack-mcp.db`)
+- `BSMCP_PUBLIC_DOMAIN` (for OAuth redirect URLs)
+- `BSMCP_SEMANTIC_SEARCH` — `true` to enable semantic tools
+- `BSMCP_EMBEDDER_URL` — embedder HTTP endpoint (default: `http://bsmcp-embedder:8081`)
+- `BSMCP_WEBHOOK_SECRET` — constant-time verified webhook secret
+
+**Embedder:**
+- `BSMCP_EMBED_TOKEN_ID` / `BSMCP_EMBED_TOKEN_SECRET` — BookStack API token for crawling
+- `BSMCP_EMBED_MODEL` — model name (default: `BAAI/bge-large-en-v1.5`)
+- `BSMCP_EMBED_THREADS`, `BSMCP_EMBED_BATCH_SIZE`, `BSMCP_EMBED_DELAY_MS` — performance tuning
 
 ## Implemented Tools (49)
 
 - **search_content** - Full-text search with BookStack query operators
+- **semantic_search** - Natural language vector search (when semantic enabled)
+- **reembed** - Trigger re-embedding of all pages (when semantic enabled)
+- **embed_status** - Check embedding job status (when semantic enabled)
 - **Shelves** - list, get, create, update, delete (5)
 - **Books** - list, get, create, update, delete (5)
 - **Chapters** - list, get, create, update, delete (5)
@@ -74,39 +126,74 @@ The server implements OAuth 2.1 (authorization code + PKCE) with a browser-based
 
 **MCP endpoint URL:** `https://your-host/mcp/sse` (must include the `/mcp/sse` path)
 
-**How to configure in Claude.ai or Claude Desktop:**
-1. Add custom connector / MCP integration with URL: `https://your-host/mcp/sse`
-2. When connecting, a login form opens — enter your BookStack API Token ID and Secret
-
 **OAuth endpoints:**
 - `GET /.well-known/oauth-authorization-server` — RFC 8414 metadata (MCP 2025-03-26)
 - `GET /.well-known/oauth-protected-resource` — RFC 9728 metadata (MCP 2025-06-18)
-- `GET /authorize` — Serves login form for API token entry (with instructions + link to BookStack)
+- `GET /authorize` — Serves login form for API token entry
 - `POST /authorize` — Validates token against BookStack, issues auth code
-- `POST /token` — Token exchange (retrieves stored credentials, issues access token)
+- `POST /token` — Token exchange
 
 **Two auth flows:**
-1. **Form-based (primary):** Claude opens /authorize → user enters BookStack API token in browser form → server validates via API → stores credentials with auth code → redirects → code exchange issues access token. Token endpoint auth method = "none".
-2. **Legacy client credentials:** Client sends BookStack token_id as client_id and token_secret as client_secret in the /token request. Still works for backward compatibility.
-
-**Also supported:** Legacy `Bearer token_id:token_secret` format on SSE/messages endpoints (Claude Code direct connection).
-
-**CORS:** Configured with `AllowOrigin::any()` to allow cross-origin requests from claude.ai and other browser-based MCP clients. Exposes `mcp-session-id` header.
-
-**Architecture:** OAuth types live in `oauth.rs`. Auth codes are in-memory (expire in 5 minutes). Access tokens are persisted in SQLite (`db.rs`) so they survive container restarts (expire in 24 hours). Cleanup runs every 30s.
+1. **Form-based (primary):** Claude opens /authorize → user enters BookStack API token → server validates → stores credentials with auth code → redirects → code exchange issues access token.
+2. **Legacy Bearer:** `Authorization: Bearer token_id:token_secret` on SSE/messages endpoints (Claude Code direct connection).
 
 ## Building
 
 ```bash
-cargo build --release    # ~10MB optimized binary
-docker compose build     # Alpine multi-stage, ~10MB image
+# Local build (both binaries)
+cargo build --release
+
+# Individual
+cargo build --release -p bsmcp-server
+cargo build --release -p bsmcp-embedder
+
+# Multi-arch Docker
+docker buildx build --builder multiarch --platform linux/amd64,linux/arm64 \
+  -f docker/Dockerfile.server \
+  -t ghcr.io/gumbees/bsmcp-server:VERSION --push .
+
+docker buildx build --builder multiarch --platform linux/amd64,linux/arm64 \
+  -f docker/Dockerfile.embedder \
+  -t ghcr.io/gumbees/bsmcp-embedder:VERSION --push .
 ```
+
+Images:
+- `ghcr.io/gumbees/bsmcp-server` — MCP server (~35MB)
+- `ghcr.io/gumbees/bsmcp-embedder` — Embedder with ONNX (~45MB)
+
+## Docker Compose
+
+Two deployment options:
+
+- `docker/docker-compose.yml` — PostgreSQL (bsmcp-postgres + bsmcp-server + bsmcp-embedder)
+- `docker/docker-compose.sqlite.yml` — SQLite (bsmcp-server + bsmcp-embedder sharing a file)
+
+## Migration
+
+**SQLite → PostgreSQL auto-migration:** When `BSMCP_DB_BACKEND=postgres` and a SQLite DB exists at `BSMCP_DB_PATH`, the server auto-migrates on startup and renames the file to `.db.migrated`.
+
+**Manual migration:**
+```bash
+bsmcp-server migrate --from-sqlite /path/to/db --to-postgres postgres://user:pass@host/db
+```
+
+Migrates: access_tokens, pages, chunks (BLOB→pgvector), relationships, embed_jobs. Validates row counts.
 
 ## Branch Info
 
 - `main` - production branch
-- `master` - active development (should be merged to main when stable)
+- `feature/semantic-search` - v0.3.0 development
 
-## Deployment
+## Breaking Changes Log
 
-Docker Compose with Traefik reverse proxy. TLS via Let's Encrypt or Cloudflare.
+### v0.3.0 (from v0.2.x)
+- **Two images:** `ghcr.io/gumbees/bsmcp-server` + `ghcr.io/gumbees/bsmcp-embedder` (was single `bookstack-mcp`)
+- **New env vars:** `BSMCP_DB_BACKEND`, `BSMCP_DATABASE_URL`, `BSMCP_EMBEDDER_URL`, `BSMCP_EMBED_TOKEN_*`, performance tuning vars
+- **Docker service renames:** `postgres` → `bsmcp-postgres`, `bookstack-mcp` → `bsmcp-server`, `pgdata` → `bsmcp-pgdata`
+- **Embedder is separate:** No more in-process ONNX model; embedder runs as its own container/binary
+
+### v0.1.3 (from v0.1.2)
+- `BSMCP_ENCRYPTION_KEY` now **required** — server panics without it
+- `BSMCP_PUBLIC_URL` removed, replaced by `BSMCP_PUBLIC_DOMAIN` (domain only, not full URL)
+- Docker volume renamed `mcp-data` → `bsmcp-data` — data migration needed
+- OAuth now enforces PKCE (S256)

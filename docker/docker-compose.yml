@@ -1,8 +1,8 @@
 services:
-  postgres:
+  bsmcp-postgres:
     image: pgvector/pgvector:pg17
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - bsmcp-pgdata:/var/lib/postgresql/data
     environment:
       POSTGRES_DB: bsmcp
       POSTGRES_USER: bsmcp
@@ -13,11 +13,11 @@ services:
       timeout: 5s
       retries: 5
 
-  bookstack-mcp:
+  bsmcp-server:
     image: ghcr.io/gumbees/bsmcp-server:0.3.0
     environment:
       BSMCP_DB_BACKEND: postgres
-      BSMCP_DATABASE_URL: postgres://bsmcp:${BSMCP_DB_PASSWORD}@postgres/bsmcp
+      BSMCP_DATABASE_URL: postgres://bsmcp:${BSMCP_DB_PASSWORD}@bsmcp-postgres/bsmcp
       BSMCP_BOOKSTACK_URL: ${BSMCP_BOOKSTACK_URL}
       BSMCP_ENCRYPTION_KEY: ${BSMCP_ENCRYPTION_KEY}
       BSMCP_PUBLIC_DOMAIN: ${BSMCP_PUBLIC_DOMAIN}
@@ -36,7 +36,7 @@ services:
     ports:
       - "${BSMCP_PORT:-8080}:${BSMCP_PORT:-8080}"
     depends_on:
-      postgres:
+      bsmcp-postgres:
         condition: service_healthy
 
   bsmcp-embedder:
@@ -45,7 +45,7 @@ services:
       - bsmcp-models:/data/models
     environment:
       BSMCP_DB_BACKEND: postgres
-      BSMCP_DATABASE_URL: postgres://bsmcp:${BSMCP_DB_PASSWORD}@postgres/bsmcp
+      BSMCP_DATABASE_URL: postgres://bsmcp:${BSMCP_DB_PASSWORD}@bsmcp-postgres/bsmcp
       BSMCP_ENCRYPTION_KEY: ${BSMCP_ENCRYPTION_KEY}
       BSMCP_BOOKSTACK_URL: ${BSMCP_BOOKSTACK_URL}
       BSMCP_EMBED_TOKEN_ID: ${BSMCP_EMBED_TOKEN_ID}
@@ -61,9 +61,9 @@ services:
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
     depends_on:
-      postgres:
+      bsmcp-postgres:
         condition: service_healthy
 
 volumes:
-  pgdata:
+  bsmcp-pgdata:
   bsmcp-models:

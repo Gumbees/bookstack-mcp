@@ -1,25 +1,48 @@
 # BookStack MCP Server
 
-An MCP (Model Context Protocol) server that gives Claude full access to a [BookStack](https://www.bookstackapp.com/) instance. Built in Rust with tokio/axum for a single static binary with zero runtime dependencies.
+An MCP (Model Context Protocol) server that gives Claude full access to a [BookStack](https://www.bookstackapp.com/) instance. Built in Rust with tokio/axum as a Cargo workspace with pluggable database backends and optional semantic vector search.
 
 ## Features
 
 - Full CRUD on all core BookStack resources (shelves, books, chapters, pages, attachments)
 - Full-text search with BookStack query operators
-- **Server-side markdown→HTML conversion** — send markdown content, server converts to HTML before sending to BookStack (avoids JSON escaping issues with complex markdown)
+- **Semantic vector search** — natural language search across all content via embeddings (optional)
+- **Pluggable database** — SQLite for simple deployments, PostgreSQL + pgvector for production
+- **Separate embedder** — background embedding service keeps ONNX/model weight out of the MCP server
+- **Server-side markdown to HTML conversion** — send markdown, server converts before sending to BookStack
 - **OAuth 2.1 support** — use as a Claude.ai or Claude Desktop custom connector without config files
 - **Encrypted token storage** — OAuth tokens encrypted at rest with AES-256-GCM
 - **Dual transport** — SSE (MCP 2024-11-05) and Streamable HTTP (MCP 2025-03-26)
 - **Dynamic structure discovery** — AI automatically learns your BookStack hierarchy on connect
+- **Auto-migration** — seamlessly migrate from SQLite to PostgreSQL on startup
 - Multi-user support via per-session BookStack API tokens
 - Multi-arch Docker images (amd64 + arm64)
-- ~10MB Docker image (Alpine + static Rust binary)
+
+## Architecture
+
+```
+crates/
+  bsmcp-common/       Shared types, traits, config, chunking, vector utils
+  bsmcp-db-sqlite/    SQLite backend (rusqlite, bundled)
+  bsmcp-db-postgres/  PostgreSQL + pgvector backend (sqlx)
+  bsmcp-server/       MCP server binary (axum, no ONNX dependency)
+  bsmcp-embedder/     Embedder binary (fastembed + ONNX, job queue worker + HTTP /embed)
+
+docker/
+  Dockerfile.server       Lightweight server image (~35MB)
+  Dockerfile.embedder     Embedder image with ONNX Runtime (~45MB)
+  docker-compose.yml      PostgreSQL deployment (production)
+  docker-compose.sqlite.yml  SQLite deployment (simple)
+```
+
+The MCP server handles all client-facing protocol, OAuth, and search. The embedder runs separately, polling a database-backed job queue to embed pages and serving a `/embed` HTTP endpoint for query-time embedding. This keeps the ONNX model out of the server process.
 
 ## Available Tools (49)
 
 | Category | Tools |
 |----------|-------|
 | **Search** | `search_content` |
+| **Semantic** | `semantic_search`, `reembed`, `embed_status` |
 | **Shelves** | `list_shelves`, `get_shelf`, `create_shelf`, `update_shelf`, `delete_shelf` |
 | **Books** | `list_books`, `get_book`, `create_book`, `update_book`, `delete_book` |
 | **Chapters** | `list_chapters`, `get_chapter`, `create_chapter`, `update_chapter`, `delete_chapter` |
@@ -35,45 +58,101 @@ An MCP (Model Context Protocol) server that gives Claude full access to a [BookS
 | **Permissions** | `get_content_permissions`, `update_content_permissions` |
 | **Roles** | `list_roles`, `get_role` |
 
+Semantic tools (`semantic_search`, `reembed`, `embed_status`) only appear when `BSMCP_SEMANTIC_SEARCH=true` and an embedder is running.
+
 ## Setup
 
 ### Prerequisites
 
 - A BookStack instance with API access enabled
 - A BookStack API token (created in your BookStack user profile under "API Tokens")
+- Docker and Docker Compose (for container deployment)
 
-### Configuration
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `BSMCP_BOOKSTACK_URL` | Yes | - | Your BookStack instance URL |
-| `BSMCP_ENCRYPTION_KEY` | Yes | - | 32+ char key for AES-256-GCM encryption of OAuth tokens at rest |
-| `BSMCP_HOST` | No | `0.0.0.0` | Bind address |
-| `BSMCP_PORT` | No | `8080` | Bind port |
-| `BSMCP_INSTANCE_NAME` | No | - | Instance name shown to AI (e.g. "Personal KB") |
-| `BSMCP_INSTANCE_DESC` | No | - | Instance description shown to AI |
-| `BSMCP_PUBLIC_DOMAIN` | No | - | Public domain this server is reachable at (e.g. `mcp.example.com`). Derives `https://{domain}` for OAuth redirects |
-| `BSMCP_INTERNAL_DOMAIN` | No | - | Internal/Docker-network domain (e.g. `bookstack-mcp`). Derives `http://{domain}` for host verification |
-| `BSMCP_DB_PATH` | No | `/data/bookstack-mcp.db` | SQLite database path for OAuth token persistence |
-| `BSMCP_BACKUP_INTERVAL` | No | - | Hours between SQLite backups (integer). If unset, backups disabled |
-| `BSMCP_BACKUP_PATH` | No | `/data/backups` | Directory for backup files |
+### Quick Start (PostgreSQL — recommended)
 
 ```bash
 cp .env.example .env
-# Edit .env with your BookStack URL
+# Edit .env with your BookStack URL, encryption key, and database password
+
+docker compose -f docker/docker-compose.yml up -d
 ```
 
-### Run with Docker Compose
+This starts three containers:
+- **bsmcp-postgres** — PostgreSQL 17 with pgvector extension
+- **bsmcp-server** — MCP server (port 8080)
+- **bsmcp-embedder** — Background embedding service
+
+### Quick Start (SQLite — simple)
 
 ```bash
-docker compose up -d
+cp .env.example .env
+# Edit .env with your BookStack URL and encryption key
+
+docker compose -f docker/docker-compose.sqlite.yml up -d
 ```
+
+This starts two containers sharing a SQLite database file.
 
 ### Run from source
 
 ```bash
-cargo run --release
+# Server
+cargo run --release -p bsmcp-server
+
+# Embedder (separate terminal)
+cargo run --release -p bsmcp-embedder
 ```
+
+### Configuration
+
+#### Server Variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `BSMCP_BOOKSTACK_URL` | Yes | - | Your BookStack instance URL |
+| `BSMCP_ENCRYPTION_KEY` | Yes | - | 32+ char key for AES-256-GCM token encryption |
+| `BSMCP_DB_BACKEND` | No | `sqlite` | Database backend: `sqlite` or `postgres` |
+| `BSMCP_DATABASE_URL` | If postgres | - | PostgreSQL connection string |
+| `BSMCP_DB_PATH` | No | `/data/bookstack-mcp.db` | SQLite database path |
+| `BSMCP_PUBLIC_DOMAIN` | No | - | Public domain for OAuth redirects (e.g. `mcp.example.com`) |
+| `BSMCP_INTERNAL_DOMAIN` | No | - | Internal/Docker-network domain |
+| `BSMCP_HOST` | No | `0.0.0.0` | Bind address |
+| `BSMCP_PORT` | No | `8080` | Bind port |
+| `BSMCP_INSTANCE_NAME` | No | - | Instance name shown to AI |
+| `BSMCP_INSTANCE_DESC` | No | - | Instance description shown to AI |
+| `BSMCP_SEMANTIC_SEARCH` | No | `false` | Enable semantic search tools |
+| `BSMCP_EMBEDDER_URL` | No | `http://bsmcp-embedder:8081` | Embedder HTTP endpoint |
+| `BSMCP_WEBHOOK_SECRET` | If semantic | - | BookStack webhook secret |
+| `BSMCP_BACKUP_INTERVAL` | No | - | Hours between backups (0 = disabled) |
+| `BSMCP_BACKUP_PATH` | No | `/data/backups` | Backup directory |
+
+#### Embedder Variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `BSMCP_EMBED_TOKEN_ID` | Yes | - | BookStack API token ID for crawling |
+| `BSMCP_EMBED_TOKEN_SECRET` | Yes | - | BookStack API token secret |
+| `BSMCP_EMBED_MODEL` | No | `BAAI/bge-large-en-v1.5` | Embedding model name |
+| `BSMCP_MODEL_PATH` | No | `/data/models` | ONNX model cache directory |
+| `BSMCP_EMBED_THREADS` | No | `0` (all cores) | Max embedding threads |
+| `BSMCP_EMBED_BATCH_SIZE` | No | `32` | Chunks per embedding batch |
+| `BSMCP_EMBED_DELAY_MS` | No | `50` | Delay between pages (API throttle) |
+| `BSMCP_EMBED_POLL_INTERVAL` | No | `5` | Seconds between job queue polls |
+| `BSMCP_EMBED_HOST` | No | `0.0.0.0` | Embedder listen address |
+| `BSMCP_EMBED_PORT` | No | `8081` | Embedder listen port |
+
+See `.env.example` for the full list with comments.
+
+### Semantic Search Setup
+
+1. Set `BSMCP_SEMANTIC_SEARCH=true` in your server env
+2. Set `BSMCP_WEBHOOK_SECRET` to a random string
+3. Create a BookStack API token with read access for the embedder (`BSMCP_EMBED_TOKEN_ID` / `BSMCP_EMBED_TOKEN_SECRET`)
+4. Configure a webhook in BookStack: **Settings > Webhooks > Add Webhook**
+   - URL: `https://your-mcp-host/webhooks/bookstack?secret=YOUR_WEBHOOK_SECRET`
+   - Events: Page Create, Page Update, Page Delete
+5. Use the `reembed` tool to trigger initial embedding of all pages
+6. After initial embedding, page changes are automatically re-embedded via webhooks
 
 ## Connecting
 
@@ -123,10 +202,11 @@ The token ID and secret come from your BookStack API token (created under **My A
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/mcp/sse` | SSE connection (MCP 2024-11-05, requires Bearer auth or OAuth) |
-| `POST` | `/mcp/sse` | Streamable HTTP (MCP 2025-03-26, requires Bearer auth or OAuth) |
+| `GET` | `/mcp/sse` | SSE connection (MCP 2024-11-05) |
+| `POST` | `/mcp/sse` | Streamable HTTP (MCP 2025-03-26) |
 | `POST` | `/mcp/messages/?sessionId=<id>` | Send MCP JSON-RPC messages (SSE transport) |
 | `GET` | `/health` | Health check |
+| `POST` | `/webhooks/bookstack?secret=<s>` | BookStack webhook receiver (semantic search) |
 | `GET` | `/.well-known/oauth-authorization-server` | OAuth metadata (RFC 8414) |
 | `GET` | `/.well-known/oauth-protected-resource` | Protected resource metadata (RFC 9728) |
 | `GET` | `/authorize` | Login form for BookStack API token |
@@ -134,66 +214,82 @@ The token ID and secret come from your BookStack API token (created under **My A
 | `POST` | `/token` | OAuth token exchange |
 | `POST` | `/register` | Dynamic client registration (RFC 7591) |
 
-## Upgrading to v0.1.3
+## Upgrading
 
-v0.1.3 introduces encrypted token storage, PKCE enforcement, and server-side markdown conversion. There are several breaking changes that require action before upgrading.
+### From v0.2.x to v0.3.0
 
-### 1. New required env var: `BSMCP_ENCRYPTION_KEY`
+v0.3.0 is a major architecture change: the monolithic server is split into a Cargo workspace with separate server and embedder binaries, pluggable database backends (SQLite or PostgreSQL), and a database-backed job queue.
 
-OAuth tokens are now encrypted at rest with AES-256-GCM. You must set a 32+ character encryption key before starting the new version. Without it, the server will refuse to start.
+#### What changed
+
+- **Two container images** instead of one: `ghcr.io/gumbees/bsmcp-server` and `ghcr.io/gumbees/bsmcp-embedder`
+- **Pluggable database**: SQLite (default, same as before) or PostgreSQL + pgvector
+- **Separate embedder**: The ONNX model and embedding pipeline run in their own container, keeping the MCP server lightweight
+- **Database-backed job queue**: Embedding jobs survive restarts; PostgreSQL supports concurrent embedders via `FOR UPDATE SKIP LOCKED`
+- **Docker service names**: `postgres` renamed to `bsmcp-postgres`, `bookstack-mcp` renamed to `bsmcp-server`, volume `pgdata` renamed to `bsmcp-pgdata`
+- **New env vars**: `BSMCP_DB_BACKEND`, `BSMCP_DATABASE_URL`, `BSMCP_EMBEDDER_URL`, `BSMCP_EMBED_TOKEN_ID`, `BSMCP_EMBED_TOKEN_SECRET`, plus embedder performance tuning vars
+
+#### Upgrade path: staying on SQLite
+
+If you're happy with SQLite, the upgrade is minimal:
+
+1. Pull the new images
+2. Replace your `docker-compose.yml` with `docker/docker-compose.sqlite.yml`
+3. Add embedder env vars (`BSMCP_EMBED_TOKEN_ID`, `BSMCP_EMBED_TOKEN_SECRET`) — create a new BookStack API token with read access
+4. Restart: `docker compose up -d`
+
+Your existing SQLite database and embeddings are preserved. The server reads the same `bsmcp-data` volume.
+
+#### Upgrade path: migrating to PostgreSQL
+
+For better performance and concurrent embedding:
+
+1. Pull the new images
+2. Replace your `docker-compose.yml` with `docker/docker-compose.yml` (the PostgreSQL version)
+3. Add new env vars: `BSMCP_DB_BACKEND=postgres`, `BSMCP_DATABASE_URL`, `BSMCP_DB_PASSWORD`, plus embedder vars
+4. Start the stack: `docker compose up -d`
+
+**Auto-migration:** If the server detects an existing SQLite database at `BSMCP_DB_PATH` when running with `BSMCP_DB_BACKEND=postgres`, it automatically migrates all data (access tokens, pages, chunks, embeddings, relationships, jobs) to PostgreSQL. After successful migration, the SQLite file is renamed to `.db.migrated` to prevent re-migration.
+
+**Manual migration:** You can also migrate explicitly:
 
 ```bash
-# Add to your .env
-BSMCP_ENCRYPTION_KEY=your-secret-key-at-least-32-characters-long
+docker exec bsmcp-server bsmcp-server migrate \
+  --from-sqlite /data/bookstack-mcp.db \
+  --to-postgres postgres://bsmcp:yourpassword@bsmcp-postgres/bsmcp
 ```
 
-Generate a key: `openssl rand -base64 48`
+**Migration details:**
+- Encrypted access tokens are copied as-is (portable when `BSMCP_ENCRYPTION_KEY` matches)
+- Chunk embeddings are converted from SQLite BLOB (LE f32 bytes) to pgvector `vector(1024)`
+- Row counts are validated after migration
+- All active OAuth sessions are preserved — connected clients don't need to re-authenticate
 
-Existing plaintext tokens in the database are automatically encrypted on first access (transparent migration). If you change the encryption key later, all previously stored OAuth tokens become invalid and users must re-authenticate.
+**Lightweight alternative:** If re-embedding is acceptable, you can skip migration entirely. Start fresh with PostgreSQL and use the `reembed` tool to re-embed all pages. Only `access_tokens` matter for session continuity.
 
-### 2. Renamed env var: `BSMCP_PUBLIC_URL` → `BSMCP_PUBLIC_DOMAIN`
+#### Upgrade path: Docker volume migration
 
-The `BSMCP_PUBLIC_URL` variable (which took a full URL like `https://mcp.example.com`) has been replaced by `BSMCP_PUBLIC_DOMAIN` (just the domain — the server prepends `https://`).
-
-```bash
-# Old (no longer recognized)
-BSMCP_PUBLIC_URL=https://mcp.example.com
-
-# New
-BSMCP_PUBLIC_DOMAIN=mcp.example.com
-```
-
-If you had `BSMCP_PUBLIC_URL` set, **remove it** and add `BSMCP_PUBLIC_DOMAIN` instead. The old variable is silently ignored.
-
-You can also now set `BSMCP_INTERNAL_DOMAIN` for Docker-network host matching (derives `http://{domain}`).
-
-### 3. Docker volume renamed: `mcp-data` → `bsmcp-data`
-
-The docker-compose volume was renamed. If you pull the new compose file and run `docker compose up`, Docker will create a new empty volume and your existing SQLite database (OAuth tokens) will be orphaned in the old volume.
-
-**To preserve your data:**
+If you're coming from v0.2.x with a `pgdata` volume and want to keep your PostgreSQL data:
 
 ```bash
-# Stop the running container
 docker compose down
-
-# Copy data from old volume to new
-docker volume create bsmcp-data
+docker volume create bsmcp-pgdata
 docker run --rm \
-  -v mcp-data:/source:ro \
-  -v bsmcp-data:/dest \
+  -v pgdata:/source:ro \
+  -v bsmcp-pgdata:/dest \
   alpine cp -a /source/. /dest/
-
-# Start with new compose
 docker compose up -d
-
-# Once verified working, remove old volume
-docker volume rm mcp-data
+# Once verified, remove old volume:
+docker volume rm pgdata
 ```
 
-### 4. PKCE now required for OAuth
+### From v0.1.2 to v0.1.3
 
-The OAuth authorization endpoint now enforces PKCE (S256). All current Claude clients (Claude.ai, Claude Desktop, Claude Code) support PKCE, so this should be transparent. Custom OAuth clients that don't send `code_challenge` will receive a `400 invalid_request` error.
+See the [v0.1.3 upgrade notes](https://github.com/gumbees/bookstack-mcp/releases/tag/v0.1.3) for details on:
+- New required `BSMCP_ENCRYPTION_KEY` env var
+- Renamed `BSMCP_PUBLIC_URL` to `BSMCP_PUBLIC_DOMAIN`
+- Docker volume renamed `mcp-data` to `bsmcp-data`
+- PKCE enforcement for OAuth
 
 ## Search Operators
 

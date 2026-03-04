@@ -199,6 +199,10 @@ async fn job_queue_worker(db: Arc<dyn SemanticDb>, model: Arc<EmbedModel>) {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(32);
+    let job_timeout: i64 = env::var("BSMCP_EMBED_JOB_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(14400); // 4 hours default
 
     let bookstack_url = env::var("BSMCP_BOOKSTACK_URL")
         .expect("BSMCP_BOOKSTACK_URL is required");
@@ -220,10 +224,17 @@ async fn job_queue_worker(db: Arc<dyn SemanticDb>, model: Arc<EmbedModel>) {
         http_client,
     );
 
-    eprintln!("Embedder: job queue worker started (poll={}s, delay={}ms, batch={})",
-        poll_interval, delay_ms, batch_size);
+    eprintln!("Embedder: job queue worker started (poll={}s, delay={}ms, batch={}, job_timeout={}s)",
+        poll_interval, delay_ms, batch_size, job_timeout);
 
     loop {
+        // Expire stale jobs before claiming
+        if let Ok(expired) = db.expire_stale_jobs(job_timeout).await {
+            if expired > 0 {
+                eprintln!("Embedder: expired {expired} stale job(s) (timeout={}s)", job_timeout);
+            }
+        }
+
         match db.claim_next_job().await {
             Ok(Some(job)) => {
                 eprintln!("Embedder: claimed job {} (scope={})", job.id, job.scope);

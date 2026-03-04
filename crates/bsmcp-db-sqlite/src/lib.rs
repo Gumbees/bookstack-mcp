@@ -586,13 +586,6 @@ impl SemanticDb for SqliteDb {
     }
 
     async fn claim_next_job(&self) -> Result<Option<EmbedJob>, String> {
-        // Expire stale jobs first (1 hour timeout)
-        if let Ok(expired) = self.expire_stale_jobs(3600).await {
-            if expired > 0 {
-                eprintln!("SQLite: expired {expired} stale job(s)");
-            }
-        }
-
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();

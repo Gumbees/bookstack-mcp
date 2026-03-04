@@ -223,6 +223,36 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
             }
             format_json(&client.update_page(id, &data).await?)
         }
+        "edit_page" => {
+            let id = arg_i64_required(args, "page_id")?;
+            let old_text = args.get("old_text").and_then(|v| v.as_str())
+                .ok_or("old_text is required")?;
+            let new_text = args.get("new_text").and_then(|v| v.as_str())
+                .ok_or("new_text is required")?;
+            let replace_all = args.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
+
+            // Fetch current markdown content
+            let md = client.export_page(id, ExportFormat::Markdown).await?;
+
+            // Validate old_text exists
+            let count = md.matches(old_text).count();
+            if count == 0 {
+                return Err(format!("old_text not found in page {id}"));
+            }
+            if count > 1 && !replace_all {
+                return Err(format!("old_text found {count} times in page {id}. Use replace_all=true to replace all, or provide more context to make it unique."));
+            }
+
+            // Apply replacement
+            let updated = if replace_all {
+                md.replace(old_text, new_text)
+            } else {
+                md.replacen(old_text, new_text, 1)
+            };
+
+            let data = json!({ "html": markdown_to_html(&updated) });
+            format_json(&client.update_page(id, &data).await?)
+        }
         "delete_page" => {
             let id = arg_i64_required(args, "page_id")?;
             client.delete_page(id).await?;
@@ -742,6 +772,16 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
         })),
         tool("update_page", "Update a page. Provide content as markdown (preferred) or html. Markdown is converted to HTML server-side.",
             update_schema("page_id", &["name", "markdown", "html"])),
+        tool("edit_page", "Performs exact string replacements in a page's markdown content. Fetches the page, finds old_text, replaces with new_text, and saves. Fails if old_text is not found or is ambiguous (found multiple times without replace_all).", json!({
+            "type": "object",
+            "properties": {
+                "page_id": { "type": "integer", "description": "The page_id" },
+                "old_text": { "type": "string", "description": "The exact text to find and replace" },
+                "new_text": { "type": "string", "description": "The replacement text" },
+                "replace_all": { "type": "boolean", "description": "Replace all occurrences (default false)", "default": false }
+            },
+            "required": ["page_id", "old_text", "new_text"]
+        })),
         tool("delete_page", "Delete a page (moves to recycle bin).",
             id_schema("page_id")),
 

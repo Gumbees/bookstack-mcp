@@ -460,6 +460,19 @@ impl SemanticDb for PostgresDb {
     }
 
     async fn create_embed_job(&self, scope: &str) -> Result<i64, String> {
+        // Dedup: if a pending or running job with the same scope exists, return it
+        let existing = sqlx::query(
+            "SELECT id FROM embed_jobs WHERE scope = $1 AND status IN ('pending', 'running') ORDER BY id DESC LIMIT 1"
+        )
+        .bind(scope)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("create_embed_job dedup check failed: {e}"))?;
+
+        if let Some(row) = existing {
+            return Ok(row.get("id"));
+        }
+
         let row = sqlx::query(
             "INSERT INTO embed_jobs (scope, status, started_at) VALUES ($1, 'pending', $2) RETURNING id"
         )
@@ -501,15 +514,36 @@ impl SemanticDb for PostgresDb {
 
     async fn expire_stale_jobs(&self, stale_secs: i64) -> Result<usize, String> {
         let cutoff = Self::now_secs() - stale_secs;
-        let result = sqlx::query(
+
+        // Supersede stale jobs that have a newer job with the same scope
+        let superseded = sqlx::query(
+            "UPDATE embed_jobs SET status = 'error', finished_at = $1, error = 'superseded'
+             WHERE status = 'running' AND started_at < $2
+               AND EXISTS (
+                   SELECT 1 FROM embed_jobs e2
+                   WHERE e2.scope = embed_jobs.scope AND e2.id > embed_jobs.id
+                     AND e2.status IN ('pending', 'running')
+               )"
+        )
+        .bind(Self::now_secs())
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("expire_stale_jobs (supersede) failed: {e}"))?
+        .rows_affected() as usize;
+
+        // Reset remaining stale jobs (no newer sibling) back to pending
+        let reset = sqlx::query(
             "UPDATE embed_jobs SET status = 'pending', started_at = NULL
              WHERE status = 'running' AND started_at < $1"
         )
         .bind(cutoff)
         .execute(&self.pool)
         .await
-        .map_err(|e| format!("expire_stale_jobs failed: {e}"))?;
-        Ok(result.rows_affected() as usize)
+        .map_err(|e| format!("expire_stale_jobs (reset) failed: {e}"))?
+        .rows_affected() as usize;
+
+        Ok(superseded + reset)
     }
 
     async fn update_job_progress(&self, job_id: i64, done: i64, total: i64) -> Result<(), String> {

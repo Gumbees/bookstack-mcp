@@ -559,6 +559,17 @@ impl SemanticDb for SqliteDb {
         let scope = scope.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
+
+            // Dedup: if a pending or running job with the same scope exists, return it
+            let existing: Option<i64> = conn.query_row(
+                "SELECT id FROM embed_jobs WHERE scope = ?1 AND status IN ('pending', 'running') ORDER BY id DESC LIMIT 1",
+                params![scope],
+                |row| row.get(0),
+            ).ok();
+            if let Some(id) = existing {
+                return Ok(id);
+            }
+
             conn.execute(
                 "INSERT INTO embed_jobs (scope, status, started_at) VALUES (?1, 'pending', ?2)",
                 params![scope, SqliteDb::now_secs()],
@@ -574,12 +585,28 @@ impl SemanticDb for SqliteDb {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             let cutoff = SqliteDb::now_secs() - stale_secs;
-            let count = conn.execute(
+            let now = SqliteDb::now_secs();
+
+            // Supersede stale jobs that have a newer job with the same scope
+            let superseded = conn.execute(
+                "UPDATE embed_jobs SET status = 'error', finished_at = ?1, error = 'superseded'
+                 WHERE status = 'running' AND started_at < ?2
+                   AND EXISTS (
+                       SELECT 1 FROM embed_jobs e2
+                       WHERE e2.scope = embed_jobs.scope AND e2.id > embed_jobs.id
+                         AND e2.status IN ('pending', 'running')
+                   )",
+                params![now, cutoff],
+            ).map_err(|e| format!("expire_stale_jobs (supersede) failed: {e}"))?;
+
+            // Reset remaining stale jobs (no newer sibling) back to pending
+            let reset = conn.execute(
                 "UPDATE embed_jobs SET status = 'pending', started_at = NULL
                  WHERE status = 'running' AND started_at < ?1",
                 params![cutoff],
-            ).map_err(|e| format!("expire_stale_jobs failed: {e}"))?;
-            Ok(count)
+            ).map_err(|e| format!("expire_stale_jobs (reset) failed: {e}"))?;
+
+            Ok(superseded + reset)
         })
         .await
         .map_err(|e| format!("Task failed: {e}"))?

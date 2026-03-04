@@ -666,12 +666,28 @@ impl SemanticDb for SqliteDb {
         let worker_id = worker_id.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            let count = conn.execute(
+            let now = SqliteDb::now_secs();
+
+            // Mark duplicate-scope orphans as superseded (keep only the newest per scope)
+            let superseded = conn.execute(
+                "UPDATE embed_jobs SET status = 'error', finished_at = ?1, error = 'superseded'
+                 WHERE status = 'running' AND (worker_id = ?2 OR worker_id IS NULL)
+                   AND EXISTS (
+                       SELECT 1 FROM embed_jobs e2
+                       WHERE e2.scope = embed_jobs.scope AND e2.id > embed_jobs.id
+                         AND e2.status = 'running' AND (e2.worker_id = ?2 OR e2.worker_id IS NULL)
+                   )",
+                params![now, worker_id],
+            ).map_err(|e| format!("recover_worker_jobs (supersede) failed: {e}"))?;
+
+            // Reset remaining jobs owned by this worker or orphaned from pre-0.3.1
+            let reset = conn.execute(
                 "UPDATE embed_jobs SET status = 'pending', started_at = NULL, worker_id = NULL
-                 WHERE status = 'running' AND worker_id = ?1",
+                 WHERE status = 'running' AND (worker_id = ?1 OR worker_id IS NULL)",
                 params![worker_id],
-            ).map_err(|e| format!("recover_worker_jobs failed: {e}"))?;
-            Ok(count)
+            ).map_err(|e| format!("recover_worker_jobs (reset) failed: {e}"))?;
+
+            Ok(superseded + reset)
         })
         .await
         .map_err(|e| format!("Task failed: {e}"))?

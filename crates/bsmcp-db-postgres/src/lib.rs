@@ -520,15 +520,35 @@ impl SemanticDb for PostgresDb {
     }
 
     async fn recover_worker_jobs(&self, worker_id: &str) -> Result<usize, String> {
-        let result = sqlx::query(
+        // Mark duplicate-scope orphans as superseded (keep only the newest per scope)
+        let superseded = sqlx::query(
+            "UPDATE embed_jobs SET status = 'error', finished_at = $1, error = 'superseded'
+             WHERE status = 'running' AND (worker_id = $2 OR worker_id IS NULL)
+               AND EXISTS (
+                   SELECT 1 FROM embed_jobs e2
+                   WHERE e2.scope = embed_jobs.scope AND e2.id > embed_jobs.id
+                     AND e2.status = 'running' AND (e2.worker_id = $2 OR e2.worker_id IS NULL)
+               )"
+        )
+        .bind(Self::now_secs())
+        .bind(worker_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("recover_worker_jobs (supersede) failed: {e}"))?
+        .rows_affected() as usize;
+
+        // Reset remaining jobs owned by this worker or orphaned from pre-0.3.1
+        let reset = sqlx::query(
             "UPDATE embed_jobs SET status = 'pending', started_at = NULL, worker_id = NULL
-             WHERE status = 'running' AND worker_id = $1"
+             WHERE status = 'running' AND (worker_id = $1 OR worker_id IS NULL)"
         )
         .bind(worker_id)
         .execute(&self.pool)
         .await
-        .map_err(|e| format!("recover_worker_jobs failed: {e}"))?;
-        Ok(result.rows_affected() as usize)
+        .map_err(|e| format!("recover_worker_jobs (reset) failed: {e}"))?
+        .rows_affected() as usize;
+
+        Ok(superseded + reset)
     }
 
     async fn expire_stale_jobs(&self, stale_secs: i64) -> Result<usize, String> {

@@ -216,6 +216,22 @@ The token ID and secret come from your BookStack API token (created under **My A
 
 ## Upgrading
 
+### From v0.3.0 to v0.3.1
+
+v0.3.1 adds embedder worker identity, job deduplication, and crash recovery improvements.
+
+**Schema migration is automatic** — the `worker_id` column is added to `embed_jobs` on startup.
+
+**If upgrading from v0.3.0 with a stuck running job**, reset it before pulling the new images:
+
+```sql
+UPDATE embed_jobs SET status = 'pending', started_at = NULL WHERE status = 'running';
+```
+
+Or just wait — the job will auto-expire after `BSMCP_EMBED_JOB_TIMEOUT` (default: 4 hours).
+
+**New env var:** `BSMCP_EMBED_JOB_TIMEOUT` — seconds before stuck jobs reset (default: 14400 / 4 hours).
+
 ### From v0.2.x to v0.3.0
 
 v0.3.0 is a major architecture change: the monolithic server is split into a Cargo workspace with separate server and embedder binaries, pluggable database backends (SQLite or PostgreSQL), and a database-backed job queue.

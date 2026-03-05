@@ -679,9 +679,9 @@ impl SemanticDb for PostgresDb {
     async fn vector_search(&self, query_embedding: &[f32], limit: usize, threshold: f32) -> Result<Vec<SearchHit>, String> {
         let vec = Vector::from(query_embedding.to_vec());
         let rows = sqlx::query(
-            "SELECT id, page_id, 1 - (embedding <=> $1::vector) AS score
+            "SELECT id, page_id, (1 - (embedding <=> $1::vector))::FLOAT4 AS score
              FROM chunks
-             WHERE 1 - (embedding <=> $1::vector) > $2
+             WHERE 1 - (embedding <=> $1::vector) > $2::FLOAT8
              ORDER BY embedding <=> $1::vector
              LIMIT $3"
         )

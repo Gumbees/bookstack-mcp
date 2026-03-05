@@ -231,6 +231,7 @@ The token ID and secret come from your BookStack API token (created under **My A
 | `POST` | `/mcp/messages/?sessionId=<id>` | Send MCP JSON-RPC messages (SSE transport) |
 | `GET` | `/health` | Health check |
 | `POST` | `/webhooks/bookstack` | BookStack webhook receiver (semantic search) |
+| `GET` | `/status` | Embedding progress page with live progress bar |
 | `GET` | `/.well-known/oauth-authorization-server` | OAuth metadata (RFC 8414) |
 | `GET` | `/.well-known/oauth-protected-resource` | Protected resource metadata (RFC 9728) |
 | `GET` | `/authorize` | Login form for BookStack API token |

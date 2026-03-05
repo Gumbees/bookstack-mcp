@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{HeaderName, Method, StatusCode};
-use axum::response::{IntoResponse, Json};
+use axum::response::{Html, IntoResponse, Json};
 use axum::{Router, routing::get};
 use serde_json::json;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -189,10 +189,13 @@ async fn main() {
         .route("/register", axum::routing::post(oauth::handle_register))
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }));
 
-    // Conditional webhook route for semantic search
+    // Conditional webhook + status routes for semantic search
     if state.semantic.is_some() {
-        app = app.route("/webhooks/bookstack", axum::routing::post(handle_webhook));
+        app = app
+            .route("/webhooks/bookstack", axum::routing::post(handle_webhook))
+            .route("/status", get(handle_status));
         eprintln!("Semantic: webhook endpoint active at POST /webhooks/bookstack");
+        eprintln!("Semantic: status page at GET /status");
     }
 
     let app = app
@@ -262,6 +265,132 @@ async fn handle_webhook(
     }
 
     StatusCode::ACCEPTED.into_response()
+}
+
+async fn handle_status(
+    State(state): State<sse::AppState>,
+) -> impl IntoResponse {
+    let semantic = match &state.semantic {
+        Some(s) => s,
+        None => return Html("Semantic search not enabled".to_string()).into_response(),
+    };
+
+    let stats = match semantic.embedding_status().await {
+        Ok(s) => s,
+        Err(e) => return Html(format!("Error: {e}")).into_response(),
+    };
+
+    let total_pages = stats["total_indexed_pages"].as_i64().unwrap_or(0);
+    let total_chunks = stats["total_chunks"].as_i64().unwrap_or(0);
+    let job = &stats["latest_job"];
+
+    let (job_status, job_scope, done, total, pct, started, finished, error) = if job.is_null() {
+        ("none".to_string(), "-".to_string(), 0i64, 0i64, 0.0f64, "-".to_string(), "-".to_string(), "-".to_string())
+    } else {
+        let status = job["status"].as_str().unwrap_or("unknown").to_string();
+        let scope = job["scope"].as_str().unwrap_or("-").to_string();
+        let d = job["done_pages"].as_i64().unwrap_or(0);
+        let t = job["total_pages"].as_i64().unwrap_or(0);
+        let p = if t > 0 { (d as f64 / t as f64) * 100.0 } else { 0.0 };
+        let s = job["started_at"].as_str().unwrap_or("-").to_string();
+        let f = job["finished_at"].as_str().map(|v| v.to_string()).unwrap_or_else(|| {
+            if job["finished_at"].is_null() { "-".to_string() } else { job["finished_at"].to_string() }
+        });
+        let e = job["error"].as_str().map(|v| v.to_string()).unwrap_or_else(|| {
+            if job["error"].is_null() { "-".to_string() } else { job["error"].to_string() }
+        });
+        (status, scope, d, t, p, s, f, e)
+    };
+
+    let bar_color = match job_status.as_str() {
+        "running" => "#3b82f6",
+        "completed" => "#22c55e",
+        "failed" => "#ef4444",
+        _ => "#6b7280",
+    };
+
+    let auto_refresh = if job_status == "running" {
+        r#"<meta http-equiv="refresh" content="5">"#
+    } else {
+        ""
+    };
+
+    let html = format!(r#"<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<title>BookStack MCP — Embedding Status</title>
+{auto_refresh}
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; padding: 2rem; }}
+  .container {{ max-width: 640px; margin: 0 auto; }}
+  h1 {{ font-size: 1.25rem; font-weight: 600; margin-bottom: 1.5rem; color: #f8fafc; }}
+  .card {{ background: #1e293b; border-radius: 0.75rem; padding: 1.5rem; margin-bottom: 1rem; }}
+  .stat-row {{ display: flex; justify-content: space-between; padding: 0.5rem 0; border-bottom: 1px solid #334155; }}
+  .stat-row:last-child {{ border-bottom: none; }}
+  .stat-label {{ color: #94a3b8; }}
+  .stat-value {{ font-weight: 500; font-variant-numeric: tabular-nums; }}
+  .bar-bg {{ background: #334155; border-radius: 9999px; height: 1.5rem; overflow: hidden; margin: 1rem 0; }}
+  .bar-fill {{ height: 100%%; border-radius: 9999px; transition: width 0.5s ease; display: flex; align-items: center; justify-content: center; font-size: 0.75rem; font-weight: 600; min-width: 2.5rem; }}
+  .status-badge {{ display: inline-block; padding: 0.125rem 0.5rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; }}
+  .running {{ background: #1e3a5f; color: #60a5fa; }}
+  .completed {{ background: #14532d; color: #4ade80; }}
+  .failed {{ background: #450a0a; color: #f87171; }}
+  .pending {{ background: #3f3f46; color: #a1a1aa; }}
+  .none {{ background: #27272a; color: #71717a; }}
+  .error {{ color: #f87171; font-size: 0.875rem; margin-top: 0.5rem; }}
+  .footer {{ text-align: center; color: #475569; font-size: 0.75rem; margin-top: 2rem; }}
+</style>
+</head><body>
+<div class="container">
+  <h1>BookStack MCP — Embedding Status</h1>
+  <div class="card">
+    <div class="stat-row">
+      <span class="stat-label">Indexed Pages</span>
+      <span class="stat-value">{total_pages}</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Total Chunks</span>
+      <span class="stat-value">{total_chunks}</span>
+    </div>
+  </div>
+  <div class="card">
+    <div class="stat-row">
+      <span class="stat-label">Job Status</span>
+      <span class="stat-value"><span class="status-badge {job_status}">{job_status}</span></span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Scope</span>
+      <span class="stat-value">{job_scope}</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Progress</span>
+      <span class="stat-value">{done} / {total}</span>
+    </div>
+    <div class="bar-bg">
+      <div class="bar-fill" style="width: {pct:.1}%; background: {bar_color};">{pct:.1}%</div>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Started</span>
+      <span class="stat-value">{started}</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Finished</span>
+      <span class="stat-value">{finished}</span>
+    </div>{error_section}
+  </div>
+  <div class="footer">Auto-refreshes every 5s while running</div>
+</div>
+</body></html>"#,
+        error_section = if error != "-" {
+            format!(r#"
+    <div class="error">Error: {error}</div>"#)
+        } else {
+            String::new()
+        },
+    );
+
+    Html(html).into_response()
 }
 
 async fn run_migration(args: &[String]) {

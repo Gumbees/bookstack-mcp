@@ -79,8 +79,9 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
             let sem = semantic.ok_or("Semantic search is not enabled")?;
             let query = arg_str(args, "query")?;
             let limit = arg_i64(args, "limit", 10).clamp(1, 50) as usize;
-            let threshold = args.get("threshold").and_then(|v| v.as_f64()).unwrap_or(0.65) as f32;
             let hybrid = args.get("hybrid").and_then(|v| v.as_bool()).unwrap_or(true);
+            let default_threshold = if hybrid { 0.55 } else { 0.65 };
+            let threshold = args.get("threshold").and_then(|v| v.as_f64()).unwrap_or(default_threshold) as f32;
             let result = sem.search(&query, limit, threshold, hybrid, client).await?;
             format_json(&result)
         }
@@ -1044,7 +1045,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
                 "properties": {
                     "query": { "type": "string", "description": "Natural language search query. Include synonyms and related terms for better results." },
                     "limit": { "type": "integer", "description": "Max number of page results to return", "default": 10 },
-                    "threshold": { "type": "number", "description": "Minimum cosine similarity score (0.0-1.0)", "default": 0.65 },
+                    "threshold": { "type": "number", "description": "Minimum cosine similarity score (0.0-1.0). Default: 0.55 for hybrid, 0.65 for pure vector.", "default": 0.55 },
                     "hybrid": { "type": "boolean", "description": "Combine vector + keyword search (default true). Set false for pure vector.", "default": true }
                 },
                 "required": ["query"]

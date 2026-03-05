@@ -229,7 +229,10 @@ impl SemanticState {
         // Remove inaccessible pages
         page_scores.retain(|pid, _| accessible_set.contains(pid));
 
-        // Blanket re-ranking: boost pages whose neighbors also appear in results
+        // Blanket re-ranking: boost pages whose neighbors also appear in vector results.
+        // Use the full set of pages from raw vector hits (not just final candidates),
+        // so neighbors that scored below the per-page threshold still contribute.
+        let all_hit_page_ids: HashSet<i64> = hits.iter().map(|h| h.page_id).collect();
         let scored_page_ids: HashSet<i64> = page_scores.keys().copied().collect();
         for page_id in scored_page_ids.iter().copied() {
             let blanket = match self.db.get_markov_blanket(page_id).await {
@@ -246,12 +249,21 @@ impl SemanticState {
                 .map(|p| p.page_id)
                 .collect();
 
-            let neighbor_count = neighbor_ids.iter()
-                .filter(|nid| scored_page_ids.contains(nid))
-                .count();
+            // Count neighbors in final results (strong signal) and raw vector hits (weak signal)
+            let mut strong = 0usize;
+            let mut weak = 0usize;
+            for nid in &neighbor_ids {
+                if scored_page_ids.contains(nid) {
+                    strong += 1;
+                } else if all_hit_page_ids.contains(nid) {
+                    weak += 1;
+                }
+            }
 
-            if neighbor_count > 0 {
-                let boost = (neighbor_count as f32 * 0.05).min(0.15);
+            if strong > 0 || weak > 0 {
+                // Strong: neighbor in final results (0.05 each, max 0.15)
+                // Weak: neighbor had a vector hit but didn't make final cut (0.02 each, max 0.06)
+                let boost = (strong as f32 * 0.05).min(0.15) + (weak as f32 * 0.02).min(0.06);
                 if let Some(entry) = page_scores.get_mut(&page_id) {
                     entry.blanket_boost = boost;
                 }

@@ -267,6 +267,10 @@ async fn handle_webhook(
     StatusCode::ACCEPTED.into_response()
 }
 
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
 async fn handle_status(
     State(state): State<sse::AppState>,
 ) -> impl IntoResponse {
@@ -277,7 +281,7 @@ async fn handle_status(
 
     let stats = match semantic.embedding_status().await {
         Ok(s) => s,
-        Err(e) => return Html(format!("Error: {e}")).into_response(),
+        Err(e) => return Html(format!("Error: {}", html_escape(&e.to_string()))).into_response(),
     };
 
     let total_pages = stats["total_indexed_pages"].as_i64().unwrap_or(0);
@@ -287,17 +291,17 @@ async fn handle_status(
     let (job_status, job_scope, done, total, pct, started, finished, error) = if job.is_null() {
         ("none".to_string(), "-".to_string(), 0i64, 0i64, 0.0f64, "-".to_string(), "-".to_string(), "-".to_string())
     } else {
-        let status = job["status"].as_str().unwrap_or("unknown").to_string();
-        let scope = job["scope"].as_str().unwrap_or("-").to_string();
+        let status = html_escape(job["status"].as_str().unwrap_or("unknown"));
+        let scope = html_escape(job["scope"].as_str().unwrap_or("-"));
         let d = job["done_pages"].as_i64().unwrap_or(0);
         let t = job["total_pages"].as_i64().unwrap_or(0);
         let p = if t > 0 { (d as f64 / t as f64) * 100.0 } else { 0.0 };
-        let s = job["started_at"].as_str().unwrap_or("-").to_string();
-        let f = job["finished_at"].as_str().map(|v| v.to_string()).unwrap_or_else(|| {
-            if job["finished_at"].is_null() { "-".to_string() } else { job["finished_at"].to_string() }
+        let s = html_escape(job["started_at"].as_str().unwrap_or("-"));
+        let f = job["finished_at"].as_str().map(|v| html_escape(v)).unwrap_or_else(|| {
+            if job["finished_at"].is_null() { "-".to_string() } else { html_escape(&job["finished_at"].to_string()) }
         });
-        let e = job["error"].as_str().map(|v| v.to_string()).unwrap_or_else(|| {
-            if job["error"].is_null() { "-".to_string() } else { job["error"].to_string() }
+        let e = job["error"].as_str().map(|v| html_escape(v)).unwrap_or_else(|| {
+            if job["error"].is_null() { "-".to_string() } else { html_escape(&job["error"].to_string()) }
         });
         (status, scope, d, t, p, s, f, e)
     };

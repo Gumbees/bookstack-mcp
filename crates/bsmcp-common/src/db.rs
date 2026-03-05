@@ -73,4 +73,7 @@ pub trait SemanticDb: Send + Sync + 'static {
 
     /// Backend-specific vector search. SQLite: brute-force cosine scan. Postgres: pgvector HNSW.
     async fn vector_search(&self, query_embedding: &[f32], limit: usize, threshold: f32) -> Result<Vec<SearchHit>, String>;
+
+    /// Delete all pages, chunks, and relationships. Used for full re-index.
+    async fn clear_all_embeddings(&self) -> Result<(), String>;
 }

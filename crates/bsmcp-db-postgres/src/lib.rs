@@ -698,4 +698,14 @@ impl SemanticDb for PostgresDb {
             score: r.get("score"),
         }).collect())
     }
+
+    async fn clear_all_embeddings(&self) -> Result<(), String> {
+        sqlx::query("DELETE FROM relationships").execute(&self.pool).await
+            .map_err(|e| format!("clear relationships: {e}"))?;
+        sqlx::query("DELETE FROM chunks").execute(&self.pool).await
+            .map_err(|e| format!("clear chunks: {e}"))?;
+        sqlx::query("DELETE FROM pages").execute(&self.pool).await
+            .map_err(|e| format!("clear pages: {e}"))?;
+        Ok(())
+    }
 }

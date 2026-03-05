@@ -251,7 +251,14 @@ async fn job_queue_worker(db: Arc<dyn SemanticDb>, model: Arc<EmbedModel>, worke
         poll_interval, delay_ms, batch_size, job_timeout);
 
     // Auto-embed on startup if requested
-    if env::var("BSMCP_EMBED_ON_STARTUP").unwrap_or_default() == "true" {
+    let embed_on_startup = env::var("BSMCP_EMBED_ON_STARTUP").unwrap_or_default();
+    if embed_on_startup == "true" || embed_on_startup == "clean" {
+        if embed_on_startup == "clean" {
+            match db.clear_all_embeddings().await {
+                Ok(()) => eprintln!("Embedder: cleared all embeddings for clean re-index"),
+                Err(e) => eprintln!("Embedder: failed to clear embeddings: {e}"),
+            }
+        }
         match db.create_embed_job("all").await {
             Ok((job_id, true)) => eprintln!("Embedder: auto-queued full embed job {job_id}"),
             Ok((_, false)) => eprintln!("Embedder: auto-embed skipped — job already active"),

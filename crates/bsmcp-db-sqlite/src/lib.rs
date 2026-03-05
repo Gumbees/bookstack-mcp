@@ -818,6 +818,19 @@ impl SemanticDb for SqliteDb {
         .await
         .map_err(|e| format!("Task failed: {e}"))?
     }
+
+    async fn clear_all_embeddings(&self) -> Result<(), String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute("DELETE FROM relationships", []).map_err(|e| format!("clear relationships: {e}"))?;
+            conn.execute("DELETE FROM chunks", []).map_err(|e| format!("clear chunks: {e}"))?;
+            conn.execute("DELETE FROM pages", []).map_err(|e| format!("clear pages: {e}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
 }
 
 /// Convert unix days (since epoch) to (year, month, day).

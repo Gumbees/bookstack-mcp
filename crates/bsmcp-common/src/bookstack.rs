@@ -255,24 +255,20 @@ impl BookStackClient {
 
     /// Check which page IDs the user can access. Returns the subset of accessible IDs.
     /// Uses BookStack's filter[id:in] for a single API call.
-    pub async fn check_pages_access(&self, page_ids: &[i64]) -> Vec<i64> {
+    pub async fn check_pages_access(&self, page_ids: &[i64]) -> Result<Vec<i64>, String> {
         if page_ids.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let ids_str = page_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
         let count_str = page_ids.len().to_string();
-        match self.get("pages", &[
+        let resp = self.get("pages", &[
             ("filter[id:in]", &ids_str),
             ("count", &count_str),
-        ]).await {
-            Ok(resp) => {
-                resp.get("data")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|p| p.get("id").and_then(|v| v.as_i64())).collect())
-                    .unwrap_or_default()
-            }
-            Err(_) => Vec::new(),
-        }
+        ]).await?;
+        Ok(resp.get("data")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|p| p.get("id").and_then(|v| v.as_i64())).collect())
+            .unwrap_or_default())
     }
 
     // --- Shelves ---

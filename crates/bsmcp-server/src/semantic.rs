@@ -95,7 +95,7 @@ impl SemanticState {
         &self,
         page_ids: &[i64],
         client: &BookStackClient,
-    ) -> Vec<i64> {
+    ) -> Result<Vec<i64>, String> {
         let token_id = client.token_id().to_string();
         let now = Instant::now();
 
@@ -121,7 +121,7 @@ impl SemanticState {
 
         // Batch check uncached page IDs against BookStack API
         if !uncached_ids.is_empty() {
-            let accessible = client.check_pages_access(&uncached_ids).await;
+            let accessible = client.check_pages_access(&uncached_ids).await?;
             let accessible_set: std::collections::HashSet<i64> = accessible.iter().copied().collect();
 
             // Update cache
@@ -143,7 +143,7 @@ impl SemanticState {
             cached_accessible.extend(accessible);
         }
 
-        cached_accessible
+        Ok(cached_accessible)
     }
 
     /// Semantic search: embed query via embedder, vector search, filter by permissions, gather Markov blanket.
@@ -171,7 +171,7 @@ impl SemanticState {
         };
 
         // Filter by user permissions
-        let accessible_ids = self.filter_by_permission(&all_page_ids, client).await;
+        let accessible_ids = self.filter_by_permission(&all_page_ids, client).await?;
         let accessible_set: std::collections::HashSet<i64> = accessible_ids.iter().copied().collect();
 
         // Filter hits to only accessible pages

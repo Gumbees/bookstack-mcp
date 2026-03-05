@@ -390,7 +390,8 @@ impl SemanticDb for PostgresDb {
     }
 
     async fn replace_relationships(&self, source: i64, targets: &[(i64, String)]) -> Result<(), String> {
-        sqlx::query("DELETE FROM relationships WHERE source_page_id = $1")
+        // Only delete explicit link relationships; preserve inferred "similar" ones
+        sqlx::query("DELETE FROM relationships WHERE source_page_id = $1 AND link_type = 'link'")
             .bind(source)
             .execute(&self.pool).await.ok();
 
@@ -729,6 +730,46 @@ impl SemanticDb for PostgresDb {
             .map_err(|e| format!("recreate index: {e}"))?;
         eprintln!("PostgreSQL: embedding column altered to vector({dims})");
         Ok(())
+    }
+
+    async fn compute_similar_pages(&self, top_k: usize, threshold: f32) -> Result<usize, String> {
+        // Clear existing "similar" relationships
+        sqlx::query("DELETE FROM relationships WHERE link_type = 'similar'")
+            .execute(&self.pool).await
+            .map_err(|e| format!("clear similar rels: {e}"))?;
+
+        // Compute page centroids (average of chunk embeddings) and find top-K
+        // most similar pages per page using pgvector cosine distance.
+        // This uses a CTE to build centroids, then a lateral join for nearest neighbors.
+        let sql = format!(
+            "WITH centroids AS (
+                SELECT page_id, AVG(embedding)::vector AS centroid
+                FROM chunks
+                GROUP BY page_id
+            )
+            INSERT INTO relationships (source_page_id, target_page_id, link_type)
+            SELECT c1.page_id, c2.page_id, 'similar'
+            FROM centroids c1
+            CROSS JOIN LATERAL (
+                SELECT c2.page_id, 1 - (c1.centroid <=> c2.centroid) AS sim
+                FROM centroids c2
+                WHERE c2.page_id != c1.page_id
+                ORDER BY c1.centroid <=> c2.centroid
+                LIMIT {top_k}
+            ) c2
+            WHERE 1 - (c1.centroid <=> c2.centroid) > $1
+            ON CONFLICT DO NOTHING"
+        );
+
+        let result = sqlx::query(&sql)
+            .bind(threshold)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("compute_similar_pages: {e}"))?;
+
+        let count = result.rows_affected() as usize;
+        eprintln!("Semantic: computed {count} similar-page relationships (top_k={top_k}, threshold={threshold})");
+        Ok(count)
     }
 
     async fn get_meta(&self, key: &str) -> Result<Option<String>, String> {

@@ -232,9 +232,16 @@ impl SemanticState {
         // Blanket re-ranking: boost pages whose neighbors also scored
         let scored_page_ids: HashSet<i64> = page_scores.keys().copied().collect();
         for page_id in scored_page_ids.iter().copied() {
-            let blanket = self.db.get_markov_blanket(page_id).await.unwrap_or_default();
+            let blanket = match self.db.get_markov_blanket(page_id).await {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("Blanket: error for page {page_id}: {e}");
+                    continue;
+                }
+            };
             let neighbor_ids: Vec<i64> = blanket.linked_from.iter()
                 .chain(blanket.links_to.iter())
+                .chain(blanket.co_linked.iter())
                 .chain(blanket.siblings.iter())
                 .map(|p| p.page_id)
                 .collect();

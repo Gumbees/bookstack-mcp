@@ -82,6 +82,12 @@ pub trait SemanticDb: Send + Sync + 'static {
     /// SQLite: no-op (BLOB columns are dimensionless).
     async fn alter_embedding_dimension(&self, dims: usize) -> Result<(), String>;
 
+    // --- Inferred relationships ---
+
+    /// Compute page centroids from chunk embeddings and store top-N most similar
+    /// pages per page as "similar" relationships. Called after a full reindex.
+    async fn compute_similar_pages(&self, top_k: usize, threshold: f32) -> Result<usize, String>;
+
     // --- Metadata key-value store ---
 
     /// Get a metadata value by key. Used for storing chunk_version, etc.

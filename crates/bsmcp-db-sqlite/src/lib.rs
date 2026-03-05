@@ -463,7 +463,8 @@ impl SemanticDb for SqliteDb {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             let tx = conn.unchecked_transaction().map_err(|e| format!("Transaction failed: {e}"))?;
-            tx.execute("DELETE FROM relationships WHERE source_page_id = ?1", params![source]).ok();
+            // Only delete explicit link relationships; preserve inferred "similar" ones
+            tx.execute("DELETE FROM relationships WHERE source_page_id = ?1 AND link_type = 'link'", params![source]).ok();
             for (target_id, link_type) in &targets {
                 tx.execute(
                     "INSERT OR IGNORE INTO relationships (source_page_id, target_page_id, link_type)
@@ -840,6 +841,82 @@ impl SemanticDb for SqliteDb {
     async fn alter_embedding_dimension(&self, _dims: usize) -> Result<(), String> {
         // SQLite uses BLOB for embeddings — dimensionless, no schema change needed
         Ok(())
+    }
+
+    async fn compute_similar_pages(&self, top_k: usize, threshold: f32) -> Result<usize, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+
+            // Clear existing similar relationships
+            conn.execute("DELETE FROM relationships WHERE link_type = 'similar'", [])
+                .map_err(|e| format!("clear similar rels: {e}"))?;
+
+            // Load all chunks grouped by page to compute centroids
+            let mut stmt = conn.prepare("SELECT page_id, embedding FROM chunks ORDER BY page_id")
+                .map_err(|e| format!("prepare: {e}"))?;
+            let rows: Vec<(i64, Vec<u8>)> = stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .map_err(|e| format!("query: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+            // Group by page_id and compute centroids
+            let mut page_chunks: std::collections::HashMap<i64, Vec<Vec<f32>>> = std::collections::HashMap::new();
+            for (page_id, blob) in &rows {
+                let emb = vector::blob_to_embedding(blob);
+                page_chunks.entry(*page_id).or_default().push(emb);
+            }
+
+            let centroids: Vec<(i64, Vec<f32>)> = page_chunks.into_iter().map(|(page_id, chunks)| {
+                let dims = chunks[0].len();
+                let n = chunks.len() as f32;
+                let mut centroid = vec![0.0f32; dims];
+                for chunk in &chunks {
+                    for (i, &val) in chunk.iter().enumerate() {
+                        centroid[i] += val;
+                    }
+                }
+                for val in &mut centroid {
+                    *val /= n;
+                }
+                (page_id, centroid)
+            }).collect();
+
+            // For each page, find top-K most similar pages
+            let mut total_inserted = 0usize;
+            let tx = conn.unchecked_transaction().map_err(|e| format!("tx: {e}"))?;
+            for (i, (page_id, centroid)) in centroids.iter().enumerate() {
+                let mut similarities: Vec<(i64, f32)> = centroids.iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != i)
+                    .map(|(_, (other_id, other_centroid))| {
+                        let sim = vector::cosine_similarity(centroid, other_centroid);
+                        (*other_id, sim)
+                    })
+                    .filter(|(_, sim)| *sim > threshold)
+                    .collect();
+
+                similarities.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                similarities.truncate(top_k);
+
+                for (target_id, _sim) in &similarities {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO relationships (source_page_id, target_page_id, link_type)
+                         VALUES (?1, ?2, 'similar')",
+                        params![page_id, target_id],
+                    ).ok();
+                    total_inserted += 1;
+                }
+            }
+            tx.commit().map_err(|e| format!("commit: {e}"))?;
+
+            eprintln!("Semantic: computed {total_inserted} similar-page relationships (top_k={top_k}, threshold={threshold})");
+            Ok(total_inserted)
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
     }
 
     async fn get_meta(&self, key: &str) -> Result<Option<String>, String> {

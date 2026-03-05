@@ -267,7 +267,7 @@ async fn embed_single_page(
     let name = page.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let slug = page.get("slug").and_then(|v| v.as_str()).unwrap_or("");
     let book_id = page.get("book_id").and_then(|v| v.as_i64()).unwrap_or(0);
-    let chapter_id = page.get("chapter_id").and_then(|v| v.as_i64());
+    let chapter_id = page.get("chapter_id").and_then(|v| v.as_i64()).filter(|&id| id > 0);
 
     // Extract book/chapter names for chunk context injection
     let book_name = page.get("book").and_then(|b| b.get("name")).and_then(|v| v.as_str()).unwrap_or("");

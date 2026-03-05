@@ -5,7 +5,7 @@
 use sha2::{Sha256, Digest};
 
 /// Chunk format version. Increment when chunking logic changes to trigger re-indexing.
-pub const CHUNK_VERSION: u32 = 3;
+pub const CHUNK_VERSION: u32 = 4;
 
 const MAX_CHUNK_LEN: usize = 1200;
 const OVERLAP_LEN: usize = 150;
@@ -160,6 +160,7 @@ pub fn chunk_html(html: &str) -> Vec<Chunk> {
 
 /// Extract internal BookStack links from HTML.
 /// Matches href="/books/{slug}/page/{slug}" and href="/link/{id}" patterns.
+/// Also handles absolute URLs (https://host/books/*/page/*).
 pub fn extract_links(html: &str) -> Vec<String> {
     let mut links = Vec::new();
     let mut pos = 0;
@@ -168,11 +169,20 @@ pub fn extract_links(html: &str) -> Vec<String> {
             let abs_start = pos + href_start + 6; // after href="
             if let Some(href_end) = html[abs_start..].find('"') {
                 let href = &html[abs_start..abs_start + href_end];
-                // Match internal BookStack links: /books/*/page/* or /link/{id}
-                if (href.starts_with("/books/") && href.contains("/page/"))
-                    || href.starts_with("/link/")
+                // Extract the path portion — handles both relative (/books/...) and
+                // absolute (https://host/books/...) URLs
+                let path = if let Some(idx) = href.find("/books/") {
+                    &href[idx..]
+                } else if let Some(idx) = href.find("/link/") {
+                    &href[idx..]
+                } else {
+                    pos = abs_start + href_end + 1;
+                    continue;
+                };
+                if (path.starts_with("/books/") && path.contains("/page/"))
+                    || path.starts_with("/link/")
                 {
-                    links.push(href.to_string());
+                    links.push(path.to_string());
                 }
                 pos = abs_start + href_end + 1;
             } else {
@@ -294,6 +304,15 @@ mod tests {
         assert_eq!(links.len(), 2);
         assert!(links[0].contains("/books/tech/page/docker-setup"));
         assert!(links[1].contains("/link/42"));
+    }
+
+    #[test]
+    fn test_extract_links_absolute_urls() {
+        let html = r#"<a href="https://kb.example.com/books/tech/page/docker-setup">Docker</a> and <a href="https://kb.example.com/link/42">link</a>"#;
+        let links = extract_links(html);
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0], "/books/tech/page/docker-setup");
+        assert_eq!(links[1], "/link/42");
     }
 
     #[test]

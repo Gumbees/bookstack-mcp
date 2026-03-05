@@ -132,7 +132,7 @@ cargo run --release -p bsmcp-embedder
 |----------|----------|---------|-------------|
 | `BSMCP_EMBED_TOKEN_ID` | Yes | - | BookStack API token ID for crawling |
 | `BSMCP_EMBED_TOKEN_SECRET` | Yes | - | BookStack API token secret |
-| `BSMCP_EMBED_MODEL` | No | `BAAI/bge-large-en-v1.5` | Embedding model name |
+| `BSMCP_EMBED_MODEL` | No | `embeddinggemma-300m` | Embedding model (see [Supported Models](#supported-models)) |
 | `BSMCP_MODEL_PATH` | No | `/data/models` | ONNX model cache directory |
 | `BSMCP_EMBED_CPUS` | No | `0` (unlimited) | Docker CPU limit for embedder |
 | `BSMCP_EMBED_JOB_TIMEOUT` | No | `14400` | Seconds before stuck jobs reset |
@@ -243,6 +243,62 @@ The token ID and secret come from your BookStack API token (created under **My A
 
 All schema migrations are automatic on startup (CREATE TABLE IF NOT EXISTS, ALTER TABLE for new columns). No manual SQL is needed.
 
+### From v0.5.0 to v0.5.1
+
+v0.5.1 switches the default embedding model and adds automatic model change detection.
+
+#### What's new
+
+- **Default model: EmbeddingGemma-300M** — Google's lightweight embedding model (768 dims, 300M params). Faster and lighter than BGE-large, especially on ARM.
+- **Model change detection** — embedder detects model changes via meta table and auto-triggers clean re-index with pgvector dimension adjustment
+- **Configurable embedding dimensions** — pgvector column type automatically adjusts when switching models
+- **HuggingFace model downloads** — custom ONNX models download automatically from HuggingFace Hub
+
+#### What's automatic
+
+- **Full re-index** — switching from BGE-large (1024 dims) to EmbeddingGemma (768 dims) triggers automatic clean re-index. PostgreSQL column type is altered automatically.
+- No env var changes required unless you want to keep the old model
+
+#### What you must do
+
+1. **Pull new images**: `ghcr.io/gumbees/bsmcp-server:0.5.1` + `ghcr.io/gumbees/bsmcp-embedder:0.5.1`
+2. **Restart** — the embedder auto-detects the model change and re-indexes. Check progress at `/status`.
+3. **To keep the old model**: Set `BSMCP_EMBED_MODEL=BAAI/bge-large-en-v1.5` in your embedder env.
+
+### From v0.4.0 to v0.5.0
+
+v0.5.0 is a search quality release — no infrastructure changes, just better results.
+
+#### What's new
+
+- **Hybrid search** — combines vector similarity with BookStack keyword search, weighted blend (70% vector + 20% keyword + blanket boost)
+- **Markov blanket re-ranking** — pages whose graph neighbors also scored get a relevance boost (up to +0.15)
+- **Tighter chunking** — max chunk size reduced from 2000 to 1200 chars with 150-char paragraph overlap between chunks
+- **Higher default threshold** — raised from 0.50 to 0.65 to filter out low-quality matches
+- **Auto-reindex on upgrade** — chunk version tracking triggers automatic clean re-index when chunking logic changes
+- **`meta` table** — new key-value metadata table in both SQLite and PostgreSQL backends
+
+#### What's automatic
+
+- **Full re-index** — the embedder detects the chunk version change (v1 → v2) and automatically clears all embeddings and re-indexes everything on first startup. No manual `reembed` needed.
+- Schema migration — `meta` table created automatically on startup
+- All existing env vars and compose files are compatible
+
+#### What you must do
+
+1. **Pull new images**: `ghcr.io/gumbees/bsmcp-server:0.5.0` + `ghcr.io/gumbees/bsmcp-embedder:0.5.0`
+2. **Restart** — the embedder auto-detects the chunk version change and re-indexes. Check progress at `/status`.
+3. **No env var changes required** — new `hybrid` parameter defaults to `true` in the `semantic_search` tool
+
+#### New `semantic_search` parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `threshold` | `0.65` | Minimum score (was 0.50 in v0.4.0) |
+| `hybrid` | `true` | Enable keyword + vector blended search |
+
+Results now include a `scoring` breakdown when hybrid mode is on, showing vector, keyword, and blanket_boost components.
+
 ### From v0.3.x to v0.4.0
 
 v0.4.0 splits the monolithic `bookstack-mcp` container into separate **server** and **embedder** binaries with a pluggable database layer (SQLite or PostgreSQL + pgvector).
@@ -267,7 +323,7 @@ v0.4.0 splits the monolithic `bookstack-mcp` container into separate **server** 
 
 1. **Replace compose file and images**:
    - Old: single `ghcr.io/gumbees/bookstack-mcp:latest` container
-   - New: `ghcr.io/gumbees/bsmcp-server:0.4.0` + `ghcr.io/gumbees/bsmcp-embedder:0.4.0`
+   - New: `ghcr.io/gumbees/bsmcp-server:latest` + `ghcr.io/gumbees/bsmcp-embedder:latest`
    - Use `docker/docker-compose.sqlite.yml` (simple) or `docker/docker-compose.yml` (PostgreSQL)
 
 2. **Add new env vars**:
@@ -349,7 +405,7 @@ This is the largest jump — from a single monolithic container with no encrypti
    - Old: `docker-compose.yml` with `ghcr.io/gumbees/bookstack-mcp:latest`
    - New (SQLite): `docker/docker-compose.sqlite.yml`
    - New (PostgreSQL): `docker/docker-compose.yml`
-   - Images: `ghcr.io/gumbees/bsmcp-server:0.4.0` + `ghcr.io/gumbees/bsmcp-embedder:0.4.0`
+   - Images: `ghcr.io/gumbees/bsmcp-server:latest` + `ghcr.io/gumbees/bsmcp-embedder:latest`
 
 4. **Create a BookStack API token** for the embedder with read access to all content
 
@@ -364,6 +420,17 @@ See the [v0.1.3 release notes](https://github.com/gumbees/bookstack-mcp/releases
 - `BSMCP_PUBLIC_URL` renamed to `BSMCP_PUBLIC_DOMAIN`
 - Docker volume renamed `mcp-data` to `bsmcp-data`
 - PKCE enforcement for OAuth
+
+## Supported Models
+
+| Model Name | Dimensions | Parameters | Notes |
+|------------|-----------|------------|-------|
+| `embeddinggemma-300m` | 768 | 300M | **Default.** Google's lightweight model, optimized for on-device. Fast on ARM. |
+| `BAAI/bge-large-en-v1.5` | 1024 | 335M | Previous default. High quality, heavier. |
+| `BAAI/bge-base-en-v1.5` | 768 | 110M | Good balance of speed and quality. |
+| `BAAI/bge-small-en-v1.5` | 384 | 33M | Fastest BGE variant, lower quality. |
+
+Set via `BSMCP_EMBED_MODEL`. Changing models triggers an automatic clean re-index on next embedder startup — no manual intervention needed.
 
 ## Search Operators
 

@@ -299,7 +299,12 @@ impl SemanticDb for SqliteDb {
             // Migration: add worker_id column if missing (existing databases)
             conn.execute_batch(
                 "ALTER TABLE embed_jobs ADD COLUMN worker_id TEXT;"
-            ).ok(); // ignore error if column already exists
+            ).ok();
+
+            // Metadata key-value store (v0.5.0+)
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+            ).ok();
 
             eprintln!("Semantic: tables initialized");
             Ok(())
@@ -826,6 +831,41 @@ impl SemanticDb for SqliteDb {
             conn.execute("DELETE FROM relationships", []).map_err(|e| format!("clear relationships: {e}"))?;
             conn.execute("DELETE FROM chunks", []).map_err(|e| format!("clear chunks: {e}"))?;
             conn.execute("DELETE FROM pages", []).map_err(|e| format!("clear pages: {e}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn alter_embedding_dimension(&self, _dims: usize) -> Result<(), String> {
+        // SQLite uses BLOB for embeddings — dimensionless, no schema change needed
+        Ok(())
+    }
+
+    async fn get_meta(&self, key: &str) -> Result<Option<String>, String> {
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn.prepare("SELECT value FROM meta WHERE key = ?1")
+                .map_err(|e| format!("get_meta: {e}"))?;
+            let result: Option<String> = stmt.query_row([&key], |row| row.get(0)).ok();
+            Ok(result)
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn set_meta(&self, key: &str, value: &str) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        let value = value.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+                rusqlite::params![key, value],
+            ).map_err(|e| format!("set_meta: {e}"))?;
             Ok(())
         })
         .await

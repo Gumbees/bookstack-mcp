@@ -20,8 +20,11 @@ use bsmcp_common::db::SemanticDb;
 
 use pipeline::EmbedModel;
 
+const DEFAULT_MODEL: &str = "embeddinggemma-300m";
+
 struct AppState {
     model: Arc<EmbedModel>,
+    model_name: String,
     db: Arc<dyn SemanticDb>,
 }
 
@@ -85,13 +88,14 @@ async fn main() {
 
     // Load embedding model
     let model_path = env::var("BSMCP_MODEL_PATH").unwrap_or_else(|_| "/data/models".into());
-    let model_name = env::var("BSMCP_EMBED_MODEL").unwrap_or_else(|_| "BAAI/bge-large-en-v1.5".into());
+    let model_name = env::var("BSMCP_EMBED_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
 
     eprintln!("Embedder: loading model {model_name} (cache={model_path})...");
 
-    let model = EmbedModel::new(&model_path).expect("Failed to load embedding model");
+    let model = EmbedModel::new(&model_name, &model_path).expect("Failed to load embedding model");
+    let dims = model.dims();
     let model = Arc::new(model);
-    eprintln!("Embedder: model ready");
+    eprintln!("Embedder: model ready ({dims} dims)");
 
     // Start HTTP server for /embed endpoint
     let host = env::var("BSMCP_EMBED_HOST").unwrap_or_else(|_| "0.0.0.0".into());
@@ -102,6 +106,7 @@ async fn main() {
 
     let state = Arc::new(AppState {
         model: model.clone(),
+        model_name: model_name.clone(),
         db: db.clone(),
     });
 
@@ -129,8 +134,10 @@ async fn main() {
     // Spawn job queue worker
     let worker_db = db.clone();
     let worker_model = model.clone();
+    let worker_model_name = model_name;
+    let worker_dims = dims;
     tokio::spawn(async move {
-        job_queue_worker(worker_db, worker_model, worker_id).await;
+        job_queue_worker(worker_db, worker_model, worker_id, worker_model_name, worker_dims).await;
     });
 
     eprintln!("Embedder: HTTP server listening on {addr}");
@@ -189,11 +196,12 @@ async fn handle_embed(
 async fn handle_health(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
+    let dims = state.model.dims();
     let stats = state.db.get_stats().await.ok();
     Json(json!({
         "status": "ok",
-        "model": "BAAI/bge-large-en-v1.5",
-        "dimensions": 1024,
+        "model": state.model_name,
+        "dimensions": dims,
         "stats": stats.map(|s| json!({
             "total_pages": s.total_pages,
             "total_chunks": s.total_chunks,
@@ -209,7 +217,13 @@ async fn handle_health(
 }
 
 /// Background job queue worker. Polls for pending embed jobs and processes them.
-async fn job_queue_worker(db: Arc<dyn SemanticDb>, model: Arc<EmbedModel>, worker_id: String) {
+async fn job_queue_worker(
+    db: Arc<dyn SemanticDb>,
+    model: Arc<EmbedModel>,
+    worker_id: String,
+    model_name: String,
+    dims: usize,
+) {
     let poll_interval: u64 = env::var("BSMCP_EMBED_POLL_INTERVAL")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -250,19 +264,48 @@ async fn job_queue_worker(db: Arc<dyn SemanticDb>, model: Arc<EmbedModel>, worke
     eprintln!("Embedder: job queue worker started (poll={}s, delay={}ms, batch={}, job_timeout={}s)",
         poll_interval, delay_ms, batch_size, job_timeout);
 
-    // Auto-embed on startup if requested
-    let embed_on_startup = env::var("BSMCP_EMBED_ON_STARTUP").unwrap_or_default();
-    if embed_on_startup == "true" || embed_on_startup == "clean" {
-        if embed_on_startup == "clean" {
-            match db.clear_all_embeddings().await {
-                Ok(()) => eprintln!("Embedder: cleared all embeddings for clean re-index"),
-                Err(e) => eprintln!("Embedder: failed to clear embeddings: {e}"),
+    // Track whether we already triggered a reindex this startup (avoid double-triggers)
+    let mut reindex_triggered = false;
+
+    // Check chunk version — auto-reindex if chunking logic changed
+    let current_chunk_version = bsmcp_common::chunking::CHUNK_VERSION.to_string();
+    let stored_version = db.get_meta("chunk_version").await.unwrap_or(None);
+    if stored_version.as_deref() != Some(&current_chunk_version) {
+        eprintln!("Embedder: chunk version changed ({} → {}) — triggering clean re-index",
+            stored_version.as_deref().unwrap_or("none"), current_chunk_version);
+        trigger_clean_reindex(&db, dims).await;
+        db.set_meta("chunk_version", &current_chunk_version).await.ok();
+        reindex_triggered = true;
+    }
+
+    // Check model change — auto-reindex if model changed
+    let stored_model = db.get_meta("embed_model").await.unwrap_or(None);
+    if !reindex_triggered && stored_model.as_deref() != Some(&model_name) {
+        eprintln!("Embedder: model changed ({} → {}) — triggering clean re-index",
+            stored_model.as_deref().unwrap_or("none"), model_name);
+        trigger_clean_reindex(&db, dims).await;
+        reindex_triggered = true;
+    }
+
+    // Store current model metadata
+    db.set_meta("embed_model", &model_name).await.ok();
+    db.set_meta("embed_dims", &dims.to_string()).await.ok();
+
+    // Auto-embed on startup if requested (and not already triggered above)
+    if !reindex_triggered {
+        let embed_on_startup = env::var("BSMCP_EMBED_ON_STARTUP").unwrap_or_default();
+        if embed_on_startup == "true" || embed_on_startup == "clean" {
+            if embed_on_startup == "clean" {
+                match db.clear_all_embeddings().await {
+                    Ok(()) => eprintln!("Embedder: cleared all embeddings for clean re-index"),
+                    Err(e) => eprintln!("Embedder: failed to clear embeddings: {e}"),
+                }
             }
-        }
-        match db.create_embed_job("all").await {
-            Ok((job_id, true)) => eprintln!("Embedder: auto-queued full embed job {job_id}"),
-            Ok((_, false)) => eprintln!("Embedder: auto-embed skipped — job already active"),
-            Err(e) => eprintln!("Embedder: auto-embed failed to queue: {e}"),
+            match db.create_embed_job("all").await {
+                Ok((job_id, true)) => eprintln!("Embedder: auto-queued full embed job {job_id}"),
+                Ok((_, false)) => eprintln!("Embedder: auto-embed skipped — job already active"),
+                Err(e) => eprintln!("Embedder: auto-embed failed to queue: {e}"),
+            }
         }
     }
 
@@ -306,5 +349,22 @@ async fn job_queue_worker(db: Arc<dyn SemanticDb>, model: Arc<EmbedModel>, worke
                 tokio::time::sleep(Duration::from_secs(poll_interval)).await;
             }
         }
+    }
+}
+
+/// Clear all embeddings, adjust pgvector column dimension, and queue a full reindex.
+async fn trigger_clean_reindex(db: &Arc<dyn SemanticDb>, dims: usize) {
+    match db.clear_all_embeddings().await {
+        Ok(()) => eprintln!("Embedder: cleared all embeddings"),
+        Err(e) => eprintln!("Embedder: failed to clear embeddings: {e}"),
+    }
+    match db.alter_embedding_dimension(dims).await {
+        Ok(()) => eprintln!("Embedder: embedding dimension set to {dims}"),
+        Err(e) => eprintln!("Embedder: failed to alter embedding dimension: {e}"),
+    }
+    match db.create_embed_job("all").await {
+        Ok((job_id, true)) => eprintln!("Embedder: auto-queued full embed job {job_id}"),
+        Ok((_, false)) => eprintln!("Embedder: re-index job already active"),
+        Err(e) => eprintln!("Embedder: failed to queue re-index: {e}"),
     }
 }

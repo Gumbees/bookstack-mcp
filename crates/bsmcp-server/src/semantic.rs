@@ -1,8 +1,8 @@
 //! Semantic search module for the MCP server.
+//! v0.5.0: Hybrid search (vector + keyword), blanket re-ranking, tighter thresholds.
 //! Delegates embedding to the external embedder service (HTTP /embed endpoint).
-//! Handles search, permission filtering with caching, job management, and webhooks.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -99,7 +99,6 @@ impl SemanticState {
         let token_id = client.token_id().to_string();
         let now = Instant::now();
 
-        // Check cache for each page
         let mut uncached_ids: Vec<i64> = Vec::new();
         let mut cached_accessible: Vec<i64> = Vec::new();
 
@@ -119,12 +118,10 @@ impl SemanticState {
             }
         }
 
-        // Batch check uncached page IDs against BookStack API
         if !uncached_ids.is_empty() {
             let accessible = client.check_pages_access(&uncached_ids).await?;
-            let accessible_set: std::collections::HashSet<i64> = accessible.iter().copied().collect();
+            let accessible_set: HashSet<i64> = accessible.iter().copied().collect();
 
-            // Update cache
             {
                 let mut cache = self.permission_cache.write().await;
                 for &pid in &uncached_ids {
@@ -134,7 +131,6 @@ impl SemanticState {
                         cached_at: now,
                     });
                 }
-                // Prune expired entries periodically (when cache grows large)
                 if cache.len() > 10_000 {
                     cache.retain(|_, entry| now.duration_since(entry.cached_at) < PERMISSION_CACHE_TTL);
                 }
@@ -146,87 +142,170 @@ impl SemanticState {
         Ok(cached_accessible)
     }
 
-    /// Semantic search: embed query via embedder, vector search, filter by permissions, gather Markov blanket.
+    /// Hybrid search: vector + keyword + blanket re-ranking.
     pub async fn search(
         &self,
         query: &str,
         limit: usize,
         threshold: f32,
+        hybrid: bool,
         client: &BookStackClient,
     ) -> Result<Value, String> {
         let start = Instant::now();
 
-        // Embed query via external embedder
-        let query_vec = self.embed_query(query).await?;
-
-        // Vector search (backend handles brute-force vs pgvector)
-        let hits = self.db.vector_search(&query_vec, limit * 5, threshold).await?;
-
-        // Collect unique page IDs for permission check
-        let all_page_ids: Vec<i64> = {
-            let mut ids: Vec<i64> = hits.iter().map(|h| h.page_id).collect();
-            ids.sort_unstable();
-            ids.dedup();
-            ids
+        // Run vector search and optional keyword search in parallel
+        let vector_future = async {
+            let query_vec = self.embed_query(query).await?;
+            self.db.vector_search(&query_vec, limit * 5, threshold).await
         };
 
-        // Filter by user permissions
-        let accessible_ids = self.filter_by_permission(&all_page_ids, client).await?;
-        let accessible_set: std::collections::HashSet<i64> = accessible_ids.iter().copied().collect();
+        let keyword_future = async {
+            if hybrid {
+                match client.search(query, 1, (limit * 2) as i64).await {
+                    Ok(resp) => {
+                        resp.get("data")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default()
+                    }
+                    Err(e) => {
+                        eprintln!("Hybrid: keyword search failed (non-fatal): {e}");
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            }
+        };
 
-        // Filter hits to only accessible pages
-        let filtered_hits: Vec<_> = hits.iter()
-            .filter(|h| accessible_set.contains(&h.page_id))
-            .collect();
+        let (vector_result, keyword_result) = tokio::join!(vector_future, keyword_future);
+        let hits = vector_result?;
+        let keyword_results: Vec<Value> = keyword_result;
 
-        // Group by page_id, keeping best chunk score per page
-        let mut page_scores: HashMap<i64, Vec<(i64, f32)>> = HashMap::new();
-        for hit in &filtered_hits {
-            page_scores.entry(hit.page_id).or_default().push((hit.chunk_id, hit.score));
+        // Build page scores from vector hits
+        let mut page_scores: HashMap<i64, PageScore> = HashMap::new();
+        for hit in &hits {
+            let entry = page_scores.entry(hit.page_id).or_insert(PageScore {
+                vector_score: 0.0,
+                keyword_rank: 0.0,
+                blanket_boost: 0.0,
+                chunks: Vec::new(),
+            });
+            if hit.score > entry.vector_score {
+                entry.vector_score = hit.score;
+            }
+            entry.chunks.push((hit.chunk_id, hit.score));
         }
 
-        // Sort pages by best chunk score
-        let mut page_results: Vec<(i64, Vec<(i64, f32)>)> = page_scores.into_iter().collect();
-        page_results.sort_by(|a, b| {
-            let best_a = a.1.iter().map(|c| c.1).fold(0.0f32, f32::max);
-            let best_b = b.1.iter().map(|c| c.1).fold(0.0f32, f32::max);
-            best_b.partial_cmp(&best_a).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        // Merge keyword results — assign a rank-based score (1.0 for first, decaying)
+        if hybrid && !keyword_results.is_empty() {
+            let total = keyword_results.len() as f32;
+            for (i, result) in keyword_results.iter().enumerate() {
+                // BookStack search returns pages, chapters, books — only care about pages
+                let result_type = result.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if result_type != "page" {
+                    continue;
+                }
+                let page_id = result.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+                if page_id == 0 {
+                    continue;
+                }
+                let rank_score = 1.0 - (i as f32 / total); // 1.0 for first, decaying
+                let entry = page_scores.entry(page_id).or_insert(PageScore {
+                    vector_score: 0.0,
+                    keyword_rank: 0.0,
+                    blanket_boost: 0.0,
+                    chunks: Vec::new(),
+                });
+                entry.keyword_rank = rank_score;
+            }
+        }
+
+        // Collect all page IDs for permission check
+        let all_page_ids: Vec<i64> = page_scores.keys().copied().collect();
+        let accessible_ids = self.filter_by_permission(&all_page_ids, client).await?;
+        let accessible_set: HashSet<i64> = accessible_ids.iter().copied().collect();
+
+        // Remove inaccessible pages
+        page_scores.retain(|pid, _| accessible_set.contains(pid));
+
+        // Blanket re-ranking: boost pages whose neighbors also scored
+        let scored_page_ids: HashSet<i64> = page_scores.keys().copied().collect();
+        for page_id in scored_page_ids.iter().copied() {
+            let blanket = self.db.get_markov_blanket(page_id).await.unwrap_or_default();
+            let neighbor_ids: Vec<i64> = blanket.linked_from.iter()
+                .chain(blanket.links_to.iter())
+                .chain(blanket.siblings.iter())
+                .map(|p| p.page_id)
+                .collect();
+
+            let neighbor_count = neighbor_ids.iter()
+                .filter(|nid| scored_page_ids.contains(nid))
+                .count();
+
+            if neighbor_count > 0 {
+                // Boost proportional to how many neighbors also appear in results
+                // Max boost: 0.15 (for 3+ neighbors)
+                let boost = (neighbor_count as f32 * 0.05).min(0.15);
+                if let Some(entry) = page_scores.get_mut(&page_id) {
+                    entry.blanket_boost = boost;
+                }
+            }
+        }
+
+        // Compute final blended score and sort
+        let mut page_results: Vec<(i64, f32, &PageScore)> = page_scores.iter()
+            .map(|(&pid, score)| {
+                let blended = if score.keyword_rank > 0.0 && score.vector_score > 0.0 {
+                    // Both sources matched — weighted blend
+                    score.vector_score * 0.7 + score.keyword_rank * 0.2 + score.blanket_boost
+                } else if score.vector_score > 0.0 {
+                    // Vector only
+                    score.vector_score + score.blanket_boost
+                } else {
+                    // Keyword only — use a base score that puts it below good vector matches
+                    // but above the threshold so it still appears
+                    (threshold + 0.05) * 0.8 + score.keyword_rank * 0.2 + score.blanket_boost
+                };
+                (pid, blended, score)
+            })
+            .collect();
+
+        page_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         page_results.truncate(limit);
 
         // Build result JSON
         let mut results = Vec::new();
-        for (page_id, chunk_hits) in &page_results {
+        for (page_id, final_score, score) in &page_results {
             let page_meta = self.db.get_page_meta(*page_id).await?;
             let (page_name, book_id) = match &page_meta {
                 Some(m) => (m.name.clone(), m.book_id),
                 None => ("Unknown".to_string(), 0),
             };
 
-            let best_score = chunk_hits.iter().map(|c| c.1).fold(0.0f32, f32::max);
-
-            // Get chunk details
-            let chunk_ids: Vec<i64> = chunk_hits.iter().map(|c| c.0).collect();
-            let chunk_details = self.db.get_chunk_details(&chunk_ids).await?;
-
+            // Get chunk details if we have vector hits
             let mut chunks_json = Vec::new();
-            for detail in &chunk_details {
-                let score = chunk_hits.iter().find(|c| c.0 == detail.chunk_id).map(|c| c.1).unwrap_or(0.0);
-                chunks_json.push(json!({
-                    "heading_path": detail.heading_path,
-                    "content": detail.content,
-                    "score": (score * 1000.0).round() / 1000.0,
-                }));
+            if !score.chunks.is_empty() {
+                let chunk_ids: Vec<i64> = score.chunks.iter().map(|c| c.0).collect();
+                let chunk_details = self.db.get_chunk_details(&chunk_ids).await?;
+                for detail in &chunk_details {
+                    let chunk_score = score.chunks.iter().find(|c| c.0 == detail.chunk_id).map(|c| c.1).unwrap_or(0.0);
+                    chunks_json.push(json!({
+                        "heading_path": detail.heading_path,
+                        "content": detail.content,
+                        "score": (chunk_score * 1000.0).round() / 1000.0,
+                    }));
+                }
             }
 
-            // Gather Markov blanket
+            // Gather Markov blanket for context
             let blanket = self.db.get_markov_blanket(*page_id).await?;
 
-            results.push(json!({
+            let mut result = json!({
                 "page_id": page_id,
                 "page_name": page_name,
                 "book_id": book_id,
-                "score": (best_score * 1000.0).round() / 1000.0,
+                "score": (*final_score * 1000.0).round() / 1000.0,
                 "chunks": chunks_json,
                 "blanket": {
                     "linked_from": blanket.linked_from.iter().map(|p| json!({"page_id": p.page_id, "name": p.name})).collect::<Vec<_>>(),
@@ -234,7 +313,18 @@ impl SemanticState {
                     "co_linked": blanket.co_linked.iter().map(|p| json!({"page_id": p.page_id, "name": p.name})).collect::<Vec<_>>(),
                     "siblings": blanket.siblings.iter().map(|p| json!({"page_id": p.page_id, "name": p.name})).collect::<Vec<_>>(),
                 },
-            }));
+            });
+
+            // Include scoring breakdown for transparency
+            if hybrid {
+                result["scoring"] = json!({
+                    "vector": (score.vector_score * 1000.0).round() / 1000.0,
+                    "keyword": (score.keyword_rank * 1000.0).round() / 1000.0,
+                    "blanket_boost": (score.blanket_boost * 1000.0).round() / 1000.0,
+                });
+            }
+
+            results.push(result);
         }
 
         let stats = self.db.get_stats().await?;
@@ -246,12 +336,12 @@ impl SemanticState {
                 "total_indexed": stats.total_pages,
                 "total_chunks": stats.total_chunks,
                 "query_time_ms": query_time_ms,
+                "mode": if hybrid { "hybrid" } else { "vector" },
             }
         }))
     }
 
     /// Trigger re-embedding by inserting a job into the queue.
-    /// The external embedder picks it up.
     pub async fn trigger_reembed(&self, scope: &str) -> Result<Value, String> {
         let (job_id, is_new) = self.db.create_embed_job(scope).await?;
         let (status, message) = if is_new {
@@ -291,7 +381,6 @@ impl SemanticState {
     }
 
     /// Handle BookStack webhook for page changes.
-    /// Creates a page-scoped embed job for the embedder to pick up.
     pub async fn handle_webhook(&self, payload: &Value) -> Result<(), String> {
         let event = payload.get("event").and_then(|v| v.as_str()).unwrap_or("");
         let related = payload.get("related_item").unwrap_or(&json!(null));
@@ -324,4 +413,11 @@ impl SemanticState {
 
         Ok(())
     }
+}
+
+struct PageScore {
+    vector_score: f32,
+    keyword_rank: f32,
+    blanket_boost: f32,
+    chunks: Vec<(i64, f32)>,
 }

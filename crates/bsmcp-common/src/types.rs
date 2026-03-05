@@ -33,7 +33,7 @@ pub struct SearchHit {
     pub score: f32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct MarkovBlanket {
     pub linked_from: Vec<RelatedPage>,
     pub links_to: Vec<RelatedPage>,

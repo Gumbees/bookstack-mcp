@@ -179,6 +179,15 @@ async fn embed_single_page(
         })
         .collect();
 
+    // Upsert page row BEFORE chunks — the chunks table has a FK to pages(page_id).
+    // Use an empty content_hash initially so a crash before insert_chunks completes
+    // will cause a re-embed on the next run (hash won't match).
+    let preliminary_meta = PageMeta {
+        content_hash: String::new(),
+        ..meta.clone()
+    };
+    db.upsert_page(&preliminary_meta).await?;
+
     db.insert_chunks(page_id, &chunk_inserts).await?;
 
     // Extract and store link relationships
@@ -199,8 +208,9 @@ async fn embed_single_page(
     }
     db.replace_relationships(page_id, &targets).await?;
 
-    // Store page metadata LAST — content hash acts as commit marker.
-    // If we crash before this, the page will be re-embedded on recovery.
+    // Store final page metadata with real content_hash — this is the commit marker.
+    // If we crashed after the preliminary upsert but before here, the empty hash
+    // ensures the page gets re-embedded on next run.
     db.upsert_page(&meta).await?;
 
     Ok(())

@@ -47,6 +47,9 @@ pub async fn run(sqlite_path: &Path, postgres_url: &str) -> Result<(), String> {
     let rels = migrate_relationships(&conn, &pool).await?;
     let jobs = migrate_embed_jobs(&conn, &pool).await?;
 
+    // Fix PostgreSQL sequences so new inserts don't collide with migrated IDs
+    fix_sequences(&pool).await?;
+
     // Validate counts
     eprintln!("\nMigration complete:");
     eprintln!("  access_tokens: {tokens}");
@@ -348,6 +351,23 @@ async fn migrate_embed_jobs(conn: &Connection, pool: &PgPool) -> Result<usize, S
     Ok(count)
 }
 
+/// Fix PostgreSQL BIGSERIAL sequences after migration so new inserts don't collide with migrated IDs.
+async fn fix_sequences(pool: &PgPool) -> Result<(), String> {
+    let sequences = [
+        ("chunks_id_seq", "chunks", "id"),
+        ("embed_jobs_id_seq", "embed_jobs", "id"),
+    ];
+    for (seq, table, col) in sequences {
+        let sql = format!("SELECT setval('{seq}', COALESCE((SELECT MAX({col}) FROM {table}), 0) + 1, false)");
+        sqlx::query(&sql)
+            .execute(pool)
+            .await
+            .map_err(|e| format!("Failed to fix sequence {seq}: {e}"))?;
+    }
+    eprintln!("  Sequences: fixed");
+    Ok(())
+}
+
 async fn validate(conn: &Connection, pool: &PgPool) -> Result<(), String> {
     eprintln!("\nValidation:");
     let mut ok = true;
@@ -379,7 +399,7 @@ async fn validate(conn: &Connection, pool: &PgPool) -> Result<(), String> {
     Ok(())
 }
 
-fn redact_url(url: &str) -> String {
+pub fn redact_url(url: &str) -> String {
     // Redact password from postgres://user:password@host/db
     if let Some(at_pos) = url.find('@') {
         if let Some(colon_pos) = url[..at_pos].rfind(':') {

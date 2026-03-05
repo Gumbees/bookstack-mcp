@@ -28,6 +28,8 @@ async fn main() {
         return;
     }
 
+    eprintln!("BookStack MCP Server v{}", env!("CARGO_PKG_VERSION"));
+
     let bookstack_url = env::var("BSMCP_BOOKSTACK_URL")
         .expect("BSMCP_BOOKSTACK_URL is required");
 
@@ -135,6 +137,9 @@ async fn main() {
     let semantic = if semantic_enabled {
         let webhook_secret = env::var("BSMCP_WEBHOOK_SECRET")
             .expect("BSMCP_WEBHOOK_SECRET is required when semantic search is enabled");
+        if webhook_secret.len() < 16 {
+            panic!("BSMCP_WEBHOOK_SECRET must be at least 16 characters");
+        }
         let embedder_url = env::var("BSMCP_EMBEDDER_URL")
             .unwrap_or_else(|_| "http://bsmcp-embedder:8081".into());
 
@@ -194,7 +199,7 @@ async fn main() {
         .layer(DefaultBodyLimit::max(1024 * 1024)) // 1MB
         .layer(
             CorsLayer::new()
-                .allow_origin(AllowOrigin::mirror_request())
+                .allow_origin(AllowOrigin::any())
                 .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
                 .allow_headers([
                     HeaderName::from_static("authorization"),
@@ -220,6 +225,7 @@ async fn main() {
 /// Webhook handler for BookStack page change events.
 async fn handle_webhook(
     State(state): State<sse::AppState>,
+    headers: axum::http::HeaderMap,
     Query(params): Query<std::collections::HashMap<String, String>>,
     body: String,
 ) -> impl IntoResponse {
@@ -228,8 +234,19 @@ async fn handle_webhook(
         None => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    // Constant-time secret verification
-    let provided_secret = params.get("secret").map(|s| s.as_str()).unwrap_or("");
+    // Prefer X-Webhook-Secret header; fall back to ?secret= query param (deprecated)
+    let provided_secret = headers
+        .get("x-webhook-secret")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            let qs = params.get("secret").cloned();
+            if qs.is_some() {
+                eprintln!("Webhook: secret via query param is deprecated — use X-Webhook-Secret header instead");
+            }
+            qs
+        });
+    let provided_secret = provided_secret.as_deref().unwrap_or("");
     let expected_secret = semantic.webhook_secret();
     if !sse::constant_time_eq(provided_secret, expected_secret) {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -307,7 +324,7 @@ async fn run_migration(args: &[String]) {
             eprintln!("\nMigration completed successfully.");
             eprintln!("You can now switch to PostgreSQL by setting:");
             eprintln!("  BSMCP_DB_BACKEND=postgres");
-            eprintln!("  BSMCP_DATABASE_URL={}", postgres_url);
+            eprintln!("  BSMCP_DATABASE_URL={}", migrate::redact_url(&postgres_url));
         }
         Err(e) => {
             eprintln!("\nMigration failed: {e}");

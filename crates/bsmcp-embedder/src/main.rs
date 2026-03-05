@@ -47,6 +47,8 @@ struct EmbedRequest {
 
 #[tokio::main]
 async fn main() {
+    eprintln!("BookStack MCP Embedder v{}", env!("CARGO_PKG_VERSION"));
+
     let encryption_key = env::var("BSMCP_ENCRYPTION_KEY")
         .expect("BSMCP_ENCRYPTION_KEY is required");
     if encryption_key.len() < 32 {

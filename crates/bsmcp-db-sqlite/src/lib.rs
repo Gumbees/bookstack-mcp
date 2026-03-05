@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use rusqlite::{Connection, params};
 use sha2::Digest;
+use zeroize::Zeroizing;
 
 use bsmcp_common::config::ACCESS_TOKEN_TTL;
 use bsmcp_common::db::{DbBackend, SemanticDb};
@@ -19,7 +20,7 @@ const BASE64: base64::engine::general_purpose::GeneralPurpose =
 
 pub struct SqliteDb {
     conn: Arc<Mutex<Connection>>,
-    encryption_key: [u8; 32],
+    encryption_key: Zeroizing<[u8; 32]>,
 }
 
 impl SqliteDb {
@@ -41,7 +42,7 @@ impl SqliteDb {
         .expect("Failed to initialize database schema");
 
         let hash = sha2::Sha256::digest(encryption_key.as_bytes());
-        let mut key = [0u8; 32];
+        let mut key = Zeroizing::new([0u8; 32]);
         key.copy_from_slice(&hash);
 
         Self {
@@ -50,8 +51,15 @@ impl SqliteDb {
         }
     }
 
+    /// SHA-256 hash a bearer token before storing as primary key.
+    /// This prevents token theft from database read access.
+    fn hash_token(token: &str) -> String {
+        let hash = sha2::Sha256::digest(token.as_bytes());
+        format!("{hash:x}")
+    }
+
     fn encrypt(&self, plaintext: &str) -> String {
-        let cipher = Aes256Gcm::new((&self.encryption_key).into());
+        let cipher = Aes256Gcm::new((&*self.encryption_key).into());
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
         let ciphertext = cipher
             .encrypt(&nonce, plaintext.as_bytes())
@@ -103,7 +111,7 @@ impl SqliteDb {
 impl DbBackend for SqliteDb {
     async fn insert_access_token(&self, token: &str, id: &str, secret: &str) -> Result<(), String> {
         let conn = self.conn.clone();
-        let token = token.to_string();
+        let token_hash = Self::hash_token(token);
         let enc_id = self.encrypt(id);
         let enc_secret = self.encrypt(secret);
 
@@ -118,7 +126,7 @@ impl DbBackend for SqliteDb {
             }
             conn.execute(
                 "INSERT OR REPLACE INTO access_tokens (token, token_id, token_secret, created_at) VALUES (?1, ?2, ?3, ?4)",
-                params![token, enc_id, enc_secret, SqliteDb::now_secs()],
+                params![token_hash, enc_id, enc_secret, SqliteDb::now_secs()],
             ).ok();
             Ok(())
         })
@@ -128,17 +136,26 @@ impl DbBackend for SqliteDb {
 
     async fn get_access_token(&self, token: &str) -> Result<Option<(String, String)>, String> {
         let conn = self.conn.clone();
-        let token = token.to_string();
-        let encryption_key = self.encryption_key;
+        let token_hash = Self::hash_token(token);
+        let token_raw = token.to_string();
+        let encryption_key = *self.encryption_key;
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             let cutoff = SqliteDb::cutoff_secs(ACCESS_TOKEN_TTL);
+
+            // Try hashed token first, then fall back to raw token (pre-hash migration)
             let result: Option<(String, String)> = conn.query_row(
                 "SELECT token_id, token_secret FROM access_tokens WHERE token = ?1 AND created_at > ?2",
-                params![token, cutoff],
+                params![token_hash, cutoff],
                 |row| Ok((row.get(0)?, row.get(1)?)),
-            ).ok();
+            ).ok().or_else(|| {
+                conn.query_row(
+                    "SELECT token_id, token_secret FROM access_tokens WHERE token = ?1 AND created_at > ?2",
+                    params![token_raw, cutoff],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                ).ok()
+            });
 
             let Some((stored_id, stored_secret)) = result else {
                 return Ok(None);
@@ -172,7 +189,7 @@ impl DbBackend for SqliteDb {
             let enc_secret = re_encrypt(&stored_secret);
             conn.execute(
                 "UPDATE access_tokens SET token_id = ?1, token_secret = ?2 WHERE token = ?3",
-                params![enc_id, enc_secret, token],
+                params![enc_id, enc_secret, token_raw],
             ).ok();
 
             Ok(Some((stored_id, stored_secret)))

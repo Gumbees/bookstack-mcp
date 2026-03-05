@@ -9,6 +9,7 @@ use pgvector::Vector;
 use sha2::Digest;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
+use zeroize::Zeroizing;
 
 use bsmcp_common::config::ACCESS_TOKEN_TTL;
 use bsmcp_common::db::{DbBackend, SemanticDb};
@@ -19,7 +20,7 @@ const BASE64: base64::engine::general_purpose::GeneralPurpose =
 
 pub struct PostgresDb {
     pool: PgPool,
-    encryption_key: [u8; 32],
+    encryption_key: Zeroizing<[u8; 32]>,
 }
 
 impl PostgresDb {
@@ -54,14 +55,20 @@ impl PostgresDb {
             .ok();
 
         let hash = sha2::Sha256::digest(encryption_key.as_bytes());
-        let mut key = [0u8; 32];
+        let mut key = Zeroizing::new([0u8; 32]);
         key.copy_from_slice(&hash);
 
         Ok(Self { pool, encryption_key: key })
     }
 
+    /// SHA-256 hash a bearer token before storing as primary key.
+    fn hash_token(token: &str) -> String {
+        let hash = sha2::Sha256::digest(token.as_bytes());
+        format!("{hash:x}")
+    }
+
     fn encrypt(&self, plaintext: &str) -> String {
-        let cipher = Aes256Gcm::new((&self.encryption_key).into());
+        let cipher = Aes256Gcm::new((&*self.encryption_key).into());
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
         let ciphertext = cipher
             .encrypt(&nonce, plaintext.as_bytes())
@@ -78,7 +85,7 @@ impl PostgresDb {
         }
         let (nonce_bytes, ciphertext) = combined.split_at(12);
         let nonce = aes_gcm::Nonce::from_slice(nonce_bytes);
-        let cipher = Aes256Gcm::new((&self.encryption_key).into());
+        let cipher = Aes256Gcm::new((&*self.encryption_key).into());
         let plaintext = cipher.decrypt(nonce, ciphertext).ok()?;
         String::from_utf8(plaintext).ok()
     }
@@ -106,6 +113,7 @@ impl DbBackend for PostgresDb {
                 .await
                 .ok();
         }
+        let token_hash = Self::hash_token(token);
         let enc_id = self.encrypt(id);
         let enc_secret = self.encrypt(secret);
         sqlx::query(
@@ -113,7 +121,7 @@ impl DbBackend for PostgresDb {
              VALUES ($1, $2, $3, $4)
              ON CONFLICT (token) DO UPDATE SET token_id = $2, token_secret = $3, created_at = $4"
         )
-        .bind(token)
+        .bind(&token_hash)
         .bind(&enc_id)
         .bind(&enc_secret)
         .bind(Self::now_secs())
@@ -125,16 +133,35 @@ impl DbBackend for PostgresDb {
 
     async fn get_access_token(&self, token: &str) -> Result<Option<(String, String)>, String> {
         let cutoff = Self::now_secs() - ACCESS_TOKEN_TTL.as_secs() as i64;
+        let token_hash = Self::hash_token(token);
+
+        // Try hashed token first, then fall back to raw token (pre-hash migration)
         let row = sqlx::query(
             "SELECT token_id, token_secret FROM access_tokens WHERE token = $1 AND created_at > $2"
         )
-        .bind(token)
+        .bind(&token_hash)
         .bind(cutoff)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| format!("get_access_token failed: {e}"))?;
 
-        let Some(row) = row else { return Ok(None); };
+        let row = match row {
+            Some(r) => r,
+            None => {
+                // Fallback: try raw token (pre-hash tokens from migration or older versions)
+                match sqlx::query(
+                    "SELECT token_id, token_secret FROM access_tokens WHERE token = $1 AND created_at > $2"
+                )
+                .bind(token)
+                .bind(cutoff)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| format!("get_access_token fallback failed: {e}"))? {
+                    Some(r) => r,
+                    None => return Ok(None),
+                }
+            }
+        };
 
         let stored_id: String = row.get("token_id");
         let stored_secret: String = row.get("token_secret");
@@ -465,16 +492,20 @@ impl SemanticDb for PostgresDb {
     }
 
     async fn create_embed_job(&self, scope: &str) -> Result<(i64, bool), String> {
-        // Check for existing active job with same scope — return it instead of creating duplicate
+        // Atomic check-and-insert in a serializable transaction to prevent duplicates
+        let mut tx = self.pool.begin().await
+            .map_err(|e| format!("create_embed_job transaction failed: {e}"))?;
+
         let existing = sqlx::query(
-            "SELECT id FROM embed_jobs WHERE scope = $1 AND status IN ('pending', 'running') ORDER BY id DESC LIMIT 1"
+            "SELECT id FROM embed_jobs WHERE scope = $1 AND status IN ('pending', 'running') ORDER BY id DESC LIMIT 1 FOR UPDATE"
         )
         .bind(scope)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| format!("create_embed_job check failed: {e}"))?;
 
         if let Some(row) = existing {
+            tx.commit().await.map_err(|e| format!("create_embed_job commit failed: {e}"))?;
             return Ok((row.get("id"), false));
         }
 
@@ -483,10 +514,11 @@ impl SemanticDb for PostgresDb {
         )
         .bind(scope)
         .bind(Self::now_secs())
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
-        .map_err(|e| format!("create_embed_job failed: {e}"))?;
+        .map_err(|e| format!("create_embed_job insert failed: {e}"))?;
 
+        tx.commit().await.map_err(|e| format!("create_embed_job commit failed: {e}"))?;
         Ok((row.get("id"), true))
     }
 

@@ -238,8 +238,11 @@ pub async fn run_pipeline(
     db.update_job_progress(job_id, 0, total_pages).await?;
     eprintln!("Pipeline: found {total_pages} pages to embed");
 
+    // Force re-embed when targeting specific pages (bypass content hash check)
+    let force = scope.starts_with("page:");
+
     for (i, page_id) in all_page_ids.iter().enumerate() {
-        if let Err(e) = embed_single_page(db, model, client, *page_id).await {
+        if let Err(e) = embed_single_page(db, model, client, *page_id, force).await {
             eprintln!("Pipeline: error embedding page {page_id}: {e}");
         }
 
@@ -255,11 +258,13 @@ pub async fn run_pipeline(
 }
 
 /// Embed a single page: fetch, check hash, chunk, embed, store relationships.
+/// When `force` is true, skip the content hash check and always re-embed.
 async fn embed_single_page(
     db: &Arc<dyn SemanticDb>,
     model: &Arc<EmbedModel>,
     client: &BookStackClient,
     page_id: i64,
+    force: bool,
 ) -> Result<(), String> {
     let page = client.get_page(page_id).await?;
 
@@ -273,17 +278,18 @@ async fn embed_single_page(
     let book_name = page.get("book").and_then(|b| b.get("name")).and_then(|v| v.as_str()).unwrap_or("");
     let chapter_name = page.get("chapter").and_then(|c| c.get("name")).and_then(|v| v.as_str()).unwrap_or("");
 
-    // Compute content hash to skip unchanged pages
+    // Compute content hash to skip unchanged pages (unless forced)
     let content_hash = {
         use sha2::{Sha256, Digest};
         let hash = Sha256::digest(html.as_bytes());
         hash.iter().map(|b| format!("{b:02x}")).collect::<String>()
     };
 
-    // Check if already embedded with same content
-    if let Ok(Some(existing_hash)) = db.get_page_content_hash(page_id).await {
-        if existing_hash == content_hash {
-            return Ok(());
+    if !force {
+        if let Ok(Some(existing_hash)) = db.get_page_content_hash(page_id).await {
+            if existing_hash == content_hash {
+                return Ok(());
+            }
         }
     }
 
@@ -299,6 +305,9 @@ async fn embed_single_page(
     // Chunk the HTML
     let chunks = chunking::chunk_html(html);
     if chunks.is_empty() {
+        if html.len() > 100 {
+            eprintln!("Pipeline: page {page_id} ({name}) has {len} bytes of HTML but chunker produced 0 chunks", len = html.len());
+        }
         db.upsert_page(&meta).await?;
         return Ok(());
     }

@@ -229,7 +229,7 @@ impl SemanticState {
         // Remove inaccessible pages
         page_scores.retain(|pid, _| accessible_set.contains(pid));
 
-        // Blanket re-ranking: boost pages whose neighbors also scored
+        // Blanket re-ranking: boost pages whose neighbors also appear in results
         let scored_page_ids: HashSet<i64> = page_scores.keys().copied().collect();
         for page_id in scored_page_ids.iter().copied() {
             let blanket = match self.db.get_markov_blanket(page_id).await {
@@ -251,8 +251,6 @@ impl SemanticState {
                 .count();
 
             if neighbor_count > 0 {
-                // Boost proportional to how many neighbors also appear in results
-                // Max boost: 0.15 (for 3+ neighbors)
                 let boost = (neighbor_count as f32 * 0.05).min(0.15);
                 if let Some(entry) = page_scores.get_mut(&page_id) {
                     entry.blanket_boost = boost;

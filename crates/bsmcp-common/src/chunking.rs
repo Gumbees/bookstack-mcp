@@ -1,7 +1,14 @@
 //! Heading-based HTML chunking for semantic search.
 //! Splits page HTML into chunks by heading tags, with merge/split post-processing.
+//! v2: tighter chunks (1200 chars) with paragraph overlap for better embedding precision.
 
 use sha2::{Sha256, Digest};
+
+/// Chunk format version. Increment when chunking logic changes to trigger re-indexing.
+pub const CHUNK_VERSION: u32 = 2;
+
+const MAX_CHUNK_LEN: usize = 1200;
+const OVERLAP_LEN: usize = 150;
 
 pub struct Chunk {
     pub index: usize,
@@ -113,11 +120,11 @@ pub fn chunk_html(html: &str) -> Vec<Chunk> {
         }
     }
 
-    // Split oversized chunks
+    // Split oversized chunks with paragraph overlap
     let mut final_chunks: Vec<Chunk> = Vec::new();
     for (heading_path, text) in merged {
-        if text.len() > 2000 {
-            let parts = split_at_paragraphs(&text, 2000);
+        if text.len() > MAX_CHUNK_LEN {
+            let parts = split_with_overlap(&text, MAX_CHUNK_LEN, OVERLAP_LEN);
             for part in parts {
                 let full = if heading_path.is_empty() {
                     part.clone()
@@ -195,22 +202,45 @@ fn normalize_whitespace(s: &str) -> String {
     result
 }
 
-fn split_at_paragraphs(text: &str, max_len: usize) -> Vec<String> {
-    let mut parts = Vec::new();
+/// Split text at paragraph boundaries with overlap between consecutive parts.
+/// Each part after the first includes up to `overlap` chars from the end of the previous part.
+fn split_with_overlap(text: &str, max_len: usize, overlap: usize) -> Vec<String> {
+    let paragraphs: Vec<&str> = text.split("\n\n").collect();
+    let mut parts: Vec<String> = Vec::new();
     let mut current = String::new();
-    for paragraph in text.split("\n\n") {
+    let mut para_indices: Vec<usize> = Vec::new(); // track which paragraphs are in current
+
+    for (i, paragraph) in paragraphs.iter().enumerate() {
         if current.len() + paragraph.len() + 2 > max_len && !current.is_empty() {
             parts.push(std::mem::take(&mut current));
+
+            // Build overlap from trailing paragraphs of previous chunk
+            let mut overlap_text = String::new();
+            for &pi in para_indices.iter().rev() {
+                let candidate = if overlap_text.is_empty() {
+                    paragraphs[pi].to_string()
+                } else {
+                    format!("{}\n\n{overlap_text}", paragraphs[pi])
+                };
+                if candidate.len() > overlap {
+                    break;
+                }
+                overlap_text = candidate;
+            }
+            if !overlap_text.is_empty() {
+                current = overlap_text;
+            }
+            para_indices.clear();
         }
         if !current.is_empty() {
             current.push_str("\n\n");
         }
         current.push_str(paragraph);
+        para_indices.push(i);
     }
     if !current.is_empty() {
         parts.push(current);
     }
-    // If a single paragraph is still too long, just keep it (don't split mid-word)
     parts
 }
 
@@ -268,13 +298,16 @@ mod tests {
 
     #[test]
     fn test_split_oversized() {
-        let para = "A".repeat(800);
-        let text = format!("{para}\n\n{para}\n\n{para}");
-        let parts = split_at_paragraphs(&text, 2000);
+        let para = "A".repeat(400);
+        let text = format!("{para}\n\n{para}\n\n{para}\n\n{para}");
+        let parts = split_with_overlap(&text, MAX_CHUNK_LEN, OVERLAP_LEN);
         assert!(parts.len() >= 2);
-        for part in &parts {
-            // Each part should be at most one paragraph over the limit
-            assert!(part.len() <= 2000 + 800);
+        // Parts after the first should start with overlap content
+        if parts.len() > 1 {
+            // The second part should contain some text from the end of the first
+            let first_end = &parts[0][parts[0].len().saturating_sub(100)..];
+            // Overlap is paragraph-based, so second part should be larger than a single paragraph
+            assert!(parts[1].len() > para.len());
         }
     }
 

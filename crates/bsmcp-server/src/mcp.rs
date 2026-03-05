@@ -79,9 +79,9 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
             let sem = semantic.ok_or("Semantic search is not enabled")?;
             let query = arg_str(args, "query")?;
             let limit = arg_i64(args, "limit", 10).clamp(1, 50) as usize;
-            let threshold = args.get("threshold").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32;
-            // Pass the user's client for permission filtering
-            let result = sem.search(&query, limit, threshold, client).await?;
+            let threshold = args.get("threshold").and_then(|v| v.as_f64()).unwrap_or(0.65) as f32;
+            let hybrid = args.get("hybrid").and_then(|v| v.as_bool()).unwrap_or(true);
+            let result = sem.search(&query, limit, threshold, hybrid, client).await?;
             format_json(&result)
         }
         "reembed" => {
@@ -1038,13 +1038,14 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
 
     if semantic_enabled {
         tools.push(tool("semantic_search",
-            "Search content by meaning using vector embeddings. Finds conceptually related pages without exact keyword matches. Returns matching chunks with relevance scores and a Markov blanket of contextually related pages.",
+            "Hybrid search combining vector embeddings with keyword matching. Finds pages by meaning AND exact terms. Results are re-ranked using graph relationships (Markov blanket). Set hybrid=false for pure vector search only.",
             json!({
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Natural language search query" },
                     "limit": { "type": "integer", "description": "Max number of page results to return", "default": 10 },
-                    "threshold": { "type": "number", "description": "Minimum cosine similarity score (0.0-1.0)", "default": 0.5 }
+                    "threshold": { "type": "number", "description": "Minimum cosine similarity score (0.0-1.0)", "default": 0.65 },
+                    "hybrid": { "type": "boolean", "description": "Combine vector + keyword search (default true). Set false for pure vector.", "default": true }
                 },
                 "required": ["query"]
             })));

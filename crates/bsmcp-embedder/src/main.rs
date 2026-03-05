@@ -250,9 +250,30 @@ async fn job_queue_worker(db: Arc<dyn SemanticDb>, model: Arc<EmbedModel>, worke
     eprintln!("Embedder: job queue worker started (poll={}s, delay={}ms, batch={}, job_timeout={}s)",
         poll_interval, delay_ms, batch_size, job_timeout);
 
-    // Auto-embed on startup if requested
+    // Check chunk version — auto-reindex if chunking logic changed
+    let current_chunk_version = bsmcp_common::chunking::CHUNK_VERSION.to_string();
+    let stored_version = db.get_meta("chunk_version").await.unwrap_or(None);
+    let needs_reindex = stored_version.as_deref() != Some(&current_chunk_version);
+    if needs_reindex {
+        eprintln!("Embedder: chunk version changed ({} → {}) — triggering clean re-index",
+            stored_version.as_deref().unwrap_or("none"), current_chunk_version);
+        match db.clear_all_embeddings().await {
+            Ok(()) => eprintln!("Embedder: cleared all embeddings for re-index"),
+            Err(e) => eprintln!("Embedder: failed to clear embeddings: {e}"),
+        }
+        match db.create_embed_job("all").await {
+            Ok((job_id, true)) => eprintln!("Embedder: auto-queued full embed job {job_id}"),
+            Ok((_, false)) => eprintln!("Embedder: re-index job already active"),
+            Err(e) => eprintln!("Embedder: failed to queue re-index: {e}"),
+        }
+        if let Err(e) = db.set_meta("chunk_version", &current_chunk_version).await {
+            eprintln!("Embedder: failed to store chunk_version: {e}");
+        }
+    }
+
+    // Auto-embed on startup if requested (and not already triggered by version change)
     let embed_on_startup = env::var("BSMCP_EMBED_ON_STARTUP").unwrap_or_default();
-    if embed_on_startup == "true" || embed_on_startup == "clean" {
+    if !needs_reindex && (embed_on_startup == "true" || embed_on_startup == "clean") {
         if embed_on_startup == "clean" {
             match db.clear_all_embeddings().await {
                 Ok(()) => eprintln!("Embedder: cleared all embeddings for clean re-index"),

@@ -258,6 +258,10 @@ impl SemanticDb for PostgresDb {
         sqlx::query("ALTER TABLE embed_jobs ADD COLUMN IF NOT EXISTS worker_id TEXT")
             .execute(&self.pool).await.ok();
 
+        // Metadata key-value store (v0.5.0+)
+        sqlx::query("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .execute(&self.pool).await.ok();
+
         eprintln!("Semantic: PostgreSQL tables initialized");
         Ok(())
     }
@@ -706,6 +710,25 @@ impl SemanticDb for PostgresDb {
             .map_err(|e| format!("clear chunks: {e}"))?;
         sqlx::query("DELETE FROM pages").execute(&self.pool).await
             .map_err(|e| format!("clear pages: {e}"))?;
+        Ok(())
+    }
+
+    async fn get_meta(&self, key: &str) -> Result<Option<String>, String> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT value FROM meta WHERE key = $1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| format!("get_meta: {e}"))?;
+        Ok(row.map(|r| r.0))
+    }
+
+    async fn set_meta(&self, key: &str, value: &str) -> Result<(), String> {
+        sqlx::query("INSERT INTO meta (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2")
+            .bind(key)
+            .bind(value)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("set_meta: {e}"))?;
         Ok(())
     }
 }

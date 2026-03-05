@@ -243,6 +243,40 @@ The token ID and secret come from your BookStack API token (created under **My A
 
 All schema migrations are automatic on startup (CREATE TABLE IF NOT EXISTS, ALTER TABLE for new columns). No manual SQL is needed.
 
+### From v0.4.0 to v0.5.0
+
+v0.5.0 is a search quality release — no infrastructure changes, just better results.
+
+#### What's new
+
+- **Hybrid search** — combines vector similarity with BookStack keyword search, weighted blend (70% vector + 20% keyword + blanket boost)
+- **Markov blanket re-ranking** — pages whose graph neighbors also scored get a relevance boost (up to +0.15)
+- **Tighter chunking** — max chunk size reduced from 2000 to 1200 chars with 150-char paragraph overlap between chunks
+- **Higher default threshold** — raised from 0.50 to 0.65 to filter out low-quality matches
+- **Auto-reindex on upgrade** — chunk version tracking triggers automatic clean re-index when chunking logic changes
+- **`meta` table** — new key-value metadata table in both SQLite and PostgreSQL backends
+
+#### What's automatic
+
+- **Full re-index** — the embedder detects the chunk version change (v1 → v2) and automatically clears all embeddings and re-indexes everything on first startup. No manual `reembed` needed.
+- Schema migration — `meta` table created automatically on startup
+- All existing env vars and compose files are compatible
+
+#### What you must do
+
+1. **Pull new images**: `ghcr.io/gumbees/bsmcp-server:0.5.0` + `ghcr.io/gumbees/bsmcp-embedder:0.5.0`
+2. **Restart** — the embedder auto-detects the chunk version change and re-indexes. Check progress at `/status`.
+3. **No env var changes required** — new `hybrid` parameter defaults to `true` in the `semantic_search` tool
+
+#### New `semantic_search` parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `threshold` | `0.65` | Minimum score (was 0.50 in v0.4.0) |
+| `hybrid` | `true` | Enable keyword + vector blended search |
+
+Results now include a `scoring` breakdown when hybrid mode is on, showing vector, keyword, and blanket_boost components.
+
 ### From v0.3.x to v0.4.0
 
 v0.4.0 splits the monolithic `bookstack-mcp` container into separate **server** and **embedder** binaries with a pluggable database layer (SQLite or PostgreSQL + pgvector).
@@ -267,7 +301,7 @@ v0.4.0 splits the monolithic `bookstack-mcp` container into separate **server** 
 
 1. **Replace compose file and images**:
    - Old: single `ghcr.io/gumbees/bookstack-mcp:latest` container
-   - New: `ghcr.io/gumbees/bsmcp-server:0.4.0` + `ghcr.io/gumbees/bsmcp-embedder:0.4.0`
+   - New: `ghcr.io/gumbees/bsmcp-server:latest` + `ghcr.io/gumbees/bsmcp-embedder:latest`
    - Use `docker/docker-compose.sqlite.yml` (simple) or `docker/docker-compose.yml` (PostgreSQL)
 
 2. **Add new env vars**:
@@ -349,7 +383,7 @@ This is the largest jump — from a single monolithic container with no encrypti
    - Old: `docker-compose.yml` with `ghcr.io/gumbees/bookstack-mcp:latest`
    - New (SQLite): `docker/docker-compose.sqlite.yml`
    - New (PostgreSQL): `docker/docker-compose.yml`
-   - Images: `ghcr.io/gumbees/bsmcp-server:0.4.0` + `ghcr.io/gumbees/bsmcp-embedder:0.4.0`
+   - Images: `ghcr.io/gumbees/bsmcp-server:latest` + `ghcr.io/gumbees/bsmcp-embedder:latest`
 
 4. **Create a BookStack API token** for the embedder with read access to all content
 

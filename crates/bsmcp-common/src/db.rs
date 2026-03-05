@@ -76,4 +76,12 @@ pub trait SemanticDb: Send + Sync + 'static {
 
     /// Delete all pages, chunks, and relationships. Used for full re-index.
     async fn clear_all_embeddings(&self) -> Result<(), String>;
+
+    // --- Metadata key-value store ---
+
+    /// Get a metadata value by key. Used for storing chunk_version, etc.
+    async fn get_meta(&self, key: &str) -> Result<Option<String>, String>;
+
+    /// Set a metadata value by key.
+    async fn set_meta(&self, key: &str, value: &str) -> Result<(), String>;
 }

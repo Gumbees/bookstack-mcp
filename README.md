@@ -139,6 +139,7 @@ cargo run --release -p bsmcp-embedder
 | `BSMCP_EMBED_BATCH_SIZE` | No | `32` | Chunks per embedding batch |
 | `BSMCP_EMBED_DELAY_MS` | No | `50` | Delay between pages (API throttle) |
 | `BSMCP_EMBED_POLL_INTERVAL` | No | `5` | Seconds between job queue polls |
+| `BSMCP_EMBED_ON_STARTUP` | No | `false` | Auto-queue a full embed job on startup |
 | `BSMCP_EMBED_HOST` | No | `0.0.0.0` | Embedder listen address |
 | `BSMCP_EMBED_PORT` | No | `8081` | Embedder listen port |
 

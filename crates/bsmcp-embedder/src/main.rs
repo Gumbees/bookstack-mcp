@@ -250,6 +250,15 @@ async fn job_queue_worker(db: Arc<dyn SemanticDb>, model: Arc<EmbedModel>, worke
     eprintln!("Embedder: job queue worker started (poll={}s, delay={}ms, batch={}, job_timeout={}s)",
         poll_interval, delay_ms, batch_size, job_timeout);
 
+    // Auto-embed on startup if requested
+    if env::var("BSMCP_EMBED_ON_STARTUP").unwrap_or_default() == "true" {
+        match db.create_embed_job("all").await {
+            Ok((job_id, true)) => eprintln!("Embedder: auto-queued full embed job {job_id}"),
+            Ok((_, false)) => eprintln!("Embedder: auto-embed skipped — job already active"),
+            Err(e) => eprintln!("Embedder: auto-embed failed to queue: {e}"),
+        }
+    }
+
     loop {
         // Expire stale jobs before claiming
         if let Ok(expired) = db.expire_stale_jobs(job_timeout).await {

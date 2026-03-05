@@ -69,8 +69,8 @@ impl EmbedModel {
                 .map_err(|e| format!("Model init failed: {e}"))?
         } else {
             // Custom model: download from HuggingFace and load via UserDefinedEmbeddingModel
-            let model_dir = download_hf_model(config.hf_repo, cache_dir)?;
-            load_custom_model(&model_dir)?
+            let downloaded = download_hf_model(config.hf_repo, cache_dir)?;
+            load_custom_model(&downloaded)?
         };
 
         eprintln!("Model loaded: {} ({} dims)", config.hf_repo, config.dims);
@@ -92,8 +92,20 @@ impl EmbedModel {
     }
 }
 
-/// Download model files from HuggingFace Hub, returning the cached directory.
-fn download_hf_model(repo_id: &str, cache_dir: &str) -> Result<PathBuf, String> {
+/// Downloaded model file paths.
+struct DownloadedModel {
+    onnx_path: PathBuf,
+    onnx_data_path: Option<PathBuf>,
+    tokenizer_path: PathBuf,
+    config_path: PathBuf,
+    special_tokens_path: PathBuf,
+    tokenizer_config_path: PathBuf,
+}
+
+/// Download model files from HuggingFace Hub.
+/// Handles repos where ONNX files are in a subfolder (e.g. onnx/model.onnx)
+/// while tokenizer files are at root.
+fn download_hf_model(repo_id: &str, cache_dir: &str) -> Result<DownloadedModel, String> {
     use hf_hub::api::sync::ApiBuilder;
 
     eprintln!("Downloading model from HuggingFace: {repo_id}");
@@ -103,57 +115,59 @@ fn download_hf_model(repo_id: &str, cache_dir: &str) -> Result<PathBuf, String> 
         .map_err(|e| format!("HF API init failed: {e}"))?;
     let repo = api.model(repo_id.to_string());
 
-    // Download required files
-    let required_files = [
-        "model.onnx",
-        "tokenizer.json",
-        "config.json",
-        "special_tokens_map.json",
-        "tokenizer_config.json",
-    ];
-
-    let mut model_dir = None;
-    for filename in &required_files {
+    let get = |filename: &str| -> Result<PathBuf, String> {
         let path = repo.get(filename)
             .map_err(|e| format!("Failed to download {filename}: {e}"))?;
-        if model_dir.is_none() {
-            model_dir = path.parent().map(|p| p.to_path_buf());
-        }
         eprintln!("  cached: {}", path.display());
-    }
-
-    // Also try to download model.onnx_data (external weights, used by EmbeddingGemma)
-    match repo.get("model.onnx_data") {
-        Ok(path) => eprintln!("  cached: {}", path.display()),
-        Err(_) => eprintln!("  no model.onnx_data (not needed for this model)"),
-    }
-
-    model_dir.ok_or_else(|| "Failed to determine model directory".to_string())
-}
-
-/// Load a custom ONNX model from a local directory.
-fn load_custom_model(model_dir: &Path) -> Result<TextEmbedding, String> {
-    let read = |name: &str| -> Result<Vec<u8>, String> {
-        std::fs::read(model_dir.join(name))
-            .map_err(|e| format!("Failed to read {name}: {e}"))
+        Ok(path)
     };
 
-    let onnx_file = read("model.onnx")?;
+    // Try onnx/model.onnx first (onnx-community layout), fall back to model.onnx
+    let onnx_path = get("onnx/model.onnx")
+        .or_else(|_| get("model.onnx"))?;
+
+    // External weights (optional)
+    let onnx_data_path = get("onnx/model.onnx_data")
+        .or_else(|_| get("model.onnx_data"))
+        .ok();
+
+    // Tokenizer files are always at root
+    let tokenizer_path = get("tokenizer.json")?;
+    let config_path = get("config.json")?;
+    let special_tokens_path = get("special_tokens_map.json")?;
+    let tokenizer_config_path = get("tokenizer_config.json")?;
+
+    Ok(DownloadedModel {
+        onnx_path,
+        onnx_data_path,
+        tokenizer_path,
+        config_path,
+        special_tokens_path,
+        tokenizer_config_path,
+    })
+}
+
+/// Load a custom ONNX model from downloaded file paths.
+fn load_custom_model(downloaded: &DownloadedModel) -> Result<TextEmbedding, String> {
+    let read = |path: &Path| -> Result<Vec<u8>, String> {
+        std::fs::read(path)
+            .map_err(|e| format!("Failed to read {}: {e}", path.display()))
+    };
+
+    let onnx_file = read(&downloaded.onnx_path)?;
     let tokenizer_files = TokenizerFiles {
-        tokenizer_file: read("tokenizer.json")?,
-        config_file: read("config.json")?,
-        special_tokens_map_file: read("special_tokens_map.json")?,
-        tokenizer_config_file: read("tokenizer_config.json")?,
+        tokenizer_file: read(&downloaded.tokenizer_path)?,
+        config_file: read(&downloaded.config_path)?,
+        special_tokens_map_file: read(&downloaded.special_tokens_path)?,
+        tokenizer_config_file: read(&downloaded.tokenizer_config_path)?,
     };
 
     let mut user_model = UserDefinedEmbeddingModel::new(onnx_file, tokenizer_files)
         .with_pooling(Pooling::Mean);
 
     // Load external weights file if present (EmbeddingGemma uses this)
-    let data_path = model_dir.join("model.onnx_data");
-    if data_path.exists() {
-        let data = std::fs::read(&data_path)
-            .map_err(|e| format!("Failed to read model.onnx_data: {e}"))?;
+    if let Some(ref data_path) = downloaded.onnx_data_path {
+        let data = read(data_path)?;
         user_model = user_model.with_external_initializer("model.onnx_data".to_string(), data);
     }
 

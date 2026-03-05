@@ -1038,11 +1038,11 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
 
     if semantic_enabled {
         tools.push(tool("semantic_search",
-            "Hybrid search combining vector embeddings with keyword matching. Finds pages by meaning AND exact terms. Results are re-ranked using graph relationships (Markov blanket). Set hybrid=false for pure vector search only.",
+            "Hybrid search combining vector embeddings with keyword matching. Finds pages by meaning AND exact terms. Results are re-ranked using graph relationships (Markov blanket). IMPORTANT: Include related terms, synonyms, and domain-specific vocabulary in your query for better recall. For example, instead of 'office gets hacked', search 'security breach incident response ransomware compromise recovery'. The richer the query, the better the vector matching. Set hybrid=false for pure vector search only.",
             json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Natural language search query" },
+                    "query": { "type": "string", "description": "Natural language search query. Include synonyms and related terms for better results." },
                     "limit": { "type": "integer", "description": "Max number of page results to return", "default": 10 },
                     "threshold": { "type": "number", "description": "Minimum cosine similarity score (0.0-1.0)", "default": 0.65 },
                     "hybrid": { "type": "boolean", "description": "Combine vector + keyword search (default true). Set false for pure vector.", "default": true }

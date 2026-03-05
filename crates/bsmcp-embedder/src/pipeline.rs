@@ -269,6 +269,10 @@ async fn embed_single_page(
     let book_id = page.get("book_id").and_then(|v| v.as_i64()).unwrap_or(0);
     let chapter_id = page.get("chapter_id").and_then(|v| v.as_i64());
 
+    // Extract book/chapter names for chunk context injection
+    let book_name = page.get("book").and_then(|b| b.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+    let chapter_name = page.get("chapter").and_then(|c| c.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+
     // Compute content hash to skip unchanged pages
     let content_hash = {
         use sha2::{Sha256, Digest};
@@ -299,8 +303,19 @@ async fn embed_single_page(
         return Ok(());
     }
 
-    // Embed all chunks
-    let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
+    // Build context prefix for embedding (book > chapter > page hierarchy)
+    let context_prefix = {
+        let mut parts = Vec::new();
+        if !book_name.is_empty() { parts.push(book_name.to_string()); }
+        if !chapter_name.is_empty() { parts.push(chapter_name.to_string()); }
+        parts.push(name.to_string());
+        format!("[{}]\n\n", parts.join(" > "))
+    };
+
+    // Prepend context to chunk text for embedding (stored content stays clean for display)
+    let texts: Vec<String> = chunks.iter()
+        .map(|c| format!("{context_prefix}{}", c.content))
+        .collect();
     let model = model.clone();
     let embeddings = tokio::task::spawn_blocking(move || {
         model.embed(texts)

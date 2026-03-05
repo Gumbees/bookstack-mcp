@@ -5,7 +5,7 @@
 use sha2::{Sha256, Digest};
 
 /// Chunk format version. Increment when chunking logic changes to trigger re-indexing.
-pub const CHUNK_VERSION: u32 = 2;
+pub const CHUNK_VERSION: u32 = 3;
 
 const MAX_CHUNK_LEN: usize = 1200;
 const OVERLAP_LEN: usize = 150;

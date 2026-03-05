@@ -37,12 +37,12 @@ docker/
 
 The MCP server handles all client-facing protocol, OAuth, and search. The embedder runs separately, polling a database-backed job queue to embed pages and serving a `/embed` HTTP endpoint for query-time embedding. This keeps the ONNX model out of the server process.
 
-## Available Tools (53)
+## Available Tools (56)
 
 | Category | Tools |
 |----------|-------|
 | **Search** | `search_content` |
-| **Semantic** | `semantic_search`, `reembed`, `embed_status` |
+| **Semantic** | `semantic_search`, `reembed`, `embedding_status` |
 | **Shelves** | `list_shelves`, `get_shelf`, `create_shelf`, `update_shelf`, `delete_shelf` |
 | **Books** | `list_books`, `get_book`, `create_book`, `update_book`, `delete_book` |
 | **Chapters** | `list_chapters`, `get_chapter`, `create_chapter`, `update_chapter`, `delete_chapter` |
@@ -58,7 +58,7 @@ The MCP server handles all client-facing protocol, OAuth, and search. The embedd
 | **Permissions** | `get_content_permissions`, `update_content_permissions` |
 | **Roles** | `list_roles`, `get_role` |
 
-Semantic tools (`semantic_search`, `reembed`, `embed_status`) only appear when `BSMCP_SEMANTIC_SEARCH=true` and an embedder is running.
+Semantic tools (`semantic_search`, `reembed`, `embedding_status`) only appear when `BSMCP_SEMANTIC_SEARCH=true` and an embedder is running. Without semantic search: 53 tools.
 
 ## Setup
 

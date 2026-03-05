@@ -31,7 +31,7 @@ pub async fn handle_request(request: &Value, client: &BookStackClient, semantic:
                 "capabilities": { "tools": {} },
                 "serverInfo": {
                     "name": "BookStack MCP",
-                    "version": "0.3.0",
+                    "version": env!("CARGO_PKG_VERSION"),
                 },
                 "instructions": instructions,
             })))

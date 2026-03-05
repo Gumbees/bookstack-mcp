@@ -132,7 +132,7 @@ cargo run --release -p bsmcp-embedder
 |----------|----------|---------|-------------|
 | `BSMCP_EMBED_TOKEN_ID` | Yes | - | BookStack API token ID for crawling |
 | `BSMCP_EMBED_TOKEN_SECRET` | Yes | - | BookStack API token secret |
-| `BSMCP_EMBED_MODEL` | No | `BAAI/bge-large-en-v1.5` | Embedding model name |
+| `BSMCP_EMBED_MODEL` | No | `embeddinggemma-300m` | Embedding model (see [Supported Models](#supported-models)) |
 | `BSMCP_MODEL_PATH` | No | `/data/models` | ONNX model cache directory |
 | `BSMCP_EMBED_CPUS` | No | `0` (unlimited) | Docker CPU limit for embedder |
 | `BSMCP_EMBED_JOB_TIMEOUT` | No | `14400` | Seconds before stuck jobs reset |
@@ -242,6 +242,28 @@ The token ID and secret come from your BookStack API token (created under **My A
 ## Upgrading
 
 All schema migrations are automatic on startup (CREATE TABLE IF NOT EXISTS, ALTER TABLE for new columns). No manual SQL is needed.
+
+### From v0.5.0 to v0.5.1
+
+v0.5.1 switches the default embedding model and adds automatic model change detection.
+
+#### What's new
+
+- **Default model: EmbeddingGemma-300M** — Google's lightweight embedding model (768 dims, 300M params). Faster and lighter than BGE-large, especially on ARM.
+- **Model change detection** — embedder detects model changes via meta table and auto-triggers clean re-index with pgvector dimension adjustment
+- **Configurable embedding dimensions** — pgvector column type automatically adjusts when switching models
+- **HuggingFace model downloads** — custom ONNX models download automatically from HuggingFace Hub
+
+#### What's automatic
+
+- **Full re-index** — switching from BGE-large (1024 dims) to EmbeddingGemma (768 dims) triggers automatic clean re-index. PostgreSQL column type is altered automatically.
+- No env var changes required unless you want to keep the old model
+
+#### What you must do
+
+1. **Pull new images**: `ghcr.io/gumbees/bsmcp-server:0.5.1` + `ghcr.io/gumbees/bsmcp-embedder:0.5.1`
+2. **Restart** — the embedder auto-detects the model change and re-indexes. Check progress at `/status`.
+3. **To keep the old model**: Set `BSMCP_EMBED_MODEL=BAAI/bge-large-en-v1.5` in your embedder env.
 
 ### From v0.4.0 to v0.5.0
 
@@ -398,6 +420,17 @@ See the [v0.1.3 release notes](https://github.com/gumbees/bookstack-mcp/releases
 - `BSMCP_PUBLIC_URL` renamed to `BSMCP_PUBLIC_DOMAIN`
 - Docker volume renamed `mcp-data` to `bsmcp-data`
 - PKCE enforcement for OAuth
+
+## Supported Models
+
+| Model Name | Dimensions | Parameters | Notes |
+|------------|-----------|------------|-------|
+| `embeddinggemma-300m` | 768 | 300M | **Default.** Google's lightweight model, optimized for on-device. Fast on ARM. |
+| `BAAI/bge-large-en-v1.5` | 1024 | 335M | Previous default. High quality, heavier. |
+| `BAAI/bge-base-en-v1.5` | 768 | 110M | Good balance of speed and quality. |
+| `BAAI/bge-small-en-v1.5` | 384 | 33M | Fastest BGE variant, lower quality. |
+
+Set via `BSMCP_EMBED_MODEL`. Changing models triggers an automatic clean re-index on next embedder startup — no manual intervention needed.
 
 ## Search Operators
 

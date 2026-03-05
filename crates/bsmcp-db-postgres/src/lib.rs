@@ -713,6 +713,24 @@ impl SemanticDb for PostgresDb {
         Ok(())
     }
 
+    async fn alter_embedding_dimension(&self, dims: usize) -> Result<(), String> {
+        // Drop the HNSW index, alter column type, recreate index
+        sqlx::query("DROP INDEX IF EXISTS idx_chunks_embedding")
+            .execute(&self.pool).await
+            .map_err(|e| format!("drop index: {e}"))?;
+        let alter_sql = format!(
+            "ALTER TABLE chunks ALTER COLUMN embedding TYPE vector({dims}) USING embedding::vector({dims})"
+        );
+        sqlx::query(&alter_sql)
+            .execute(&self.pool).await
+            .map_err(|e| format!("alter column: {e}"))?;
+        sqlx::query("CREATE INDEX idx_chunks_embedding ON chunks USING hnsw (embedding vector_cosine_ops)")
+            .execute(&self.pool).await
+            .map_err(|e| format!("recreate index: {e}"))?;
+        eprintln!("PostgreSQL: embedding column altered to vector({dims})");
+        Ok(())
+    }
+
     async fn get_meta(&self, key: &str) -> Result<Option<String>, String> {
         let row: Option<(String,)> = sqlx::query_as("SELECT value FROM meta WHERE key = $1")
             .bind(key)

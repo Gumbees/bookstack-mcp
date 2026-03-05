@@ -1,30 +1,88 @@
 //! Embedding pipeline: fetch pages from BookStack, chunk, embed, store.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use fastembed::{TextEmbedding, InitOptions, EmbeddingModel};
+use fastembed::{
+    EmbeddingModel, InitOptions, InitOptionsUserDefined, Pooling, TextEmbedding,
+    TokenizerFiles, UserDefinedEmbeddingModel,
+};
 
 use bsmcp_common::bookstack::BookStackClient;
 use bsmcp_common::chunking;
 use bsmcp_common::db::SemanticDb;
 use bsmcp_common::types::{ChunkInsert, PageMeta};
 
+/// Known model configurations.
+struct ModelConfig {
+    builtin: Option<EmbeddingModel>,
+    hf_repo: &'static str,
+    dims: usize,
+}
+
+/// Resolve a model name to its configuration.
+fn resolve_model(name: &str) -> Option<ModelConfig> {
+    match name {
+        "BAAI/bge-large-en-v1.5" => Some(ModelConfig {
+            builtin: Some(EmbeddingModel::BGELargeENV15),
+            hf_repo: "BAAI/bge-large-en-v1.5",
+            dims: 1024,
+        }),
+        "BAAI/bge-base-en-v1.5" => Some(ModelConfig {
+            builtin: Some(EmbeddingModel::BGEBaseENV15),
+            hf_repo: "BAAI/bge-base-en-v1.5",
+            dims: 768,
+        }),
+        "BAAI/bge-small-en-v1.5" => Some(ModelConfig {
+            builtin: Some(EmbeddingModel::BGESmallENV15),
+            hf_repo: "BAAI/bge-small-en-v1.5",
+            dims: 384,
+        }),
+        "onnx-community/embeddinggemma-300m-ONNX"
+        | "google/embeddinggemma-300m"
+        | "embeddinggemma-300m" => Some(ModelConfig {
+            builtin: None,
+            hf_repo: "onnx-community/embeddinggemma-300m-ONNX",
+            dims: 768,
+        }),
+        _ => None,
+    }
+}
+
 /// Thread-safe wrapper around the fastembed TextEmbedding model.
 pub struct EmbedModel {
     model: std::sync::Mutex<TextEmbedding>,
+    dims: usize,
 }
 
 impl EmbedModel {
-    pub fn new(model_path: &str) -> Result<Self, String> {
-        let options = InitOptions::new(EmbeddingModel::BGELargeENV15)
-            .with_cache_dir(model_path.into())
-            .with_show_download_progress(true);
-        let model = TextEmbedding::try_new(options)
-            .map_err(|e| format!("Model init failed: {e}"))?;
-        eprintln!("Model loaded: BAAI/bge-large-en-v1.5 (1024 dims)");
+    pub fn new(model_name: &str, cache_dir: &str) -> Result<Self, String> {
+        let config = resolve_model(model_name)
+            .ok_or_else(|| format!("Unknown model: {model_name}. Supported: BAAI/bge-large-en-v1.5, BAAI/bge-base-en-v1.5, BAAI/bge-small-en-v1.5, embeddinggemma-300m"))?;
+
+        let model = if let Some(builtin) = config.builtin {
+            // Use fastembed's built-in model registry
+            let options = InitOptions::new(builtin)
+                .with_cache_dir(cache_dir.into())
+                .with_show_download_progress(true);
+            TextEmbedding::try_new(options)
+                .map_err(|e| format!("Model init failed: {e}"))?
+        } else {
+            // Custom model: download from HuggingFace and load via UserDefinedEmbeddingModel
+            let model_dir = download_hf_model(config.hf_repo, cache_dir)?;
+            load_custom_model(&model_dir)?
+        };
+
+        eprintln!("Model loaded: {} ({} dims)", config.hf_repo, config.dims);
         Ok(Self {
             model: std::sync::Mutex::new(model),
+            dims: config.dims,
         })
+    }
+
+    /// Return the embedding dimensions for this model.
+    pub fn dims(&self) -> usize {
+        self.dims
     }
 
     /// Embed a batch of texts. Thread-safe (locks internally).
@@ -32,6 +90,76 @@ impl EmbedModel {
         let mut m = self.model.lock().map_err(|e| format!("Model lock poisoned: {e}"))?;
         m.embed(texts, None).map_err(|e| format!("{e}"))
     }
+}
+
+/// Download model files from HuggingFace Hub, returning the cached directory.
+fn download_hf_model(repo_id: &str, cache_dir: &str) -> Result<PathBuf, String> {
+    use hf_hub::api::sync::ApiBuilder;
+
+    eprintln!("Downloading model from HuggingFace: {repo_id}");
+    let api = ApiBuilder::new()
+        .with_cache_dir(PathBuf::from(cache_dir))
+        .build()
+        .map_err(|e| format!("HF API init failed: {e}"))?;
+    let repo = api.model(repo_id.to_string());
+
+    // Download required files
+    let required_files = [
+        "model.onnx",
+        "tokenizer.json",
+        "config.json",
+        "special_tokens_map.json",
+        "tokenizer_config.json",
+    ];
+
+    let mut model_dir = None;
+    for filename in &required_files {
+        let path = repo.get(filename)
+            .map_err(|e| format!("Failed to download {filename}: {e}"))?;
+        if model_dir.is_none() {
+            model_dir = path.parent().map(|p| p.to_path_buf());
+        }
+        eprintln!("  cached: {}", path.display());
+    }
+
+    // Also try to download model.onnx_data (external weights, used by EmbeddingGemma)
+    match repo.get("model.onnx_data") {
+        Ok(path) => eprintln!("  cached: {}", path.display()),
+        Err(_) => eprintln!("  no model.onnx_data (not needed for this model)"),
+    }
+
+    model_dir.ok_or_else(|| "Failed to determine model directory".to_string())
+}
+
+/// Load a custom ONNX model from a local directory.
+fn load_custom_model(model_dir: &Path) -> Result<TextEmbedding, String> {
+    let read = |name: &str| -> Result<Vec<u8>, String> {
+        std::fs::read(model_dir.join(name))
+            .map_err(|e| format!("Failed to read {name}: {e}"))
+    };
+
+    let onnx_file = read("model.onnx")?;
+    let tokenizer_files = TokenizerFiles {
+        tokenizer_file: read("tokenizer.json")?,
+        config_file: read("config.json")?,
+        special_tokens_map_file: read("special_tokens_map.json")?,
+        tokenizer_config_file: read("tokenizer_config.json")?,
+    };
+
+    let mut user_model = UserDefinedEmbeddingModel::new(onnx_file, tokenizer_files)
+        .with_pooling(Pooling::Mean);
+
+    // Load external weights file if present (EmbeddingGemma uses this)
+    let data_path = model_dir.join("model.onnx_data");
+    if data_path.exists() {
+        let data = std::fs::read(&data_path)
+            .map_err(|e| format!("Failed to read model.onnx_data: {e}"))?;
+        user_model = user_model.with_external_initializer("model.onnx_data".to_string(), data);
+    }
+
+    let options = InitOptionsUserDefined::default();
+    TextEmbedding::try_new_from_user_defined(user_model, options)
+        .map_err(|e| format!("Custom model init failed: {e}"))
 }
 
 /// Run the embedding pipeline for a job.
@@ -209,8 +337,6 @@ async fn embed_single_page(
     db.replace_relationships(page_id, &targets).await?;
 
     // Store final page metadata with real content_hash — this is the commit marker.
-    // If we crashed after the preliminary upsert but before here, the empty hash
-    // ensures the page gets re-embedded on next run.
     db.upsert_page(&meta).await?;
 
     Ok(())

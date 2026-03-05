@@ -837,6 +837,11 @@ impl SemanticDb for SqliteDb {
         .map_err(|e| format!("Task failed: {e}"))?
     }
 
+    async fn alter_embedding_dimension(&self, _dims: usize) -> Result<(), String> {
+        // SQLite uses BLOB for embeddings — dimensionless, no schema change needed
+        Ok(())
+    }
+
     async fn get_meta(&self, key: &str) -> Result<Option<String>, String> {
         let conn = self.conn.clone();
         let key = key.to_string();

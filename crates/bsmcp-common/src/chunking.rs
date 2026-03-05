@@ -305,7 +305,7 @@ mod tests {
         // Parts after the first should start with overlap content
         if parts.len() > 1 {
             // The second part should contain some text from the end of the first
-            let first_end = &parts[0][parts[0].len().saturating_sub(100)..];
+            let _first_end = &parts[0][parts[0].len().saturating_sub(100)..];
             // Overlap is paragraph-based, so second part should be larger than a single paragraph
             assert!(parts[1].len() > para.len());
         }

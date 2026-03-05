@@ -147,14 +147,35 @@ See `.env.example` for the full list with comments.
 ### Semantic Search Setup
 
 1. Set `BSMCP_SEMANTIC_SEARCH=true` in your server env
-2. Set `BSMCP_WEBHOOK_SECRET` to a random string
+2. Set `BSMCP_WEBHOOK_SECRET` to a random string (16+ characters)
 3. Create a BookStack API token with read access for the embedder (`BSMCP_EMBED_TOKEN_ID` / `BSMCP_EMBED_TOKEN_SECRET`)
-4. Configure a webhook in BookStack: **Settings > Webhooks > Add Webhook**
-   - URL: `https://your-mcp-host/webhooks/bookstack`
-   - Events: Page Create, Page Update, Page Delete
-   - Add a custom header: `X-Webhook-Secret: YOUR_WEBHOOK_SECRET`
-5. Use the `reembed` tool to trigger initial embedding of all pages
-6. After initial embedding, page changes are automatically re-embedded via webhooks
+4. Start the embedder container — it downloads the ONNX model (~1.3GB) on first run
+5. Use the `reembed` tool (via Claude) to trigger initial embedding of all pages
+6. Configure a webhook in BookStack for automatic re-embedding on page changes:
+
+#### BookStack Webhook Configuration
+
+Go to **Settings > Webhooks > Create Webhook** in your BookStack instance:
+
+| Field | Value |
+|-------|-------|
+| **Name** | MCP Semantic Search |
+| **Endpoint URL** | `https://your-mcp-host/webhooks/bookstack` |
+| **Active** | Yes |
+
+**Events to select:**
+- Page Create
+- Page Update
+- Page Delete
+
+**Custom header** (required for verification):
+```
+X-Webhook-Secret: YOUR_WEBHOOK_SECRET
+```
+
+The `YOUR_WEBHOOK_SECRET` value must match `BSMCP_WEBHOOK_SECRET` in your server environment. The server uses constant-time comparison to verify the header.
+
+After saving, any page create/update/delete in BookStack automatically queues a re-embedding job. The embedder picks it up within seconds (configurable via `BSMCP_EMBED_POLL_INTERVAL`).
 
 ## Connecting
 
@@ -220,15 +241,75 @@ The token ID and secret come from your BookStack API token (created under **My A
 
 All schema migrations are automatic on startup (CREATE TABLE IF NOT EXISTS, ALTER TABLE for new columns). No manual SQL is needed.
 
-### From v0.1.x to v0.3.x
+### From v0.3.x to v0.4.0
 
-This is the largest jump — from a single monolithic container with no encryption and no semantic search to a multi-container workspace.
+v0.4.0 splits the monolithic `bookstack-mcp` container into separate **server** and **embedder** binaries with a pluggable database layer (SQLite or PostgreSQL + pgvector).
+
+#### What's new
+
+- **Separate containers** — `bsmcp-server` (MCP protocol, OAuth, search) and `bsmcp-embedder` (ONNX model, background embedding, `/embed` HTTP endpoint)
+- **PostgreSQL + pgvector** — optional production backend with native HNSW vector indexing
+- **Database-backed job queue** — embedding jobs persist across restarts
+- **Auto-migration** — switch `BSMCP_DB_BACKEND=postgres` and the server migrates SQLite data automatically
+- **Dual MCP transport** — SSE (2024-11-05) and Streamable HTTP (2025-03-26)
+- **New page editing tools** — `edit_page`, `append_to_page`, `replace_section`, `insert_after`
+
+#### What's automatic
+
+- SQLite schema is compatible — same tables, same columns
+- `worker_id` column auto-added to `embed_jobs` if missing
+- Existing embeddings preserved (same model: `BAAI/bge-large-en-v1.5`, same 1024 dimensions)
+- Auto-migration from SQLite to PostgreSQL when switching backends
+
+#### What you must do
+
+1. **Replace compose file and images**:
+   - Old: single `ghcr.io/gumbees/bookstack-mcp:latest` container
+   - New: `ghcr.io/gumbees/bsmcp-server:0.4.0` + `ghcr.io/gumbees/bsmcp-embedder:0.4.0`
+   - Use `docker/docker-compose.sqlite.yml` (simple) or `docker/docker-compose.yml` (PostgreSQL)
+
+2. **Add new env vars**:
+   ```bash
+   # Database backend (required)
+   BSMCP_DB_BACKEND=sqlite   # or postgres
+
+   # Embedder connection (required for semantic search)
+   BSMCP_EMBEDDER_URL=http://bsmcp-embedder:8081
+
+   # Separate BookStack API token for the embedder (required for semantic search)
+   BSMCP_EMBED_TOKEN_ID=<BookStack API token ID>
+   BSMCP_EMBED_TOKEN_SECRET=<BookStack API token secret>
+
+   # PostgreSQL (only if switching to postgres)
+   BSMCP_DATABASE_URL=postgres://bsmcp:yourpassword@bsmcp-postgres/bsmcp
+   BSMCP_DB_PASSWORD=yourpassword
+   ```
+
+3. **`BSMCP_EMBED_THREADS` is removed** — use `BSMCP_EMBED_CPUS` (Docker CPU limit) instead.
+
+4. **Update webhook** to use `X-Webhook-Secret` header instead of `?secret=` query param (query param still works but is deprecated).
+
+#### Migrating to PostgreSQL
+
+Set `BSMCP_DB_BACKEND=postgres` and keep the SQLite file accessible at `BSMCP_DB_PATH`. The server auto-migrates all data on startup and renames the SQLite file to `.db.migrated`.
+
+Manual migration is also available:
+```bash
+docker exec bsmcp-server bsmcp-server migrate \
+  --from-sqlite /data/bookstack-mcp.db \
+  --to-postgres postgres://bsmcp:yourpassword@bsmcp-postgres/bsmcp
+```
+
+Migration copies encrypted tokens as-is (portable when `BSMCP_ENCRYPTION_KEY` matches), converts embeddings from BLOB to pgvector format, and fixes PostgreSQL sequences.
+
+### From v0.1.x to v0.4.0
+
+This is the largest jump — from a single monolithic container with no encryption and no semantic search to the full multi-container architecture.
 
 #### What's automatic
 
 - Plaintext tokens from v0.1.0-0.1.2 are transparently encrypted on first access (the server detects unencrypted values and re-encrypts them in place)
 - All database tables are created on startup via `CREATE TABLE IF NOT EXISTS`
-- The `worker_id` column is auto-added to `embed_jobs`
 
 #### What you must do
 
@@ -254,8 +335,9 @@ This is the largest jump — from a single monolithic container with no encrypti
    BSMCP_WEBHOOK_SECRET=<random string, 16+ chars>
    BSMCP_EMBED_TOKEN_ID=<BookStack API token ID>
    BSMCP_EMBED_TOKEN_SECRET=<BookStack API token secret>
+   BSMCP_EMBEDDER_URL=http://bsmcp-embedder:8081
 
-   # ADD (for PostgreSQL — optional):
+   # ADD (for PostgreSQL — recommended):
    BSMCP_DB_BACKEND=postgres
    BSMCP_DATABASE_URL=postgres://bsmcp:yourpassword@bsmcp-postgres/bsmcp
    BSMCP_DB_PASSWORD=yourpassword
@@ -265,68 +347,13 @@ This is the largest jump — from a single monolithic container with no encrypti
    - Old: `docker-compose.yml` with `ghcr.io/gumbees/bookstack-mcp:latest`
    - New (SQLite): `docker/docker-compose.sqlite.yml`
    - New (PostgreSQL): `docker/docker-compose.yml`
-   - Images: `ghcr.io/gumbees/bsmcp-server:0.3.3` + `ghcr.io/gumbees/bsmcp-embedder:0.3.3`
+   - Images: `ghcr.io/gumbees/bsmcp-server:0.4.0` + `ghcr.io/gumbees/bsmcp-embedder:0.4.0`
 
 4. **Create a BookStack API token** for the embedder with read access to all content
 
-5. **Configure webhook** in BookStack (Settings > Webhooks) with `X-Webhook-Secret` header
+5. **Configure webhook** in BookStack (see [Semantic Search Setup](#semantic-search-setup))
 
 6. **Trigger initial embedding** via the `reembed` MCP tool
-
-### From v0.2.x to v0.3.x
-
-v0.3.0 splits the monolithic server into separate server and embedder containers with pluggable database backends.
-
-#### What's automatic
-
-- SQLite schema is compatible — same tables, same columns
-- `worker_id` column auto-added to `embed_jobs`
-- Existing embeddings preserved (same model: `BAAI/bge-large-en-v1.5`, same 1024 dimensions)
-- Auto-migration from SQLite to PostgreSQL if switching backends
-
-#### What you must do
-
-1. **Replace compose file and images**:
-   - Old: single `ghcr.io/gumbees/bookstack-mcp:latest` container
-   - New: `ghcr.io/gumbees/bsmcp-server:0.3.3` + `ghcr.io/gumbees/bsmcp-embedder:0.3.3`
-   - Use `docker/docker-compose.sqlite.yml` or `docker/docker-compose.yml` (PostgreSQL)
-
-2. **Add new env vars**:
-   ```bash
-   BSMCP_DB_BACKEND=sqlite   # or postgres
-   BSMCP_EMBEDDER_URL=http://bsmcp-embedder:8081
-   BSMCP_EMBED_TOKEN_ID=<BookStack API token ID>
-   BSMCP_EMBED_TOKEN_SECRET=<BookStack API token secret>
-   BSMCP_EMBED_JOB_TIMEOUT=14400
-   ```
-
-3. **Model cache path changed**: `/models` → `/data/models`. The model re-downloads on first start if the volume mount path changes.
-
-4. **Update webhook URL** to use `X-Webhook-Secret` header instead of `?secret=` query param (query param still works but is deprecated).
-
-#### Migrating to PostgreSQL
-
-Set `BSMCP_DB_BACKEND=postgres` and keep the SQLite file accessible. The server auto-migrates all data on startup and renames the SQLite file to `.db.migrated`.
-
-Manual migration is also available:
-```bash
-docker exec bsmcp-server bsmcp-server migrate \
-  --from-sqlite /data/bookstack-mcp.db \
-  --to-postgres postgres://bsmcp:yourpassword@bsmcp-postgres/bsmcp
-```
-
-Migration copies encrypted tokens as-is (portable when `BSMCP_ENCRYPTION_KEY` matches), converts embeddings from BLOB to pgvector format, and fixes PostgreSQL sequences.
-
-### From v0.3.0/v0.3.1 to v0.3.3
-
-Incremental upgrade. No schema changes after v0.3.1.
-
-1. Update image tags to `0.3.3`
-2. New optional env vars: `BSMCP_EMBED_CPUS` (Docker CPU limit), `BSMCP_EMBED_JOB_TIMEOUT` (default 14400s)
-3. `BSMCP_EMBED_THREADS` is deprecated — use `BSMCP_EMBED_CPUS` instead (fastembed ignores thread env vars; Docker `cpus` is the only reliable limit)
-4. New MCP tools automatically appear: `edit_page`, `append_to_page`, `replace_section`, `insert_after`
-5. Update webhook to use `X-Webhook-Secret` header (query param still works but deprecated)
-6. Stuck v0.3.0 jobs auto-expire after `BSMCP_EMBED_JOB_TIMEOUT` (default: 4 hours)
 
 ### From v0.1.2 to v0.1.3
 

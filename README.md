@@ -425,9 +425,9 @@ See the [v0.1.3 release notes](https://github.com/gumbees/bookstack-mcp/releases
 
 | Model Name | Dimensions | Parameters | Notes |
 |------------|-----------|------------|-------|
-| `embeddinggemma-300m` | 768 | 300M | **Default.** Google's lightweight model, optimized for on-device. Fast on ARM. |
-| `BAAI/bge-large-en-v1.5` | 1024 | 335M | Previous default. High quality, heavier. |
-| `BAAI/bge-base-en-v1.5` | 768 | 110M | Good balance of speed and quality. |
+| `BAAI/bge-base-en-v1.5` | 768 | 110M | **Default.** Good balance of speed and quality. 3x faster than large. |
+| `BAAI/bge-large-en-v1.5` | 1024 | 335M | Previous default. Highest quality, heavier. |
+| `embeddinggemma-300m` | 768 | 300M | Google's lightweight model (experimental — external weights loading may have issues). |
 | `BAAI/bge-small-en-v1.5` | 384 | 33M | Fastest BGE variant, lower quality. |
 
 Set via `BSMCP_EMBED_MODEL`. Changing models triggers an automatic clean re-index on next embedder startup — no manual intervention needed.

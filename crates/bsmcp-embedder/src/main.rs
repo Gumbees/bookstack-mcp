@@ -20,7 +20,7 @@ use bsmcp_common::db::SemanticDb;
 
 use pipeline::EmbedModel;
 
-const DEFAULT_MODEL: &str = "embeddinggemma-300m";
+const DEFAULT_MODEL: &str = "BAAI/bge-base-en-v1.5";
 
 struct AppState {
     model: Arc<EmbedModel>,

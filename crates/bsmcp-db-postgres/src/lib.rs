@@ -804,7 +804,7 @@ impl SemanticDb for PostgresDb {
                 GROUP BY page_id
             )
             INSERT INTO relationships (source_page_id, target_page_id, link_type)
-            SELECT c1.page_id, c2.page_id, 'similar'
+            SELECT c1.page_id, nn.page_id, 'similar'
             FROM centroids c1
             CROSS JOIN LATERAL (
                 SELECT c2.page_id, 1 - (c1.centroid <=> c2.centroid) AS sim
@@ -812,8 +812,8 @@ impl SemanticDb for PostgresDb {
                 WHERE c2.page_id != c1.page_id
                 ORDER BY c1.centroid <=> c2.centroid
                 LIMIT {top_k}
-            ) c2
-            WHERE 1 - (c1.centroid <=> c2.centroid) > $1
+            ) nn
+            WHERE nn.sim > $1
             ON CONFLICT DO NOTHING"
         );
 

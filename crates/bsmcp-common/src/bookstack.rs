@@ -251,24 +251,21 @@ impl BookStackClient {
         self.get("books", &[("count", "1")]).await
     }
 
-    // --- Batch access check ---
+    // --- Permission check ---
 
-    /// Check which page IDs the user can access. Returns the subset of accessible IDs.
-    /// Uses BookStack's filter[id:in] for a single API call.
-    pub async fn check_pages_access(&self, page_ids: &[i64]) -> Result<Vec<i64>, String> {
-        if page_ids.is_empty() {
-            return Ok(Vec::new());
+    /// Check if the user can access a specific page.
+    /// Uses GET /api/pages/{id} which correctly evaluates entity permissions.
+    /// Returns true on 200, false on 403/404 or any error.
+    pub async fn can_access_page(&self, page_id: i64) -> bool {
+        let resp = self.client
+            .get(format!("{}/api/pages/{page_id}", self.base_url))
+            .header("Authorization", self.auth_header())
+            .send()
+            .await;
+        match resp {
+            Ok(r) => r.status().is_success(),
+            Err(_) => false,
         }
-        let ids_str = page_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
-        let count_str = page_ids.len().to_string();
-        let resp = self.get("pages", &[
-            ("filter[id:in]", &ids_str),
-            ("count", &count_str),
-        ]).await?;
-        Ok(resp.get("data")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|p| p.get("id").and_then(|v| v.as_i64())).collect())
-            .unwrap_or_default())
     }
 
     // --- Shelves ---

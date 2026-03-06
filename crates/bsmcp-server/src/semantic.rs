@@ -14,7 +14,6 @@ use bsmcp_common::db::SemanticDb;
 
 const PERMISSION_CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
 
-/// Per-token permission cache entry.
 struct CachedAccess {
     accessible: bool,
     cached_at: Instant,
@@ -115,17 +114,20 @@ impl SemanticState {
     }
 
     /// Filter search results by the user's BookStack API permissions.
-    /// Uses a per-(token_id, page_id) cache with 5-minute TTL.
+    /// Checks each page individually via GET /api/pages/{id} — returns 200 for
+    /// accessible pages, 403/404 for restricted. This correctly handles custom
+    /// entity permissions (unlike filter[id:in] on the list endpoint).
+    /// Results are cached per (token_id, page_id) for 5 minutes.
     async fn filter_by_permission(
         &self,
         page_ids: &[i64],
         client: &BookStackClient,
-    ) -> Result<Vec<i64>, String> {
+    ) -> Vec<i64> {
         let token_id = client.token_id().to_string();
         let now = Instant::now();
 
         let mut uncached_ids: Vec<i64> = Vec::new();
-        let mut cached_accessible: Vec<i64> = Vec::new();
+        let mut accessible: Vec<i64> = Vec::new();
 
         {
             let cache = self.permission_cache.read().await;
@@ -134,7 +136,7 @@ impl SemanticState {
                 if let Some(entry) = cache.get(&key) {
                     if now.duration_since(entry.cached_at) < PERMISSION_CACHE_TTL {
                         if entry.accessible {
-                            cached_accessible.push(pid);
+                            accessible.push(pid);
                         }
                         continue;
                     }
@@ -144,27 +146,46 @@ impl SemanticState {
         }
 
         if !uncached_ids.is_empty() {
-            let accessible = client.check_pages_access(&uncached_ids).await?;
-            let accessible_set: HashSet<i64> = accessible.iter().copied().collect();
+            // Check each page individually with concurrency limit
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
+            let mut handles = Vec::new();
+
+            for pid in uncached_ids.clone() {
+                let client = client.clone();
+                let sem = semaphore.clone();
+                handles.push(tokio::spawn(async move {
+                    let _permit = sem.acquire().await;
+                    let ok = client.can_access_page(pid).await;
+                    (pid, ok)
+                }));
+            }
+
+            let mut results: Vec<(i64, bool)> = Vec::new();
+            for handle in handles {
+                if let Ok(result) = handle.await {
+                    results.push(result);
+                }
+            }
 
             {
                 let mut cache = self.permission_cache.write().await;
-                for &pid in &uncached_ids {
-                    let key = (token_id.clone(), pid);
-                    cache.insert(key, CachedAccess {
-                        accessible: accessible_set.contains(&pid),
+                for &(pid, ok) in &results {
+                    cache.insert((token_id.clone(), pid), CachedAccess {
+                        accessible: ok,
                         cached_at: now,
                     });
+                    if ok {
+                        accessible.push(pid);
+                    }
                 }
+                // Evict stale entries if cache grows large
                 if cache.len() > 10_000 {
                     cache.retain(|_, entry| now.duration_since(entry.cached_at) < PERMISSION_CACHE_TTL);
                 }
             }
-
-            cached_accessible.extend(accessible);
         }
 
-        Ok(cached_accessible)
+        accessible
     }
 
     /// Hybrid search: vector + keyword + blanket re-ranking.
@@ -246,12 +267,10 @@ impl SemanticState {
             }
         }
 
-        // Collect all page IDs for permission check
+        // Permission check: filter out pages the user can't access
         let all_page_ids: Vec<i64> = page_scores.keys().copied().collect();
-        let accessible_ids = self.filter_by_permission(&all_page_ids, client).await?;
+        let accessible_ids = self.filter_by_permission(&all_page_ids, client).await;
         let accessible_set: HashSet<i64> = accessible_ids.iter().copied().collect();
-
-        // Remove inaccessible pages
         page_scores.retain(|pid, _| accessible_set.contains(pid));
 
         // Blanket re-ranking: boost pages whose neighbors also appear in vector results.

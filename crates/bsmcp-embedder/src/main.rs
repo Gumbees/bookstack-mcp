@@ -332,13 +332,11 @@ async fn job_queue_worker(
                         }
                         eprintln!("Embedder: job {} completed", job.id);
 
-                        // After a full reindex, compute inferred similar-page relationships
-                        if job.scope == "all" {
-                            eprintln!("Embedder: computing similar-page relationships...");
-                            match db.compute_similar_pages(5, 0.65).await {
-                                Ok(n) => eprintln!("Embedder: stored {n} similar-page relationships"),
-                                Err(e) => eprintln!("Embedder: similar-page computation failed: {e}"),
-                            }
+                        // Recompute similar-page relationships after any embedding job
+                        eprintln!("Embedder: computing similar-page relationships...");
+                        match db.compute_similar_pages(5, 0.65).await {
+                            Ok(n) => eprintln!("Embedder: stored {n} similar-page relationships"),
+                            Err(e) => eprintln!("Embedder: similar-page computation failed: {e}"),
                         }
                     }
                     Err(e) => {

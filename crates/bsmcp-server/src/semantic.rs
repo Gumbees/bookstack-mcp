@@ -423,9 +423,15 @@ impl SemanticState {
     }
 
     /// Handle BookStack webhook for content changes.
-    /// Page events trigger per-page re-embed. Chapter/book/shelf events trigger
-    /// a book-scoped re-embed so page context prefixes ([Book > Chapter > Page])
-    /// stay accurate after moves/renames.
+    ///
+    /// Embedding context is `[Shelf > Book > Chapter > Page]`, so any event that
+    /// renames, moves, creates, or deletes an entity at any level can change the
+    /// context prefix baked into embeddings.
+    ///
+    /// Strategy:
+    /// - Page events → re-embed that specific page
+    /// - Chapter/book events → re-embed the affected book (all pages get fresh context)
+    /// - Shelf events → full re-embed (can't determine affected books from webhook payload)
     pub async fn handle_webhook(&self, payload: &Value) -> Result<(), String> {
         let event = payload.get("event").and_then(|v| v.as_str()).unwrap_or("");
         let related = payload.get("related_item").unwrap_or(&json!(null));
@@ -434,15 +440,21 @@ impl SemanticState {
         eprintln!("Semantic: webhook event={event} item_id={item_id:?}");
 
         match event {
-            "page_create" | "page_update" => {
+            // --- Page events ---
+            "page_create" | "page_update" | "page_restore" => {
                 if let Some(pid) = item_id {
                     let scope = format!("page:{pid}");
                     let (job_id, is_new) = self.db.create_embed_job(&scope).await?;
-                    if is_new {
-                        eprintln!("Semantic: queued embed job {job_id} for page {pid}");
-                    } else {
-                        eprintln!("Semantic: embed job {job_id} already active for page {pid}");
-                    }
+                    eprintln!("Semantic: {event} — queued page:{pid} embed job {job_id} (new={is_new})");
+                }
+            }
+            "page_move" => {
+                // Page moved to different book/chapter — context prefix changed.
+                // Re-embed with force since HTML is the same but context differs.
+                if let Some(pid) = item_id {
+                    let scope = format!("page:{pid}");
+                    let (job_id, is_new) = self.db.create_embed_job(&scope).await?;
+                    eprintln!("Semantic: page_move — queued page:{pid} embed job {job_id} (new={is_new})");
                 }
             }
             "page_delete" => {
@@ -451,36 +463,58 @@ impl SemanticState {
                     eprintln!("Semantic: deleted embeddings for page {pid}");
                 }
             }
-            // Chapter/book updates can rename or move content, changing the
-            // context prefix injected into chunk embeddings. Re-embed the
-            // affected book so all page embeddings reflect the new hierarchy.
+
+            // --- Chapter events (re-embed the containing book) ---
             "chapter_create" | "chapter_update" | "chapter_delete" => {
                 let book_id = related.get("book_id").and_then(|v| v.as_i64());
                 if let Some(bid) = book_id {
                     let scope = format!("book:{bid}");
                     let (job_id, is_new) = self.db.create_embed_job(&scope).await?;
-                    eprintln!("Semantic: chapter event — queued book:{bid} embed job {job_id} (new={is_new})");
+                    eprintln!("Semantic: {event} — queued book:{bid} embed job {job_id} (new={is_new})");
                 }
             }
-            "book_update" => {
+            "chapter_move" => {
+                // Pages moved between books — re-embed both source and destination.
+                // BookStack webhook gives us the chapter's new book_id.
+                // We can't easily get the old book_id, so re-embed the new book
+                // and queue a full re-embed to catch the orphaned old book.
+                let book_id = related.get("book_id").and_then(|v| v.as_i64());
+                if let Some(bid) = book_id {
+                    let scope = format!("book:{bid}");
+                    let (job_id, is_new) = self.db.create_embed_job(&scope).await?;
+                    eprintln!("Semantic: chapter_move — queued book:{bid} embed job {job_id} (new={is_new})");
+                }
+                // Also queue full re-embed to catch the source book
+                let (job_id, is_new) = self.db.create_embed_job("all").await?;
+                eprintln!("Semantic: chapter_move — queued full re-embed job {job_id} (new={is_new})");
+            }
+
+            // --- Book events (re-embed the book) ---
+            "book_update" | "book_sort" | "book_create_from_chapter" => {
+                // book_update: name changed → context prefix changed
+                // book_sort: pages moved between chapters → context prefix changed
+                // book_create_from_chapter: pages moved to new book → context changed
                 if let Some(bid) = item_id {
                     let scope = format!("book:{bid}");
                     let (job_id, is_new) = self.db.create_embed_job(&scope).await?;
-                    eprintln!("Semantic: book update — queued book:{bid} embed job {job_id} (new={is_new})");
+                    eprintln!("Semantic: {event} — queued book:{bid} embed job {job_id} (new={is_new})");
                 }
             }
             "book_delete" => {
                 // Pages are cascade-deleted by BookStack; page_delete webhooks
                 // should fire for each page. Just log for awareness.
-                eprintln!("Semantic: book deleted (id={item_id:?}) — page deletions handled by page_delete events");
+                eprintln!("Semantic: book_delete (id={item_id:?}) — page deletions handled by page_delete events");
             }
-            // Shelf renames change the context prefix for all pages in all
-            // books on that shelf. Trigger a full re-embed since we can't
-            // efficiently determine which books belong to the shelf from here.
-            "shelf_update" => {
+
+            // --- Shelf events (full re-embed) ---
+            // Shelf changes affect the context prefix for all pages on that shelf.
+            // We can't efficiently determine which books belong to a shelf from
+            // the webhook payload, so trigger a full re-embed.
+            "bookshelf_create_from_book" | "bookshelf_update" | "bookshelf_delete" => {
                 let (job_id, is_new) = self.db.create_embed_job("all").await?;
-                eprintln!("Semantic: shelf update — queued full re-embed job {job_id} (new={is_new})");
+                eprintln!("Semantic: {event} — queued full re-embed job {job_id} (new={is_new})");
             }
+
             _ => {
                 eprintln!("Semantic: ignoring webhook event {event}");
             }

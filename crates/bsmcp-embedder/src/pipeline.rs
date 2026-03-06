@@ -288,8 +288,11 @@ pub async fn run_pipeline(
     db.update_job_progress(job_id, 0, total_pages).await?;
     eprintln!("Pipeline: found {total_pages} pages to embed");
 
-    // Force re-embed when targeting specific pages (bypass content hash check)
-    let force = scope.starts_with("page:");
+    // Always force re-embed (bypass content hash check).
+    // Context prefix changes (shelf/book/chapter renames, moves) don't change
+    // the HTML, so the content hash would incorrectly skip affected pages.
+    // The shelf lookup is rebuilt each run, ensuring fresh context.
+    let force = true;
 
     for (i, page_id) in all_page_ids.iter().enumerate() {
         if let Err(e) = embed_single_page(db, model, client, *page_id, force, &shelf_lookup).await {

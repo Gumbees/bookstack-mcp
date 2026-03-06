@@ -21,9 +21,13 @@ pub struct Chunk {
 /// Chunk HTML content by heading tags (h1-h3).
 /// Each heading starts a new chunk; heading stack tracks nesting.
 /// Post-processing merges tiny chunks and splits oversized ones.
-pub fn chunk_html(html: &str) -> Vec<Chunk> {
+///
+/// If `page_name` is provided, the first h1 heading is skipped when it matches
+/// the page name (BookStack pages typically repeat the title as the first h1).
+pub fn chunk_html_with_name(html: &str, page_name: Option<&str>) -> Vec<Chunk> {
     let mut raw_chunks: Vec<(Vec<String>, String)> = Vec::new(); // (heading_stack, content)
     let mut heading_stack: Vec<(u8, String)> = Vec::new(); // (level, text)
+    let mut skipped_title = false;
     let mut current_content = String::new();
     let mut in_tag = false;
     let mut tag_buf = String::new();
@@ -67,6 +71,15 @@ pub fn chunk_html(html: &str) -> Vec<Chunk> {
             if is_closing_heading {
                 if let Some(level) = collecting_heading.take() {
                     let text = heading_text.trim().to_string();
+                    // Skip the first h1 if it matches the page name (avoids duplication)
+                    if !skipped_title && level == 1 {
+                        if let Some(pname) = page_name {
+                            if text.eq_ignore_ascii_case(pname.trim()) {
+                                skipped_title = true;
+                                continue;
+                            }
+                        }
+                    }
                     // Pop headings at same or deeper level
                     while heading_stack.last().is_some_and(|(l, _)| *l >= level) {
                         heading_stack.pop();
@@ -157,6 +170,11 @@ pub fn chunk_html(html: &str) -> Vec<Chunk> {
     }
 
     final_chunks
+}
+
+/// Chunk HTML without page name context (backward-compatible).
+pub fn chunk_html(html: &str) -> Vec<Chunk> {
+    chunk_html_with_name(html, None)
 }
 
 /// Extract internal BookStack links from HTML.
@@ -278,6 +296,22 @@ mod tests {
         let chunks = chunk_html(html);
         assert!(chunks.len() >= 2);
         assert!(chunks[0].content.contains("Title"));
+    }
+
+    #[test]
+    fn test_skip_duplicate_page_title() {
+        let html = "<h1>My Page Title</h1><p>Introduction text that is long enough to form a real chunk on its own.</p><h2>Section A</h2><p>Content for section A with enough text to be a real chunk.</p>";
+        // Without page name: h1 appears in heading_path
+        let chunks = chunk_html(html);
+        assert!(chunks.iter().any(|c| c.heading_path.contains("My Page Title")));
+
+        // With matching page name: h1 is skipped
+        let chunks = chunk_html_with_name(html, Some("My Page Title"));
+        assert!(!chunks.iter().any(|c| c.heading_path.contains("My Page Title")),
+            "Page title should be stripped from heading_path when it matches page name");
+        assert!(!chunks.is_empty());
+        // Section A should still appear
+        assert!(chunks.iter().any(|c| c.heading_path.contains("Section A")));
     }
 
     #[test]

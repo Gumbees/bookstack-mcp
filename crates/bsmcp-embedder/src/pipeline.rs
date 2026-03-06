@@ -354,8 +354,8 @@ async fn embed_single_page(
         content_hash: content_hash.clone(),
     };
 
-    // Chunk the HTML
-    let chunks = chunking::chunk_html(html);
+    // Chunk the HTML (skip first h1 if it matches page name to avoid duplication)
+    let chunks = chunking::chunk_html_with_name(html, Some(name));
     if chunks.is_empty() {
         if html.len() > 100 {
             // Log a sample of the HTML to help diagnose why chunking failed

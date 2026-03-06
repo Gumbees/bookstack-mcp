@@ -306,11 +306,16 @@ async fn embed_single_page(
     let chunks = chunking::chunk_html(html);
     if chunks.is_empty() {
         if html.len() > 100 {
-            eprintln!("Pipeline: page {page_id} ({name}) has {len} bytes of HTML but chunker produced 0 chunks", len = html.len());
+            // Log a sample of the HTML to help diagnose why chunking failed
+            let sample: String = html.chars().take(300).collect();
+            eprintln!("Pipeline: page {page_id} ({name}) has {len} bytes of HTML but chunker produced 0 chunks. Sample: {sample}",
+                len = html.len());
         }
         db.upsert_page(&meta).await?;
         return Ok(());
     }
+    eprintln!("Pipeline: page {page_id} ({name}) — {n} chunks from {len} bytes",
+        n = chunks.len(), len = html.len());
 
     // Build context prefix for embedding (book > chapter > page hierarchy)
     let context_prefix = {

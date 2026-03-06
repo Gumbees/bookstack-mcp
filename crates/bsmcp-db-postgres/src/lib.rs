@@ -342,10 +342,15 @@ impl SemanticDb for PostgresDb {
     }
 
     async fn insert_chunks(&self, page_id: i64, chunks: &[ChunkInsert]) -> Result<(), String> {
-        // Delete old chunks first
+        // Wrap DELETE + INSERTs in a transaction to prevent partial state
+        // (without this, queries hitting the table between DELETE and INSERT see zero chunks)
+        let mut tx = self.pool.begin().await
+            .map_err(|e| format!("insert_chunks transaction begin failed: {e}"))?;
+
         sqlx::query("DELETE FROM chunks WHERE page_id = $1")
             .bind(page_id)
-            .execute(&self.pool).await.ok();
+            .execute(&mut *tx).await
+            .map_err(|e| format!("insert_chunks delete failed: {e}"))?;
 
         for chunk in chunks {
             let vec = Vector::from(chunk.embedding.clone());
@@ -359,10 +364,13 @@ impl SemanticDb for PostgresDb {
             .bind(&chunk.content)
             .bind(&chunk.content_hash)
             .bind(vec)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| format!("insert_chunks failed for chunk {}: {e}", chunk.chunk_index))?;
         }
+
+        tx.commit().await
+            .map_err(|e| format!("insert_chunks commit failed: {e}"))?;
         Ok(())
     }
 
@@ -682,7 +690,22 @@ impl SemanticDb for PostgresDb {
     }
 
     async fn vector_search(&self, query_embedding: &[f32], limit: usize, threshold: f32) -> Result<Vec<SearchHit>, String> {
+        // Sanity check: detect garbage embeddings (all zeros, NaN, etc.)
+        let magnitude: f32 = query_embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if magnitude < 0.01 || magnitude.is_nan() {
+            return Err(format!("vector_search: query embedding appears invalid (magnitude={magnitude:.4}, dims={})", query_embedding.len()));
+        }
+
         let vec = Vector::from(query_embedding.to_vec());
+
+        // Use a transaction so SET LOCAL ef_search applies to the search query
+        let mut tx = self.pool.begin().await
+            .map_err(|e| format!("vector_search transaction failed: {e}"))?;
+
+        // Increase HNSW ef_search for better recall (default 40 can miss results after bulk ops)
+        sqlx::query("SET LOCAL hnsw.ef_search = 100")
+            .execute(&mut *tx).await.ok();
+
         let rows = sqlx::query(
             "SELECT id, page_id, (1 - (embedding <=> $1::vector))::FLOAT4 AS score
              FROM chunks
@@ -693,18 +716,51 @@ impl SemanticDb for PostgresDb {
         .bind(&vec)
         .bind(threshold)
         .bind(limit as i64)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| format!("vector_search failed: {e}"))?;
 
-        Ok(rows.iter().map(|r| SearchHit {
+        tx.commit().await.ok();
+
+        let results: Vec<SearchHit> = rows.iter().map(|r| SearchHit {
             chunk_id: r.get("id"),
             page_id: r.get("page_id"),
             score: r.get("score"),
-        }).collect())
+        }).collect();
+
+        // Diagnostic: if zero results, check why
+        if results.is_empty() {
+            let chunk_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM chunks")
+                .fetch_one(&self.pool).await.unwrap_or((0,));
+            if chunk_count.0 == 0 {
+                eprintln!("vector_search: 0 results — chunks table is EMPTY (embeddings may have been cleared)");
+            } else {
+                // Check max score to see if threshold is the issue
+                let top: Option<(f32,)> = sqlx::query_as(
+                    "SELECT (1 - (embedding <=> $1::vector))::FLOAT4 FROM chunks ORDER BY embedding <=> $1::vector LIMIT 1"
+                )
+                .bind(&vec)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+                let max_score = top.map(|t| t.0).unwrap_or(0.0);
+                eprintln!("vector_search: 0 results — {count} chunks exist, threshold={threshold:.3}, max_score={max_score:.3}, dims={dims}",
+                    count = chunk_count.0, dims = query_embedding.len());
+            }
+        }
+
+        Ok(results)
     }
 
     async fn clear_all_embeddings(&self) -> Result<(), String> {
+        // Log what's being cleared for debugging intermittent search death
+        let pages: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pages")
+            .fetch_one(&self.pool).await.unwrap_or((0,));
+        let chunks: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM chunks")
+            .fetch_one(&self.pool).await.unwrap_or((0,));
+        eprintln!("clear_all_embeddings: clearing {} pages, {} chunks", pages.0, chunks.0);
+
         sqlx::query("DELETE FROM relationships").execute(&self.pool).await
             .map_err(|e| format!("clear relationships: {e}"))?;
         sqlx::query("DELETE FROM chunks").execute(&self.pool).await

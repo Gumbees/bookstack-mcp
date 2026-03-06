@@ -331,6 +331,35 @@ mod tests {
     }
 
     #[test]
+    fn test_table_heavy_content() {
+        // Simulate a BookStack markdown-rendered table (like page 1144)
+        let html = r#"<p>Career progression roadmap from T2 to Junior Engineer.</p>
+<table>
+<thead><tr><th>Skill Area</th><th>Current (T2)</th><th>Target (Junior)</th></tr></thead>
+<tbody>
+<tr><td>PowerShell</td><td>Basic scripts</td><td>Advanced automation</td></tr>
+<tr><td>Networking</td><td>IP basics</td><td>Subnetting, VLANs</td></tr>
+<tr><td>Active Directory</td><td>User management</td><td>GPO, DNS integration</td></tr>
+<tr><td>Cloud</td><td>Portal navigation</td><td>Azure AD, Intune</td></tr>
+</tbody>
+</table>"#;
+        let chunks = chunk_html(html);
+        assert!(!chunks.is_empty(), "Table-heavy HTML must produce at least one chunk");
+        // Verify table content was extracted
+        let all_content: String = chunks.iter().map(|c| c.content.clone()).collect();
+        assert!(all_content.contains("PowerShell"), "Table cell content should be extracted");
+        assert!(all_content.contains("Active Directory"), "Table cell content should be extracted");
+    }
+
+    #[test]
+    fn test_no_headings_content() {
+        // Page with no headings at all — all content should go into one chunk
+        let html = "<p>This is a page with no headings but enough content to be meaningful. It should produce at least one chunk even without any heading tags.</p>";
+        let chunks = chunk_html(html);
+        assert!(!chunks.is_empty(), "Content without headings must produce chunks");
+    }
+
+    #[test]
     fn test_content_hash_deterministic() {
         let html = "<h1>Test</h1><p>Some content for hashing that is long enough to not be merged away.</p>";
         let chunks1 = chunk_html(html);

@@ -422,17 +422,20 @@ impl SemanticState {
         }))
     }
 
-    /// Handle BookStack webhook for page changes.
+    /// Handle BookStack webhook for content changes.
+    /// Page events trigger per-page re-embed. Chapter/book/shelf events trigger
+    /// a book-scoped re-embed so page context prefixes ([Book > Chapter > Page])
+    /// stay accurate after moves/renames.
     pub async fn handle_webhook(&self, payload: &Value) -> Result<(), String> {
         let event = payload.get("event").and_then(|v| v.as_str()).unwrap_or("");
         let related = payload.get("related_item").unwrap_or(&json!(null));
-        let page_id = related.get("id").and_then(|v| v.as_i64());
+        let item_id = related.get("id").and_then(|v| v.as_i64());
 
-        eprintln!("Semantic: webhook event={event} page_id={page_id:?}");
+        eprintln!("Semantic: webhook event={event} item_id={item_id:?}");
 
         match event {
             "page_create" | "page_update" => {
-                if let Some(pid) = page_id {
+                if let Some(pid) = item_id {
                     let scope = format!("page:{pid}");
                     let (job_id, is_new) = self.db.create_embed_job(&scope).await?;
                     if is_new {
@@ -443,10 +446,33 @@ impl SemanticState {
                 }
             }
             "page_delete" => {
-                if let Some(pid) = page_id {
+                if let Some(pid) = item_id {
                     self.db.delete_page(pid).await?;
                     eprintln!("Semantic: deleted embeddings for page {pid}");
                 }
+            }
+            // Chapter/book updates can rename or move content, changing the
+            // context prefix injected into chunk embeddings. Re-embed the
+            // affected book so all page embeddings reflect the new hierarchy.
+            "chapter_create" | "chapter_update" | "chapter_delete" => {
+                let book_id = related.get("book_id").and_then(|v| v.as_i64());
+                if let Some(bid) = book_id {
+                    let scope = format!("book:{bid}");
+                    let (job_id, is_new) = self.db.create_embed_job(&scope).await?;
+                    eprintln!("Semantic: chapter event — queued book:{bid} embed job {job_id} (new={is_new})");
+                }
+            }
+            "book_update" => {
+                if let Some(bid) = item_id {
+                    let scope = format!("book:{bid}");
+                    let (job_id, is_new) = self.db.create_embed_job(&scope).await?;
+                    eprintln!("Semantic: book update — queued book:{bid} embed job {job_id} (new={is_new})");
+                }
+            }
+            "book_delete" => {
+                // Pages are cascade-deleted by BookStack; page_delete webhooks
+                // should fire for each page. Just log for awareness.
+                eprintln!("Semantic: book deleted (id={item_id:?}) — page deletions handled by page_delete events");
             }
             _ => {
                 eprintln!("Semantic: ignoring webhook event {event}");

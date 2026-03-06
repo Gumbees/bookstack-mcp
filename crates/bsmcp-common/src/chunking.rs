@@ -5,7 +5,8 @@
 use sha2::{Sha256, Digest};
 
 /// Chunk format version. Increment when chunking logic changes to trigger re-indexing.
-pub const CHUNK_VERSION: u32 = 4;
+/// v5: added shelf to context prefix (Shelf > Book > Chapter > Page)
+pub const CHUNK_VERSION: u32 = 5;
 
 const MAX_CHUNK_LEN: usize = 1200;
 const OVERLAP_LEN: usize = 150;

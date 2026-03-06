@@ -1,5 +1,6 @@
 //! Embedding pipeline: fetch pages from BookStack, chunk, embed, store.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -176,6 +177,52 @@ fn load_custom_model(downloaded: &DownloadedModel) -> Result<TextEmbedding, Stri
         .map_err(|e| format!("Custom model init failed: {e}"))
 }
 
+/// Build a book_id → shelf_name lookup by fetching all shelves from BookStack.
+async fn build_shelf_lookup(client: &BookStackClient) -> HashMap<i64, String> {
+    let mut lookup: HashMap<i64, String> = HashMap::new();
+    let mut offset = 0i64;
+    loop {
+        let list = match client.list_shelves(100, offset).await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Pipeline: failed to list shelves for context lookup: {e}");
+                break;
+            }
+        };
+        let data = list.get("data").and_then(|v| v.as_array());
+        let Some(shelves) = data else { break };
+        if shelves.is_empty() { break; }
+
+        for shelf in shelves {
+            let shelf_id = shelf.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+            if shelf_id == 0 { continue; }
+            let shelf_name = shelf.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if shelf_name.is_empty() { continue; }
+
+            // Fetch shelf detail to get its books
+            match client.get_shelf(shelf_id).await {
+                Ok(detail) => {
+                    if let Some(books) = detail.get("books").and_then(|v| v.as_array()) {
+                        for book in books {
+                            let bid = book.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+                            if bid > 0 {
+                                lookup.insert(bid, shelf_name.clone());
+                            }
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Pipeline: failed to get shelf {shelf_id}: {e}"),
+            }
+        }
+
+        let total = list.get("total").and_then(|v| v.as_i64()).unwrap_or(0);
+        offset += 100;
+        if offset >= total { break; }
+    }
+    eprintln!("Pipeline: shelf lookup built ({} book→shelf mappings)", lookup.len());
+    lookup
+}
+
 /// Run the embedding pipeline for a job.
 pub async fn run_pipeline(
     db: &Arc<dyn SemanticDb>,
@@ -187,6 +234,9 @@ pub async fn run_pipeline(
     _batch_size: usize,
 ) -> Result<(), String> {
     eprintln!("Pipeline: starting (scope={scope}, job_id={job_id})");
+
+    // Build shelf lookup for context prefix injection
+    let shelf_lookup = build_shelf_lookup(client).await;
 
     // Collect page IDs to embed
     let mut offset = 0i64;
@@ -242,7 +292,7 @@ pub async fn run_pipeline(
     let force = scope.starts_with("page:");
 
     for (i, page_id) in all_page_ids.iter().enumerate() {
-        if let Err(e) = embed_single_page(db, model, client, *page_id, force).await {
+        if let Err(e) = embed_single_page(db, model, client, *page_id, force, &shelf_lookup).await {
             eprintln!("Pipeline: error embedding page {page_id}: {e}");
         }
 
@@ -265,6 +315,7 @@ async fn embed_single_page(
     client: &BookStackClient,
     page_id: i64,
     force: bool,
+    shelf_lookup: &HashMap<i64, String>,
 ) -> Result<(), String> {
     let page = client.get_page(page_id).await?;
 
@@ -274,7 +325,8 @@ async fn embed_single_page(
     let book_id = page.get("book_id").and_then(|v| v.as_i64()).unwrap_or(0);
     let chapter_id = page.get("chapter_id").and_then(|v| v.as_i64()).filter(|&id| id > 0);
 
-    // Extract book/chapter names for chunk context injection
+    // Extract shelf/book/chapter names for chunk context injection
+    let shelf_name = shelf_lookup.get(&book_id).map(|s| s.as_str()).unwrap_or("");
     let book_name = page.get("book").and_then(|b| b.get("name")).and_then(|v| v.as_str()).unwrap_or("");
     let chapter_name = page.get("chapter").and_then(|c| c.get("name")).and_then(|v| v.as_str()).unwrap_or("");
 
@@ -317,9 +369,10 @@ async fn embed_single_page(
     eprintln!("Pipeline: page {page_id} ({name}) — {n} chunks from {len} bytes",
         n = chunks.len(), len = html.len());
 
-    // Build context prefix for embedding (book > chapter > page hierarchy)
+    // Build context prefix for embedding (shelf > book > chapter > page hierarchy)
     let context_prefix = {
         let mut parts = Vec::new();
+        if !shelf_name.is_empty() { parts.push(shelf_name.to_string()); }
         if !book_name.is_empty() { parts.push(book_name.to_string()); }
         if !chapter_name.is_empty() { parts.push(chapter_name.to_string()); }
         parts.push(name.to_string());

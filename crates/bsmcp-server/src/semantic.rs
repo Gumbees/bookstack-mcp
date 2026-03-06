@@ -474,6 +474,13 @@ impl SemanticState {
                 // should fire for each page. Just log for awareness.
                 eprintln!("Semantic: book deleted (id={item_id:?}) — page deletions handled by page_delete events");
             }
+            // Shelf renames change the context prefix for all pages in all
+            // books on that shelf. Trigger a full re-embed since we can't
+            // efficiently determine which books belong to the shelf from here.
+            "shelf_update" => {
+                let (job_id, is_new) = self.db.create_embed_job("all").await?;
+                eprintln!("Semantic: shelf update — queued full re-embed job {job_id} (new={is_new})");
+            }
             _ => {
                 eprintln!("Semantic: ignoring webhook event {event}");
             }

@@ -54,39 +54,64 @@ impl SemanticState {
     }
 
     /// Embed a query by calling the external embedder service.
+    /// Retries once on transient failures (connection errors, timeouts, 5xx).
     async fn embed_query(&self, query: &str) -> Result<Vec<f32>, String> {
         let url = format!("{}/embed", self.embedder_url);
-        let resp = self.http_client
-            .post(&url)
-            .json(&json!({ "texts": [query] }))
-            .send()
-            .await
-            .map_err(|e| format!("Embedder request failed: {e}"))?;
+        let mut last_err = String::new();
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Embedder error {status}: {body}"));
+        for attempt in 0..2 {
+            if attempt > 0 {
+                eprintln!("embed_query: retry {attempt} after error: {last_err}");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+
+            let resp = match self.http_client
+                .post(&url)
+                .json(&json!({ "texts": [query] }))
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = format!("Embedder request failed: {e}");
+                    continue;
+                }
+            };
+
+            if resp.status().is_server_error() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                last_err = format!("Embedder error {status}: {body}");
+                continue;
+            }
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(format!("Embedder error {status}: {body}"));
+            }
+
+            let body: Value = resp.json().await
+                .map_err(|e| format!("Embedder response parse error: {e}"))?;
+
+            let embedding = body.get("embeddings")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_array())
+                .ok_or("Invalid embedder response format")?;
+
+            let vec: Vec<f32> = embedding.iter()
+                .filter_map(|v| v.as_f64().map(|f| f as f32))
+                .collect();
+
+            if vec.is_empty() {
+                return Err("Empty embedding returned".to_string());
+            }
+
+            return Ok(vec);
         }
 
-        let body: Value = resp.json().await
-            .map_err(|e| format!("Embedder response parse error: {e}"))?;
-
-        let embedding = body.get("embeddings")
-            .and_then(|v| v.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|v| v.as_array())
-            .ok_or("Invalid embedder response format")?;
-
-        let vec: Vec<f32> = embedding.iter()
-            .filter_map(|v| v.as_f64().map(|f| f as f32))
-            .collect();
-
-        if vec.is_empty() {
-            return Err("Empty embedding returned".to_string());
-        }
-
-        Ok(vec)
+        Err(last_err)
     }
 
     /// Filter search results by the user's BookStack API permissions.

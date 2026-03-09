@@ -10,7 +10,7 @@ use rusqlite::{Connection, params};
 use sha2::Digest;
 use zeroize::Zeroizing;
 
-use bsmcp_common::config::{ACCESS_TOKEN_TTL, REFRESH_TOKEN_TTL};
+use bsmcp_common::config::{access_token_ttl, refresh_token_ttl};
 use bsmcp_common::db::{DbBackend, SemanticDb};
 use bsmcp_common::types::*;
 use bsmcp_common::vector;
@@ -128,7 +128,7 @@ impl DbBackend for SqliteDb {
                 .query_row("SELECT COUNT(*) FROM access_tokens", [], |row| row.get(0))
                 .unwrap_or(0);
             if count >= 10000 {
-                let cutoff = SqliteDb::cutoff_secs(ACCESS_TOKEN_TTL);
+                let cutoff = SqliteDb::cutoff_secs(access_token_ttl());
                 conn.execute("DELETE FROM access_tokens WHERE created_at <= ?1", params![cutoff]).ok();
             }
             conn.execute(
@@ -149,7 +149,7 @@ impl DbBackend for SqliteDb {
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            let cutoff = SqliteDb::cutoff_secs(ACCESS_TOKEN_TTL);
+            let cutoff = SqliteDb::cutoff_secs(access_token_ttl());
 
             // Try hashed token first, then fall back to raw token (pre-hash migration)
             let result: Option<(String, String)> = conn.query_row(
@@ -209,9 +209,9 @@ impl DbBackend for SqliteDb {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            let cutoff = SqliteDb::cutoff_secs(ACCESS_TOKEN_TTL);
+            let cutoff = SqliteDb::cutoff_secs(access_token_ttl());
             conn.execute("DELETE FROM access_tokens WHERE created_at <= ?1", params![cutoff]).ok();
-            let refresh_cutoff = SqliteDb::cutoff_secs(REFRESH_TOKEN_TTL);
+            let refresh_cutoff = SqliteDb::cutoff_secs(refresh_token_ttl());
             conn.execute("DELETE FROM refresh_tokens WHERE created_at <= ?1", params![refresh_cutoff]).ok();
             Ok(())
         })
@@ -244,7 +244,7 @@ impl DbBackend for SqliteDb {
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            let cutoff = SqliteDb::cutoff_secs(REFRESH_TOKEN_TTL);
+            let cutoff = SqliteDb::cutoff_secs(refresh_token_ttl());
 
             let result: Option<(String, String)> = conn.query_row(
                 "SELECT token_id, token_secret FROM refresh_tokens WHERE token = ?1 AND created_at > ?2",

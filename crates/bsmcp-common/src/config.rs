@@ -1,12 +1,27 @@
 use std::time::Duration;
 
-/// Access tokens expire after 24 hours.
-/// Used by all database backends for token cleanup and retrieval.
-pub const ACCESS_TOKEN_TTL: Duration = Duration::from_secs(86400);
+const DEFAULT_ACCESS_TOKEN_TTL_SECS: u64 = 86400;       // 24 hours
+const DEFAULT_REFRESH_TOKEN_TTL_SECS: u64 = 90 * 86400; // 90 days
 
-/// Refresh tokens expire after 30 days.
-/// Users only need to re-enter BookStack API credentials when the refresh token expires.
-pub const REFRESH_TOKEN_TTL: Duration = Duration::from_secs(30 * 86400);
+/// Access token TTL. Configurable via `BSMCP_ACCESS_TOKEN_TTL` (seconds).
+pub fn access_token_ttl() -> Duration {
+    let secs = std::env::var("BSMCP_ACCESS_TOKEN_TTL")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_ACCESS_TOKEN_TTL_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Refresh token TTL. Configurable via `BSMCP_REFRESH_TOKEN_TTL` (seconds).
+/// As long as the stored BookStack API credentials are valid, refreshing
+/// transparently issues new tokens without user re-authentication.
+pub fn refresh_token_ttl() -> Duration {
+    let secs = std::env::var("BSMCP_REFRESH_TOKEN_TTL")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_REFRESH_TOKEN_TTL_SECS);
+    Duration::from_secs(secs)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DbBackendType {

@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use zeroize::Zeroize;
 
 use bsmcp_common::bookstack::BookStackClient;
-use bsmcp_common::config::ACCESS_TOKEN_TTL;
+use bsmcp_common::config::access_token_ttl;
 
 use crate::sse::AppState;
 
@@ -226,7 +226,8 @@ button:hover {{ background: #3498db; }}
       <li>Click <strong>Access &amp; Security</strong> in the left sidebar</li>
       <li>Scroll down to <strong>API Tokens</strong> and click <strong>Create Token</strong></li>
       <li>Give it a name (e.g. &ldquo;Claude&rdquo;) and save</li>
-      <li>Copy the <strong>Token ID</strong> and <strong>Token Secret</strong> into the fields above</li>
+      <li><strong>Save the Token ID and Token Secret in your password manager</strong> &mdash; BookStack only shows the secret once</li>
+      <li>Paste them into the fields above</li>
     </ol>
   </div>
 </div>
@@ -538,7 +539,7 @@ async fn handle_token_refresh(state: AppState, form: TokenForm) -> Response {
             return oauth_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_grant",
-                Some("Invalid or expired refresh token"),
+                Some("Invalid or expired refresh token. Please re-authenticate with your BookStack API credentials."),
             )
         }
         Err(e) => {
@@ -551,12 +552,27 @@ async fn handle_token_refresh(state: AppState, form: TokenForm) -> Response {
         }
     };
 
+    // Validate the stored BookStack credentials are still valid
+    let bs_client = BookStackClient::new(
+        &state.bookstack_url, &token_id, &token_secret, state.http_client.clone(),
+    );
+    if let Err(e) = bs_client.validate().await {
+        eprintln!("OAuth: stored BookStack credentials no longer valid: {e}");
+        // Consume the invalid refresh token
+        state.db.delete_refresh_token(&old_refresh).await.ok();
+        return oauth_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_grant",
+            Some("BookStack API credentials are no longer valid. Please re-authenticate with new credentials."),
+        );
+    }
+
     // Consume the old refresh token (rotation)
     if let Err(e) = state.db.delete_refresh_token(&old_refresh).await {
         eprintln!("OAuth: failed to delete old refresh token: {e}");
     }
 
-    eprintln!("OAuth: refreshing token");
+    eprintln!("OAuth: refreshing token (credentials validated)");
     issue_tokens(&state, &token_id, &token_secret).await
 }
 
@@ -564,7 +580,7 @@ async fn handle_token_refresh(state: AppState, form: TokenForm) -> Response {
 async fn issue_tokens(state: &AppState, token_id: &str, token_secret: &str) -> Response {
     let access_token = uuid::Uuid::new_v4().to_string();
     let refresh_token = uuid::Uuid::new_v4().to_string();
-    let expires_in = ACCESS_TOKEN_TTL.as_secs();
+    let expires_in = access_token_ttl().as_secs();
 
     if let Err(e) = state.db.insert_access_token(&access_token, token_id, token_secret).await {
         eprintln!("OAuth: failed to persist access token: {e}");

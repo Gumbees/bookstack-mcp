@@ -11,7 +11,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use zeroize::Zeroizing;
 
-use bsmcp_common::config::{ACCESS_TOKEN_TTL, REFRESH_TOKEN_TTL};
+use bsmcp_common::config::{access_token_ttl, refresh_token_ttl};
 use bsmcp_common::db::{DbBackend, SemanticDb};
 use bsmcp_common::types::*;
 
@@ -123,7 +123,7 @@ impl DbBackend for PostgresDb {
             .await
             .unwrap_or((0,));
         if count.0 >= 10000 {
-            let cutoff = Self::now_secs() - ACCESS_TOKEN_TTL.as_secs() as i64;
+            let cutoff = Self::now_secs() - access_token_ttl().as_secs() as i64;
             sqlx::query("DELETE FROM access_tokens WHERE created_at <= $1")
                 .bind(cutoff)
                 .execute(&self.pool)
@@ -149,7 +149,7 @@ impl DbBackend for PostgresDb {
     }
 
     async fn get_access_token(&self, token: &str) -> Result<Option<(String, String)>, String> {
-        let cutoff = Self::now_secs() - ACCESS_TOKEN_TTL.as_secs() as i64;
+        let cutoff = Self::now_secs() - access_token_ttl().as_secs() as i64;
         let token_hash = Self::hash_token(token);
 
         // Try hashed token first, then fall back to raw token (pre-hash migration)
@@ -202,13 +202,13 @@ impl DbBackend for PostgresDb {
     }
 
     async fn cleanup_expired_tokens(&self) -> Result<(), String> {
-        let cutoff = Self::now_secs() - ACCESS_TOKEN_TTL.as_secs() as i64;
+        let cutoff = Self::now_secs() - access_token_ttl().as_secs() as i64;
         sqlx::query("DELETE FROM access_tokens WHERE created_at <= $1")
             .bind(cutoff)
             .execute(&self.pool)
             .await
             .ok();
-        let refresh_cutoff = Self::now_secs() - REFRESH_TOKEN_TTL.as_secs() as i64;
+        let refresh_cutoff = Self::now_secs() - refresh_token_ttl().as_secs() as i64;
         sqlx::query("DELETE FROM refresh_tokens WHERE created_at <= $1")
             .bind(refresh_cutoff)
             .execute(&self.pool)
@@ -237,7 +237,7 @@ impl DbBackend for PostgresDb {
     }
 
     async fn get_refresh_token(&self, token: &str) -> Result<Option<(String, String)>, String> {
-        let cutoff = Self::now_secs() - REFRESH_TOKEN_TTL.as_secs() as i64;
+        let cutoff = Self::now_secs() - refresh_token_ttl().as_secs() as i64;
         let token_hash = Self::hash_token(token);
         let row = sqlx::query(
             "SELECT token_id, token_secret FROM refresh_tokens WHERE token = $1 AND created_at > $2"

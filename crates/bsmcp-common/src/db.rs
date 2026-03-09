@@ -14,8 +14,18 @@ pub trait DbBackend: Send + Sync + 'static {
     /// Retrieve and decrypt an access token's BookStack credentials.
     async fn get_access_token(&self, token: &str) -> Result<Option<(String, String)>, String>;
 
-    /// Delete expired access tokens.
+    /// Delete expired access tokens and refresh tokens.
     async fn cleanup_expired_tokens(&self) -> Result<(), String>;
+
+    /// Store a refresh token mapped to encrypted BookStack credentials.
+    async fn insert_refresh_token(&self, token: &str, id: &str, secret: &str) -> Result<(), String>;
+
+    /// Retrieve and decrypt a refresh token's BookStack credentials.
+    /// Returns None if the token doesn't exist or has expired.
+    async fn get_refresh_token(&self, token: &str) -> Result<Option<(String, String)>, String>;
+
+    /// Delete a refresh token (used during rotation — old token is consumed).
+    async fn delete_refresh_token(&self, token: &str) -> Result<(), String>;
 
     /// Create a database backup. SQLite: VACUUM INTO. Postgres: no-op (use pg_dump).
     async fn backup(&self, path: &Path) -> Result<(), String>;

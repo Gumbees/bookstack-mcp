@@ -11,7 +11,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use zeroize::Zeroizing;
 
-use bsmcp_common::config::ACCESS_TOKEN_TTL;
+use bsmcp_common::config::{ACCESS_TOKEN_TTL, REFRESH_TOKEN_TTL};
 use bsmcp_common::db::{DbBackend, SemanticDb};
 use bsmcp_common::types::*;
 
@@ -50,6 +50,23 @@ impl PostgresDb {
         .map_err(|e| format!("Failed to create access_tokens table: {e}"))?;
 
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_tokens_created ON access_tokens(created_at)")
+            .execute(&pool)
+            .await
+            .ok();
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS refresh_tokens (
+                token TEXT PRIMARY KEY,
+                token_id TEXT NOT NULL,
+                token_secret TEXT NOT NULL,
+                created_at BIGINT NOT NULL
+            )"
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("Failed to create refresh_tokens table: {e}"))?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_refresh_tokens_created ON refresh_tokens(created_at)")
             .execute(&pool)
             .await
             .ok();
@@ -191,6 +208,67 @@ impl DbBackend for PostgresDb {
             .execute(&self.pool)
             .await
             .ok();
+        let refresh_cutoff = Self::now_secs() - REFRESH_TOKEN_TTL.as_secs() as i64;
+        sqlx::query("DELETE FROM refresh_tokens WHERE created_at <= $1")
+            .bind(refresh_cutoff)
+            .execute(&self.pool)
+            .await
+            .ok();
+        Ok(())
+    }
+
+    async fn insert_refresh_token(&self, token: &str, id: &str, secret: &str) -> Result<(), String> {
+        let token_hash = Self::hash_token(token);
+        let enc_id = self.encrypt(id);
+        let enc_secret = self.encrypt(secret);
+        sqlx::query(
+            "INSERT INTO refresh_tokens (token, token_id, token_secret, created_at)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (token) DO UPDATE SET token_id = $2, token_secret = $3, created_at = $4"
+        )
+        .bind(&token_hash)
+        .bind(&enc_id)
+        .bind(&enc_secret)
+        .bind(Self::now_secs())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("insert_refresh_token failed: {e}"))?;
+        Ok(())
+    }
+
+    async fn get_refresh_token(&self, token: &str) -> Result<Option<(String, String)>, String> {
+        let cutoff = Self::now_secs() - REFRESH_TOKEN_TTL.as_secs() as i64;
+        let token_hash = Self::hash_token(token);
+        let row = sqlx::query(
+            "SELECT token_id, token_secret FROM refresh_tokens WHERE token = $1 AND created_at > $2"
+        )
+        .bind(&token_hash)
+        .bind(cutoff)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("get_refresh_token failed: {e}"))?;
+
+        let row = match row {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        let stored_id: String = row.get("token_id");
+        let stored_secret: String = row.get("token_secret");
+
+        match (self.decrypt(&stored_id), self.decrypt(&stored_secret)) {
+            (Some(tid), Some(tsec)) => Ok(Some((tid, tsec))),
+            _ => Ok(None),
+        }
+    }
+
+    async fn delete_refresh_token(&self, token: &str) -> Result<(), String> {
+        let token_hash = Self::hash_token(token);
+        sqlx::query("DELETE FROM refresh_tokens WHERE token = $1")
+            .bind(&token_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("delete_refresh_token failed: {e}"))?;
         Ok(())
     }
 

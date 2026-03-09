@@ -4,6 +4,10 @@ use std::time::Duration;
 /// Used by all database backends for token cleanup and retrieval.
 pub const ACCESS_TOKEN_TTL: Duration = Duration::from_secs(86400);
 
+/// Refresh tokens expire after 30 days.
+/// Users only need to re-enter BookStack API credentials when the refresh token expires.
+pub const REFRESH_TOKEN_TTL: Duration = Duration::from_secs(30 * 86400);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DbBackendType {
     Sqlite,

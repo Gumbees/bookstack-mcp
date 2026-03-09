@@ -10,7 +10,7 @@ use rusqlite::{Connection, params};
 use sha2::Digest;
 use zeroize::Zeroizing;
 
-use bsmcp_common::config::ACCESS_TOKEN_TTL;
+use bsmcp_common::config::{ACCESS_TOKEN_TTL, REFRESH_TOKEN_TTL};
 use bsmcp_common::db::{DbBackend, SemanticDb};
 use bsmcp_common::types::*;
 use bsmcp_common::vector;
@@ -37,6 +37,13 @@ impl SqliteDb {
                  created_at INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_tokens_created ON access_tokens(created_at);
+             CREATE TABLE IF NOT EXISTS refresh_tokens (
+                 token TEXT PRIMARY KEY,
+                 token_id TEXT NOT NULL,
+                 token_secret TEXT NOT NULL,
+                 created_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_refresh_tokens_created ON refresh_tokens(created_at);
              DROP TABLE IF EXISTS registrations;",
         )
         .expect("Failed to initialize database schema");
@@ -204,6 +211,77 @@ impl DbBackend for SqliteDb {
             let conn = conn.lock().unwrap();
             let cutoff = SqliteDb::cutoff_secs(ACCESS_TOKEN_TTL);
             conn.execute("DELETE FROM access_tokens WHERE created_at <= ?1", params![cutoff]).ok();
+            let refresh_cutoff = SqliteDb::cutoff_secs(REFRESH_TOKEN_TTL);
+            conn.execute("DELETE FROM refresh_tokens WHERE created_at <= ?1", params![refresh_cutoff]).ok();
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn insert_refresh_token(&self, token: &str, id: &str, secret: &str) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let token_hash = Self::hash_token(token);
+        let enc_id = self.encrypt(id);
+        let enc_secret = self.encrypt(secret);
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO refresh_tokens (token, token_id, token_secret, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![token_hash, enc_id, enc_secret, SqliteDb::now_secs()],
+            ).ok();
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn get_refresh_token(&self, token: &str) -> Result<Option<(String, String)>, String> {
+        let conn = self.conn.clone();
+        let token_hash = Self::hash_token(token);
+        let encryption_key = *self.encryption_key;
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let cutoff = SqliteDb::cutoff_secs(REFRESH_TOKEN_TTL);
+
+            let result: Option<(String, String)> = conn.query_row(
+                "SELECT token_id, token_secret FROM refresh_tokens WHERE token = ?1 AND created_at > ?2",
+                params![token_hash, cutoff],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).ok();
+
+            let Some((stored_id, stored_secret)) = result else {
+                return Ok(None);
+            };
+
+            let cipher = Aes256Gcm::new((&encryption_key).into());
+            let try_decrypt = |stored: &str| -> Option<String> {
+                let combined = BASE64.decode(stored).ok()?;
+                if combined.len() < 12 { return None; }
+                let (nonce_bytes, ciphertext) = combined.split_at(12);
+                let nonce = aes_gcm::Nonce::from_slice(nonce_bytes);
+                let plaintext = cipher.decrypt(nonce, ciphertext).ok()?;
+                String::from_utf8(plaintext).ok()
+            };
+
+            match (try_decrypt(&stored_id), try_decrypt(&stored_secret)) {
+                (Some(tid), Some(tsec)) => Ok(Some((tid, tsec))),
+                _ => Ok(None),
+            }
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn delete_refresh_token(&self, token: &str) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let token_hash = Self::hash_token(token);
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute("DELETE FROM refresh_tokens WHERE token = ?1", params![token_hash]).ok();
             Ok(())
         })
         .await

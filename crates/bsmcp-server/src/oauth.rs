@@ -77,6 +77,7 @@ pub struct TokenForm {
     client_secret: Option<String>,
     code_verifier: Option<String>,
     redirect_uri: Option<String>,
+    refresh_token: Option<String>,
 }
 
 impl Drop for TokenForm {
@@ -86,6 +87,9 @@ impl Drop for TokenForm {
         }
         if let Some(ref mut v) = self.code_verifier {
             v.zeroize();
+        }
+        if let Some(ref mut r) = self.refresh_token {
+            r.zeroize();
         }
     }
 }
@@ -246,7 +250,7 @@ pub async fn handle_metadata(
         "token_endpoint": format!("{base}/token"),
         "registration_endpoint": format!("{base}/register"),
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
     }))
@@ -370,14 +374,22 @@ pub async fn handle_token(
     headers: HeaderMap,
     Form(form): Form<TokenForm>,
 ) -> Response {
-    if form.grant_type != "authorization_code" {
-        return oauth_error(
+    match form.grant_type.as_str() {
+        "authorization_code" => handle_token_authorization_code(state, headers, form).await,
+        "refresh_token" => handle_token_refresh(state, form).await,
+        _ => oauth_error(
             StatusCode::BAD_REQUEST,
             "unsupported_grant_type",
-            Some("Only authorization_code is supported"),
-        );
+            Some("Supported grant types: authorization_code, refresh_token"),
+        ),
     }
+}
 
+async fn handle_token_authorization_code(
+    state: AppState,
+    headers: HeaderMap,
+    form: TokenForm,
+) -> Response {
     let code = match &form.code {
         Some(c) => c.clone(),
         None => {
@@ -504,10 +516,57 @@ pub async fn handle_token(
         (client_id, client_secret)
     };
 
+    issue_tokens(&state, &token_id, &token_secret).await
+}
+
+async fn handle_token_refresh(state: AppState, form: TokenForm) -> Response {
+    let old_refresh = match &form.refresh_token {
+        Some(t) => t.clone(),
+        None => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                Some("Missing refresh_token"),
+            )
+        }
+    };
+
+    // Look up the refresh token to get the stored BookStack credentials
+    let (token_id, token_secret) = match state.db.get_refresh_token(&old_refresh).await {
+        Ok(Some(creds)) => creds,
+        Ok(None) => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                Some("Invalid or expired refresh token"),
+            )
+        }
+        Err(e) => {
+            eprintln!("OAuth: refresh token lookup failed: {e}");
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                Some("Failed to validate refresh token"),
+            );
+        }
+    };
+
+    // Consume the old refresh token (rotation)
+    if let Err(e) = state.db.delete_refresh_token(&old_refresh).await {
+        eprintln!("OAuth: failed to delete old refresh token: {e}");
+    }
+
+    eprintln!("OAuth: refreshing token");
+    issue_tokens(&state, &token_id, &token_secret).await
+}
+
+/// Issue a new access token + refresh token pair for the given BookStack credentials.
+async fn issue_tokens(state: &AppState, token_id: &str, token_secret: &str) -> Response {
     let access_token = uuid::Uuid::new_v4().to_string();
+    let refresh_token = uuid::Uuid::new_v4().to_string();
     let expires_in = ACCESS_TOKEN_TTL.as_secs();
 
-    if let Err(e) = state.db.insert_access_token(&access_token, &token_id, &token_secret).await {
+    if let Err(e) = state.db.insert_access_token(&access_token, token_id, token_secret).await {
         eprintln!("OAuth: failed to persist access token: {e}");
         return oauth_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -516,7 +575,16 @@ pub async fn handle_token(
         );
     }
 
-    eprintln!("OAuth: issued access token");
+    if let Err(e) = state.db.insert_refresh_token(&refresh_token, token_id, token_secret).await {
+        eprintln!("OAuth: failed to persist refresh token: {e}");
+        return oauth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            Some("Failed to persist refresh token"),
+        );
+    }
+
+    eprintln!("OAuth: issued access token + refresh token");
 
     (
         StatusCode::OK,
@@ -529,6 +597,7 @@ pub async fn handle_token(
             "access_token": access_token,
             "token_type": "bearer",
             "expires_in": expires_in,
+            "refresh_token": refresh_token,
         })),
     )
         .into_response()
@@ -602,7 +671,7 @@ pub async fn handle_register(State(state): State<AppState>, body: String) -> Res
             .unwrap_or_default()
             .as_secs(),
         "token_endpoint_auth_method": "none",
-        "grant_types": ["authorization_code"],
+        "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
     });
 

@@ -682,7 +682,11 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool) ->
          Markdown content is automatically converted to HTML server-side. \
          You can send markdown via the 'markdown' parameter for pages and comments — \
          the server handles conversion reliably, avoiding JSON escaping issues with \
-         complex markdown. Use 'html' only when you need precise HTML control.\n\n",
+         complex markdown. Use 'html' only when you need precise HTML control.\n\n\
+         IMPORTANT: BookStack automatically displays the page name as an H1 title at the top \
+         of every page. Do NOT include the page title as a heading (e.g. '# Page Name') in \
+         the markdown/html content — this causes a duplicate title. Start content directly with \
+         body text or a sub-heading (## or lower).\n\n",
     );
 
     match build_structure(client).await {
@@ -834,7 +838,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
         tool("list_pages", "List all pages across all books.", paginated_schema()),
         tool("get_page", "Get a page by ID, including full content.",
             id_schema("page_id")),
-        tool("create_page", "Create a new page. Must provide either book_id or chapter_id. Provide content as markdown (preferred) or html. Markdown is converted to HTML server-side for reliable formatting.", json!({
+        tool("create_page", "Create a new page. Must provide either book_id or chapter_id. Provide content as markdown (preferred) or html. Markdown is converted to HTML server-side. IMPORTANT: Do NOT include the page title as a heading in the content — BookStack displays the 'name' as an H1 automatically. Start with body text or ## sub-headings.", json!({
             "type": "object",
             "properties": {
                 "name": { "type": "string", "description": "Page name" },
@@ -845,7 +849,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             },
             "required": ["name"]
         })),
-        tool("update_page", "Update a page. Provide content as markdown (preferred) or html. Markdown is converted to HTML server-side.",
+        tool("update_page", "Update a page. Provide content as markdown (preferred) or html. Markdown is converted to HTML server-side. Do NOT include the page title as a heading — BookStack renders the name as H1 automatically.",
             update_schema("page_id", &["name", "markdown", "html"])),
         tool("edit_page", "Performs exact string replacements in a page's markdown content. Fetches the page, finds old_text, replaces with new_text, and saves. Fails if old_text is not found or is ambiguous (found multiple times without replace_all).", json!({
             "type": "object",

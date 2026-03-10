@@ -441,6 +441,11 @@ impl SemanticState {
         }))
     }
 
+    /// List all active (pending/running) jobs plus recent completed/failed jobs.
+    pub async fn list_jobs(&self, recent: usize) -> Result<Vec<bsmcp_common::types::EmbedJob>, String> {
+        self.db.list_jobs(recent).await
+    }
+
     /// Handle BookStack webhook for content changes.
     ///
     /// Embedding context is `[Shelf > Book > Chapter > Page]`, so any event that

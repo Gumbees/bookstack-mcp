@@ -271,6 +271,49 @@ fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
+fn format_timestamp(ts: Option<i64>) -> String {
+    match ts {
+        Some(epoch) => {
+            // Format as relative time + absolute
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            let diff = now - epoch;
+            let relative = if diff < 60 {
+                format!("{diff}s ago")
+            } else if diff < 3600 {
+                format!("{}m ago", diff / 60)
+            } else if diff < 86400 {
+                format!("{}h {}m ago", diff / 3600, (diff % 3600) / 60)
+            } else {
+                format!("{}d ago", diff / 86400)
+            };
+            relative
+        }
+        None => "-".to_string(),
+    }
+}
+
+fn badge_class(status: &str) -> &str {
+    match status {
+        "running" => "running",
+        "completed" => "completed",
+        "failed" => "failed",
+        "pending" => "pending",
+        _ => "none",
+    }
+}
+
+fn bar_color(status: &str) -> &str {
+    match status {
+        "running" => "#3b82f6",
+        "completed" => "#22c55e",
+        "failed" => "#ef4444",
+        _ => "#6b7280",
+    }
+}
+
 async fn handle_status(
     State(state): State<sse::AppState>,
 ) -> impl IntoResponse {
@@ -284,39 +327,79 @@ async fn handle_status(
         Err(e) => return Html(format!("Error: {}", html_escape(&e.to_string()))).into_response(),
     };
 
+    let jobs = semantic.list_jobs(10).await.unwrap_or_default();
+
     let total_pages = stats["total_indexed_pages"].as_i64().unwrap_or(0);
     let total_chunks = stats["total_chunks"].as_i64().unwrap_or(0);
-    let job = &stats["latest_job"];
 
-    let (job_status, job_scope, done, total, pct, started, finished, error) = if job.is_null() {
-        ("none".to_string(), "-".to_string(), 0i64, 0i64, 0.0f64, "-".to_string(), "-".to_string(), "-".to_string())
-    } else {
-        let status = html_escape(job["status"].as_str().unwrap_or("unknown"));
-        let scope = html_escape(job["scope"].as_str().unwrap_or("-"));
-        let d = job["done_pages"].as_i64().unwrap_or(0);
-        let t = job["total_pages"].as_i64().unwrap_or(0);
-        let p = if t > 0 { (d as f64 / t as f64) * 100.0 } else { 0.0 };
-        let s = html_escape(job["started_at"].as_str().unwrap_or("-"));
-        let f = job["finished_at"].as_str().map(|v| html_escape(v)).unwrap_or_else(|| {
-            if job["finished_at"].is_null() { "-".to_string() } else { html_escape(&job["finished_at"].to_string()) }
-        });
-        let e = job["error"].as_str().map(|v| html_escape(v)).unwrap_or_else(|| {
-            if job["error"].is_null() { "-".to_string() } else { html_escape(&job["error"].to_string()) }
-        });
-        (status, scope, d, t, p, s, f, e)
-    };
-
-    let bar_color = match job_status.as_str() {
-        "running" => "#3b82f6",
-        "completed" => "#22c55e",
-        "failed" => "#ef4444",
-        _ => "#6b7280",
-    };
-
-    let auto_refresh = if job_status == "running" {
+    let has_active = jobs.iter().any(|j| j.status == "running" || j.status == "pending");
+    let auto_refresh = if has_active {
         r#"<meta http-equiv="refresh" content="5">"#
     } else {
         ""
+    };
+
+    // Build job rows
+    let mut job_rows = String::new();
+    for job in &jobs {
+        let pct = if job.total_pages > 0 {
+            (job.done_pages as f64 / job.total_pages as f64) * 100.0
+        } else {
+            0.0
+        };
+        let color = bar_color(&job.status);
+        let badge = badge_class(&job.status);
+        let scope = html_escape(&job.scope);
+        let started = format_timestamp(job.started_at);
+        let finished = format_timestamp(job.finished_at);
+        let error_html = match &job.error {
+            Some(e) => format!(r#"<div class="error">Error: {}</div>"#, html_escape(e)),
+            None => String::new(),
+        };
+        let progress_html = if job.status == "running" || job.status == "completed" || job.status == "failed" {
+            format!(r#"
+      <div class="bar-bg bar-sm">
+        <div class="bar-fill" style="width: {pct:.1}%; background: {color};">{done}/{total}</div>
+      </div>"#,
+                done = job.done_pages,
+                total = job.total_pages,
+            )
+        } else {
+            String::new()
+        };
+
+        job_rows.push_str(&format!(r#"
+    <div class="job-row">
+      <div class="job-header">
+        <span class="status-badge {badge}">{status}</span>
+        <span class="job-scope">{scope}</span>
+        <span class="job-id">#{id}</span>
+      </div>{progress_html}
+      <div class="job-meta">
+        <span>Started: {started}</span>
+        {finished_span}
+      </div>{error_html}
+    </div>"#,
+            status = html_escape(&job.status),
+            id = job.id,
+            finished_span = if job.finished_at.is_some() {
+                format!("<span>Finished: {finished}</span>")
+            } else {
+                String::new()
+            },
+        ));
+    }
+
+    if jobs.is_empty() {
+        job_rows = r#"<div class="job-row"><span style="color:#64748b">No jobs found</span></div>"#.to_string();
+    }
+
+    let pending_count = jobs.iter().filter(|j| j.status == "pending").count();
+    let running_count = jobs.iter().filter(|j| j.status == "running").count();
+    let queue_summary = if pending_count > 0 || running_count > 0 {
+        format!("{running_count} running, {pending_count} pending")
+    } else {
+        "idle".to_string()
     };
 
     let html = format!(r#"<!DOCTYPE html>
@@ -327,22 +410,30 @@ async fn handle_status(
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; padding: 2rem; }}
-  .container {{ max-width: 640px; margin: 0 auto; }}
+  .container {{ max-width: 720px; margin: 0 auto; }}
   h1 {{ font-size: 1.25rem; font-weight: 600; margin-bottom: 1.5rem; color: #f8fafc; }}
+  h2 {{ font-size: 1rem; font-weight: 600; margin-bottom: 0.75rem; color: #f8fafc; }}
   .card {{ background: #1e293b; border-radius: 0.75rem; padding: 1.5rem; margin-bottom: 1rem; }}
   .stat-row {{ display: flex; justify-content: space-between; padding: 0.5rem 0; border-bottom: 1px solid #334155; }}
   .stat-row:last-child {{ border-bottom: none; }}
   .stat-label {{ color: #94a3b8; }}
   .stat-value {{ font-weight: 500; font-variant-numeric: tabular-nums; }}
-  .bar-bg {{ background: #334155; border-radius: 9999px; height: 1.5rem; overflow: hidden; margin: 1rem 0; }}
-  .bar-fill {{ height: 100%%; border-radius: 9999px; transition: width 0.5s ease; display: flex; align-items: center; justify-content: center; font-size: 0.75rem; font-weight: 600; min-width: 2.5rem; }}
-  .status-badge {{ display: inline-block; padding: 0.125rem 0.5rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; }}
+  .bar-bg {{ background: #334155; border-radius: 9999px; height: 1.5rem; overflow: hidden; margin: 0.5rem 0; }}
+  .bar-sm {{ height: 1.25rem; }}
+  .bar-fill {{ height: 100%%; border-radius: 9999px; transition: width 0.5s ease; display: flex; align-items: center; justify-content: center; font-size: 0.7rem; font-weight: 600; min-width: 2.5rem; color: #fff; }}
+  .status-badge {{ display: inline-block; padding: 0.125rem 0.5rem; border-radius: 9999px; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; }}
   .running {{ background: #1e3a5f; color: #60a5fa; }}
   .completed {{ background: #14532d; color: #4ade80; }}
   .failed {{ background: #450a0a; color: #f87171; }}
   .pending {{ background: #3f3f46; color: #a1a1aa; }}
   .none {{ background: #27272a; color: #71717a; }}
-  .error {{ color: #f87171; font-size: 0.875rem; margin-top: 0.5rem; }}
+  .error {{ color: #f87171; font-size: 0.8rem; margin-top: 0.25rem; }}
+  .job-row {{ padding: 0.75rem 0; border-bottom: 1px solid #334155; }}
+  .job-row:last-child {{ border-bottom: none; }}
+  .job-header {{ display: flex; align-items: center; gap: 0.5rem; }}
+  .job-scope {{ font-weight: 500; }}
+  .job-id {{ color: #64748b; font-size: 0.8rem; margin-left: auto; }}
+  .job-meta {{ display: flex; gap: 1rem; font-size: 0.8rem; color: #94a3b8; margin-top: 0.25rem; }}
   .footer {{ text-align: center; color: #475569; font-size: 0.75rem; margin-top: 2rem; }}
 </style>
 </head><body>
@@ -357,42 +448,18 @@ async fn handle_status(
       <span class="stat-label">Total Chunks</span>
       <span class="stat-value">{total_chunks}</span>
     </div>
+    <div class="stat-row">
+      <span class="stat-label">Queue</span>
+      <span class="stat-value">{queue_summary}</span>
+    </div>
   </div>
   <div class="card">
-    <div class="stat-row">
-      <span class="stat-label">Job Status</span>
-      <span class="stat-value"><span class="status-badge {job_status}">{job_status}</span></span>
-    </div>
-    <div class="stat-row">
-      <span class="stat-label">Scope</span>
-      <span class="stat-value">{job_scope}</span>
-    </div>
-    <div class="stat-row">
-      <span class="stat-label">Progress</span>
-      <span class="stat-value">{done} / {total}</span>
-    </div>
-    <div class="bar-bg">
-      <div class="bar-fill" style="width: {pct:.1}%; background: {bar_color};">{pct:.1}%</div>
-    </div>
-    <div class="stat-row">
-      <span class="stat-label">Started</span>
-      <span class="stat-value">{started}</span>
-    </div>
-    <div class="stat-row">
-      <span class="stat-label">Finished</span>
-      <span class="stat-value">{finished}</span>
-    </div>{error_section}
+    <h2>Job Queue</h2>
+    {job_rows}
   </div>
-  <div class="footer">Auto-refreshes every 5s while running</div>
+  <div class="footer">Auto-refreshes every 5s while jobs are active</div>
 </div>
-</body></html>"#,
-        error_section = if error != "-" {
-            format!(r#"
-    <div class="error">Error: {error}</div>"#)
-        } else {
-            String::new()
-        },
-    );
+</body></html>"#);
 
     Html(html).into_response()
 }

@@ -767,6 +767,34 @@ impl SemanticDb for PostgresDb {
         })
     }
 
+    async fn list_jobs(&self, recent: usize) -> Result<Vec<EmbedJob>, String> {
+        // All active jobs (pending/running) + most recent completed/failed
+        let rows = sqlx::query(
+            &format!(
+                "(SELECT id, scope, status, total_pages, done_pages, started_at, finished_at, error, worker_id
+                 FROM embed_jobs WHERE status IN ('pending', 'running') ORDER BY id ASC)
+                UNION ALL
+                (SELECT id, scope, status, total_pages, done_pages, started_at, finished_at, error, worker_id
+                 FROM embed_jobs WHERE status NOT IN ('pending', 'running') ORDER BY id DESC LIMIT {recent})"
+            )
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_jobs failed: {e}"))?;
+
+        Ok(rows.iter().map(|r| EmbedJob {
+            id: r.get("id"),
+            scope: r.get("scope"),
+            status: r.get("status"),
+            total_pages: r.get("total_pages"),
+            done_pages: r.get("done_pages"),
+            started_at: r.get("started_at"),
+            finished_at: r.get("finished_at"),
+            error: r.get("error"),
+            worker_id: r.get("worker_id"),
+        }).collect())
+    }
+
     async fn vector_search(&self, query_embedding: &[f32], limit: usize, threshold: f32) -> Result<Vec<SearchHit>, String> {
         // Sanity check: detect garbage embeddings (all zeros, NaN, etc.)
         let magnitude: f32 = query_embedding.iter().map(|x| x * x).sum::<f32>().sqrt();

@@ -881,6 +881,50 @@ impl SemanticDb for SqliteDb {
         .map_err(|e| format!("Task failed: {e}"))?
     }
 
+    async fn list_jobs(&self, recent: usize) -> Result<Vec<EmbedJob>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut jobs = Vec::new();
+
+            // Active jobs (pending/running)
+            let mut stmt = conn.prepare(
+                "SELECT id, scope, status, total_pages, done_pages, started_at, finished_at, error, worker_id
+                 FROM embed_jobs WHERE status IN ('pending', 'running') ORDER BY id ASC"
+            ).map_err(|e| format!("list_jobs prepare failed: {e}"))?;
+            let active = stmt.query_map([], |row| Ok(EmbedJob {
+                id: row.get(0)?, scope: row.get(1)?, status: row.get(2)?,
+                total_pages: row.get(3)?, done_pages: row.get(4)?,
+                started_at: row.get(5)?, finished_at: row.get(6)?,
+                error: row.get(7)?, worker_id: row.get(8)?,
+            })).map_err(|e| format!("list_jobs query failed: {e}"))?;
+            for job in active.flatten() {
+                jobs.push(job);
+            }
+
+            // Recent completed/failed
+            let mut stmt = conn.prepare(
+                &format!(
+                    "SELECT id, scope, status, total_pages, done_pages, started_at, finished_at, error, worker_id
+                     FROM embed_jobs WHERE status NOT IN ('pending', 'running') ORDER BY id DESC LIMIT {recent}"
+                )
+            ).map_err(|e| format!("list_jobs prepare failed: {e}"))?;
+            let completed = stmt.query_map([], |row| Ok(EmbedJob {
+                id: row.get(0)?, scope: row.get(1)?, status: row.get(2)?,
+                total_pages: row.get(3)?, done_pages: row.get(4)?,
+                started_at: row.get(5)?, finished_at: row.get(6)?,
+                error: row.get(7)?, worker_id: row.get(8)?,
+            })).map_err(|e| format!("list_jobs query failed: {e}"))?;
+            for job in completed.flatten() {
+                jobs.push(job);
+            }
+
+            Ok(jobs)
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
     async fn vector_search(&self, query_embedding: &[f32], limit: usize, threshold: f32) -> Result<Vec<SearchHit>, String> {
         let conn = self.conn.clone();
         let query_embedding = query_embedding.to_vec();

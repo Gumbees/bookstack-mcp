@@ -79,6 +79,9 @@ pub trait SemanticDb: Send + Sync + 'static {
     async fn get_latest_job(&self) -> Result<Option<EmbedJob>, String>;
     async fn get_stats(&self) -> Result<EmbedStats, String>;
 
+    /// List all pending/running jobs, plus the most recent completed/failed jobs (up to `recent`).
+    async fn list_jobs(&self, recent: usize) -> Result<Vec<EmbedJob>, String>;
+
     // --- Vector search ---
 
     /// Backend-specific vector search. SQLite: brute-force cosine scan. Postgres: pgvector HNSW.

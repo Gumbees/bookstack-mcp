@@ -257,6 +257,24 @@ The token ID and secret come from your BookStack API token (created under **My A
 
 All schema migrations are automatic on startup (CREATE TABLE IF NOT EXISTS, ALTER TABLE for new columns). No manual SQL is needed.
 
+### From v0.5.2 to v0.5.3
+
+v0.5.3 fixes embedding dimension detection, adds Ollama LLM support for summaries, and improves hybrid search scoring.
+
+#### What's new
+
+- **Ollama LLM support** — `BSMCP_LLM_PROVIDER=ollama` for instance summaries using local models (no API key needed)
+- **Configurable summary refresh** — `BSMCP_SUMMARY_INTERVAL` (hours) for periodic regeneration instead of one-time only
+- **Configurable LLM base URL** — `BSMCP_LLM_API_URL` for remote Ollama instances or custom endpoints
+- **Hybrid search scoring fix** — keyword-only results no longer inflate above actual semantic matches via blanket boost. Pages with zero vector similarity are capped below real semantic results.
+- **Embedding dimension auto-detection fix** — empty `BSMCP_EMBED_DIMS` env var no longer bypasses Ollama dimension detection (was silently defaulting to 768)
+- **Auto-reindex on dimension change** — embedder now detects stored vs actual dimensions and triggers clean reindex automatically
+
+#### What you must do
+
+1. **Pull new images**: `ghcr.io/gumbees/bsmcp-server:0.5.3` + `ghcr.io/gumbees/bsmcp-embedder:0.5.3`
+2. **Restart** — dimension mismatch auto-reindexes if needed
+
 ### From v0.5.1 to v0.5.2
 
 v0.5.2 adds pluggable embedding providers, AI instance summaries, OAuth refresh tokens, and several quality-of-life improvements.
@@ -281,7 +299,7 @@ v0.5.2 adds pluggable embedding providers, AI instance summaries, OAuth refresh 
 
 #### What you must do
 
-1. **Pull new images**: `ghcr.io/gumbees/bsmcp-server:0.5.2` + `ghcr.io/gumbees/bsmcp-embedder:0.5.2`
+1. **Pull new images**: `ghcr.io/gumbees/bsmcp-server:0.5.2` + `ghcr.io/gumbees/bsmcp-embedder:0.5.2` (or use `latest`)
 2. **Restart** — that's it for the base upgrade
 
 **Optional: Enable AI instance summary** — add LLM env vars:

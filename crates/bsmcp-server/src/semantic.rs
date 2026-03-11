@@ -324,9 +324,9 @@ impl SemanticState {
                     // Vector only
                     score.vector_score + score.blanket_boost
                 } else {
-                    // Keyword only — use a base score that puts it below good vector matches
-                    // but above the threshold so it still appears
-                    (threshold + 0.05) * 0.8 + score.keyword_rank * 0.2 + score.blanket_boost
+                    // Keyword only — cap below vector results, no blanket boost
+                    // (graph proximity shouldn't rescue zero-similarity pages)
+                    (threshold + 0.05) * 0.8 + score.keyword_rank * 0.15
                 };
                 (pid, blended, score)
             })

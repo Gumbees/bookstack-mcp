@@ -686,7 +686,12 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool) ->
          IMPORTANT: BookStack automatically displays the page name as an H1 title at the top \
          of every page. Do NOT include the page title as a heading (e.g. '# Page Name') in \
          the markdown/html content — this causes a duplicate title. Start content directly with \
-         body text or a sub-heading (## or lower).\n\n",
+         body text or a sub-heading (## or lower).\n\n\
+         All editing tools (edit_page, replace_section, append_to_page, insert_after) work on \
+         ALL pages regardless of editor type (markdown or WYSIWYG). They use BookStack's \
+         markdown export API which converts HTML content to markdown automatically. Prefer \
+         these targeted tools over update_page for partial edits — update_page rewrites the \
+         entire page and should only be used when the whole page needs replacing.\n\n",
     );
 
     match build_structure(client).await {
@@ -851,7 +856,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
         })),
         tool("update_page", "Update a page. Provide content as markdown (preferred) or html. Markdown is converted to HTML server-side. Do NOT include the page title as a heading — BookStack renders the name as H1 automatically.",
             update_schema("page_id", &["name", "markdown", "html"])),
-        tool("edit_page", "Performs exact string replacements in a page's markdown content. Fetches the page, finds old_text, replaces with new_text, and saves. Fails if old_text is not found or is ambiguous (found multiple times without replace_all).", json!({
+        tool("edit_page", "Performs exact string replacements in a page's content. Works on ALL pages including WYSIWYG — content is exported as markdown for matching regardless of editor type. Finds old_text, replaces with new_text, saves. Fails if old_text is not found or is ambiguous (found multiple times without replace_all).", json!({
             "type": "object",
             "properties": {
                 "page_id": { "type": "integer", "description": "The page_id" },
@@ -861,7 +866,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             },
             "required": ["page_id", "old_text", "new_text"]
         })),
-        tool("append_to_page", "Append markdown content to the end of a page. No need to read the page first.", json!({
+        tool("append_to_page", "Append markdown content to the end of a page. Works on ALL pages including WYSIWYG. No need to read the page first.", json!({
             "type": "object",
             "properties": {
                 "page_id": { "type": "integer", "description": "The page_id" },
@@ -869,7 +874,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             },
             "required": ["page_id", "markdown"]
         })),
-        tool("replace_section", "Replace all content under a heading (up to the next heading of same or higher level). Useful for updating a specific section without touching the rest. No need to read the page first.", json!({
+        tool("replace_section", "Replace all content under a heading (up to the next heading of same or higher level). Works on ALL pages including WYSIWYG. Useful for updating a specific section without touching the rest. No need to read the page first.", json!({
             "type": "object",
             "properties": {
                 "page_id": { "type": "integer", "description": "The page_id" },
@@ -878,7 +883,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             },
             "required": ["page_id", "heading", "markdown"]
         })),
-        tool("insert_after", "Insert markdown content after a specific line in a page. The anchor is matched by exact line content (trimmed). No need to read the page first.", json!({
+        tool("insert_after", "Insert markdown content after a specific line in a page. Works on ALL pages including WYSIWYG. The anchor is matched by exact line content (trimmed). No need to read the page first.", json!({
             "type": "object",
             "properties": {
                 "page_id": { "type": "integer", "description": "The page_id" },

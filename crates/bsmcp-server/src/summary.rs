@@ -12,27 +12,54 @@ use bsmcp_common::db::SemanticDb;
 use crate::llm::LlmClient;
 
 const META_KEY: &str = "instance_summary";
+const META_KEY_TS: &str = "instance_summary_ts";
 
 /// Cached instance summary, shared across the server.
 pub type SummaryCache = Arc<RwLock<Option<String>>>;
 
-/// Generate an instance summary in the background.
-/// Checks the DB cache first; if missing or forced, calls the LLM.
+/// Check if the cached summary is stale (older than max_age_secs).
+async fn is_cache_stale(db: &Option<Arc<dyn SemanticDb>>, max_age_secs: u64) -> bool {
+    if max_age_secs == 0 {
+        return false; // No interval = never stale once cached
+    }
+    if let Some(ref db) = db {
+        if let Ok(Some(ts_str)) = db.get_meta(META_KEY_TS).await {
+            if let Ok(ts) = ts_str.parse::<u64>() {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                return now.saturating_sub(ts) > max_age_secs;
+            }
+        }
+    }
+    true // No timestamp = treat as stale
+}
+
+/// Generate an instance summary.
+/// Checks the DB cache first; if missing, stale, or forced, calls the LLM.
 pub async fn generate_summary(
     llm: LlmClient,
     client: BookStackClient,
     db: Option<Arc<dyn SemanticDb>>,
     cache: SummaryCache,
     force: bool,
+    max_age_secs: u64,
 ) {
     // Check DB cache first (survives restarts)
     if !force {
         if let Some(ref db) = db {
             if let Ok(Some(cached)) = db.get_meta(META_KEY).await {
                 if !cached.is_empty() {
-                    eprintln!("Summary: loaded from cache ({} chars)", cached.len());
+                    let stale = is_cache_stale(&Some(db.clone()), max_age_secs).await;
+                    if !stale {
+                        eprintln!("Summary: loaded from cache ({} chars)", cached.len());
+                        *cache.write().await = Some(cached);
+                        return;
+                    }
+                    // Cache is stale but usable — load it, then regenerate
+                    eprintln!("Summary: cache is stale, loading existing and regenerating...");
                     *cache.write().await = Some(cached);
-                    return;
                 }
             }
         }
@@ -73,10 +100,17 @@ pub async fn generate_summary(
     match llm.complete(system, &user_msg).await {
         Ok(summary) => {
             eprintln!("Summary: generated ({} chars)", summary.len());
-            // Store in DB cache
+            // Store in DB cache with timestamp
             if let Some(ref db) = db {
                 if let Err(e) = db.set_meta(META_KEY, &summary).await {
                     eprintln!("Summary: failed to cache in DB: {e}");
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if let Err(e) = db.set_meta(META_KEY_TS, &now.to_string()).await {
+                    eprintln!("Summary: failed to cache timestamp: {e}");
                 }
             }
             *cache.write().await = Some(summary);
@@ -85,6 +119,29 @@ pub async fn generate_summary(
             eprintln!("Summary: LLM call failed: {e}");
         }
     }
+}
+
+/// Spawn summary generation in the background.
+/// If `interval_secs > 0`, regenerates periodically. Otherwise, generates once.
+pub fn spawn_summary_loop(
+    llm: LlmClient,
+    client: BookStackClient,
+    db: Option<Arc<dyn SemanticDb>>,
+    cache: SummaryCache,
+    interval_secs: u64,
+) {
+    tokio::spawn(async move {
+        // Initial generation (non-forced, respects cache + staleness)
+        generate_summary(llm.clone(), client.clone(), db.clone(), cache.clone(), false, interval_secs).await;
+        // Periodic regeneration (only if interval is set)
+        if interval_secs > 0 {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+                eprintln!("Summary: periodic regeneration triggered");
+                generate_summary(llm.clone(), client.clone(), db.clone(), cache.clone(), true, interval_secs).await;
+            }
+        }
+    });
 }
 
 /// Build the shelf > book > chapter structure tree (same format as MCP instructions).
@@ -205,7 +262,7 @@ pub async fn invalidate_summary(
         let db = db.cloned();
         let cache = cache.clone();
         tokio::spawn(async move {
-            generate_summary(llm, client, db, cache, true).await;
+            generate_summary(llm, client, db, cache, true, 0).await;
         });
     }
 }

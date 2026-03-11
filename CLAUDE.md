@@ -92,9 +92,11 @@ All prefixed `BSMCP_`. See `.env.example` for full list. Key ones:
 - `BSMCP_EMBED_BATCH_SIZE`, `BSMCP_EMBED_DELAY_MS` — performance tuning
 
 **Instance Summary (optional):**
-- `BSMCP_LLM_PROVIDER` — `openrouter`, `anthropic`, `openai`
-- `BSMCP_LLM_API_KEY` — API key for LLM
+- `BSMCP_LLM_PROVIDER` — `openrouter`, `anthropic`, `openai`, `ollama`
+- `BSMCP_LLM_API_KEY` — API key for LLM (not needed for ollama)
 - `BSMCP_LLM_MODEL` — model ID (defaults per provider)
+- `BSMCP_LLM_API_URL` — base URL (useful for ollama on different host)
+- `BSMCP_SUMMARY_INTERVAL` — hours between regenerations (0 = only on first startup)
 - `BSMCP_SUMMARY_TOKEN_ID/SECRET` — BookStack token (falls back to BSMCP_EMBED_TOKEN_*)
 
 ## Implemented Tools (56)

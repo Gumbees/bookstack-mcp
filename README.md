@@ -128,9 +128,11 @@ cargo run --release -p bsmcp-embedder
 | `BSMCP_REFRESH_TOKEN_TTL` | No | `7776000` | Refresh token TTL in seconds (90d) |
 | `BSMCP_BACKUP_INTERVAL` | No | - | Hours between backups (0 = disabled) |
 | `BSMCP_BACKUP_PATH` | No | `/data/backups` | Backup directory |
-| `BSMCP_LLM_PROVIDER` | No | - | LLM for instance summary: `openrouter`, `anthropic`, `openai` |
-| `BSMCP_LLM_API_KEY` | No | - | API key for LLM provider |
+| `BSMCP_LLM_PROVIDER` | No | - | LLM for instance summary: `openrouter`, `anthropic`, `openai`, `ollama` |
+| `BSMCP_LLM_API_KEY` | No | - | API key for LLM provider (not needed for ollama) |
 | `BSMCP_LLM_MODEL` | No | (per provider) | Model ID for summary generation |
+| `BSMCP_LLM_API_URL` | No | (per provider) | Base URL for LLM API (useful for ollama on different host) |
+| `BSMCP_SUMMARY_INTERVAL` | No | `0` | Hours between summary regeneration (0 = only on first startup) |
 | `BSMCP_SUMMARY_TOKEN_ID` | No | - | BookStack token for summary (falls back to `BSMCP_EMBED_TOKEN_*`) |
 | `BSMCP_SUMMARY_TOKEN_SECRET` | No | - | BookStack token secret for summary |
 
@@ -284,8 +286,9 @@ v0.5.2 adds pluggable embedding providers, AI instance summaries, OAuth refresh 
 
 **Optional: Enable AI instance summary** — add LLM env vars:
 ```bash
-BSMCP_LLM_PROVIDER=openrouter  # or: anthropic, openai
-BSMCP_LLM_API_KEY=your-api-key
+BSMCP_LLM_PROVIDER=openrouter  # or: anthropic, openai, ollama
+BSMCP_LLM_API_KEY=your-api-key  # not needed for ollama
+BSMCP_SUMMARY_INTERVAL=24       # regenerate every 24h (0 = only on first startup)
 # Uses BSMCP_EMBED_TOKEN_ID/SECRET for BookStack API access
 ```
 

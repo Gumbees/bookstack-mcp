@@ -186,12 +186,25 @@ async fn main() {
                 &tsec,
                 reqwest::Client::new(),
             );
-            let sdb = semantic_db.clone();
-            let cache = summary_cache.clone();
-            eprintln!("Summary: LLM configured ({:?}), will generate in background", llm_client.provider());
-            tokio::spawn(async move {
-                summary::generate_summary(llm_client, bs_client, sdb, cache, false).await;
-            });
+            // BSMCP_SUMMARY_INTERVAL: hours between regenerations (0 = only on startup if no cache)
+            let interval_hours: u64 = env::var("BSMCP_SUMMARY_INTERVAL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let interval_secs = interval_hours * 3600;
+
+            if interval_hours > 0 {
+                eprintln!("Summary: LLM configured ({:?}), regenerating every {interval_hours}h", llm_client.provider());
+            } else {
+                eprintln!("Summary: LLM configured ({:?}), one-time generation", llm_client.provider());
+            }
+            summary::spawn_summary_loop(
+                llm_client,
+                bs_client,
+                semantic_db.clone(),
+                summary_cache.clone(),
+                interval_secs,
+            );
         } else {
             eprintln!("Summary: LLM configured but no BookStack service token (set BSMCP_SUMMARY_TOKEN_ID/SECRET or BSMCP_EMBED_TOKEN_ID/SECRET)");
         }

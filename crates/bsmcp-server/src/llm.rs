@@ -1,5 +1,5 @@
 //! Lightweight LLM client for instance summary generation.
-//! Supports OpenRouter (OpenAI-compatible) and direct Anthropic API.
+//! Supports OpenRouter, Anthropic, OpenAI, and Ollama.
 
 use serde_json::{json, Value};
 
@@ -8,39 +8,53 @@ pub enum LlmProvider {
     OpenRouter,
     Anthropic,
     OpenAI,
+    Ollama,
 }
 
 #[derive(Clone)]
 pub struct LlmClient {
     provider: LlmProvider,
     api_key: String,
+    base_url: String,
     model: String,
     http: reqwest::Client,
 }
 
 impl LlmClient {
     pub fn from_env() -> Option<Self> {
-        let api_key = std::env::var("BSMCP_LLM_API_KEY").ok()?;
-        if api_key.is_empty() {
-            return None;
-        }
-
         let provider = match std::env::var("BSMCP_LLM_PROVIDER")
-            .unwrap_or_else(|_| "openrouter".into())
+            .unwrap_or_default()
             .to_lowercase()
             .as_str()
         {
             "anthropic" => LlmProvider::Anthropic,
             "openai" => LlmProvider::OpenAI,
-            _ => LlmProvider::OpenRouter,
+            "ollama" => LlmProvider::Ollama,
+            "openrouter" => LlmProvider::OpenRouter,
+            _ => return None, // No provider configured
         };
+
+        // API key required for cloud providers, optional for Ollama
+        let api_key = std::env::var("BSMCP_LLM_API_KEY").unwrap_or_default();
+        if api_key.is_empty() && !matches!(provider, LlmProvider::Ollama) {
+            return None;
+        }
 
         let default_model = match provider {
             LlmProvider::Anthropic => "claude-sonnet-4-20250514".to_string(),
             LlmProvider::OpenRouter => "anthropic/claude-sonnet-4".to_string(),
             LlmProvider::OpenAI => "gpt-4o".to_string(),
+            LlmProvider::Ollama => "llama3.2".to_string(),
         };
         let model = std::env::var("BSMCP_LLM_MODEL").unwrap_or(default_model);
+
+        let default_url = match provider {
+            LlmProvider::OpenRouter => "https://openrouter.ai".to_string(),
+            LlmProvider::OpenAI => "https://api.openai.com".to_string(),
+            LlmProvider::Anthropic => "https://api.anthropic.com".to_string(),
+            LlmProvider::Ollama => "http://localhost:11434".to_string(),
+        };
+        let base_url = std::env::var("BSMCP_LLM_API_URL").unwrap_or(default_url);
 
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
@@ -50,6 +64,7 @@ impl LlmClient {
         Some(Self {
             provider,
             api_key,
+            base_url: base_url.trim_end_matches('/').to_string(),
             model,
             http,
         })
@@ -62,13 +77,13 @@ impl LlmClient {
     /// Send a single user message and get the assistant's text response.
     pub async fn complete(&self, system: &str, user_message: &str) -> Result<String, String> {
         match self.provider {
-            LlmProvider::OpenRouter => self.complete_openai_compat(
-                "https://openrouter.ai/api/v1/chat/completions",
+            LlmProvider::OpenRouter | LlmProvider::OpenAI => self.complete_openai_compat(
+                &format!("{}/v1/chat/completions", self.base_url),
                 system,
                 user_message,
             ).await,
-            LlmProvider::OpenAI => self.complete_openai_compat(
-                "https://api.openai.com/v1/chat/completions",
+            LlmProvider::Ollama => self.complete_openai_compat(
+                &format!("{}/v1/chat/completions", self.base_url),
                 system,
                 user_message,
             ).await,

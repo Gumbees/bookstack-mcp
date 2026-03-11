@@ -1,8 +1,10 @@
+mod llm;
 mod mcp;
 mod migrate;
 mod oauth;
 mod semantic;
 mod sse;
+mod summary;
 
 use std::env;
 use std::net::SocketAddr;
@@ -168,6 +170,33 @@ async fn main() {
         None
     };
 
+    // Instance summary (optional — requires LLM API key + BookStack service token)
+    let summary_cache: summary::SummaryCache = Arc::new(tokio::sync::RwLock::new(None));
+    if let Some(llm_client) = llm::LlmClient::from_env() {
+        // Need a service-level BookStack client for reading content
+        let summary_token_id = env::var("BSMCP_SUMMARY_TOKEN_ID")
+            .or_else(|_| env::var("BSMCP_EMBED_TOKEN_ID"));
+        let summary_token_secret = env::var("BSMCP_SUMMARY_TOKEN_SECRET")
+            .or_else(|_| env::var("BSMCP_EMBED_TOKEN_SECRET"));
+
+        if let (Ok(tid), Ok(tsec)) = (summary_token_id, summary_token_secret) {
+            let bs_client = bsmcp_common::bookstack::BookStackClient::new(
+                &bookstack_url,
+                &tid,
+                &tsec,
+                reqwest::Client::new(),
+            );
+            let sdb = semantic_db.clone();
+            let cache = summary_cache.clone();
+            eprintln!("Summary: LLM configured ({:?}), will generate in background", llm_client.provider());
+            tokio::spawn(async move {
+                summary::generate_summary(llm_client, bs_client, sdb, cache, false).await;
+            });
+        } else {
+            eprintln!("Summary: LLM configured but no BookStack service token (set BSMCP_SUMMARY_TOKEN_ID/SECRET or BSMCP_EMBED_TOKEN_ID/SECRET)");
+        }
+    }
+
     let state = sse::AppState::new(
         bookstack_url,
         db,
@@ -175,6 +204,7 @@ async fn main() {
         backup_interval_hours,
         backup_path,
         semantic,
+        summary_cache,
     );
     state.spawn_cleanup();
     state.spawn_backup();

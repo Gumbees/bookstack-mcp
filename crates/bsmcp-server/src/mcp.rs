@@ -10,7 +10,12 @@ use crate::semantic::SemanticState;
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
 
-pub async fn handle_request(request: &Value, client: &BookStackClient, semantic: Option<&SemanticState>) -> Option<Value> {
+pub async fn handle_request(
+    request: &Value,
+    client: &BookStackClient,
+    semantic: Option<&SemanticState>,
+    summary_cache: &crate::summary::SummaryCache,
+) -> Option<Value> {
     let id = request.get("id");
 
     match request.get("jsonrpc").and_then(|v| v.as_str()) {
@@ -25,7 +30,8 @@ pub async fn handle_request(request: &Value, client: &BookStackClient, semantic:
 
     match method {
         "initialize" => {
-            let instructions = build_instructions(client, semantic.is_some()).await;
+            let summary = summary_cache.read().await.clone();
+            let instructions = build_instructions(client, semantic.is_some(), summary.as_deref()).await;
             Some(json_rpc_result(id, json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": { "tools": {} },
@@ -659,7 +665,7 @@ fn markdown_to_html(md: &str) -> String {
 
 // --- Dynamic instructions (sent on initialize) ---
 
-async fn build_instructions(client: &BookStackClient, semantic_enabled: bool) -> String {
+async fn build_instructions(client: &BookStackClient, semantic_enabled: bool, summary: Option<&str>) -> String {
     let instance_name = env::var("BSMCP_INSTANCE_NAME").unwrap_or_default();
     let instance_desc = env::var("BSMCP_INSTANCE_DESC").unwrap_or_default();
 
@@ -671,6 +677,13 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool) ->
         }
         instructions.push_str("\n\n");
     }
+
+    // Include AI-generated instance summary if available
+    if let Some(summary) = summary {
+        instructions.push_str(summary);
+        instructions.push_str("\n\n");
+    }
+
     instructions.push_str(
         "BookStack knowledge management server. Content is organized as: \
          Shelves > Books > Chapters > Pages. Use search_content to find content, \

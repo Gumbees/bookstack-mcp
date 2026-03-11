@@ -43,6 +43,7 @@ pub struct AppState {
     backup_interval_hours: Option<u64>,
     backup_path: PathBuf,
     pub semantic: Option<Arc<SemanticState>>,
+    pub summary_cache: crate::summary::SummaryCache,
 }
 
 pub(crate) struct RateLimit {
@@ -97,6 +98,7 @@ impl AppState {
         backup_interval_hours: Option<u64>,
         backup_path: PathBuf,
         semantic: Option<Arc<SemanticState>>,
+        summary_cache: crate::summary::SummaryCache,
     ) -> Self {
         let http_client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -117,6 +119,7 @@ impl AppState {
             backup_interval_hours,
             backup_path,
             semantic,
+            summary_cache,
         }
     }
 
@@ -401,7 +404,7 @@ pub async fn handle_message(
     };
 
     let semantic = state.semantic.as_deref();
-    let response = mcp::handle_request(&request, &client, semantic).await;
+    let response = mcp::handle_request(&request, &client, semantic, &state.summary_cache).await;
 
     if let Some(response) = response {
         let data = serde_json::to_string(&response).unwrap_or_default();
@@ -477,7 +480,7 @@ pub async fn handle_streamable(
     }
 
     let semantic = state.semantic.as_deref();
-    let response = mcp::handle_request(&request, &client, semantic).await;
+    let response = mcp::handle_request(&request, &client, semantic, &state.summary_cache).await;
 
     match response {
         Some(resp) => {

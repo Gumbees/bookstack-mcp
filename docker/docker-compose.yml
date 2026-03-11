@@ -14,7 +14,7 @@ services:
       retries: 5
 
   bsmcp-server:
-    image: ghcr.io/gumbees/bsmcp-server:0.5.1
+    image: ghcr.io/gumbees/bsmcp-server:0.5.2
     environment:
       BSMCP_DB_BACKEND: postgres
       BSMCP_DATABASE_URL: postgres://bsmcp:${BSMCP_DB_PASSWORD}@bsmcp-postgres/bsmcp
@@ -31,6 +31,11 @@ services:
       BSMCP_WEBHOOK_SECRET: ${BSMCP_WEBHOOK_SECRET}
       BSMCP_ACCESS_TOKEN_TTL: ${BSMCP_ACCESS_TOKEN_TTL:-86400}
       BSMCP_REFRESH_TOKEN_TTL: ${BSMCP_REFRESH_TOKEN_TTL:-7776000}
+      BSMCP_LLM_PROVIDER: ${BSMCP_LLM_PROVIDER:-}
+      BSMCP_LLM_API_KEY: ${BSMCP_LLM_API_KEY:-}
+      BSMCP_LLM_MODEL: ${BSMCP_LLM_MODEL:-}
+      BSMCP_SUMMARY_TOKEN_ID: ${BSMCP_SUMMARY_TOKEN_ID:-}
+      BSMCP_SUMMARY_TOKEN_SECRET: ${BSMCP_SUMMARY_TOKEN_SECRET:-}
       BSMCP_BACKUP_INTERVAL: ${BSMCP_BACKUP_INTERVAL:-}
       BSMCP_BACKUP_PATH: ${BSMCP_BACKUP_PATH:-/data/backups}
       PUID: ${PUID:-1000}
@@ -42,7 +47,7 @@ services:
         condition: service_healthy
 
   bsmcp-embedder:
-    image: ghcr.io/gumbees/bsmcp-embedder:0.5.1
+    image: ghcr.io/gumbees/bsmcp-embedder:0.5.2
     cpus: ${BSMCP_EMBED_CPUS:-0}
     volumes:
       - bsmcp-models:/data/models

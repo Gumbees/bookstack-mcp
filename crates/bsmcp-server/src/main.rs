@@ -103,11 +103,14 @@ async fn main() {
     // Build known_urls from BSMCP_PUBLIC_DOMAIN and BSMCP_INTERNAL_DOMAIN
     let known_urls = {
         let mut urls: Vec<String> = Vec::new();
-        if let Ok(domain) = env::var("BSMCP_PUBLIC_DOMAIN") {
-            let domain = domain.trim().trim_end_matches('/');
-            if !domain.is_empty() {
-                urls.push(format!("https://{domain}"));
-            }
+        let public_domain = env::var("BSMCP_PUBLIC_DOMAIN")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().trim_end_matches('/').to_string());
+        if let Some(domain) = &public_domain {
+            urls.push(format!("https://{domain}"));
+        } else {
+            eprintln!("Warning: BSMCP_PUBLIC_DOMAIN is not set — AI assistants won't be able to present clickable BookStack links to users");
         }
         if let Ok(domain) = env::var("BSMCP_INTERNAL_DOMAIN") {
             let domain = domain.trim().trim_end_matches('/');

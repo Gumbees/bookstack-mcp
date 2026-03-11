@@ -8,11 +8,12 @@ An MCP (Model Context Protocol) server that gives Claude full access to a [BookS
 - Full-text search with BookStack query operators
 - **Semantic vector search** — natural language search across all content via embeddings (optional)
 - **Pluggable database** — SQLite for simple deployments, PostgreSQL + pgvector for production
-- **Separate embedder** — background embedding service keeps ONNX/model weight out of the MCP server
+- **Separate embedder** — background embedding service with pluggable backends (local ONNX, Ollama, OpenAI)
 - **Server-side markdown to HTML conversion** — send markdown, server converts before sending to BookStack
 - **OAuth 2.1 support** — use as a Claude.ai or Claude Desktop custom connector without config files
 - **Encrypted token storage** — OAuth tokens encrypted at rest with AES-256-GCM
 - **Dual transport** — SSE (MCP 2024-11-05) and Streamable HTTP (MCP 2025-03-26)
+- **AI instance summary** — optional LLM-generated summary of your knowledge base included in MCP context
 - **Dynamic structure discovery** — AI automatically learns your BookStack hierarchy on connect
 - **Auto-migration** — seamlessly migrate from SQLite to PostgreSQL on startup
 - Multi-user support via per-session BookStack API tokens
@@ -26,7 +27,7 @@ crates/
   bsmcp-db-sqlite/    SQLite backend (rusqlite, bundled)
   bsmcp-db-postgres/  PostgreSQL + pgvector backend (sqlx)
   bsmcp-server/       MCP server binary (axum, no ONNX dependency)
-  bsmcp-embedder/     Embedder binary (fastembed + ONNX, job queue worker + HTTP /embed)
+  bsmcp-embedder/     Embedder binary (local ONNX / Ollama / OpenAI, job queue worker + HTTP /embed)
 
 docker/
   Dockerfile.server       Lightweight server image (~35MB)
@@ -35,7 +36,7 @@ docker/
   docker-compose.sqlite.yml  SQLite deployment (simple)
 ```
 
-The MCP server handles all client-facing protocol, OAuth, and search. The embedder runs separately, polling a database-backed job queue to embed pages and serving a `/embed` HTTP endpoint for query-time embedding. This keeps the ONNX model out of the server process.
+The MCP server handles all client-facing protocol, OAuth, and search. The embedder runs separately, polling a database-backed job queue to embed pages and serving a `/embed` HTTP endpoint for query-time embedding. The embedder supports three backends: local ONNX models (fastembed), Ollama, or OpenAI-compatible APIs.
 
 ## Available Tools (56)
 
@@ -123,8 +124,15 @@ cargo run --release -p bsmcp-embedder
 | `BSMCP_SEMANTIC_SEARCH` | No | `false` | Enable semantic search tools |
 | `BSMCP_EMBEDDER_URL` | No | `http://bsmcp-embedder:8081` | Embedder HTTP endpoint |
 | `BSMCP_WEBHOOK_SECRET` | If semantic | - | BookStack webhook secret |
+| `BSMCP_ACCESS_TOKEN_TTL` | No | `86400` | Access token TTL in seconds (24h) |
+| `BSMCP_REFRESH_TOKEN_TTL` | No | `7776000` | Refresh token TTL in seconds (90d) |
 | `BSMCP_BACKUP_INTERVAL` | No | - | Hours between backups (0 = disabled) |
 | `BSMCP_BACKUP_PATH` | No | `/data/backups` | Backup directory |
+| `BSMCP_LLM_PROVIDER` | No | - | LLM for instance summary: `openrouter`, `anthropic`, `openai` |
+| `BSMCP_LLM_API_KEY` | No | - | API key for LLM provider |
+| `BSMCP_LLM_MODEL` | No | (per provider) | Model ID for summary generation |
+| `BSMCP_SUMMARY_TOKEN_ID` | No | - | BookStack token for summary (falls back to `BSMCP_EMBED_TOKEN_*`) |
+| `BSMCP_SUMMARY_TOKEN_SECRET` | No | - | BookStack token secret for summary |
 
 #### Embedder Variables
 
@@ -132,8 +140,12 @@ cargo run --release -p bsmcp-embedder
 |----------|----------|---------|-------------|
 | `BSMCP_EMBED_TOKEN_ID` | Yes | - | BookStack API token ID for crawling |
 | `BSMCP_EMBED_TOKEN_SECRET` | Yes | - | BookStack API token secret |
-| `BSMCP_EMBED_MODEL` | No | `embeddinggemma-300m` | Embedding model (see [Supported Models](#supported-models)) |
-| `BSMCP_MODEL_PATH` | No | `/data/models` | ONNX model cache directory |
+| `BSMCP_EMBED_PROVIDER` | No | `local` | Embedding backend: `local`, `ollama`, `openai` |
+| `BSMCP_EMBED_MODEL` | No | (per provider) | Model name (see [Embedding Providers](#embedding-providers)) |
+| `BSMCP_EMBED_API_KEY` | If openai | - | API key for OpenAI embedding provider |
+| `BSMCP_EMBED_API_URL` | No | (per provider) | Base URL for Ollama or OpenAI-compatible endpoint |
+| `BSMCP_EMBED_DIMS` | No | (auto) | Embedding dimensions (auto-detected for Ollama) |
+| `BSMCP_MODEL_PATH` | No | `/data/models` | ONNX model cache directory (local provider only) |
 | `BSMCP_EMBED_CPUS` | No | `0` (unlimited) | Docker CPU limit for embedder |
 | `BSMCP_EMBED_JOB_TIMEOUT` | No | `14400` | Seconds before stuck jobs reset |
 | `BSMCP_EMBED_BATCH_SIZE` | No | `32` | Chunks per embedding batch |
@@ -242,6 +254,48 @@ The token ID and secret come from your BookStack API token (created under **My A
 ## Upgrading
 
 All schema migrations are automatic on startup (CREATE TABLE IF NOT EXISTS, ALTER TABLE for new columns). No manual SQL is needed.
+
+### From v0.5.1 to v0.5.2
+
+v0.5.2 adds pluggable embedding providers, AI instance summaries, OAuth refresh tokens, and several quality-of-life improvements.
+
+#### What's new
+
+- **Embedding providers** — choose between local ONNX (`local`), Ollama (`ollama`), or OpenAI (`openai`) via `BSMCP_EMBED_PROVIDER`. Ollama auto-detects dimensions. OpenAI works with any compatible endpoint.
+- **AI instance summary** — optional LLM call at startup generates a contextual summary of the knowledge base, included in MCP instructions so connecting AI assistants immediately understand what this BookStack is about. Supports OpenRouter, Anthropic, and OpenAI.
+- **OAuth refresh tokens** — clients no longer need to re-enter API credentials every 24 hours. Refresh tokens silently issue new access tokens as long as BookStack credentials remain valid.
+- **Configurable token TTLs** — `BSMCP_ACCESS_TOKEN_TTL` and `BSMCP_REFRESH_TOKEN_TTL` env vars.
+- **Job queue status page** — `/status` now shows all pending/running jobs with progress bars plus recent completed/failed jobs.
+- **Similar-page computation** — runs after every embedding job, not just full reindexes.
+- **WYSIWYG editing** — all editing tools (`edit_page`, `replace_section`, `append_to_page`, `insert_after`) now explicitly documented to work on WYSIWYG pages.
+- **Duplicate title prevention** — instructions tell AI not to include page title as H1 in content.
+- **Auto-migration fix** — handles pre-semantic SQLite databases that lack `pages` table.
+
+#### What's automatic
+
+- All schema changes (refresh_tokens table, etc.) are applied on startup
+- Existing deployments continue working with no env var changes
+- Local ONNX embedding remains the default if `BSMCP_EMBED_PROVIDER` is not set
+
+#### What you must do
+
+1. **Pull new images**: `ghcr.io/gumbees/bsmcp-server:0.5.2` + `ghcr.io/gumbees/bsmcp-embedder:0.5.2`
+2. **Restart** — that's it for the base upgrade
+
+**Optional: Enable AI instance summary** — add LLM env vars:
+```bash
+BSMCP_LLM_PROVIDER=openrouter  # or: anthropic, openai
+BSMCP_LLM_API_KEY=your-api-key
+# Uses BSMCP_EMBED_TOKEN_ID/SECRET for BookStack API access
+```
+
+**Optional: Switch to Ollama/OpenAI embeddings** — set `BSMCP_EMBED_PROVIDER`:
+```bash
+BSMCP_EMBED_PROVIDER=ollama
+BSMCP_EMBED_MODEL=nomic-embed-text
+BSMCP_EMBED_API_URL=http://ollama:11434
+```
+Switching provider triggers an automatic clean re-index.
 
 ### From v0.5.0 to v0.5.1
 
@@ -421,16 +475,42 @@ See the [v0.1.3 release notes](https://github.com/gumbees/bookstack-mcp/releases
 - Docker volume renamed `mcp-data` to `bsmcp-data`
 - PKCE enforcement for OAuth
 
-## Supported Models
+## Embedding Providers
+
+Set via `BSMCP_EMBED_PROVIDER`. Changing provider or model triggers an automatic clean re-index.
+
+### Local (default)
+
+Uses fastembed with ONNX Runtime. No external API needed but requires the heavier embedder container.
 
 | Model Name | Dimensions | Parameters | Notes |
 |------------|-----------|------------|-------|
-| `BAAI/bge-base-en-v1.5` | 768 | 110M | **Default.** Good balance of speed and quality. 3x faster than large. |
-| `BAAI/bge-large-en-v1.5` | 1024 | 335M | Previous default. Highest quality, heavier. |
-| `embeddinggemma-300m` | 768 | 300M | Google's lightweight model (experimental — external weights loading may have issues). |
-| `BAAI/bge-small-en-v1.5` | 384 | 33M | Fastest BGE variant, lower quality. |
+| `BAAI/bge-base-en-v1.5` | 768 | 110M | **Default.** Good balance of speed and quality. |
+| `BAAI/bge-large-en-v1.5` | 1024 | 335M | Highest quality, heavier. |
+| `BAAI/bge-small-en-v1.5` | 384 | 33M | Fastest, lower quality. |
+| `embeddinggemma-300m` | 768 | 300M | Google's lightweight model. |
 
-Set via `BSMCP_EMBED_MODEL`. Changing models triggers an automatic clean re-index on next embedder startup — no manual intervention needed.
+### Ollama
+
+Uses a local or remote Ollama instance. Dimensions auto-detected. No API key needed.
+
+```bash
+BSMCP_EMBED_PROVIDER=ollama
+BSMCP_EMBED_MODEL=nomic-embed-text        # or any Ollama embedding model
+BSMCP_EMBED_API_URL=http://ollama:11434    # default: http://localhost:11434
+```
+
+### OpenAI
+
+Uses OpenAI's embedding API or any OpenAI-compatible endpoint.
+
+```bash
+BSMCP_EMBED_PROVIDER=openai
+BSMCP_EMBED_MODEL=text-embedding-3-small   # default
+BSMCP_EMBED_API_KEY=sk-...
+BSMCP_EMBED_DIMS=1536                      # must match model output
+BSMCP_EMBED_API_URL=https://api.openai.com # or any compatible endpoint
+```
 
 ## Search Operators
 

@@ -30,12 +30,15 @@ crates/
     src/sse.rs           SSE session management, Streamable HTTP, multi-user auth
     src/mcp.rs           MCP protocol handler, tool definitions, tool execution
     src/bookstack.rs     BookStack REST API client (reqwest)
-    src/oauth.rs         OAuth 2.1, login form, token exchange, dynamic registration
+    src/oauth.rs         OAuth 2.1 + refresh tokens, login form, token exchange
     src/semantic.rs      Semantic search (calls embedder /embed, queries db), webhook handler
     src/migrate.rs       SQLite → PostgreSQL migration tool
+    src/llm.rs           LLM client (OpenRouter, Anthropic, OpenAI) for instance summary
+    src/summary.rs       Instance summary generator (background, cached in DB)
 
-  bsmcp-embedder/        Embedder binary (fastembed + ONNX Runtime)
-    src/main.rs          Job queue worker + HTTP /embed endpoint
+  bsmcp-embedder/        Embedder binary (pluggable backends)
+    src/main.rs          Job queue worker + HTTP /embed endpoint + provider selection
+    src/embed.rs         Embedder trait + implementations (LocalEmbedder, OllamaEmbedder, OpenAIEmbedder)
     src/pipeline.rs      Embedding pipeline (fetch pages, chunk, embed, store)
 ```
 
@@ -81,10 +84,20 @@ All prefixed `BSMCP_`. See `.env.example` for full list. Key ones:
 
 **Embedder:**
 - `BSMCP_EMBED_TOKEN_ID` / `BSMCP_EMBED_TOKEN_SECRET` — BookStack API token for crawling
-- `BSMCP_EMBED_MODEL` — model name (default: `BAAI/bge-large-en-v1.5`)
-- `BSMCP_EMBED_THREADS`, `BSMCP_EMBED_BATCH_SIZE`, `BSMCP_EMBED_DELAY_MS` — performance tuning
+- `BSMCP_EMBED_PROVIDER` — `local` (default ONNX), `ollama`, `openai`
+- `BSMCP_EMBED_MODEL` — model name (default per provider)
+- `BSMCP_EMBED_API_KEY` — API key (openai provider only)
+- `BSMCP_EMBED_API_URL` — base URL for ollama/openai
+- `BSMCP_EMBED_DIMS` — embedding dimensions (auto-detected for ollama)
+- `BSMCP_EMBED_BATCH_SIZE`, `BSMCP_EMBED_DELAY_MS` — performance tuning
 
-## Implemented Tools (49)
+**Instance Summary (optional):**
+- `BSMCP_LLM_PROVIDER` — `openrouter`, `anthropic`, `openai`
+- `BSMCP_LLM_API_KEY` — API key for LLM
+- `BSMCP_LLM_MODEL` — model ID (defaults per provider)
+- `BSMCP_SUMMARY_TOKEN_ID/SECRET` — BookStack token (falls back to BSMCP_EMBED_TOKEN_*)
+
+## Implemented Tools (56)
 
 - **search_content** - Full-text search with BookStack query operators
 - **semantic_search** - Natural language vector search (when semantic enabled)
@@ -182,7 +195,6 @@ Migrates: access_tokens, pages, chunks (BLOB→pgvector), relationships, embed_j
 ## Branch Info
 
 - `main` - production branch
-- `feature/semantic-search` - v0.3.0 development
 
 ## Breaking Changes Log
 

@@ -328,11 +328,20 @@ async fn job_queue_worker(
         reindex_triggered = true;
     }
 
-    // Check model change — auto-reindex if model changed
+    // Check model or dimension change — auto-reindex if either changed
     let stored_model = db.get_meta("embed_model").await.unwrap_or(None);
-    if !reindex_triggered && stored_model.as_deref() != Some(&model_name) {
-        eprintln!("Embedder: model changed ({} → {}) — triggering clean re-index",
-            stored_model.as_deref().unwrap_or("none"), model_name);
+    let stored_dims = db.get_meta("embed_dims").await.unwrap_or(None);
+    let dims_str = dims.to_string();
+    let model_changed = stored_model.as_deref() != Some(&model_name);
+    let dims_changed = stored_dims.as_deref().is_some_and(|d| d != dims_str);
+    if !reindex_triggered && (model_changed || dims_changed) {
+        if model_changed {
+            eprintln!("Embedder: model changed ({} → {}) — triggering clean re-index",
+                stored_model.as_deref().unwrap_or("none"), model_name);
+        } else {
+            eprintln!("Embedder: dimensions changed ({} → {}) — triggering clean re-index",
+                stored_dims.as_deref().unwrap_or("?"), dims);
+        }
         trigger_clean_reindex(&db, dims).await;
         reindex_triggered = true;
     }

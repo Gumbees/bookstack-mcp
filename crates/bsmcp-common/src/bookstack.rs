@@ -89,6 +89,11 @@ impl BookStackClient {
         }
     }
 
+    /// Get the base URL of the BookStack instance.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Get the token ID (for use as a cache key, not a secret).
     pub fn token_id(&self) -> &str {
         &self.token_id

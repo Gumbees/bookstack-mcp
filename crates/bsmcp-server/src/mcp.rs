@@ -707,6 +707,18 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool, su
          entire page and should only be used when the whole page needs replacing.\n\n",
     );
 
+    // Include BookStack URL so AI can construct links for users
+    let base_url = client.base_url();
+    instructions.push_str(&format!(
+        "BookStack URL: {base_url}\n\
+         When you create or update a page, present a clickable link to the user so they can \
+         review it. Page URLs follow the pattern: {base_url}/books/{{book_slug}}/page/{{page_slug}}\n\
+         The slug is returned in the API response. For other content types:\n\
+         - Books: {base_url}/books/{{slug}}\n\
+         - Chapters: {base_url}/books/{{book_slug}}/chapter/{{slug}}\n\
+         - Shelves: {base_url}/shelves/{{slug}}\n\n"
+    ));
+
     match build_structure(client).await {
         Some(structure) => {
             instructions.push_str("Current structure:\n\n");

@@ -1,3 +1,4 @@
+mod embed;
 mod pipeline;
 
 use std::env;
@@ -18,13 +19,16 @@ use bsmcp_common::bookstack::BookStackClient;
 use bsmcp_common::config::DbBackendType;
 use bsmcp_common::db::SemanticDb;
 
-use pipeline::EmbedModel;
+use embed::Embedder;
 
-const DEFAULT_MODEL: &str = "BAAI/bge-base-en-v1.5";
+const DEFAULT_LOCAL_MODEL: &str = "BAAI/bge-base-en-v1.5";
+const DEFAULT_OLLAMA_MODEL: &str = "nomic-embed-text";
+const DEFAULT_OPENAI_MODEL: &str = "text-embedding-3-small";
 
 struct AppState {
-    model: Arc<EmbedModel>,
+    embedder: Arc<dyn Embedder>,
     model_name: String,
+    provider_name: String,
     db: Arc<dyn SemanticDb>,
 }
 
@@ -86,16 +90,72 @@ async fn main() {
     // Initialize semantic tables
     db.init_semantic_tables().await.expect("Failed to initialize semantic tables");
 
-    // Load embedding model
-    let model_path = env::var("BSMCP_MODEL_PATH").unwrap_or_else(|_| "/data/models".into());
-    let model_name = env::var("BSMCP_EMBED_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
+    // Select embedding provider
+    let provider = env::var("BSMCP_EMBED_PROVIDER")
+        .unwrap_or_else(|_| "local".into())
+        .to_lowercase();
 
-    eprintln!("Embedder: loading model {model_name} (cache={model_path})...");
+    let (embedder, model_name, dims): (Arc<dyn Embedder>, String, usize) = match provider.as_str() {
+        "openai" => {
+            let api_key = env::var("BSMCP_EMBED_API_KEY")
+                .expect("BSMCP_EMBED_API_KEY is required when BSMCP_EMBED_PROVIDER=openai");
+            let model = env::var("BSMCP_EMBED_MODEL")
+                .unwrap_or_else(|_| DEFAULT_OPENAI_MODEL.into());
+            let base_url = env::var("BSMCP_EMBED_API_URL")
+                .unwrap_or_else(|_| "https://api.openai.com".into());
+            let dims: usize = env::var("BSMCP_EMBED_DIMS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1536);
+            eprintln!("Embedder: OpenAI provider (model={model}, dims={dims}, url={base_url})");
+            let e = embed::OpenAIEmbedder::new(&api_key, &model, &base_url, dims);
+            (Arc::new(e), model, dims)
+        }
+        "ollama" => {
+            let model = env::var("BSMCP_EMBED_MODEL")
+                .unwrap_or_else(|_| DEFAULT_OLLAMA_MODEL.into());
+            let base_url = env::var("BSMCP_EMBED_API_URL")
+                .unwrap_or_else(|_| "http://localhost:11434".into());
 
-    let model = EmbedModel::new(&model_name, &model_path).expect("Failed to load embedding model");
-    let dims = model.dims();
-    let model = Arc::new(model);
-    eprintln!("Embedder: model ready ({dims} dims)");
+            // Auto-detect dimensions unless explicitly set
+            let dims: usize = if let Ok(d) = env::var("BSMCP_EMBED_DIMS") {
+                d.parse().unwrap_or(768)
+            } else {
+                eprintln!("Embedder: detecting {model} dimensions from Ollama...");
+                match embed::OllamaEmbedder::detect_dims(&model, &base_url).await {
+                    Ok(d) => {
+                        eprintln!("Embedder: detected {d} dimensions");
+                        d
+                    }
+                    Err(e) => {
+                        eprintln!("Embedder: dimension detection failed ({e}), defaulting to 768");
+                        768
+                    }
+                }
+            };
+
+            eprintln!("Embedder: Ollama provider (model={model}, dims={dims}, url={base_url})");
+            let e = embed::OllamaEmbedder::new(&model, &base_url, dims);
+            (Arc::new(e), model, dims)
+        }
+        _ => {
+            // Local fastembed/ONNX model
+            let model_path = env::var("BSMCP_MODEL_PATH").unwrap_or_else(|_| "/data/models".into());
+            let model_name = env::var("BSMCP_EMBED_MODEL")
+                .unwrap_or_else(|_| DEFAULT_LOCAL_MODEL.into());
+
+            eprintln!("Embedder: loading local model {model_name} (cache={model_path})...");
+            let local = pipeline::EmbedModel::new(&model_name, &model_path)
+                .expect("Failed to load embedding model");
+            let dims = local.dims();
+            let local = Arc::new(local);
+            eprintln!("Embedder: local model ready ({dims} dims)");
+            let e = embed::LocalEmbedder::new(local);
+            (Arc::new(e), model_name, dims)
+        }
+    };
+
+    eprintln!("Embedder: provider={provider}, model={model_name}, dims={dims}");
 
     // Start HTTP server for /embed endpoint
     let host = env::var("BSMCP_EMBED_HOST").unwrap_or_else(|_| "0.0.0.0".into());
@@ -105,8 +165,9 @@ async fn main() {
         .expect("BSMCP_EMBED_PORT must be a valid port number");
 
     let state = Arc::new(AppState {
-        model: model.clone(),
+        embedder: embedder.clone(),
         model_name: model_name.clone(),
+        provider_name: provider.clone(),
         db: db.clone(),
     });
 
@@ -118,8 +179,9 @@ async fn main() {
     let addr: SocketAddr = format!("{host}:{port}").parse().unwrap();
 
     // Worker identity — persistent UUID for job ownership
+    let model_path = env::var("BSMCP_MODEL_PATH").unwrap_or_else(|_| "/data/models".into());
     let worker_data_dir = PathBuf::from(
-        env::var("BSMCP_EMBED_DATA_DIR").unwrap_or_else(|_| model_path.clone())
+        env::var("BSMCP_EMBED_DATA_DIR").unwrap_or_else(|_| model_path)
     );
     let worker_id = load_or_create_worker_id(&worker_data_dir);
     eprintln!("Embedder: worker_id={worker_id}");
@@ -133,11 +195,11 @@ async fn main() {
 
     // Spawn job queue worker
     let worker_db = db.clone();
-    let worker_model = model.clone();
+    let worker_embedder = embedder.clone();
     let worker_model_name = model_name;
     let worker_dims = dims;
     tokio::spawn(async move {
-        job_queue_worker(worker_db, worker_model, worker_id, worker_model_name, worker_dims).await;
+        job_queue_worker(worker_db, worker_embedder, worker_id, worker_model_name, worker_dims).await;
     });
 
     eprintln!("Embedder: HTTP server listening on {addr}");
@@ -165,28 +227,14 @@ async fn handle_embed(
             .into_response();
     }
 
-    let model = state.model.clone();
-    let texts = req.texts;
-    let result = tokio::task::spawn_blocking(move || {
-        model.embed(texts)
-    })
-    .await;
-
-    match result {
-        Ok(Ok(embeddings)) => {
+    match state.embedder.embed(req.texts).await {
+        Ok(embeddings) => {
             Json(json!({ "embeddings": embeddings })).into_response()
-        }
-        Ok(Err(e)) => {
-            (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Embedding failed: {e}")})),
-            )
-                .into_response()
         }
         Err(e) => {
             (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Task failed: {e}")})),
+                Json(json!({"error": format!("Embedding failed: {e}")})),
             )
                 .into_response()
         }
@@ -196,10 +244,11 @@ async fn handle_embed(
 async fn handle_health(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let dims = state.model.dims();
+    let dims = state.embedder.dims();
     let stats = state.db.get_stats().await.ok();
     Json(json!({
         "status": "ok",
+        "provider": state.provider_name,
         "model": state.model_name,
         "dimensions": dims,
         "stats": stats.map(|s| json!({
@@ -219,7 +268,7 @@ async fn handle_health(
 /// Background job queue worker. Polls for pending embed jobs and processes them.
 async fn job_queue_worker(
     db: Arc<dyn SemanticDb>,
-    model: Arc<EmbedModel>,
+    embedder: Arc<dyn Embedder>,
     worker_id: String,
     model_name: String,
     dims: usize,
@@ -321,7 +370,7 @@ async fn job_queue_worker(
             Ok(Some(job)) => {
                 eprintln!("Embedder: claimed job {} (scope={})", job.id, job.scope);
                 let result = pipeline::run_pipeline(
-                    &db, &model, &client,
+                    &db, &embedder, &client,
                     job.id, &job.scope,
                     delay_ms, batch_size,
                 ).await;

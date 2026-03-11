@@ -14,6 +14,8 @@ use bsmcp_common::chunking;
 use bsmcp_common::db::SemanticDb;
 use bsmcp_common::types::{ChunkInsert, PageMeta};
 
+use crate::embed::Embedder;
+
 /// Known model configurations.
 struct ModelConfig {
     builtin: Option<EmbeddingModel>,
@@ -226,7 +228,7 @@ async fn build_shelf_lookup(client: &BookStackClient) -> HashMap<i64, String> {
 /// Run the embedding pipeline for a job.
 pub async fn run_pipeline(
     db: &Arc<dyn SemanticDb>,
-    model: &Arc<EmbedModel>,
+    embedder: &Arc<dyn Embedder>,
     client: &BookStackClient,
     job_id: i64,
     scope: &str,
@@ -295,7 +297,7 @@ pub async fn run_pipeline(
     let force = true;
 
     for (i, page_id) in all_page_ids.iter().enumerate() {
-        if let Err(e) = embed_single_page(db, model, client, *page_id, force, &shelf_lookup).await {
+        if let Err(e) = embed_single_page(db, embedder, client, *page_id, force, &shelf_lookup).await {
             eprintln!("Pipeline: error embedding page {page_id}: {e}");
         }
 
@@ -314,7 +316,7 @@ pub async fn run_pipeline(
 /// When `force` is true, skip the content hash check and always re-embed.
 async fn embed_single_page(
     db: &Arc<dyn SemanticDb>,
-    model: &Arc<EmbedModel>,
+    embedder: &Arc<dyn Embedder>,
     client: &BookStackClient,
     page_id: i64,
     force: bool,
@@ -386,12 +388,7 @@ async fn embed_single_page(
     let texts: Vec<String> = chunks.iter()
         .map(|c| format!("{context_prefix}{}", c.content))
         .collect();
-    let model = model.clone();
-    let embeddings = tokio::task::spawn_blocking(move || {
-        model.embed(texts)
-    })
-    .await
-    .map_err(|e| format!("Embed task failed: {e}"))??;
+    let embeddings = embedder.embed(texts).await?;
 
     // Store chunks with embeddings
     let chunk_inserts: Vec<ChunkInsert> = chunks

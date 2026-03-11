@@ -12,6 +12,16 @@ use sqlx::PgPool;
 
 use bsmcp_common::vector;
 
+fn table_exists(conn: &Connection, table: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        [table],
+        |row| row.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
+        > 0
+}
+
 pub async fn run(sqlite_path: &Path, postgres_url: &str) -> Result<(), String> {
     eprintln!("Migration: SQLite → PostgreSQL");
     eprintln!("  Source: {}", sqlite_path.display());
@@ -40,12 +50,32 @@ pub async fn run(sqlite_path: &Path, postgres_url: &str) -> Result<(), String> {
     // Create tables (same as PostgresDb::new and init_semantic_tables)
     ensure_schema(&pool).await?;
 
-    // Migrate each table
+    // Migrate each table (only if it exists in the source SQLite DB)
     let tokens = migrate_access_tokens(&conn, &pool).await?;
-    let pages = migrate_pages(&conn, &pool).await?;
-    let chunks = migrate_chunks(&conn, &pool).await?;
-    let rels = migrate_relationships(&conn, &pool).await?;
-    let jobs = migrate_embed_jobs(&conn, &pool).await?;
+    let pages = if table_exists(&conn, "pages") {
+        migrate_pages(&conn, &pool).await?
+    } else {
+        eprintln!("  pages: table not found in SQLite, skipping");
+        0
+    };
+    let chunks = if table_exists(&conn, "chunks") {
+        migrate_chunks(&conn, &pool).await?
+    } else {
+        eprintln!("  chunks: table not found in SQLite, skipping");
+        0
+    };
+    let rels = if table_exists(&conn, "relationships") {
+        migrate_relationships(&conn, &pool).await?
+    } else {
+        eprintln!("  relationships: table not found in SQLite, skipping");
+        0
+    };
+    let jobs = if table_exists(&conn, "embed_jobs") {
+        migrate_embed_jobs(&conn, &pool).await?
+    } else {
+        eprintln!("  embed_jobs: table not found in SQLite, skipping");
+        0
+    };
 
     // Fix PostgreSQL sequences so new inserts don't collide with migrated IDs
     fix_sequences(&pool).await?;
@@ -374,6 +404,11 @@ async fn validate(conn: &Connection, pool: &PgPool) -> Result<(), String> {
 
     let tables = ["access_tokens", "pages", "chunks", "relationships", "embed_jobs"];
     for table in tables {
+        if !table_exists(conn, table) {
+            eprintln!("  {table}: not in SQLite, skipped");
+            continue;
+        }
+
         let sqlite_count: i64 = conn
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
             .unwrap_or(-1);

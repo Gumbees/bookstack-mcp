@@ -105,6 +105,7 @@ async fn main() {
                 .unwrap_or_else(|_| "https://api.openai.com".into());
             let dims: usize = env::var("BSMCP_EMBED_DIMS")
                 .ok()
+                .filter(|s| !s.is_empty())
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1536);
             eprintln!("Embedder: OpenAI provider (model={model}, dims={dims}, url={base_url})");
@@ -118,8 +119,8 @@ async fn main() {
                 .unwrap_or_else(|_| "http://localhost:11434".into());
 
             // Auto-detect dimensions unless explicitly set
-            let dims: usize = if let Ok(d) = env::var("BSMCP_EMBED_DIMS") {
-                d.parse().unwrap_or(768)
+            let dims: usize = if let Some(d) = env::var("BSMCP_EMBED_DIMS").ok().filter(|s| !s.is_empty()) {
+                d.parse().expect("BSMCP_EMBED_DIMS must be a valid number")
             } else {
                 eprintln!("Embedder: detecting {model} dimensions from Ollama...");
                 match embed::OllamaEmbedder::detect_dims(&model, &base_url).await {

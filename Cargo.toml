@@ -10,7 +10,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-version = "0.5.3"
+version = "0.5.4"
 
 [profile.release]
 lto = true

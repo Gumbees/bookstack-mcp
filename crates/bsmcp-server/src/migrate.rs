@@ -108,7 +108,8 @@ async fn ensure_schema(pool: &PgPool) -> Result<(), String> {
             name TEXT NOT NULL,
             slug TEXT NOT NULL,
             content_hash TEXT NOT NULL,
-            embedded_at BIGINT NOT NULL
+            embedded_at BIGINT NOT NULL,
+            updated_at TEXT
         )",
         "CREATE TABLE IF NOT EXISTS chunks (
             id BIGSERIAL PRIMARY KEY,
@@ -193,10 +194,10 @@ async fn migrate_access_tokens(conn: &Connection, pool: &PgPool) -> Result<usize
 #[allow(clippy::type_complexity)]
 async fn migrate_pages(conn: &Connection, pool: &PgPool) -> Result<usize, String> {
     let mut stmt = conn
-        .prepare("SELECT page_id, book_id, chapter_id, name, slug, content_hash, embedded_at FROM pages")
+        .prepare("SELECT page_id, book_id, chapter_id, name, slug, content_hash, embedded_at, updated_at FROM pages")
         .map_err(|e| format!("Failed to query pages: {e}"))?;
 
-    let rows: Vec<(i64, i64, Option<i64>, String, String, String, i64)> = stmt
+    let rows: Vec<(i64, i64, Option<i64>, String, String, String, i64, Option<String>)> = stmt
         .query_map([], |row| {
             Ok((
                 row.get(0)?,
@@ -206,6 +207,7 @@ async fn migrate_pages(conn: &Connection, pool: &PgPool) -> Result<usize, String
                 row.get(4)?,
                 row.get(5)?,
                 row.get(6)?,
+                row.get(7)?,
             ))
         })
         .map_err(|e| format!("Failed to read pages: {e}"))?
@@ -213,17 +215,18 @@ async fn migrate_pages(conn: &Connection, pool: &PgPool) -> Result<usize, String
         .collect();
 
     let count = rows.len();
-    for (page_id, book_id, chapter_id, name, slug, content_hash, embedded_at) in &rows {
+    for (page_id, book_id, chapter_id, name, slug, content_hash, embedded_at, updated_at) in &rows {
         sqlx::query(
-            "INSERT INTO pages (page_id, book_id, chapter_id, name, slug, content_hash, embedded_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+            "INSERT INTO pages (page_id, book_id, chapter_id, name, slug, content_hash, embedded_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (page_id) DO UPDATE SET
                 book_id = EXCLUDED.book_id,
                 chapter_id = EXCLUDED.chapter_id,
                 name = EXCLUDED.name,
                 slug = EXCLUDED.slug,
                 content_hash = EXCLUDED.content_hash,
-                embedded_at = EXCLUDED.embedded_at",
+                embedded_at = EXCLUDED.embedded_at,
+                updated_at = EXCLUDED.updated_at",
         )
         .bind(page_id)
         .bind(book_id)
@@ -232,6 +235,7 @@ async fn migrate_pages(conn: &Connection, pool: &PgPool) -> Result<usize, String
         .bind(slug)
         .bind(content_hash)
         .bind(embedded_at)
+        .bind(updated_at)
         .execute(pool)
         .await
         .map_err(|e| format!("Failed to insert page {page_id}: {e}"))?;

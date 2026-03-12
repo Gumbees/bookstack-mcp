@@ -102,12 +102,26 @@ async fn main() {
             let model = env::var("BSMCP_EMBED_MODEL")
                 .unwrap_or_else(|_| DEFAULT_OPENAI_MODEL.into());
             let base_url = env::var("BSMCP_EMBED_API_URL")
-                .unwrap_or_else(|_| "https://api.openai.com".into());
-            let dims: usize = env::var("BSMCP_EMBED_DIMS")
                 .ok()
                 .filter(|s| !s.is_empty())
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1536);
+                .unwrap_or_else(|| "https://api.openai.com".into());
+
+            // Auto-detect dimensions unless explicitly set
+            let dims: usize = if let Some(d) = env::var("BSMCP_EMBED_DIMS").ok().filter(|s| !s.is_empty()) {
+                d.parse().expect("BSMCP_EMBED_DIMS must be a valid number")
+            } else {
+                eprintln!("Embedder: detecting {model} dimensions from OpenAI...");
+                match embed::OpenAIEmbedder::detect_dims(&api_key, &model, &base_url).await {
+                    Ok(d) => {
+                        eprintln!("Embedder: detected {d} dimensions");
+                        d
+                    }
+                    Err(e) => {
+                        panic!("Embedder: OpenAI dimension detection failed: {e}");
+                    }
+                }
+            };
+
             eprintln!("Embedder: OpenAI provider (model={model}, dims={dims}, url={base_url})");
             let e = embed::OpenAIEmbedder::new(&api_key, &model, &base_url, dims);
             (Arc::new(e), model, dims)
@@ -290,6 +304,14 @@ async fn job_queue_worker(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(14400); // 4 hours default
+    let failure_threshold: usize = env::var("BSMCP_EMBED_FAILURE_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(pipeline::DEFAULT_FAILURE_THRESHOLD);
+    let consecutive_abort: usize = env::var("BSMCP_EMBED_CONSECUTIVE_ABORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(pipeline::DEFAULT_CONSECUTIVE_ABORT);
 
     let bookstack_url = env::var("BSMCP_BOOKSTACK_URL")
         .expect("BSMCP_BOOKSTACK_URL is required");
@@ -311,8 +333,8 @@ async fn job_queue_worker(
         http_client,
     );
 
-    eprintln!("Embedder: job queue worker started (poll={}s, delay={}ms, batch={}, job_timeout={}s)",
-        poll_interval, delay_ms, batch_size, job_timeout);
+    eprintln!("Embedder: job queue worker started (poll={}s, delay={}ms, batch={}, job_timeout={}s, fail_threshold={}, consecutive_abort={})",
+        poll_interval, delay_ms, batch_size, job_timeout, failure_threshold, consecutive_abort);
 
     // Track whether we already triggered a reindex this startup (avoid double-triggers)
     let mut reindex_triggered = false;
@@ -383,19 +405,73 @@ async fn job_queue_worker(
                     &db, &embedder, &client,
                     job.id, &job.scope,
                     delay_ms, batch_size,
+                    consecutive_abort,
                 ).await;
                 match result {
-                    Ok(()) => {
-                        if let Err(e) = db.complete_job(job.id, None).await {
-                            eprintln!("Embedder: failed to mark job {} complete: {e}", job.id);
-                        }
-                        eprintln!("Embedder: job {} completed", job.id);
+                    Ok(pr) => {
+                        let failed_count = pr.failed_pages.len();
 
-                        // Recompute similar-page relationships after any embedding job
-                        eprintln!("Embedder: computing similar-page relationships...");
-                        match db.compute_similar_pages(5, 0.65).await {
-                            Ok(n) => eprintln!("Embedder: stored {n} similar-page relationships"),
-                            Err(e) => eprintln!("Embedder: similar-page computation failed: {e}"),
+                        if failed_count >= failure_threshold || pr.aborted {
+                            // Systemic failure — mark job as failed, don't auto-requeue
+                            let sample_errors: Vec<String> = pr.failed_pages.iter()
+                                .take(3)
+                                .map(|(pid, e)| format!("page {pid}: {e}"))
+                                .collect();
+                            let err_msg = format!(
+                                "{failed_count} pages failed (aborted={}). Sample errors: {}",
+                                pr.aborted,
+                                sample_errors.join("; ")
+                            );
+                            eprintln!("Embedder: job {} failed — {err_msg}", job.id);
+                            if let Err(e) = db.complete_job(job.id, Some(&err_msg)).await {
+                                eprintln!("Embedder: failed to mark job {} failed: {e}", job.id);
+                            }
+                        } else if failed_count > 0 {
+                            // Partial failure — mark job complete, queue retries for failed pages
+                            if let Err(e) = db.complete_job(job.id, None).await {
+                                eprintln!("Embedder: failed to mark job {} complete: {e}", job.id);
+                            }
+                            eprintln!(
+                                "Embedder: job {} completed with {failed_count} failure(s), \
+                                 queueing individual retries",
+                                job.id
+                            );
+                            for (page_id, err) in &pr.failed_pages {
+                                let scope = format!("page:{page_id}");
+                                match db.create_embed_job(&scope).await {
+                                    Ok((retry_id, true)) => {
+                                        eprintln!("Embedder: queued retry job {retry_id} for page {page_id} (error: {err})");
+                                    }
+                                    Ok((_, false)) => {
+                                        eprintln!("Embedder: retry for page {page_id} already queued");
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Embedder: failed to queue retry for page {page_id}: {e}");
+                                    }
+                                }
+                            }
+
+                            // Still recompute relationships for the pages that succeeded
+                            if pr.succeeded > 0 {
+                                eprintln!("Embedder: computing similar-page relationships...");
+                                match db.compute_similar_pages(5, 0.65).await {
+                                    Ok(n) => eprintln!("Embedder: stored {n} similar-page relationships"),
+                                    Err(e) => eprintln!("Embedder: similar-page computation failed: {e}"),
+                                }
+                            }
+                        } else {
+                            // Full success
+                            if let Err(e) = db.complete_job(job.id, None).await {
+                                eprintln!("Embedder: failed to mark job {} complete: {e}", job.id);
+                            }
+                            eprintln!("Embedder: job {} completed ({} pages)", job.id, pr.succeeded);
+
+                            // Recompute similar-page relationships after any embedding job
+                            eprintln!("Embedder: computing similar-page relationships...");
+                            match db.compute_similar_pages(5, 0.65).await {
+                                Ok(n) => eprintln!("Embedder: stored {n} similar-page relationships"),
+                                Err(e) => eprintln!("Embedder: similar-page computation failed: {e}"),
+                            }
                         }
                     }
                     Err(e) => {

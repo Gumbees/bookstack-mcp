@@ -195,6 +195,7 @@ impl SemanticState {
         limit: usize,
         threshold: f32,
         hybrid: bool,
+        verbose: bool,
         client: &BookStackClient,
     ) -> Result<Value, String> {
         let start = Instant::now();
@@ -314,19 +315,21 @@ impl SemanticState {
             }
         }
 
+        // In hybrid mode, filter out keyword-only results (vector_score == 0.0).
+        // A keyword match with zero semantic relevance is noise.
+        if hybrid {
+            page_scores.retain(|_, score| score.vector_score > 0.0 || score.keyword_rank == 0.0);
+        }
+
         // Compute final blended score and sort
         let mut page_results: Vec<(i64, f32, &PageScore)> = page_scores.iter()
             .map(|(&pid, score)| {
                 let blended = if score.keyword_rank > 0.0 && score.vector_score > 0.0 {
                     // Both sources matched — weighted blend
                     score.vector_score * 0.7 + score.keyword_rank * 0.2 + score.blanket_boost
-                } else if score.vector_score > 0.0 {
-                    // Vector only
-                    score.vector_score + score.blanket_boost
                 } else {
-                    // Keyword only — cap below vector results, no blanket boost
-                    // (graph proximity shouldn't rescue zero-similarity pages)
-                    (threshold + 0.05) * 0.8 + score.keyword_rank * 0.15
+                    // Vector only (keyword-only results were filtered above)
+                    score.vector_score + score.blanket_boost
                 };
                 (pid, blended, score)
             })
@@ -335,13 +338,38 @@ impl SemanticState {
         page_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         page_results.truncate(limit);
 
+        // Guarantee results even if threshold filtering left us empty — fall back to
+        // top-k from raw vector hits (ignoring threshold) so the caller always gets something.
+        if page_results.is_empty() && !hits.is_empty() {
+            page_scores.clear();
+            for hit in &hits {
+                let entry = page_scores.entry(hit.page_id).or_insert(PageScore {
+                    vector_score: 0.0,
+                    keyword_rank: 0.0,
+                    blanket_boost: 0.0,
+                    chunks: Vec::new(),
+                });
+                if hit.score > entry.vector_score {
+                    entry.vector_score = hit.score;
+                }
+                entry.chunks.push((hit.chunk_id, hit.score));
+            }
+            page_scores.retain(|pid, _| accessible_set.contains(pid));
+
+            page_results = page_scores.iter()
+                .map(|(&pid, score)| (pid, score.vector_score, score))
+                .collect();
+            page_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            page_results.truncate(limit);
+        }
+
         // Build result JSON
         let mut results = Vec::new();
         for (page_id, final_score, score) in &page_results {
             let page_meta = self.db.get_page_meta(*page_id).await?;
-            let (page_name, book_id) = match &page_meta {
-                Some(m) => (m.name.clone(), m.book_id),
-                None => ("Unknown".to_string(), 0),
+            let (page_name, book_id, updated_at) = match &page_meta {
+                Some(m) => (m.name.clone(), m.book_id, m.updated_at.clone()),
+                None => ("Unknown".to_string(), 0, None),
             };
 
             // Get chunk details if we have vector hits
@@ -359,29 +387,31 @@ impl SemanticState {
                 }
             }
 
-            // Gather Markov blanket for context
-            let blanket = self.db.get_markov_blanket(*page_id).await?;
-
             let mut result = json!({
                 "page_id": page_id,
                 "page_name": page_name,
                 "book_id": book_id,
                 "score": (*final_score * 1000.0).round() / 1000.0,
                 "chunks": chunks_json,
-                "blanket": {
+                "scoring": {
+                    "vector": (score.vector_score * 1000.0).round() / 1000.0,
+                    "keyword": (score.keyword_rank * 1000.0).round() / 1000.0,
+                    "blanket_boost": (score.blanket_boost * 1000.0).round() / 1000.0,
+                },
+            });
+
+            if let Some(ref ts) = updated_at {
+                result["updated_at"] = json!(ts);
+            }
+
+            // Only include full blanket data in verbose mode
+            if verbose {
+                let blanket = self.db.get_markov_blanket(*page_id).await?;
+                result["blanket"] = json!({
                     "linked_from": blanket.linked_from.iter().map(|p| json!({"page_id": p.page_id, "name": p.name})).collect::<Vec<_>>(),
                     "links_to": blanket.links_to.iter().map(|p| json!({"page_id": p.page_id, "name": p.name})).collect::<Vec<_>>(),
                     "co_linked": blanket.co_linked.iter().map(|p| json!({"page_id": p.page_id, "name": p.name})).collect::<Vec<_>>(),
                     "siblings": blanket.siblings.iter().map(|p| json!({"page_id": p.page_id, "name": p.name})).collect::<Vec<_>>(),
-                },
-            });
-
-            // Include scoring breakdown for transparency
-            if hybrid {
-                result["scoring"] = json!({
-                    "vector": (score.vector_score * 1000.0).round() / 1000.0,
-                    "keyword": (score.keyword_rank * 1000.0).round() / 1000.0,
-                    "blanket_boost": (score.blanket_boost * 1000.0).round() / 1000.0,
                 });
             }
 

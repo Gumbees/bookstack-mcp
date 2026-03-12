@@ -6,6 +6,8 @@ pub struct PageMeta {
     pub name: String,
     pub slug: String,
     pub content_hash: String,
+    /// ISO 8601 timestamp from BookStack API (e.g. "2025-03-10T14:30:00.000000Z")
+    pub updated_at: Option<String>,
 }
 
 #[derive(Clone, Debug)]

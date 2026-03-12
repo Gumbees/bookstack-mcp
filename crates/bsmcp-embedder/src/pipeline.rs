@@ -225,6 +225,21 @@ async fn build_shelf_lookup(client: &BookStackClient) -> HashMap<i64, String> {
     lookup
 }
 
+/// Result of a pipeline run, including any per-page failures.
+pub struct PipelineResult {
+    pub total_pages: usize,
+    pub succeeded: usize,
+    pub failed_pages: Vec<(i64, String)>,
+    /// True if the pipeline aborted early due to too many consecutive failures.
+    pub aborted: bool,
+}
+
+/// Default threshold for total failures before marking the job as failed.
+pub const DEFAULT_FAILURE_THRESHOLD: usize = 10;
+
+/// Default threshold for consecutive failures before aborting early (systemic issue).
+pub const DEFAULT_CONSECUTIVE_ABORT: usize = 10;
+
 /// Run the embedding pipeline for a job.
 pub async fn run_pipeline(
     db: &Arc<dyn SemanticDb>,
@@ -234,7 +249,8 @@ pub async fn run_pipeline(
     scope: &str,
     delay_ms: u64,
     _batch_size: usize,
-) -> Result<(), String> {
+    consecutive_abort: usize,
+) -> Result<PipelineResult, String> {
     eprintln!("Pipeline: starting (scope={scope}, job_id={job_id})");
 
     // Build shelf lookup for context prefix injection
@@ -286,8 +302,8 @@ pub async fn run_pipeline(
         }
     }
 
-    let total_pages = all_page_ids.len() as i64;
-    db.update_job_progress(job_id, 0, total_pages).await?;
+    let total_pages = all_page_ids.len();
+    db.update_job_progress(job_id, 0, total_pages as i64).await?;
     eprintln!("Pipeline: found {total_pages} pages to embed");
 
     // Always force re-embed (bypass content hash check).
@@ -296,20 +312,56 @@ pub async fn run_pipeline(
     // The shelf lookup is rebuilt each run, ensuring fresh context.
     let force = true;
 
+    let mut failed_pages: Vec<(i64, String)> = Vec::new();
+    let mut succeeded = 0usize;
+    let mut consecutive_failures = 0usize;
+    let mut aborted = false;
+
     for (i, page_id) in all_page_ids.iter().enumerate() {
-        if let Err(e) = embed_single_page(db, embedder, client, *page_id, force, &shelf_lookup).await {
-            eprintln!("Pipeline: error embedding page {page_id}: {e}");
+        match embed_single_page(db, embedder, client, *page_id, force, &shelf_lookup).await {
+            Ok(()) => {
+                succeeded += 1;
+                consecutive_failures = 0;
+            }
+            Err(e) => {
+                eprintln!("Pipeline: error embedding page {page_id}: {e}");
+                failed_pages.push((*page_id, e));
+                consecutive_failures += 1;
+
+                // Abort early if we hit too many consecutive failures — likely systemic
+                if consecutive_failures >= consecutive_abort {
+                    eprintln!(
+                        "Pipeline: aborting — {consecutive_failures} consecutive failures \
+                         (likely systemic issue, not retrying remaining {} pages)",
+                        total_pages - i - 1
+                    );
+                    aborted = true;
+                    db.update_job_progress(job_id, (i + 1) as i64, total_pages as i64).await?;
+                    break;
+                }
+            }
         }
 
-        db.update_job_progress(job_id, (i + 1) as i64, total_pages).await?;
+        db.update_job_progress(job_id, (i + 1) as i64, total_pages as i64).await?;
 
         if delay_ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
     }
 
-    eprintln!("Pipeline: completed ({total_pages} pages)");
-    Ok(())
+    let failed_count = failed_pages.len();
+    if failed_count > 0 {
+        eprintln!("Pipeline: finished with {failed_count} failure(s) out of {total_pages} pages (aborted={aborted})");
+    } else {
+        eprintln!("Pipeline: completed ({total_pages} pages, 0 failures)");
+    }
+
+    Ok(PipelineResult {
+        total_pages,
+        succeeded,
+        failed_pages,
+        aborted,
+    })
 }
 
 /// Embed a single page: fetch, check hash, chunk, embed, store relationships.
@@ -350,6 +402,8 @@ async fn embed_single_page(
         }
     }
 
+    let updated_at = page.get("updated_at").and_then(|v| v.as_str()).map(|s| s.to_string());
+
     let meta = PageMeta {
         page_id,
         book_id,
@@ -357,6 +411,7 @@ async fn embed_single_page(
         name: name.to_string(),
         slug: slug.to_string(),
         content_hash: content_hash.clone(),
+        updated_at,
     };
 
     // Chunk the HTML (skip first h1 if it matches page name to avoid duplication)

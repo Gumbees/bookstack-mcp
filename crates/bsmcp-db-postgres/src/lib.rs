@@ -340,21 +340,26 @@ impl SemanticDb for PostgresDb {
         sqlx::query("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             .execute(&self.pool).await.ok();
 
+        // Schema migration: add updated_at column if missing
+        sqlx::query("ALTER TABLE pages ADD COLUMN IF NOT EXISTS updated_at TEXT")
+            .execute(&self.pool).await.ok();
+
         eprintln!("Semantic: PostgreSQL tables initialized");
         Ok(())
     }
 
     async fn upsert_page(&self, meta: &PageMeta) -> Result<(), String> {
         sqlx::query(
-            "INSERT INTO pages (page_id, book_id, chapter_id, name, slug, content_hash, embedded_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+            "INSERT INTO pages (page_id, book_id, chapter_id, name, slug, content_hash, embedded_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (page_id) DO UPDATE SET
                 book_id = EXCLUDED.book_id,
                 chapter_id = EXCLUDED.chapter_id,
                 name = EXCLUDED.name,
                 slug = EXCLUDED.slug,
                 content_hash = EXCLUDED.content_hash,
-                embedded_at = EXCLUDED.embedded_at"
+                embedded_at = EXCLUDED.embedded_at,
+                updated_at = EXCLUDED.updated_at"
         )
         .bind(meta.page_id)
         .bind(meta.book_id)
@@ -363,6 +368,7 @@ impl SemanticDb for PostgresDb {
         .bind(&meta.slug)
         .bind(&meta.content_hash)
         .bind(Self::now_secs())
+        .bind(&meta.updated_at)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("upsert_page failed: {e}"))?;
@@ -393,7 +399,7 @@ impl SemanticDb for PostgresDb {
 
     async fn get_page_meta(&self, page_id: i64) -> Result<Option<PageMeta>, String> {
         let row = sqlx::query(
-            "SELECT page_id, book_id, chapter_id, name, slug, content_hash FROM pages WHERE page_id = $1"
+            "SELECT page_id, book_id, chapter_id, name, slug, content_hash, updated_at FROM pages WHERE page_id = $1"
         )
         .bind(page_id)
         .fetch_optional(&self.pool)
@@ -407,6 +413,7 @@ impl SemanticDb for PostgresDb {
             name: r.get("name"),
             slug: r.get("slug"),
             content_hash: r.get("content_hash"),
+            updated_at: r.get("updated_at"),
         }))
     }
 

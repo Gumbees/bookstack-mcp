@@ -43,6 +43,50 @@ impl OpenAIEmbedder {
             http,
         }
     }
+
+    /// Auto-detect embedding dimensions by sending a test string.
+    pub async fn detect_dims(api_key: &str, model: &str, base_url: &str) -> Result<usize, String> {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .map_err(|e| format!("HTTP client build failed: {e}"))?;
+
+        let base = base_url.trim_end_matches('/');
+        let body = serde_json::json!({
+            "model": model,
+            "input": "dimension test",
+        });
+
+        let resp = http
+            .post(format!("{base}/v1/embeddings"))
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("OpenAI dim detection failed: {e}"))?;
+
+        let status = resp.status();
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("OpenAI dim detection parse failed: {e}"))?;
+
+        if !status.is_success() {
+            let msg = json.get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error");
+            return Err(format!("OpenAI dim detection error {status}: {msg}"));
+        }
+
+        let dims = json["data"][0]["embedding"]
+            .as_array()
+            .map(|a| a.len())
+            .ok_or("Could not detect dimensions from OpenAI response")?;
+
+        Ok(dims)
+    }
 }
 
 #[async_trait]
@@ -61,7 +105,11 @@ impl Embedder for OpenAIEmbedder {
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("OpenAI embed request failed: {e}"))?;
+            .map_err(|e| {
+                let url = format!("{}/v1/embeddings", self.base_url);
+                format!("OpenAI embed request failed: {e:?} (url={url}, key_len={}, model={})",
+                    self.api_key.len(), self.model)
+            })?;
 
         let status = resp.status();
         let json: serde_json::Value = resp

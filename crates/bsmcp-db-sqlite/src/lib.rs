@@ -384,6 +384,11 @@ impl SemanticDb for SqliteDb {
                 "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
             ).ok();
 
+            // Migration: add updated_at column if missing
+            conn.execute_batch(
+                "ALTER TABLE pages ADD COLUMN updated_at TEXT;"
+            ).ok();
+
             eprintln!("Semantic: tables initialized");
             Ok(())
         })
@@ -397,16 +402,17 @@ impl SemanticDb for SqliteDb {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             conn.execute(
-                "INSERT INTO pages (page_id, book_id, chapter_id, name, slug, content_hash, embedded_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "INSERT INTO pages (page_id, book_id, chapter_id, name, slug, content_hash, embedded_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(page_id) DO UPDATE SET
                     book_id = excluded.book_id,
                     chapter_id = excluded.chapter_id,
                     name = excluded.name,
                     slug = excluded.slug,
                     content_hash = excluded.content_hash,
-                    embedded_at = excluded.embedded_at",
-                params![meta.page_id, meta.book_id, meta.chapter_id, meta.name, meta.slug, meta.content_hash, SqliteDb::now_secs()],
+                    embedded_at = excluded.embedded_at,
+                    updated_at = excluded.updated_at",
+                params![meta.page_id, meta.book_id, meta.chapter_id, meta.name, meta.slug, meta.content_hash, SqliteDb::now_secs(), meta.updated_at],
             ).map_err(|e| format!("upsert_page failed: {e}"))?;
             Ok(())
         })
@@ -448,7 +454,7 @@ impl SemanticDb for SqliteDb {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             Ok(conn.query_row(
-                "SELECT page_id, book_id, chapter_id, name, slug, content_hash FROM pages WHERE page_id = ?1",
+                "SELECT page_id, book_id, chapter_id, name, slug, content_hash, updated_at FROM pages WHERE page_id = ?1",
                 params![page_id],
                 |row| Ok(PageMeta {
                     page_id: row.get(0)?,
@@ -457,6 +463,7 @@ impl SemanticDb for SqliteDb {
                     name: row.get(3)?,
                     slug: row.get(4)?,
                     content_hash: row.get(5)?,
+                    updated_at: row.get(6)?,
                 }),
             ).ok())
         })

@@ -686,9 +686,23 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool, su
 
     instructions.push_str(
         "BookStack knowledge management server. Content is organized as: \
-         Shelves > Books > Chapters > Pages. Use search_content to find content, \
-         or navigate the hierarchy using the IDs below.\n\n\
-         IMPORTANT: Before creating or updating any page, first retrieve an existing page \
+         Shelves > Books > Chapters > Pages. ",
+    );
+
+    if semantic_enabled {
+        instructions.push_str(
+            "Use search_content to find content by keyword or tag, \
+             or navigate the hierarchy using the IDs below.\n\n",
+        );
+    } else {
+        instructions.push_str(
+            "Use search_content to find content, \
+             or navigate the hierarchy using the IDs below.\n\n",
+        );
+    }
+
+    instructions.push_str(
+        "IMPORTANT: Before creating or updating any page, first retrieve an existing page \
          from the same book or chapter using get_page to identify the writing style, \
          formatting conventions, heading structure, and markdown patterns already in use. \
          Match the established style of the surrounding content.\n\n\

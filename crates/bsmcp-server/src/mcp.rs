@@ -211,10 +211,11 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
             } else {
                 return Err("Either book_id or chapter_id is required".to_string());
             }
+            let page_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
             if let Some(md) = args.get("markdown").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-                data["markdown"] = json!(md);
+                data["markdown"] = json!(strip_duplicate_title(md, page_name));
             } else if let Some(v) = args.get("html").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-                data["html"] = json!(v);
+                data["html"] = json!(strip_duplicate_title(v, page_name));
             }
             let result = client.create_page(&data).await?;
             Ok(format_page_success("Page created successfully.", &result))
@@ -222,13 +223,25 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
         "update_page" => {
             let id = arg_i64_required(args, "page_id")?;
             let mut data = json!({});
+            let has_content = args.get("markdown").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).is_some()
+                || args.get("html").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).is_some();
+            // Get the page name for duplicate title stripping
+            let page_name = if let Some(n) = args.get("name").and_then(|v| v.as_str()) {
+                n.to_string()
+            } else if has_content {
+                // Fetch current name so we can strip duplicate H1
+                client.get_page(id).await?
+                    .get("name").and_then(|v| v.as_str()).unwrap_or("").to_string()
+            } else {
+                String::new()
+            };
             if let Some(v) = args.get("name").and_then(|v| v.as_str()) {
                 data["name"] = json!(v);
             }
             if let Some(md) = args.get("markdown").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-                data["markdown"] = json!(md);
+                data["markdown"] = json!(strip_duplicate_title(md, &page_name));
             } else if let Some(v) = args.get("html").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-                data["html"] = json!(v);
+                data["html"] = json!(strip_duplicate_title(v, &page_name));
             }
             let result = client.update_page(id, &data).await?;
             Ok(format_page_success("Page updated successfully.", &result))
@@ -656,6 +669,43 @@ fn strip_html_tags(input: &str) -> String {
         }
     }
     result
+}
+
+/// Strip a leading H1 heading from content if it matches the page name.
+/// BookStack automatically renders the page name as H1, so including it in
+/// content causes a duplicate title. Handles both markdown (`# Title`) and
+/// HTML (`<h1>Title</h1>`).
+fn strip_duplicate_title(content: &str, page_name: &str) -> String {
+    let trimmed = content.trim_start();
+
+    // Markdown: lines starting with "# Title"
+    if let Some(rest) = trimmed.strip_prefix('#') {
+        // Make sure it's H1 (not ## or ###)
+        if !rest.starts_with('#') {
+            let heading_text = rest.trim();
+            // Check first line only
+            let first_line = heading_text.lines().next().unwrap_or("");
+            if first_line.trim().eq_ignore_ascii_case(page_name.trim()) {
+                // Remove the H1 line and any immediately following blank lines
+                let after_heading = heading_text.strip_prefix(first_line).unwrap_or("");
+                return after_heading.trim_start_matches('\n').trim_start_matches('\r').to_string();
+            }
+        }
+    }
+
+    // HTML: <h1>Title</h1> or <h1 ...>Title</h1>
+    if trimmed.starts_with("<h1") {
+        if let Some(close_pos) = trimmed.find("</h1>") {
+            let tag_content = &trimmed[..close_pos + 5]; // include </h1>
+            let text = strip_html_tags(tag_content);
+            if text.trim().eq_ignore_ascii_case(page_name.trim()) {
+                let after = &trimmed[close_pos + 5..];
+                return after.trim_start_matches('\n').trim_start_matches('\r').to_string();
+            }
+        }
+    }
+
+    content.to_string()
 }
 
 /// Truncate a description to a reasonable length for the structure tree.

@@ -212,11 +212,12 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
                 return Err("Either book_id or chapter_id is required".to_string());
             }
             if let Some(md) = args.get("markdown").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-                data["html"] = json!(markdown_to_html(md));
+                data["markdown"] = json!(md);
             } else if let Some(v) = args.get("html").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                 data["html"] = json!(v);
             }
-            format_json(&client.create_page(&data).await?)
+            let result = client.create_page(&data).await?;
+            Ok(format_page_success("Page created successfully.", &result))
         }
         "update_page" => {
             let id = arg_i64_required(args, "page_id")?;
@@ -225,11 +226,12 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
                 data["name"] = json!(v);
             }
             if let Some(md) = args.get("markdown").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-                data["html"] = json!(markdown_to_html(md));
+                data["markdown"] = json!(md);
             } else if let Some(v) = args.get("html").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                 data["html"] = json!(v);
             }
-            format_json(&client.update_page(id, &data).await?)
+            let result = client.update_page(id, &data).await?;
+            Ok(format_page_success("Page updated successfully.", &result))
         }
         "edit_page" => {
             let id = arg_i64_required(args, "page_id")?;
@@ -239,13 +241,13 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
                 .ok_or("new_text is required")?;
             let replace_all = args.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
 
-            // Fetch current markdown content
-            let md = client.export_page(id, ExportFormat::Markdown).await?;
+            // Fetch page in its native format
+            let (editor, native_content) = get_page_content(client, id).await?;
 
-            // Validate old_text exists
-            let count = md.matches(old_text).count();
+            // Validate old_text exists in native content
+            let count = native_content.matches(old_text).count();
             if count == 0 {
-                return Err(format!("old_text not found in page {id}"));
+                return Err(format!("old_text not found in page {id}. This page uses the '{editor}' editor — make sure old_text matches the '{}' field from get_page.", if editor == "markdown" { "markdown" } else { "html" }));
             }
             if count > 1 && !replace_all {
                 return Err(format!("old_text found {count} times in page {id}. Use replace_all=true to replace all, or provide more context to make it unique."));
@@ -253,22 +255,35 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
 
             // Apply replacement
             let updated = if replace_all {
-                md.replace(old_text, new_text)
+                native_content.replace(old_text, new_text)
             } else {
-                md.replacen(old_text, new_text, 1)
+                native_content.replacen(old_text, new_text, 1)
             };
 
-            let data = json!({ "html": markdown_to_html(&updated) });
-            format_json(&client.update_page(id, &data).await?)
+            let data = if editor == "markdown" {
+                json!({ "markdown": updated })
+            } else {
+                json!({ "html": updated })
+            };
+            let result = client.update_page(id, &data).await?;
+            Ok(format_page_success("Page updated successfully.", &result))
         }
         "append_to_page" => {
             let id = arg_i64_required(args, "page_id")?;
             let content = args.get("markdown").and_then(|v| v.as_str())
                 .ok_or("markdown is required")?;
-            let md = client.export_page(id, ExportFormat::Markdown).await?;
-            let updated = format!("{}\n\n{}", md.trim_end(), content);
-            let data = json!({ "html": markdown_to_html(&updated) });
-            format_json(&client.update_page(id, &data).await?)
+            let (editor, existing) = get_page_content(client, id).await?;
+
+            let data = if editor == "markdown" {
+                let updated = format!("{}\n\n{}", existing.trim_end(), content);
+                json!({ "markdown": updated })
+            } else {
+                let html_content = markdown_to_html(content);
+                let updated = format!("{}\n{}", existing.trim_end(), html_content);
+                json!({ "html": updated })
+            };
+            let result = client.update_page(id, &data).await?;
+            Ok(format_page_success("Content appended successfully.", &result))
         }
         "replace_section" => {
             let id = arg_i64_required(args, "page_id")?;
@@ -276,38 +291,18 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
                 .ok_or("heading is required")?;
             let content = args.get("markdown").and_then(|v| v.as_str())
                 .ok_or("markdown is required")?;
+            let (editor, existing) = get_page_content(client, id).await?;
 
-            let md = client.export_page(id, ExportFormat::Markdown).await?;
-            let lines: Vec<&str> = md.lines().collect();
-
-            // Find the heading line
-            let heading_pattern = heading.trim_start_matches('#').trim();
-            let start = lines.iter().position(|line| {
-                let trimmed = line.trim_start_matches('#').trim();
-                trimmed.eq_ignore_ascii_case(heading_pattern)
-            }).ok_or(format!("Heading '{}' not found in page {id}", heading))?;
-
-            // Determine the heading level (count leading #)
-            let level = lines[start].chars().take_while(|c| *c == '#').count();
-
-            // Find end: next heading of same or higher level, or EOF
-            let end = lines[start + 1..].iter().position(|line| {
-                let l = line.chars().take_while(|c| *c == '#').count();
-                l > 0 && l <= level
-            }).map(|p| p + start + 1).unwrap_or(lines.len());
-
-            // Rebuild: before + heading + new content + after
-            let mut updated = lines[..=start].join("\n");
-            updated.push('\n');
-            updated.push_str(content);
-            updated.push('\n');
-            if end < lines.len() {
-                updated.push('\n');
-                updated.push_str(&lines[end..].join("\n"));
-            }
-
-            let data = json!({ "html": markdown_to_html(&updated) });
-            format_json(&client.update_page(id, &data).await?)
+            let data = if editor == "markdown" {
+                let updated = replace_section_markdown(&existing, heading, content, id)?;
+                json!({ "markdown": updated })
+            } else {
+                let html_content = markdown_to_html(content);
+                let updated = replace_section_html(&existing, heading, &html_content, id)?;
+                json!({ "html": updated })
+            };
+            let result = client.update_page(id, &data).await?;
+            Ok(format_page_success("Section replaced successfully.", &result))
         }
         "insert_after" => {
             let id = arg_i64_required(args, "page_id")?;
@@ -315,25 +310,35 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
                 .ok_or("after is required")?;
             let content = args.get("markdown").and_then(|v| v.as_str())
                 .ok_or("markdown is required")?;
-
-            let md = client.export_page(id, ExportFormat::Markdown).await?;
+            let (editor, existing) = get_page_content(client, id).await?;
 
             // Find the anchor — match by line content (trimmed)
-            let lines: Vec<&str> = md.lines().collect();
+            let lines: Vec<&str> = existing.lines().collect();
             let pos = lines.iter().position(|line| line.trim() == after.trim())
-                .ok_or(format!("Anchor '{}' not found in page {id}", after))?;
+                .ok_or(format!("Anchor '{}' not found in page {id}. This page uses the '{editor}' editor — make sure the anchor matches a line from the '{}' field.", after, if editor == "markdown" { "markdown" } else { "html" }))?;
+
+            let insert_content = if editor == "markdown" {
+                content.to_string()
+            } else {
+                markdown_to_html(content)
+            };
 
             // Insert after the matched line
             let mut updated = lines[..=pos].join("\n");
             updated.push('\n');
-            updated.push_str(content);
+            updated.push_str(&insert_content);
             updated.push('\n');
             if pos + 1 < lines.len() {
                 updated.push_str(&lines[pos + 1..].join("\n"));
             }
 
-            let data = json!({ "html": markdown_to_html(&updated) });
-            format_json(&client.update_page(id, &data).await?)
+            let data = if editor == "markdown" {
+                json!({ "markdown": updated })
+            } else {
+                json!({ "html": updated })
+            };
+            let result = client.update_page(id, &data).await?;
+            Ok(format_page_success("Content inserted successfully.", &result))
         }
         "delete_page" => {
             let id = arg_i64_required(args, "page_id")?;
@@ -664,6 +669,145 @@ fn markdown_to_html(md: &str) -> String {
     out
 }
 
+/// Fetch page and return (editor_type, native_content).
+/// For markdown pages: returns ("markdown", markdown_source).
+/// For WYSIWYG pages: returns ("wysiwyg", html_content).
+async fn get_page_content(client: &BookStackClient, id: i64) -> Result<(String, String), String> {
+    let page = client.get_page(id).await?;
+    let editor = page.get("editor")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if editor == "markdown" {
+        let content = page.get("markdown")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        Ok(("markdown".to_string(), content))
+    } else {
+        // "wysiwyg" or "" (system default) — use HTML
+        let content = page.get("html")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        Ok(("wysiwyg".to_string(), content))
+    }
+}
+
+/// Slim success response for page create/update operations.
+fn format_page_success(action: &str, result: &Value) -> String {
+    let id = result.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let name = result.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let slug = result.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+    let editor = result.get("editor").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let book_id = result.get("book_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let revision = result.get("revision_count").and_then(|v| v.as_i64()).unwrap_or(0);
+    format!("{action}\nPage ID: {id}\nBook ID: {book_id}\nName: {name}\nEditor: {editor}\nSlug: {slug}\nRevision: {revision}\nUse get_page({id}) to verify content if needed.")
+}
+
+/// Replace a section in markdown content by heading.
+fn replace_section_markdown(md: &str, heading: &str, content: &str, page_id: i64) -> Result<String, String> {
+    let lines: Vec<&str> = md.lines().collect();
+    let heading_pattern = heading.trim_start_matches('#').trim();
+
+    let start = lines.iter().position(|line| {
+        let trimmed = line.trim_start_matches('#').trim();
+        trimmed.eq_ignore_ascii_case(heading_pattern)
+    }).ok_or(format!("Heading '{}' not found in page {page_id}", heading))?;
+
+    let level = lines[start].chars().take_while(|c| *c == '#').count();
+
+    let end = lines[start + 1..].iter().position(|line| {
+        let l = line.chars().take_while(|c| *c == '#').count();
+        l > 0 && l <= level
+    }).map(|p| p + start + 1).unwrap_or(lines.len());
+
+    let mut updated = lines[..=start].join("\n");
+    updated.push('\n');
+    updated.push_str(content);
+    updated.push('\n');
+    if end < lines.len() {
+        updated.push('\n');
+        updated.push_str(&lines[end..].join("\n"));
+    }
+
+    Ok(updated)
+}
+
+/// Replace a section in HTML content by heading.
+/// Finds <hN>heading</hN> and replaces content up to the next heading of same or higher level.
+fn replace_section_html(html: &str, heading: &str, new_content: &str, page_id: i64) -> Result<String, String> {
+    let heading_pattern = heading.trim_start_matches('#').trim();
+
+    // Find the heading element
+    let mut start_pos = None;
+    let mut heading_level = 0usize;
+    let mut search_from = 0;
+
+    while search_from < html.len() {
+        let Some(h_pos) = html[search_from..].find("<h") else { break };
+        let abs_pos = search_from + h_pos;
+        let rest = &html[abs_pos..];
+
+        if rest.len() > 2 {
+            let level_char = rest.as_bytes()[2];
+            if level_char >= b'1' && level_char <= b'6' {
+                let level = (level_char - b'0') as usize;
+                let close_tag = format!("</h{}>", level);
+                if let Some(close_pos) = rest.find(&close_tag) {
+                    let tag_content = &rest[..close_pos + close_tag.len()];
+                    let text = strip_html_tags(tag_content);
+                    if text.trim().eq_ignore_ascii_case(heading_pattern) {
+                        start_pos = Some(abs_pos);
+                        heading_level = level;
+                        break;
+                    }
+                }
+            }
+        }
+        search_from = abs_pos + 1;
+    }
+
+    let start = start_pos.ok_or(format!("Heading '{}' not found in page {page_id}", heading))?;
+
+    // Find end of the heading tag
+    let close_tag = format!("</h{}>", heading_level);
+    let heading_end = html[start..].find(&close_tag)
+        .map(|p| start + p + close_tag.len())
+        .ok_or("Malformed heading HTML".to_string())?;
+
+    // Find next heading of same or higher level
+    let mut end_pos = html.len();
+    let mut search_from = heading_end;
+
+    while search_from < html.len() {
+        let Some(h_pos) = html[search_from..].find("<h") else { break };
+        let abs_pos = search_from + h_pos;
+        let rest = &html[abs_pos..];
+
+        if rest.len() > 2 {
+            let level_char = rest.as_bytes()[2];
+            if level_char >= b'1' && level_char <= b'6' {
+                let level = (level_char - b'0') as usize;
+                if level <= heading_level {
+                    end_pos = abs_pos;
+                    break;
+                }
+            }
+        }
+        search_from = abs_pos + 1;
+    }
+
+    // Rebuild: heading + new content + rest
+    let mut updated = html[..heading_end].to_string();
+    updated.push('\n');
+    updated.push_str(new_content);
+    updated.push('\n');
+    updated.push_str(&html[end_pos..]);
+
+    Ok(updated)
+}
+
 // --- Dynamic instructions (sent on initialize) ---
 
 async fn build_instructions(client: &BookStackClient, semantic_enabled: bool, summary: Option<&str>) -> String {
@@ -719,7 +863,13 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool, su
          ALL pages regardless of editor type (markdown or WYSIWYG). They use BookStack's \
          markdown export API which converts HTML content to markdown automatically. Prefer \
          these targeted tools over update_page for partial edits — update_page rewrites the \
-         entire page and should only be used when the whole page needs replacing.\n\n",
+         entire page and should only be used when the whole page needs replacing.\n\n\
+         IMPORTANT: Pages have an 'editor' field ('markdown' or 'wysiwyg'). \
+         For edit_page, old_text/new_text must match the page's native format: \
+         the 'markdown' field for markdown pages, the 'html' field for WYSIWYG pages. \
+         Check the editor type via get_page before using edit_page. \
+         For append_to_page, replace_section, and insert_after, always pass markdown content — \
+         it is automatically converted to HTML for WYSIWYG pages.\n\n",
     );
 
     // Include public BookStack URL so AI can construct clickable links for users.
@@ -887,9 +1037,9 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
 
         // Pages
         tool("list_pages", "List all pages across all books.", paginated_schema()),
-        tool("get_page", "Get a page by ID, including full content.",
+        tool("get_page", "Get a page by ID, including full content. Response includes 'editor' field ('markdown' or 'wysiwyg'), 'markdown' field (source for markdown pages, empty for WYSIWYG), and 'html' field (rendered content). Use the editor field to determine which content field to reference for edit_page calls.",
             id_schema("page_id")),
-        tool("create_page", "Create a new page. Must provide either book_id or chapter_id. Provide content as markdown (preferred) or html. Markdown is converted to HTML server-side. IMPORTANT: Do NOT include the page title as a heading in the content — BookStack displays the 'name' as an H1 automatically. Start with body text or ## sub-headings.", json!({
+        tool("create_page", "Create a new page. Must provide either book_id or chapter_id. Provide content as markdown (preferred, creates a markdown-editor page) or html (creates a WYSIWYG page). Content is sent directly to BookStack. IMPORTANT: Do NOT include the page title as a heading in the content — BookStack displays the 'name' as an H1 automatically. Start with body text or ## sub-headings.", json!({
             "type": "object",
             "properties": {
                 "name": { "type": "string", "description": "Page name" },
@@ -900,9 +1050,9 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             },
             "required": ["name"]
         })),
-        tool("update_page", "Update a page. Provide content as markdown (preferred) or html. Markdown is converted to HTML server-side. Do NOT include the page title as a heading — BookStack renders the name as H1 automatically.",
+        tool("update_page", "Update a page (full rewrite). Provide content as markdown or html — sent directly to BookStack (no client-side conversion). Use markdown for markdown-editor pages, html for WYSIWYG pages. Do NOT include the page title as a heading — BookStack renders the name as H1 automatically. Prefer edit_page, replace_section, or append_to_page for partial edits.",
             update_schema("page_id", &["name", "markdown", "html"])),
-        tool("edit_page", "Performs exact string replacements in a page's content. Works on ALL pages including WYSIWYG — content is exported as markdown for matching regardless of editor type. Finds old_text, replaces with new_text, saves. Fails if old_text is not found or is ambiguous (found multiple times without replace_all).", json!({
+        tool("edit_page", "Performs exact string replacements in a page's native content. For markdown pages, matches against the 'markdown' field. For WYSIWYG pages, matches against the 'html' field. Check the page's 'editor' field from get_page to know which format to use for old_text/new_text. Fails if old_text is not found or is ambiguous (found multiple times without replace_all).", json!({
             "type": "object",
             "properties": {
                 "page_id": { "type": "integer", "description": "The page_id" },

@@ -658,6 +658,20 @@ fn strip_html_tags(input: &str) -> String {
     result
 }
 
+/// Truncate a description to a reasonable length for the structure tree.
+/// Strips HTML tags, collapses whitespace, and caps at 150 chars.
+fn truncate_desc(desc: &str) -> String {
+    let clean = strip_html_tags(desc);
+    // Collapse whitespace and newlines into single spaces
+    let collapsed: String = clean.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.len() <= 150 {
+        collapsed
+    } else {
+        let truncated: String = collapsed.chars().take(147).collect();
+        format!("{truncated}...")
+    }
+}
+
 fn markdown_to_html(md: &str) -> String {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
@@ -851,6 +865,13 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool, su
          from the same book or chapter using get_page to identify the writing style, \
          formatting conventions, heading structure, and markdown patterns already in use. \
          Match the established style of the surrounding content.\n\n\
+         IMPORTANT: Validate content placement before creating pages. Each shelf, book, and \
+         chapter has a specific purpose described in the structure below. Do NOT place content \
+         where it doesn't belong — for example, do not mix SOPs with design documents, general \
+         reference knowledge with company-specific knowledge, or personal content with work \
+         content. If the user asks to create content in a location that doesn't match the \
+         target's purpose, push back and suggest the correct location. When unsure, check the \
+         shelf/book/chapter descriptions using get_shelf, get_book, or get_chapter.\n\n\
          Markdown content is automatically converted to HTML server-side. \
          You can send markdown via the 'markdown' parameter for pages and comments — \
          the server handles conversion reliably, avoiding JSON escaping issues with \
@@ -935,17 +956,18 @@ async fn build_structure(client: &BookStackClient) -> Option<String> {
         .and_then(|v| v["data"].as_array().cloned())
         .unwrap_or_default();
 
-    let mut chapters_by_book: HashMap<i64, Vec<(i64, String)>> = HashMap::new();
+    let mut chapters_by_book: HashMap<i64, Vec<(i64, String, String)>> = HashMap::new();
     for ch in &chapters {
         if let (Some(book_id), Some(id), Some(name)) = (
             ch["book_id"].as_i64(),
             ch["id"].as_i64(),
             ch["name"].as_str(),
         ) {
+            let desc = ch["description"].as_str().unwrap_or("").to_string();
             chapters_by_book
                 .entry(book_id)
                 .or_default()
-                .push((id, name.to_string()));
+                .push((id, name.to_string(), desc));
         }
     }
 
@@ -953,17 +975,32 @@ async fn build_structure(client: &BookStackClient) -> Option<String> {
     for shelf in shelf_details.iter().flatten() {
         let name = shelf["name"].as_str().unwrap_or("?");
         let id = shelf["id"].as_i64().unwrap_or(0);
-        output.push_str(&format!("Shelf: {name} (ID: {id})\n"));
+        let desc = truncate_desc(shelf["description"].as_str().unwrap_or(""));
+        if desc.is_empty() {
+            output.push_str(&format!("Shelf: {name} (ID: {id})\n"));
+        } else {
+            output.push_str(&format!("Shelf: {name} (ID: {id}) — {desc}\n"));
+        }
 
         if let Some(books) = shelf["books"].as_array() {
             for book in books {
                 let bname = book["name"].as_str().unwrap_or("?");
                 let bid = book["id"].as_i64().unwrap_or(0);
-                output.push_str(&format!("  Book: {bname} (ID: {bid})\n"));
+                let bdesc = truncate_desc(book["description"].as_str().unwrap_or(""));
+                if bdesc.is_empty() {
+                    output.push_str(&format!("  Book: {bname} (ID: {bid})\n"));
+                } else {
+                    output.push_str(&format!("  Book: {bname} (ID: {bid}) — {bdesc}\n"));
+                }
 
                 if let Some(chs) = chapters_by_book.get(&bid) {
-                    for (cid, cname) in chs {
-                        output.push_str(&format!("    Chapter: {cname} (ID: {cid})\n"));
+                    for (cid, cname, cdesc) in chs {
+                        let cdesc = truncate_desc(cdesc);
+                        if cdesc.is_empty() {
+                            output.push_str(&format!("    Chapter: {cname} (ID: {cid})\n"));
+                        } else {
+                            output.push_str(&format!("    Chapter: {cname} (ID: {cid}) — {cdesc}\n"));
+                        }
                     }
                 }
             }

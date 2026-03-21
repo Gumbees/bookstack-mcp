@@ -943,12 +943,12 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool, su
          it is automatically converted to HTML for WYSIWYG pages.\n\n",
     );
 
-    // Include public BookStack URL so AI can construct clickable links for users.
-    // Uses BSMCP_PUBLIC_DOMAIN (not BSMCP_BOOKSTACK_URL which may be an internal Docker URL).
-    if let Ok(domain) = env::var("BSMCP_PUBLIC_DOMAIN") {
-        let domain = domain.trim().trim_end_matches('/');
-        if !domain.is_empty() {
-            let public_url = format!("https://{domain}");
+    // Include BookStack URL so AI can construct clickable links for users.
+    // Uses BSMCP_BOOKSTACK_URL (the actual BookStack instance), NOT BSMCP_PUBLIC_DOMAIN
+    // (which is the MCP server's own domain for OAuth).
+    if let Ok(url) = env::var("BSMCP_BOOKSTACK_URL") {
+        let public_url = url.trim().trim_end_matches('/').to_string();
+        if !public_url.is_empty() {
             instructions.push_str(&format!(
                 "BookStack URL: {public_url}\n\
                  When you create or update a page, present a clickable link to the user so they can \

@@ -110,7 +110,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
             let page = arg_i64(args, "page", 1).max(1);
             let count = arg_count(args, 20);
             let result = client.search(&query, page, count).await?;
-            Ok(format_search_results(&result))
+            Ok(format_search_results(&result, client.base_url()))
         }
 
         // Shelves
@@ -218,7 +218,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
                 data["html"] = json!(strip_duplicate_title(v, page_name));
             }
             let result = client.create_page(&data).await?;
-            Ok(format_page_success("Page created successfully.", &result))
+            Ok(format_page_success("Page created successfully.", &result, client.base_url()))
         }
         "update_page" => {
             let id = arg_i64_required(args, "page_id")?;
@@ -244,7 +244,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
                 data["html"] = json!(strip_duplicate_title(v, &page_name));
             }
             let result = client.update_page(id, &data).await?;
-            Ok(format_page_success("Page updated successfully.", &result))
+            Ok(format_page_success("Page updated successfully.", &result, client.base_url()))
         }
         "edit_page" => {
             let id = arg_i64_required(args, "page_id")?;
@@ -279,7 +279,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
                 json!({ "html": updated })
             };
             let result = client.update_page(id, &data).await?;
-            Ok(format_page_success("Page updated successfully.", &result))
+            Ok(format_page_success("Page updated successfully.", &result, client.base_url()))
         }
         "append_to_page" => {
             let id = arg_i64_required(args, "page_id")?;
@@ -296,7 +296,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
                 json!({ "html": updated })
             };
             let result = client.update_page(id, &data).await?;
-            Ok(format_page_success("Content appended successfully.", &result))
+            Ok(format_page_success("Content appended successfully.", &result, client.base_url()))
         }
         "replace_section" => {
             let id = arg_i64_required(args, "page_id")?;
@@ -315,7 +315,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
                 json!({ "html": updated })
             };
             let result = client.update_page(id, &data).await?;
-            Ok(format_page_success("Section replaced successfully.", &result))
+            Ok(format_page_success("Section replaced successfully.", &result, client.base_url()))
         }
         "insert_after" => {
             let id = arg_i64_required(args, "page_id")?;
@@ -351,7 +351,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
                 json!({ "html": updated })
             };
             let result = client.update_page(id, &data).await?;
-            Ok(format_page_success("Content inserted successfully.", &result))
+            Ok(format_page_success("Content inserted successfully.", &result, client.base_url()))
         }
         "delete_page" => {
             let id = arg_i64_required(args, "page_id")?;
@@ -619,7 +619,7 @@ fn format_json(v: &Value) -> Result<String, String> {
     serde_json::to_string_pretty(v).map_err(|e| e.to_string())
 }
 
-fn format_search_results(data: &Value) -> String {
+fn format_search_results(data: &Value, base_url: &str) -> String {
     let results = data.get("data").and_then(|v| v.as_array());
     let total = data.get("total").and_then(|v| v.as_i64()).unwrap_or(0);
 
@@ -636,7 +636,14 @@ fn format_search_results(data: &Value) -> String {
         let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
         let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let id = item.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
-        lines.push(format!("- [{item_type}] {name} (id: {id})"));
+        let url = item.get("url").and_then(|v| v.as_str())
+            .map(|u| format!("{base_url}{u}"))
+            .unwrap_or_default();
+        if url.is_empty() {
+            lines.push(format!("- [{item_type}] {name} (id: {id})"));
+        } else {
+            lines.push(format!("- [{item_type}] {name} (id: {id}) — {url}"));
+        }
 
         if let Some(preview) = item.get("preview_html") {
             let raw = if let Some(content) = preview.get("content").and_then(|v| v.as_str()) {
@@ -759,14 +766,29 @@ async fn get_page_content(client: &BookStackClient, id: i64) -> Result<(String, 
 }
 
 /// Slim success response for page create/update operations.
-fn format_page_success(action: &str, result: &Value) -> String {
+fn format_page_success(action: &str, result: &Value, base_url: &str) -> String {
     let id = result.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
     let name = result.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let slug = result.get("slug").and_then(|v| v.as_str()).unwrap_or("");
     let editor = result.get("editor").and_then(|v| v.as_str()).unwrap_or("unknown");
     let book_id = result.get("book_id").and_then(|v| v.as_i64()).unwrap_or(0);
     let revision = result.get("revision_count").and_then(|v| v.as_i64()).unwrap_or(0);
-    format!("{action}\nPage ID: {id}\nBook ID: {book_id}\nName: {name}\nEditor: {editor}\nSlug: {slug}\nRevision: {revision}\nUse get_page({id}) to verify content if needed.")
+    let url = if let Some(rel) = result.get("url").and_then(|v| v.as_str()) {
+        format!("{base_url}{rel}")
+    } else {
+        let book_slug = result.get("book_slug").and_then(|v| v.as_str()).unwrap_or("");
+        if !book_slug.is_empty() && !slug.is_empty() {
+            format!("{base_url}/books/{book_slug}/page/{slug}")
+        } else {
+            String::new()
+        }
+    };
+    let url_line = if url.is_empty() {
+        String::new()
+    } else {
+        format!("\nURL: {url}")
+    };
+    format!("{action}\nPage ID: {id}\nBook ID: {book_id}\nName: {name}\nEditor: {editor}\nSlug: {slug}\nRevision: {revision}{url_line}\nUse get_page({id}) to verify content if needed.")
 }
 
 /// Replace a section in markdown content by heading.

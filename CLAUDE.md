@@ -211,3 +211,16 @@ Migrates: access_tokens, pages, chunks (BLOB→pgvector), relationships, embed_j
 - `BSMCP_PUBLIC_URL` removed, replaced by `BSMCP_PUBLIC_DOMAIN` (domain only, not full URL)
 - Docker volume renamed `mcp-data` → `bsmcp-data` — data migration needed
 - OAuth now enforces PKCE (S256)
+
+## Git Workflow
+
+**Branching Model:**
+* `development` — default branch (HEAD), active work lands here
+* `release` — stable/production branch, merged from development when ready
+* `enhancement/{name}` — branched from development for new functionality
+* `problem/{name}` — branched from development for bug fixes and issue resolution
+* No `main` or `master` branches
+
+**GitHub Issues & Labels:**
+* New functionality uses the **enhancement** label, not "feature"
+* Configure repository labels accordingly

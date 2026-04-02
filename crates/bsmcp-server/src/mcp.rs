@@ -126,12 +126,17 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
         "create_shelf" => {
             let name = arg_str(args, "name")?;
             let desc = arg_str_default(args, "description", "");
-            format_json(&client.create_shelf(&name, &desc).await?)
+            let result = client.create_shelf(&name, &desc).await?;
+            Ok(format_shelf_success("Shelf created successfully.", &result, client.base_url()))
         }
         "update_shelf" => {
             let id = arg_i64_required(args, "shelf_id")?;
-            let data = filter_string_update_fields(args, &["name", "description"]);
-            format_json(&client.update_shelf(id, &data).await?)
+            let mut data = filter_string_update_fields(args, &["name", "description"]);
+            if let Some(books) = args.get("books").and_then(|v| v.as_array()) {
+                data["books"] = json!(books.iter().filter_map(|v| v.as_i64()).collect::<Vec<_>>());
+            }
+            let result = client.update_shelf(id, &data).await?;
+            Ok(format_shelf_success("Shelf updated successfully.", &result, client.base_url()))
         }
         "delete_shelf" => {
             let id = arg_i64_required(args, "shelf_id")?;
@@ -152,12 +157,14 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
         "create_book" => {
             let name = arg_str(args, "name")?;
             let desc = arg_str_default(args, "description", "");
-            format_json(&client.create_book(&name, &desc).await?)
+            let result = client.create_book(&name, &desc).await?;
+            Ok(format_book_success("Book created successfully.", &result, client.base_url()))
         }
         "update_book" => {
             let id = arg_i64_required(args, "book_id")?;
             let data = filter_string_update_fields(args, &["name", "description"]);
-            format_json(&client.update_book(id, &data).await?)
+            let result = client.update_book(id, &data).await?;
+            Ok(format_book_success("Book updated successfully.", &result, client.base_url()))
         }
         "delete_book" => {
             let id = arg_i64_required(args, "book_id")?;
@@ -179,12 +186,14 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
             let book_id = arg_i64_required(args, "book_id")?;
             let name = arg_str(args, "name")?;
             let desc = arg_str_default(args, "description", "");
-            format_json(&client.create_chapter(book_id, &name, &desc).await?)
+            let result = client.create_chapter(book_id, &name, &desc).await?;
+            Ok(format_chapter_success("Chapter created successfully.", &result, client.base_url()))
         }
         "update_chapter" => {
             let id = arg_i64_required(args, "chapter_id")?;
             let data = filter_string_update_fields(args, &["name", "description"]);
-            format_json(&client.update_chapter(id, &data).await?)
+            let result = client.update_chapter(id, &data).await?;
+            Ok(format_chapter_success("Chapter updated successfully.", &result, client.base_url()))
         }
         "delete_chapter" => {
             let id = arg_i64_required(args, "chapter_id")?;
@@ -791,6 +800,62 @@ fn format_page_success(action: &str, result: &Value, base_url: &str) -> String {
     format!("{action}\nPage ID: {id}\nBook ID: {book_id}\nName: {name}\nEditor: {editor}\nSlug: {slug}\nRevision: {revision}{url_line}\nUse get_page({id}) to verify content if needed.")
 }
 
+/// Slim success response for shelf create/update operations.
+fn format_shelf_success(action: &str, result: &Value, base_url: &str) -> String {
+    let id = result.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let name = result.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let slug = result.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+    let desc = result.get("description").and_then(|v| v.as_str()).unwrap_or("");
+    let url = format!("{base_url}/shelves/{slug}");
+    let desc_line = if desc.is_empty() {
+        String::new()
+    } else {
+        format!("\nDescription: {desc}")
+    };
+    format!("{action}\nShelf ID: {id}\nName: {name}\nSlug: {slug}{desc_line}\nURL: {url}")
+}
+
+/// Slim success response for book create/update operations.
+fn format_book_success(action: &str, result: &Value, base_url: &str) -> String {
+    let id = result.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let name = result.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let slug = result.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+    let desc = result.get("description").and_then(|v| v.as_str()).unwrap_or("");
+    let url = format!("{base_url}/books/{slug}");
+    let desc_line = if desc.is_empty() {
+        String::new()
+    } else {
+        format!("\nDescription: {desc}")
+    };
+    format!("{action}\nBook ID: {id}\nName: {name}\nSlug: {slug}{desc_line}\nURL: {url}")
+}
+
+/// Slim success response for chapter create/update operations.
+fn format_chapter_success(action: &str, result: &Value, base_url: &str) -> String {
+    let id = result.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let name = result.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let slug = result.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+    let book_id = result.get("book_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let desc = result.get("description").and_then(|v| v.as_str()).unwrap_or("");
+    let book_slug = result.get("book_slug").and_then(|v| v.as_str()).unwrap_or("");
+    let url = if !book_slug.is_empty() && !slug.is_empty() {
+        format!("{base_url}/books/{book_slug}/chapter/{slug}")
+    } else {
+        String::new()
+    };
+    let url_line = if url.is_empty() {
+        String::new()
+    } else {
+        format!("\nURL: {url}")
+    };
+    let desc_line = if desc.is_empty() {
+        String::new()
+    } else {
+        format!("\nDescription: {desc}")
+    };
+    format!("{action}\nChapter ID: {id}\nBook ID: {book_id}\nName: {name}\nSlug: {slug}{desc_line}{url_line}")
+}
+
 /// Replace a section in markdown content by heading.
 fn replace_section_markdown(md: &str, heading: &str, content: &str, page_id: i64) -> Result<String, String> {
     let lines: Vec<&str> = md.lines().collect();
@@ -1110,8 +1175,16 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             id_schema("shelf_id")),
         tool("create_shelf", "Create a new shelf.",
             name_desc_schema()),
-        tool("update_shelf", "Update a shelf.",
-            update_schema("shelf_id", &["name", "description"])),
+        tool("update_shelf", "Update a shelf. Use 'books' to set which books belong to this shelf (replaces existing assignments).", json!({
+            "type": "object",
+            "properties": {
+                "shelf_id": { "type": "integer", "description": "The shelf_id" },
+                "name": { "type": "string", "description": "New name" },
+                "description": { "type": "string", "description": "New description" },
+                "books": { "type": "array", "items": { "type": "integer" }, "description": "Array of book IDs to assign to this shelf (replaces current assignments)" }
+            },
+            "required": ["shelf_id"]
+        })),
         tool("delete_shelf", "Delete a shelf. This does NOT delete the books inside it.",
             id_schema("shelf_id")),
 

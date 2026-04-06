@@ -3,6 +3,7 @@ use std::env;
 
 use serde_json::{json, Value};
 
+use base64::Engine;
 use pulldown_cmark::{html, Options, Parser};
 
 use bsmcp_common::bookstack::{BookStackClient, ContentType, ExportFormat};
@@ -396,6 +397,16 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
             client.delete_attachment(id).await?;
             Ok(format!("Attachment {id} deleted."))
         }
+        "upload_attachment" => {
+            let name = arg_str(args, "name")?;
+            let uploaded_to = arg_i64_required(args, "uploaded_to")?;
+            let filename = arg_str(args, "filename")?;
+            let mime_type = arg_str_default(args, "mime_type", "application/octet-stream");
+            let file_data = arg_str(args, "file_data")?;
+            let bytes = base64::engine::general_purpose::STANDARD.decode(&file_data)
+                .map_err(|e| format!("Invalid base64 file_data: {e}"))?;
+            format_json(&client.create_file_attachment(&name, uploaded_to, &filename, bytes, &mime_type).await?)
+        }
 
         // Exports
         "export_page" => {
@@ -528,6 +539,18 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
             let id = arg_i64_required(args, "image_id")?;
             client.delete_image(id).await?;
             Ok(format!("Image {id} deleted."))
+        }
+        "upload_image" => {
+            let name = arg_str(args, "name")?;
+            let image_type = arg_str_default(args, "type", "gallery");
+            validate_enum(&image_type, &["gallery", "drawio"], "type")?;
+            let uploaded_to = arg_i64_required(args, "uploaded_to")?;
+            let filename = arg_str(args, "filename")?;
+            let mime_type = arg_str_default(args, "mime_type", "image/png");
+            let image_data = arg_str(args, "image_data")?;
+            let bytes = base64::engine::general_purpose::STANDARD.decode(&image_data)
+                .map_err(|e| format!("Invalid base64 image_data: {e}"))?;
+            format_json(&client.upload_image(&name, &image_type, uploaded_to, &filename, bytes, &mime_type).await?)
         }
 
         // Content Permissions
@@ -1292,6 +1315,17 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             update_schema("attachment_id", &["name", "link"])),
         tool("delete_attachment", "Delete an attachment.",
             id_schema("attachment_id")),
+        tool("upload_attachment", "Upload a file as an attachment to a page. Provide file content as base64-encoded data.", json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Attachment name" },
+                "uploaded_to": { "type": "integer", "description": "Page ID to attach to" },
+                "filename": { "type": "string", "description": "Filename including extension (e.g. 'document.pdf')" },
+                "file_data": { "type": "string", "description": "Base64-encoded file content" },
+                "mime_type": { "type": "string", "description": "MIME type of the file", "default": "application/octet-stream" }
+            },
+            "required": ["name", "uploaded_to", "filename", "file_data"]
+        })),
 
         // Exports
         tool("export_page", "Export a page as markdown, plaintext, or html. Returns the raw exported content.", json!({
@@ -1395,6 +1429,18 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
         })),
         tool("delete_image", "Delete an image from the gallery.",
             id_schema("image_id")),
+        tool("upload_image", "Upload an image to the BookStack image gallery. Provide image content as base64-encoded data.", json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Image name" },
+                "uploaded_to": { "type": "integer", "description": "Page ID the image is associated with" },
+                "filename": { "type": "string", "description": "Filename including extension (e.g. 'photo.png')" },
+                "image_data": { "type": "string", "description": "Base64-encoded image file content" },
+                "type": { "type": "string", "enum": ["gallery", "drawio"], "description": "Image type", "default": "gallery" },
+                "mime_type": { "type": "string", "description": "MIME type of the image", "default": "image/png" }
+            },
+            "required": ["name", "uploaded_to", "filename", "image_data"]
+        })),
 
         // Content Permissions
         tool("get_content_permissions", "Get permissions for a content item.", json!({

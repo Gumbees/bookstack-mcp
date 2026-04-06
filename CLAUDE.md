@@ -99,7 +99,7 @@ All prefixed `BSMCP_`. See `.env.example` for full list. Key ones:
 - `BSMCP_SUMMARY_INTERVAL` — hours between regenerations (0 = only on first startup)
 - `BSMCP_SUMMARY_TOKEN_ID/SECRET` — BookStack token (falls back to BSMCP_EMBED_TOKEN_*)
 
-## Implemented Tools (56)
+## Implemented Tools (58)
 
 - **search_content** - Full-text search with BookStack query operators
 - **semantic_search** - Natural language vector search (when semantic enabled)
@@ -109,14 +109,14 @@ All prefixed `BSMCP_`. See `.env.example` for full list. Key ones:
 - **Books** - list, get, create, update, delete (5)
 - **Chapters** - list, get, create, update, delete (5)
 - **Pages** - list, get, create, update, delete (5)
-- **Attachments** - list, get, create, update, delete (5) - link attachments only
+- **Attachments** - list, get, create, upload, update, delete (6)
 - **Exports** - export_page, export_chapter, export_book (3) - markdown, plaintext, or html
 - **Comments** - list, get, create, update, delete (5)
 - **Recycle Bin** - list, restore, destroy (3)
 - **Users** - list, get (2) - read-only
 - **Audit Log** - list (1)
 - **System** - get_system_info (1)
-- **Image Gallery** - list, get, update, delete (4) - no upload (requires multipart)
+- **Image Gallery** - list, get, upload, update, delete (5)
 - **Content Permissions** - get, update (2)
 - **Roles** - list, get (2) - read-only
 
@@ -125,7 +125,7 @@ All prefixed `BSMCP_`. See `.env.example` for full list. Key ones:
 - **Imports** - ZIP file handling doesn't work well over MCP text protocol.
 - **User/Role CRUD** - Creating/deleting users/roles is admin-level; read-only is sufficient.
 - **PDF/ZIP export** - Binary formats can't be returned as MCP text content.
-- **Image upload** - Requires multipart form data, not JSON.
+
 
 ## Adding a New Tool
 

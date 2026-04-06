@@ -636,6 +636,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
             let image_type = arg_str_default(args, "type", "gallery");
             validate_enum(&image_type, &["gallery", "drawio"], "type")?;
             let uploaded_to = arg_i64_required(args, "uploaded_to")?;
+            let embed = arg_bool(args, "embed", false);
             let staging_id = args.get("staging_id").and_then(|v| v.as_str());
             let url = args.get("url").and_then(|v| v.as_str());
             let (bytes, auto_filename, resolved_mime) = if let Some(sid) = staging_id {
@@ -654,7 +655,30 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
                 Some(f) if !f.is_empty() => f.to_string(),
                 _ => auto_filename,
             };
-            format_json(&client.upload_image(&name, &image_type, uploaded_to, &filename, bytes, &mime_type).await?)
+            let result = client.upload_image(&name, &image_type, uploaded_to, &filename, bytes, &mime_type).await?;
+
+            if embed {
+                let display_url = result.get("thumbs")
+                    .and_then(|t| t.get("display"))
+                    .and_then(|v| v.as_str())
+                    .or_else(|| result.get("url").and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                let alt_text = result.get("name").and_then(|v| v.as_str()).unwrap_or(&name);
+                let img_markdown = format!("![{}]({})", alt_text, display_url);
+
+                let (editor, existing) = get_page_content(client, uploaded_to).await?;
+                let data = if editor == "markdown" {
+                    let updated = format!("{}\n\n{}", existing.trim_end(), img_markdown);
+                    json!({ "markdown": updated })
+                } else {
+                    let html_content = markdown_to_html(&img_markdown);
+                    let updated = format!("{}\n{}", existing.trim_end(), html_content);
+                    json!({ "html": updated })
+                };
+                client.update_page(uploaded_to, &data).await?;
+            }
+
+            format_json(&result)
         }
         "prepare_upload" => {
             let staging_id = uuid::Uuid::new_v4().to_string();
@@ -746,6 +770,10 @@ fn arg_i64_required(args: &Value, key: &str) -> Result<i64, String> {
     args.get(key)
         .and_then(|v| v.as_i64())
         .ok_or_else(|| format!("Missing required argument: {key}"))
+}
+
+fn arg_bool(args: &Value, key: &str, default: bool) -> bool {
+    args.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
 }
 
 fn validate_enum(value: &str, allowed: &[&str], name: &str) -> Result<(), String> {
@@ -1616,7 +1644,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
         })),
         tool("delete_image", "Delete an image from the gallery.",
             id_schema("image_id")),
-        tool("upload_image", "Upload an image to the BookStack image gallery. Use staging_id from prepare_upload for local files, or url to fetch from a remote URL.", json!({
+        tool("upload_image", "Upload an image to the BookStack image gallery. Use staging_id from prepare_upload for local files, or url to fetch from a remote URL. Set embed=true to automatically append the image to the target page's content.", json!({
             "type": "object",
             "properties": {
                 "name": { "type": "string", "description": "Image name" },
@@ -1625,7 +1653,8 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
                 "url": { "type": "string", "description": "URL to fetch the image from" },
                 "filename": { "type": "string", "description": "Override the auto-detected filename" },
                 "type": { "type": "string", "enum": ["gallery", "drawio"], "description": "Image type", "default": "gallery" },
-                "mime_type": { "type": "string", "description": "MIME type of the image", "default": "image/png" }
+                "mime_type": { "type": "string", "description": "MIME type of the image", "default": "image/png" },
+                "embed": { "type": "boolean", "description": "Automatically append the image to the page content after uploading", "default": false }
             },
             "required": ["name", "uploaded_to"]
         })),

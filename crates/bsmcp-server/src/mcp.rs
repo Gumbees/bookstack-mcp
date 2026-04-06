@@ -385,6 +385,9 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
             if chapter_id.is_none() && book_id.is_none() {
                 return Err("Either chapter_id or book_id is required".to_string());
             }
+            if chapter_id.is_some() && book_id.is_some() {
+                return Err("Provide either chapter_id or book_id, not both".to_string());
+            }
             let mut data = json!({});
             if let Some(v) = chapter_id {
                 data["chapter_id"] = json!(v);

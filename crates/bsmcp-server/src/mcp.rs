@@ -15,6 +15,7 @@ pub async fn handle_request(
     client: &BookStackClient,
     semantic: Option<&SemanticState>,
     summary_cache: &crate::summary::SummaryCache,
+    staging: &crate::staging::StagingStore,
 ) -> Option<Value> {
     let id = request.get("id");
 
@@ -47,7 +48,7 @@ pub async fn handle_request(
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let result = execute_tool(name, &args, client, semantic).await;
+            let result = execute_tool(name, &args, client, semantic, staging).await;
             match result {
                 Ok(text) => Some(json_rpc_result(id, json!({
                     "content": [{ "type": "text", "text": text }],
@@ -78,7 +79,7 @@ fn json_rpc_error(id: Option<&Value>, code: i64, message: &str) -> Value {
     })
 }
 
-async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semantic: Option<&SemanticState>) -> Result<String, String> {
+async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semantic: Option<&SemanticState>, staging: &crate::staging::StagingStore) -> Result<String, String> {
     match name {
         // Semantic Search (conditional)
         "semantic_search" => {
@@ -477,11 +478,20 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
         "upload_attachment" => {
             let name = arg_str(args, "name")?;
             let uploaded_to = arg_i64_required(args, "uploaded_to")?;
-            let mime_type = arg_str_default(args, "mime_type", "application/octet-stream");
-            let file_path = args.get("file_path").and_then(|v| v.as_str());
+            let staging_id = args.get("staging_id").and_then(|v| v.as_str());
             let url = args.get("url").and_then(|v| v.as_str());
-            let (bytes, auto_filename) = bookstack::resolve_file_content(file_path, url).await
-                .map_err(|e| e.to_string())?;
+            let (bytes, auto_filename, resolved_mime) = if let Some(sid) = staging_id {
+                let entry = crate::staging::consume_staged(staging, sid).await
+                    .ok_or_else(|| format!("Staging slot '{}' not found or already consumed (slots expire after 5 minutes)", sid))?;
+                (entry.bytes, entry.filename, entry.mime_type)
+            } else if let Some(u) = url {
+                let (b, f) = bookstack::resolve_file_content(None, Some(u)).await
+                    .map_err(|e| e.to_string())?;
+                (b, f, "application/octet-stream".to_string())
+            } else {
+                return Err("Either staging_id or url is required. Use prepare_upload to stage local files.".to_string());
+            };
+            let mime_type = arg_str_default(args, "mime_type", &resolved_mime);
             let filename = match args.get("filename").and_then(|v| v.as_str()) {
                 Some(f) if !f.is_empty() => f.to_string(),
                 _ => auto_filename,
@@ -626,16 +636,78 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
             let image_type = arg_str_default(args, "type", "gallery");
             validate_enum(&image_type, &["gallery", "drawio"], "type")?;
             let uploaded_to = arg_i64_required(args, "uploaded_to")?;
-            let mime_type = arg_str_default(args, "mime_type", "image/png");
-            let file_path = args.get("file_path").and_then(|v| v.as_str());
+            let embed = arg_bool(args, "embed", false);
+            let staging_id = args.get("staging_id").and_then(|v| v.as_str());
             let url = args.get("url").and_then(|v| v.as_str());
-            let (bytes, auto_filename) = bookstack::resolve_file_content(file_path, url).await
-                .map_err(|e| e.to_string())?;
+            let (bytes, auto_filename, resolved_mime) = if let Some(sid) = staging_id {
+                let entry = crate::staging::consume_staged(staging, sid).await
+                    .ok_or_else(|| format!("Staging slot '{}' not found or already consumed (slots expire after 5 minutes)", sid))?;
+                (entry.bytes, entry.filename, entry.mime_type)
+            } else if let Some(u) = url {
+                let (b, f) = bookstack::resolve_file_content(None, Some(u)).await
+                    .map_err(|e| e.to_string())?;
+                (b, f, "image/png".to_string())
+            } else {
+                return Err("Either staging_id or url is required. Use prepare_upload to stage local files.".to_string());
+            };
+            let mime_type = arg_str_default(args, "mime_type", &resolved_mime);
             let filename = match args.get("filename").and_then(|v| v.as_str()) {
                 Some(f) if !f.is_empty() => f.to_string(),
                 _ => auto_filename,
             };
-            format_json(&client.upload_image(&name, &image_type, uploaded_to, &filename, bytes, &mime_type).await?)
+            let result = client.upload_image(&name, &image_type, uploaded_to, &filename, bytes, &mime_type).await?;
+
+            if embed {
+                let display_url = result.get("thumbs")
+                    .and_then(|t| t.get("display"))
+                    .and_then(|v| v.as_str())
+                    .or_else(|| result.get("url").and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                let alt_text = result.get("name").and_then(|v| v.as_str()).unwrap_or(&name);
+                let img_markdown = format!("![{}]({})", alt_text, display_url);
+
+                let (editor, existing) = get_page_content(client, uploaded_to).await?;
+                let data = if editor == "markdown" {
+                    let updated = format!("{}\n\n{}", existing.trim_end(), img_markdown);
+                    json!({ "markdown": updated })
+                } else {
+                    let html_content = markdown_to_html(&img_markdown);
+                    let updated = format!("{}\n{}", existing.trim_end(), html_content);
+                    json!({ "html": updated })
+                };
+                client.update_page(uploaded_to, &data).await?;
+            }
+
+            format_json(&result)
+        }
+        "prepare_upload" => {
+            let staging_id = uuid::Uuid::new_v4().to_string();
+            let base_url = env::var("BSMCP_PUBLIC_DOMAIN")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| format!("https://{}", s.trim().trim_end_matches('/')))
+                .unwrap_or_default();
+            let upload_url = if base_url.is_empty() {
+                format!("/stage/upload/{staging_id}")
+            } else {
+                format!("{base_url}/stage/upload/{staging_id}")
+            };
+            // Pre-register the slot so the staging_id acts as auth
+            {
+                let mut store = staging.write().await;
+                store.insert(staging_id.clone(), crate::staging::StagingEntry {
+                    bytes: Vec::new(),
+                    filename: String::new(),
+                    mime_type: String::new(),
+                    created_at: std::time::Instant::now(),
+                });
+            }
+            format_json(&json!({
+                "staging_id": staging_id,
+                "upload_url": upload_url,
+                "instructions": "POST a multipart/form-data request with a 'file' field to the upload_url. No authorization header needed. Then pass the staging_id to upload_image or upload_attachment.",
+                "ttl_seconds": 300
+            }))
         }
 
         // Content Permissions
@@ -698,6 +770,10 @@ fn arg_i64_required(args: &Value, key: &str) -> Result<i64, String> {
     args.get(key)
         .and_then(|v| v.as_i64())
         .ok_or_else(|| format!("Missing required argument: {key}"))
+}
+
+fn arg_bool(args: &Value, key: &str, default: bool) -> bool {
+    args.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
 }
 
 fn validate_enum(value: &str, allowed: &[&str], name: &str) -> Result<(), String> {
@@ -1135,7 +1211,14 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool, su
          the 'markdown' field for markdown pages, the 'html' field for WYSIWYG pages. \
          Check the editor type via get_page before using edit_page. \
          For append_to_page, replace_section, and insert_after, always pass markdown content — \
-         it is automatically converted to HTML for WYSIWYG pages.\n\n",
+         it is automatically converted to HTML for WYSIWYG pages.\n\n\
+         To upload images or file attachments from local files, use the staging upload flow: \
+         (1) call prepare_upload to get a staging_id and upload_url, \
+         (2) POST the file to the upload_url using curl: \
+         `curl -X POST -F 'file=@/path/to/file' <upload_url>` (no auth header needed), \
+         (3) call upload_image or upload_attachment with the staging_id. \
+         Alternatively, if the file is at a public URL, pass the url parameter directly \
+         to upload_image or upload_attachment without staging.\n\n",
     );
 
     // Include BookStack URL so AI can construct clickable links for users.
@@ -1446,12 +1529,12 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             update_schema("attachment_id", &["name", "link"])),
         tool("delete_attachment", "Delete an attachment.",
             id_schema("attachment_id")),
-        tool("upload_attachment", "Upload a file attachment to a page from a local file path or URL.", json!({
+        tool("upload_attachment", "Upload a file attachment to a page. Use staging_id from prepare_upload for local files, or url to fetch from a remote URL.", json!({
             "type": "object",
             "properties": {
                 "name": { "type": "string", "description": "Attachment name" },
                 "uploaded_to": { "type": "integer", "description": "Page ID to attach to" },
-                "file_path": { "type": "string", "description": "Local filesystem path to the file" },
+                "staging_id": { "type": "string", "description": "Staging slot ID from prepare_upload — use for local file uploads" },
                 "url": { "type": "string", "description": "URL to fetch the file from" },
                 "filename": { "type": "string", "description": "Override the auto-detected filename" },
                 "mime_type": { "type": "string", "description": "MIME type of the file", "default": "application/octet-stream" }
@@ -1561,18 +1644,23 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
         })),
         tool("delete_image", "Delete an image from the gallery.",
             id_schema("image_id")),
-        tool("upload_image", "Upload an image to the BookStack image gallery from a local file path or URL.", json!({
+        tool("upload_image", "Upload an image to the BookStack image gallery. Use staging_id from prepare_upload for local files, or url to fetch from a remote URL. Set embed=true to automatically append the image to the target page's content.", json!({
             "type": "object",
             "properties": {
                 "name": { "type": "string", "description": "Image name" },
                 "uploaded_to": { "type": "integer", "description": "Page ID the image is associated with" },
-                "file_path": { "type": "string", "description": "Local filesystem path to the image file" },
+                "staging_id": { "type": "string", "description": "Staging slot ID from prepare_upload — use for local file uploads" },
                 "url": { "type": "string", "description": "URL to fetch the image from" },
                 "filename": { "type": "string", "description": "Override the auto-detected filename" },
                 "type": { "type": "string", "enum": ["gallery", "drawio"], "description": "Image type", "default": "gallery" },
-                "mime_type": { "type": "string", "description": "MIME type of the image", "default": "image/png" }
+                "mime_type": { "type": "string", "description": "MIME type of the image", "default": "image/png" },
+                "embed": { "type": "boolean", "description": "Automatically append the image to the page content after uploading", "default": false }
             },
             "required": ["name", "uploaded_to"]
+        })),
+        tool("prepare_upload", "Create a staging slot for uploading a local file. Returns a staging_id and upload_url. Step 1: call prepare_upload. Step 2: POST the file to upload_url as multipart/form-data with a 'file' field (no auth header needed): curl -X POST -F 'file=@/path/to/file' <upload_url>. Step 3: call upload_image or upload_attachment with the staging_id.", json!({
+            "type": "object",
+            "properties": {}
         })),
 
         // Content Permissions

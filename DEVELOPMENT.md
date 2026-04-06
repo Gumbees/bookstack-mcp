@@ -71,8 +71,8 @@ docker compose -f docker/docker-compose.sqlite.yml up -d
 
 GitHub Actions builds Docker images on every push to `development` and `release`:
 
-- Push to `development` ... tags image as `dev`
-- Push to `release` ... tags image as `latest`, `release`, plus semver tags
+- Push to `development` ... tags image as `dev` and `VERSION-dev.SHA` (e.g. `0.7.0-dev.abc1234`)
+- Push to `release` ... tags image as `latest` and `release`
 - Push `v*` tag ... adds immutable semver tags (`x.y.z`, `x.y`, `x`)
 
 Images are published to `ghcr.io/bees-roadhouse/bsmcp-server` and `ghcr.io/bees-roadhouse/bsmcp-embedder` for `linux/amd64` and `linux/arm64`.

@@ -255,10 +255,15 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
             } else if let Some(v) = args.get("html").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                 data["html"] = json!(strip_duplicate_title(v, &page_name));
             }
-            if let Some(v) = args.get("chapter_id").and_then(|v| v.as_i64()) {
+            let move_chapter_id = args.get("chapter_id").and_then(|v| v.as_i64());
+            let move_book_id = args.get("book_id").and_then(|v| v.as_i64());
+            if move_chapter_id.is_some() && move_book_id.is_some() {
+                return Err("Provide either chapter_id or book_id, not both".to_string());
+            }
+            if let Some(v) = move_chapter_id {
                 data["chapter_id"] = json!(v);
             }
-            if let Some(v) = args.get("book_id").and_then(|v| v.as_i64()) {
+            if let Some(v) = move_book_id {
                 data["book_id"] = json!(v);
             }
             let result = client.update_page(id, &data).await?;

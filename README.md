@@ -38,7 +38,7 @@ docker/
 
 The MCP server handles all client-facing protocol, OAuth, and search. The embedder runs separately, polling a database-backed job queue to embed pages and serving a `/embed` HTTP endpoint for query-time embedding. The embedder supports three backends: local ONNX models (fastembed), Ollama, or OpenAI-compatible APIs.
 
-## Available Tools (56)
+## Available Tools (61)
 
 | Category | Tools |
 |----------|-------|
@@ -48,18 +48,19 @@ The MCP server handles all client-facing protocol, OAuth, and search. The embedd
 | **Books** | `list_books`, `get_book`, `create_book`, `update_book`, `delete_book` |
 | **Chapters** | `list_chapters`, `get_chapter`, `create_chapter`, `update_chapter`, `delete_chapter` |
 | **Pages** | `list_pages`, `get_page`, `create_page`, `update_page`, `delete_page`, `edit_page`, `append_to_page`, `replace_section`, `insert_after` |
-| **Attachments** | `list_attachments`, `get_attachment`, `create_attachment`, `update_attachment`, `delete_attachment` |
+| **Move** | `move_page`, `move_chapter`, `move_book_to_shelf` |
+| **Attachments** | `list_attachments`, `get_attachment`, `create_attachment`, `update_attachment`, `delete_attachment`, `upload_attachment` |
 | **Exports** | `export_page`, `export_chapter`, `export_book` (markdown, plaintext, html) |
 | **Comments** | `list_comments`, `get_comment`, `create_comment`, `update_comment`, `delete_comment` |
 | **Recycle Bin** | `list_recycle_bin`, `restore_recycle_bin_item`, `destroy_recycle_bin_item` |
 | **Users** | `list_users`, `get_user` |
 | **Audit Log** | `list_audit_log` |
 | **System** | `get_system_info` |
-| **Images** | `list_images`, `get_image`, `update_image`, `delete_image` |
+| **Images** | `list_images`, `get_image`, `upload_image`, `update_image`, `delete_image` |
 | **Permissions** | `get_content_permissions`, `update_content_permissions` |
 | **Roles** | `list_roles`, `get_role` |
 
-Semantic tools (`semantic_search`, `reembed`, `embedding_status`) only appear when `BSMCP_SEMANTIC_SEARCH=true` and an embedder is running. Without semantic search: 53 tools.
+Semantic tools (`semantic_search`, `reembed`, `embedding_status`) only appear when `BSMCP_SEMANTIC_SEARCH=true` and an embedder is running. Without semantic search: 58 tools.
 
 ## Setup
 

@@ -23,7 +23,11 @@ jobs:
 
       - name: Extract version from Cargo.toml
         id: version
-        run: echo "version=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *\"\(.*\)\"/\1/')" >> "$GITHUB_OUTPUT"
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
+          SHORT_SHA=${GITHUB_SHA::7}
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-qemu-action@v3
 
@@ -41,13 +45,15 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/bees-roadhouse/bsmcp-server
           tags: |
-            # dev + versioned dev tag from development branch
+            # development branch: dev tags
             type=raw,value=dev,enable=${{ github.ref == 'refs/heads/development' }}
-            type=raw,value=${{ steps.version.outputs.version }}-dev.${{ github.sha }},enable=${{ github.ref == 'refs/heads/development' }}
-            # latest + release from release branch
+            type=raw,value=${{ steps.version.outputs.version }}-dev,enable=${{ github.ref == 'refs/heads/development' }}
+            type=raw,value=${{ steps.version.outputs.version }}-dev-${{ steps.version.outputs.short_sha }},enable=${{ github.ref == 'refs/heads/development' }}
+            # release branch: production tags
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/release' }}
             type=raw,value=release,enable=${{ github.ref == 'refs/heads/release' }}
-            # semver tags from v* tags
+            type=raw,value=${{ steps.version.outputs.version }},enable=${{ github.ref == 'refs/heads/release' }}
+            # semver from v* tags
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
@@ -75,7 +81,11 @@ jobs:
 
       - name: Extract version from Cargo.toml
         id: version
-        run: echo "version=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *\"\(.*\)\"/\1/')" >> "$GITHUB_OUTPUT"
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
+          SHORT_SHA=${GITHUB_SHA::7}
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-qemu-action@v3
 
@@ -93,13 +103,15 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/bees-roadhouse/bsmcp-embedder
           tags: |
-            # dev + versioned dev tag from development branch
+            # development branch: dev tags
             type=raw,value=dev,enable=${{ github.ref == 'refs/heads/development' }}
-            type=raw,value=${{ steps.version.outputs.version }}-dev.${{ github.sha }},enable=${{ github.ref == 'refs/heads/development' }}
-            # latest + release from release branch
+            type=raw,value=${{ steps.version.outputs.version }}-dev,enable=${{ github.ref == 'refs/heads/development' }}
+            type=raw,value=${{ steps.version.outputs.version }}-dev-${{ steps.version.outputs.short_sha }},enable=${{ github.ref == 'refs/heads/development' }}
+            # release branch: production tags
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/release' }}
             type=raw,value=release,enable=${{ github.ref == 'refs/heads/release' }}
-            # semver tags from v* tags
+            type=raw,value=${{ steps.version.outputs.version }},enable=${{ github.ref == 'refs/heads/release' }}
+            # semver from v* tags
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}

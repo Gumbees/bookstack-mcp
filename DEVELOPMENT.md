@@ -69,10 +69,10 @@ docker compose -f docker/docker-compose.sqlite.yml up -d
 
 ## CI/CD
 
-GitHub Actions builds Docker images on every push to `development` and `release`:
+GitHub Actions builds Docker images when code is merged to `development` or `release`. Since `development` requires PRs (branch protection), the `push` trigger only fires on PR merges.
 
-- Push to `development` ... tags image as `dev` and `VERSION-dev.SHA` (e.g. `0.7.0-dev.abc1234`)
-- Push to `release` ... tags image as `latest` and `release`
+- Push to `development` (PR merge) ... tags image as `dev`, `{version}-dev`, and `{version}-dev-{sha}`
+- Push to `release` (merge from development) ... tags image as `latest`, `release`, and `{version}`
 - Push `v*` tag ... adds immutable semver tags (`x.y.z`, `x.y`, `x`)
 
 Images are published to `ghcr.io/bees-roadhouse/bsmcp-server` and `ghcr.io/bees-roadhouse/bsmcp-embedder` for `linux/amd64` and `linux/arm64`.

@@ -191,7 +191,10 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
         }
         "update_chapter" => {
             let id = arg_i64_required(args, "chapter_id")?;
-            let data = filter_string_update_fields(args, &["name", "description"]);
+            let mut data = filter_string_update_fields(args, &["name", "description"]);
+            if let Some(v) = args.get("book_id").and_then(|v| v.as_i64()) {
+                data["book_id"] = json!(v);
+            }
             let result = client.update_chapter(id, &data).await?;
             Ok(format_chapter_success("Chapter updated successfully.", &result, client.base_url()))
         }
@@ -251,6 +254,12 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
                 data["markdown"] = json!(strip_duplicate_title(md, &page_name));
             } else if let Some(v) = args.get("html").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                 data["html"] = json!(strip_duplicate_title(v, &page_name));
+            }
+            if let Some(v) = args.get("chapter_id").and_then(|v| v.as_i64()) {
+                data["chapter_id"] = json!(v);
+            }
+            if let Some(v) = args.get("book_id").and_then(|v| v.as_i64()) {
+                data["book_id"] = json!(v);
             }
             let result = client.update_page(id, &data).await?;
             Ok(format_page_success("Page updated successfully.", &result, client.base_url()))
@@ -1205,7 +1214,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             id_schema("shelf_id")),
         tool("create_shelf", "Create a new shelf.",
             name_desc_schema()),
-        tool("update_shelf", "Update a shelf. Use 'books' to set which books belong to this shelf (replaces existing assignments).", json!({
+        tool("update_shelf", "Update a shelf's name, description, or set which books it contains via the 'books' array (replaces all existing book assignments on this shelf).", json!({
             "type": "object",
             "properties": {
                 "shelf_id": { "type": "integer", "description": "The shelf_id" },
@@ -1242,8 +1251,16 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             },
             "required": ["book_id", "name"]
         })),
-        tool("update_chapter", "Update a chapter.",
-            update_schema("chapter_id", &["name", "description"])),
+        tool("update_chapter", "Update a chapter's name, description, or move it to a different book by providing book_id.", json!({
+            "type": "object",
+            "properties": {
+                "chapter_id": { "type": "integer", "description": "The chapter_id" },
+                "name": { "type": "string", "description": "New name" },
+                "description": { "type": "string", "description": "New description" },
+                "book_id": { "type": "integer", "description": "Move chapter to a different book by providing the target book ID" }
+            },
+            "required": ["chapter_id"]
+        })),
         tool("delete_chapter", "Delete a chapter. Pages inside become book-level pages.",
             id_schema("chapter_id")),
 
@@ -1262,8 +1279,18 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             },
             "required": ["name"]
         })),
-        tool("update_page", "Update a page (full rewrite). Provide content as markdown or html — sent directly to BookStack (no client-side conversion). Use markdown for markdown-editor pages, html for WYSIWYG pages. Do NOT include the page title as a heading — BookStack renders the name as H1 automatically. Prefer edit_page, replace_section, or append_to_page for partial edits.",
-            update_schema("page_id", &["name", "markdown", "html"])),
+        tool("update_page", "Update a page's name, content, or move it to a different chapter (chapter_id) or book (book_id). Full rewrite — provide content as markdown or html sent directly to BookStack. Use markdown for markdown-editor pages, html for WYSIWYG pages. Do NOT include the page title as a heading — BookStack renders the name as H1 automatically. Prefer edit_page, replace_section, or append_to_page for partial edits.", json!({
+            "type": "object",
+            "properties": {
+                "page_id": { "type": "integer", "description": "The page_id" },
+                "name": { "type": "string", "description": "New name" },
+                "markdown": { "type": "string", "description": "New markdown content (for markdown-editor pages)" },
+                "html": { "type": "string", "description": "New HTML content (for WYSIWYG pages)" },
+                "chapter_id": { "type": "integer", "description": "Move page to a different chapter by providing the target chapter ID" },
+                "book_id": { "type": "integer", "description": "Move page to a different book (at book level, not in any chapter) by providing the target book ID" }
+            },
+            "required": ["page_id"]
+        })),
         tool("edit_page", "Performs exact string replacements in a page's native content. For markdown pages, matches against the 'markdown' field. For WYSIWYG pages, matches against the 'html' field. Check the page's 'editor' field from get_page to know which format to use for old_text/new_text. Fails if old_text is not found or is ambiguous (found multiple times without replace_all).", json!({
             "type": "object",
             "properties": {

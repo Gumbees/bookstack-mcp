@@ -1,6 +1,10 @@
 use reqwest::Client;
 use serde_json::Value;
+use url::Url;
 use zeroize::Zeroize;
+
+/// Maximum size for file content fetched from URLs (50MB).
+const MAX_FILE_CONTENT_SIZE: usize = 50 * 1024 * 1024;
 
 /// Resolve file content from either a local file path or a URL.
 /// Exactly one of file_path or url must be provided.
@@ -22,17 +26,38 @@ pub async fn resolve_file_content(
             Ok((bytes, filename))
         }
         (None, Some(url)) => {
+            // Validate URL scheme — only http and https are permitted.
+            // Note: private IP ranges (169.254.x.x, 10.x.x.x, etc.) are not blocked here;
+            // that is a known limitation and a future enhancement.
+            let parsed = Url::parse(url).map_err(|e| format!("Invalid URL '{}': {}", url, e))?;
+            match parsed.scheme() {
+                "http" | "https" => {}
+                scheme => return Err(format!("URL scheme '{}' is not allowed; only http and https are permitted", scheme)),
+            }
+
             let resp = reqwest::get(url)
                 .await
                 .map_err(|e| format!("Failed to fetch URL '{}': {}", url, e))?;
             if !resp.status().is_success() {
                 return Err(format!("URL returned status {}", resp.status()));
             }
+
+            // Fast-reject via Content-Length before downloading the body.
+            if let Some(len) = resp.content_length() {
+                if len as usize > MAX_FILE_CONTENT_SIZE {
+                    return Err(format!("Remote file too large: {} bytes (limit {})", len, MAX_FILE_CONTENT_SIZE));
+                }
+            }
+
             let bytes = resp
                 .bytes()
                 .await
-                .map_err(|e| format!("Failed to read URL response: {}", e))?
-                .to_vec();
+                .map_err(|e| format!("Failed to read URL response: {}", e))?;
+
+            if bytes.len() > MAX_FILE_CONTENT_SIZE {
+                return Err(format!("Remote file too large: {} bytes (limit {})", bytes.len(), MAX_FILE_CONTENT_SIZE));
+            }
+
             let filename = url
                 .rsplit('/')
                 .next()
@@ -40,7 +65,7 @@ pub async fn resolve_file_content(
                 .filter(|s| !s.is_empty())
                 .unwrap_or("download")
                 .to_string();
-            Ok((bytes, filename))
+            Ok((bytes.to_vec(), filename))
         }
         (Some(_), Some(_)) => Err("Provide either file_path or url, not both".to_string()),
         (None, None) => Err("Either file_path or url is required".to_string()),

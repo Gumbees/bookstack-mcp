@@ -55,7 +55,8 @@ pub async fn resolve_file_content(
                 scheme => return Err(format!("URL scheme '{}' is not allowed; only http and https are permitted", scheme)),
             }
 
-            // Resolve hostname and reject private/loopback/link-local IPs (SSRF protection).
+            // Resolve hostname, reject private/loopback/link-local IPs, then pin the
+            // validated addresses into the reqwest client to prevent DNS rebinding.
             let host = parsed.host_str()
                 .ok_or_else(|| format!("URL '{}' has no host", url))?;
             let port = parsed.port_or_known_default().unwrap_or(80);
@@ -72,7 +73,18 @@ pub async fn resolve_file_content(
                 }
             }
 
-            let resp = reqwest::get(url)
+            // Pin validated addresses into the client so reqwest uses them directly
+            // instead of re-resolving DNS (prevents DNS rebinding attacks).
+            let mut client_builder = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(120));
+            for addr in &addrs {
+                client_builder = client_builder.resolve(host, *addr);
+            }
+            let client = client_builder.build()
+                .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+
+            let resp = client.get(url).send()
                 .await
                 .map_err(|e| format!("Failed to fetch URL '{}': {}", url, e))?;
             if !resp.status().is_success() {

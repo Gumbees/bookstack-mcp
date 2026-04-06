@@ -20,7 +20,8 @@ jobs:
       - uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          prompt: |
+          use_bedrock: false
+          direct_prompt: |
             Scan this codebase for security vulnerabilities, bugs, and correctness issues.
             Focus on:
             - OWASP top 10 (injection, auth flaws, XSS, SSRF, etc.)

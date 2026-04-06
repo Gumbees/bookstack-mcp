@@ -24,7 +24,6 @@ use embed::Embedder;
 const DEFAULT_LOCAL_MODEL: &str = "BAAI/bge-base-en-v1.5";
 const DEFAULT_OLLAMA_MODEL: &str = "nomic-embed-text";
 const DEFAULT_OPENAI_MODEL: &str = "text-embedding-3-small";
-const DEFAULT_VOYAGE_MODEL: &str = "voyage-3-lite";
 
 struct AppState {
     embedder: Arc<dyn Embedder>,
@@ -125,36 +124,6 @@ async fn main() {
 
             eprintln!("Embedder: OpenAI provider (model={model}, dims={dims}, url={base_url})");
             let e = embed::OpenAIEmbedder::new(&api_key, &model, &base_url, dims);
-            (Arc::new(e), model, dims)
-        }
-        "voyage" => {
-            let api_key = env::var("BSMCP_EMBED_API_KEY")
-                .expect("BSMCP_EMBED_API_KEY is required when BSMCP_EMBED_PROVIDER=voyage");
-            let model = env::var("BSMCP_EMBED_MODEL")
-                .unwrap_or_else(|_| DEFAULT_VOYAGE_MODEL.into());
-            let base_url = env::var("BSMCP_EMBED_API_URL")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "https://api.voyageai.com".into());
-
-            // Auto-detect dimensions unless explicitly set
-            let dims: usize = if let Some(d) = env::var("BSMCP_EMBED_DIMS").ok().filter(|s| !s.is_empty()) {
-                d.parse().expect("BSMCP_EMBED_DIMS must be a valid number")
-            } else {
-                eprintln!("Embedder: detecting {model} dimensions from Voyage AI...");
-                match embed::VoyageEmbedder::detect_dims(&api_key, &model, &base_url).await {
-                    Ok(d) => {
-                        eprintln!("Embedder: detected {d} dimensions");
-                        d
-                    }
-                    Err(e) => {
-                        panic!("Embedder: Voyage dimension detection failed: {e}");
-                    }
-                }
-            };
-
-            eprintln!("Embedder: Voyage AI provider (model={model}, dims={dims}, url={base_url})");
-            let e = embed::VoyageEmbedder::new(&api_key, &model, &base_url, dims);
             (Arc::new(e), model, dims)
         }
         "ollama" => {

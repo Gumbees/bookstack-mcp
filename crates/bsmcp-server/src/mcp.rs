@@ -3,9 +3,10 @@ use std::env;
 
 use serde_json::{json, Value};
 
+use base64::Engine;
 use pulldown_cmark::{html, Options, Parser};
 
-use bsmcp_common::bookstack::{self, BookStackClient, ContentType, ExportFormat};
+use bsmcp_common::bookstack::{BookStackClient, ContentType, ExportFormat};
 use crate::semantic::SemanticState;
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
@@ -399,15 +400,11 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
         "upload_attachment" => {
             let name = arg_str(args, "name")?;
             let uploaded_to = arg_i64_required(args, "uploaded_to")?;
+            let filename = arg_str(args, "filename")?;
             let mime_type = arg_str_default(args, "mime_type", "application/octet-stream");
-            let file_path = args.get("file_path").and_then(|v| v.as_str());
-            let url = args.get("url").and_then(|v| v.as_str());
-            let (bytes, auto_filename) = bookstack::resolve_file_content(file_path, url).await
-                .map_err(|e| e.to_string())?;
-            let filename = match args.get("filename").and_then(|v| v.as_str()) {
-                Some(f) if !f.is_empty() => f.to_string(),
-                _ => auto_filename,
-            };
+            let file_data = arg_str(args, "file_data")?;
+            let bytes = base64::engine::general_purpose::STANDARD.decode(&file_data)
+                .map_err(|e| format!("Invalid base64 file_data: {e}"))?;
             format_json(&client.create_file_attachment(&name, uploaded_to, &filename, bytes, &mime_type).await?)
         }
 
@@ -548,15 +545,11 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
             let image_type = arg_str_default(args, "type", "gallery");
             validate_enum(&image_type, &["gallery", "drawio"], "type")?;
             let uploaded_to = arg_i64_required(args, "uploaded_to")?;
+            let filename = arg_str(args, "filename")?;
             let mime_type = arg_str_default(args, "mime_type", "image/png");
-            let file_path = args.get("file_path").and_then(|v| v.as_str());
-            let url = args.get("url").and_then(|v| v.as_str());
-            let (bytes, auto_filename) = bookstack::resolve_file_content(file_path, url).await
-                .map_err(|e| e.to_string())?;
-            let filename = match args.get("filename").and_then(|v| v.as_str()) {
-                Some(f) if !f.is_empty() => f.to_string(),
-                _ => auto_filename,
-            };
+            let image_data = arg_str(args, "image_data")?;
+            let bytes = base64::engine::general_purpose::STANDARD.decode(&image_data)
+                .map_err(|e| format!("Invalid base64 image_data: {e}"))?;
             format_json(&client.upload_image(&name, &image_type, uploaded_to, &filename, bytes, &mime_type).await?)
         }
 
@@ -1322,17 +1315,16 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             update_schema("attachment_id", &["name", "link"])),
         tool("delete_attachment", "Delete an attachment.",
             id_schema("attachment_id")),
-        tool("upload_attachment", "Upload a file attachment to a page from a local file path or URL.", json!({
+        tool("upload_attachment", "Upload a file as an attachment to a page. Provide file content as base64-encoded data.", json!({
             "type": "object",
             "properties": {
                 "name": { "type": "string", "description": "Attachment name" },
                 "uploaded_to": { "type": "integer", "description": "Page ID to attach to" },
-                "file_path": { "type": "string", "description": "Local filesystem path to the file" },
-                "url": { "type": "string", "description": "URL to fetch the file from" },
-                "filename": { "type": "string", "description": "Override the auto-detected filename" },
+                "filename": { "type": "string", "description": "Filename including extension (e.g. 'document.pdf')" },
+                "file_data": { "type": "string", "description": "Base64-encoded file content" },
                 "mime_type": { "type": "string", "description": "MIME type of the file", "default": "application/octet-stream" }
             },
-            "required": ["name", "uploaded_to"]
+            "required": ["name", "uploaded_to", "filename", "file_data"]
         })),
 
         // Exports
@@ -1437,18 +1429,17 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
         })),
         tool("delete_image", "Delete an image from the gallery.",
             id_schema("image_id")),
-        tool("upload_image", "Upload an image to the BookStack image gallery from a local file path or URL.", json!({
+        tool("upload_image", "Upload an image to the BookStack image gallery. Provide image content as base64-encoded data.", json!({
             "type": "object",
             "properties": {
                 "name": { "type": "string", "description": "Image name" },
                 "uploaded_to": { "type": "integer", "description": "Page ID the image is associated with" },
-                "file_path": { "type": "string", "description": "Local filesystem path to the image file" },
-                "url": { "type": "string", "description": "URL to fetch the image from" },
-                "filename": { "type": "string", "description": "Override the auto-detected filename" },
+                "filename": { "type": "string", "description": "Filename including extension (e.g. 'photo.png')" },
+                "image_data": { "type": "string", "description": "Base64-encoded image file content" },
                 "type": { "type": "string", "enum": ["gallery", "drawio"], "description": "Image type", "default": "gallery" },
                 "mime_type": { "type": "string", "description": "MIME type of the image", "default": "image/png" }
             },
-            "required": ["name", "uploaded_to"]
+            "required": ["name", "uploaded_to", "filename", "image_data"]
         })),
 
         // Content Permissions

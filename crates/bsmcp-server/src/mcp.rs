@@ -377,6 +377,64 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
             Ok(format!("Page {id} deleted."))
         }
 
+        // Move operations
+        "move_page" => {
+            let id = arg_i64_required(args, "page_id")?;
+            let chapter_id = args.get("chapter_id").and_then(|v| v.as_i64());
+            let book_id = args.get("book_id").and_then(|v| v.as_i64());
+            if chapter_id.is_none() && book_id.is_none() {
+                return Err("Either chapter_id or book_id is required".to_string());
+            }
+            let mut data = json!({});
+            if let Some(v) = chapter_id {
+                data["chapter_id"] = json!(v);
+            }
+            if let Some(v) = book_id {
+                data["book_id"] = json!(v);
+            }
+            let result = client.update_page(id, &data).await?;
+            Ok(format_page_success("Page moved successfully.", &result, client.base_url()))
+        }
+        "move_chapter" => {
+            let id = arg_i64_required(args, "chapter_id")?;
+            let book_id = arg_i64_required(args, "target_book_id")?;
+            let data = json!({ "book_id": book_id });
+            let result = client.update_chapter(id, &data).await?;
+            Ok(format_chapter_success("Chapter moved successfully.", &result, client.base_url()))
+        }
+        "move_book_to_shelf" => {
+            let book_id = arg_i64_required(args, "book_id")?;
+            let target_shelf_id = arg_i64_required(args, "target_shelf_id")?;
+            let remove_from_shelf_id = args.get("remove_from_shelf_id").and_then(|v| v.as_i64());
+
+            // Add book to target shelf
+            let target_shelf = client.get_shelf(target_shelf_id).await?;
+            let mut target_books: Vec<i64> = target_shelf.get("books")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|b| b.get("id").and_then(|id| id.as_i64())).collect())
+                .unwrap_or_default();
+            if !target_books.contains(&book_id) {
+                target_books.push(book_id);
+            }
+            client.update_shelf(target_shelf_id, &json!({ "books": target_books })).await?;
+
+            // Remove from source shelf if specified
+            let mut removed_from = String::new();
+            if let Some(source_id) = remove_from_shelf_id {
+                let source_shelf = client.get_shelf(source_id).await?;
+                let source_name = source_shelf.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let source_books: Vec<i64> = source_shelf.get("books")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|b| b.get("id").and_then(|id| id.as_i64())).filter(|&id| id != book_id).collect())
+                    .unwrap_or_default();
+                client.update_shelf(source_id, &json!({ "books": source_books })).await?;
+                removed_from = format!("\nRemoved from shelf: {} (ID: {})", source_name, source_id);
+            }
+
+            let target_name = target_shelf.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            Ok(format!("Book {book_id} moved to shelf \"{target_name}\" (ID: {target_shelf_id}).{removed_from}"))
+        }
+
         // Attachments
         "list_attachments" => {
             format_json(&client.list_attachments().await?)
@@ -1329,6 +1387,34 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
         })),
         tool("delete_page", "Delete a page (moves to recycle bin).",
             id_schema("page_id")),
+
+        // Move operations
+        tool("move_page", "Move a page to a different chapter or book. Only moves — does not modify content. Provide chapter_id to move into a chapter, or book_id to move to book level (not in any chapter).", json!({
+            "type": "object",
+            "properties": {
+                "page_id": { "type": "integer", "description": "The page to move" },
+                "chapter_id": { "type": "integer", "description": "Target chapter ID (moves page into this chapter)" },
+                "book_id": { "type": "integer", "description": "Target book ID (moves page to book level, outside any chapter)" }
+            },
+            "required": ["page_id"]
+        })),
+        tool("move_chapter", "Move a chapter (with all its pages) to a different book.", json!({
+            "type": "object",
+            "properties": {
+                "chapter_id": { "type": "integer", "description": "The chapter to move" },
+                "target_book_id": { "type": "integer", "description": "The book to move the chapter into" }
+            },
+            "required": ["chapter_id", "target_book_id"]
+        })),
+        tool("move_book_to_shelf", "Move a book to a different shelf. Optionally remove it from a source shelf. Books can appear on multiple shelves — this adds to the target and optionally removes from the source.", json!({
+            "type": "object",
+            "properties": {
+                "book_id": { "type": "integer", "description": "The book to move" },
+                "target_shelf_id": { "type": "integer", "description": "The shelf to add the book to" },
+                "remove_from_shelf_id": { "type": "integer", "description": "Optional: shelf to remove the book from (for a true move rather than just adding)" }
+            },
+            "required": ["book_id", "target_shelf_id"]
+        })),
 
         // Attachments
         tool("list_attachments", "List all attachments.", json!({

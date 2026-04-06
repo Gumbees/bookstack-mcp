@@ -21,10 +21,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Extract version from Cargo.toml
-        id: version
-        run: echo "version=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *\"\(.*\)\"/\1/')" >> "$GITHUB_OUTPUT"
-
       - uses: docker/setup-qemu-action@v3
 
       - uses: docker/setup-buildx-action@v3
@@ -41,9 +37,8 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/bees-roadhouse/bsmcp-server
           tags: |
-            # dev + versioned dev tag from development branch
+            # dev tag from development branch
             type=raw,value=dev,enable=${{ github.ref == 'refs/heads/development' }}
-            type=raw,value=${{ steps.version.outputs.version }}-dev.${{ github.sha }},enable=${{ github.ref == 'refs/heads/development' }}
             # latest + release from release branch
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/release' }}
             type=raw,value=release,enable=${{ github.ref == 'refs/heads/release' }}
@@ -73,10 +68,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Extract version from Cargo.toml
-        id: version
-        run: echo "version=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *\"\(.*\)\"/\1/')" >> "$GITHUB_OUTPUT"
-
       - uses: docker/setup-qemu-action@v3
 
       - uses: docker/setup-buildx-action@v3
@@ -93,9 +84,8 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/bees-roadhouse/bsmcp-embedder
           tags: |
-            # dev + versioned dev tag from development branch
+            # dev tag from development branch
             type=raw,value=dev,enable=${{ github.ref == 'refs/heads/development' }}
-            type=raw,value=${{ steps.version.outputs.version }}-dev.${{ github.sha }},enable=${{ github.ref == 'refs/heads/development' }}
             # latest + release from release branch
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/release' }}
             type=raw,value=release,enable=${{ github.ref == 'refs/heads/release' }}

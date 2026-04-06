@@ -1,25 +1,41 @@
 name: Security Scan
 
 on:
-  pull_request:
-    types: [opened, synchronize]
+  push:
+    branches:
+      - development
+      - release
 
 jobs:
   scan:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       pull-requests: write
       id-token: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
       - uses: anthropics/claude-code-action@v1
         with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           prompt: |
-            Perform a security-focused review of the changes in this PR.
+            Scan this codebase for security vulnerabilities, bugs, and correctness issues.
             Focus on:
             - OWASP top 10 (injection, auth flaws, XSS, SSRF, etc.)
             - Unsafe deserialization or input handling
-            - Secrets, credentials, or API keys in code
+            - Logic errors that could cause data loss or corruption
             - Dependency issues or known CVEs
             - Improper error handling that leaks sensitive info
-            Only flag real vulnerabilities. Do not comment on style or minor improvements.
+
+            If you find real issues:
+            1. Create a new branch named problem/security-{short-description} from the current branch
+            2. Fix the issues directly in the code
+            3. Commit with a clear message explaining what was found and fixed
+            4. Push the branch and open a PR back to the source branch
+
+            If no issues are found, just output "No security issues found." and do nothing else.
+            Do not create PRs for style nits, minor improvements, or hypothetical issues.
+            Only real vulnerabilities and bugs.

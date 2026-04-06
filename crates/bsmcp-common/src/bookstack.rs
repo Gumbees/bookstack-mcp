@@ -2,6 +2,51 @@ use reqwest::Client;
 use serde_json::Value;
 use zeroize::Zeroize;
 
+/// Resolve file content from either a local file path or a URL.
+/// Exactly one of file_path or url must be provided.
+/// Returns (bytes, filename).
+pub async fn resolve_file_content(
+    file_path: Option<&str>,
+    url: Option<&str>,
+) -> Result<(Vec<u8>, String), String> {
+    match (file_path, url) {
+        (Some(path), None) => {
+            let bytes = tokio::fs::read(path)
+                .await
+                .map_err(|e| format!("Failed to read file '{}': {}", path, e))?;
+            let filename = std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file")
+                .to_string();
+            Ok((bytes, filename))
+        }
+        (None, Some(url)) => {
+            let resp = reqwest::get(url)
+                .await
+                .map_err(|e| format!("Failed to fetch URL '{}': {}", url, e))?;
+            if !resp.status().is_success() {
+                return Err(format!("URL returned status {}", resp.status()));
+            }
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| format!("Failed to read URL response: {}", e))?
+                .to_vec();
+            let filename = url
+                .rsplit('/')
+                .next()
+                .and_then(|s| s.split('?').next())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("download")
+                .to_string();
+            Ok((bytes, filename))
+        }
+        (Some(_), Some(_)) => Err("Provide either file_path or url, not both".to_string()),
+        (None, None) => Err("Either file_path or url is required".to_string()),
+    }
+}
+
 // --- Type-safe enums for URL path parameters (defense-in-depth) ---
 
 pub enum ExportFormat {

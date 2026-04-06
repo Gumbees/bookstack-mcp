@@ -1,5 +1,5 @@
 //! Embedding provider abstraction.
-//! Supports local ONNX models (fastembed), OpenAI API, and Ollama.
+//! Supports local ONNX models (fastembed), OpenAI API, Ollama, and Voyage AI.
 
 use std::sync::Arc;
 
@@ -269,6 +269,142 @@ impl Embedder for OllamaEmbedder {
 
     fn provider_name(&self) -> &str {
         "ollama"
+    }
+}
+
+// --- Voyage AI embedder ---
+
+pub struct VoyageEmbedder {
+    api_key: String,
+    model: String,
+    base_url: String,
+    dims: usize,
+    http: reqwest::Client,
+}
+
+impl VoyageEmbedder {
+    pub fn new(api_key: &str, model: &str, base_url: &str, dims: usize) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .expect("Failed to build HTTP client");
+        Self {
+            api_key: api_key.to_string(),
+            model: model.to_string(),
+            base_url: base_url.trim_end_matches('/').to_string(),
+            dims,
+            http,
+        }
+    }
+
+    /// Auto-detect embedding dimensions by sending a test string.
+    pub async fn detect_dims(api_key: &str, model: &str, base_url: &str) -> Result<usize, String> {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .map_err(|e| format!("HTTP client build failed: {e}"))?;
+
+        let base = base_url.trim_end_matches('/');
+        let body = serde_json::json!({
+            "model": model,
+            "input": ["dimension test"],
+        });
+
+        let resp = http
+            .post(format!("{base}/v1/embeddings"))
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Voyage dim detection failed: {e}"))?;
+
+        let status = resp.status();
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Voyage dim detection parse failed: {e}"))?;
+
+        if !status.is_success() {
+            let msg = json.get("detail")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error");
+            return Err(format!("Voyage dim detection error {status}: {msg}"));
+        }
+
+        let dims = json["data"][0]["embedding"]
+            .as_array()
+            .map(|a| a.len())
+            .ok_or("Could not detect dimensions from Voyage response")?;
+
+        Ok(dims)
+    }
+}
+
+#[async_trait]
+impl Embedder for VoyageEmbedder {
+    async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
+        let body = serde_json::json!({
+            "model": self.model,
+            "input": texts,
+        });
+
+        let resp = self
+            .http
+            .post(format!("{}/v1/embeddings", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                let url = format!("{}/v1/embeddings", self.base_url);
+                format!("Voyage embed request failed: {e:?} (url={url}, key_len={}, model={})",
+                    self.api_key.len(), self.model)
+            })?;
+
+        let status = resp.status();
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Voyage embed response parse failed: {e}"))?;
+
+        if !status.is_success() {
+            return Err(format!(
+                "Voyage embed error {status}: {}",
+                json.get("detail")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown error")
+            ));
+        }
+
+        let data = json["data"]
+            .as_array()
+            .ok_or("No data array in Voyage response")?;
+
+        let mut embeddings: Vec<(usize, Vec<f32>)> = Vec::with_capacity(data.len());
+        for item in data {
+            let index = item["index"].as_u64().unwrap_or(0) as usize;
+            let embedding: Vec<f32> = item["embedding"]
+                .as_array()
+                .ok_or("No embedding array in response item")?
+                .iter()
+                .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+                .collect();
+            embeddings.push((index, embedding));
+        }
+
+        // Sort by index to match input order
+        embeddings.sort_by_key(|(i, _)| *i);
+        Ok(embeddings.into_iter().map(|(_, e)| e).collect())
+    }
+
+    fn dims(&self) -> usize {
+        self.dims
+    }
+
+    fn provider_name(&self) -> &str {
+        "voyage"
     }
 }
 

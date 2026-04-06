@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{Multipart, Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
@@ -29,11 +29,16 @@ pub fn new_staging_store() -> StagingStore {
 
 pub async fn consume_staged(store: &StagingStore, id: &str) -> Option<StagingEntry> {
     let mut map = store.write().await;
-    map.remove(id)
+    let entry = map.remove(id)?;
+    // Don't return empty pre-registered slots
+    if entry.bytes.is_empty() {
+        None
+    } else {
+        Some(entry)
+    }
 }
 
 pub fn cleanup_expired_sync(store: &StagingStore) {
-    // Use try_write to avoid blocking if someone else holds the lock
     if let Ok(mut map) = store.try_write() {
         let before = map.len();
         map.retain(|_, entry| entry.created_at.elapsed() < STAGING_TTL);
@@ -46,26 +51,19 @@ pub fn cleanup_expired_sync(store: &StagingStore) {
 
 pub async fn handle_stage_upload(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(staging_id): Path<String>,
     mut multipart: Multipart,
 ) -> Response {
-    // Auth required
-    let (_token_id, _token_secret) = match crate::sse::resolve_credentials(
-        &headers,
-        state.db.as_ref(),
-        &state.known_urls,
-    ).await {
-        Ok(creds) => creds,
-        Err(resp) => return resp,
-    };
-
-    // Validate staging_id is a UUID
-    if uuid::Uuid::parse_str(&staging_id).is_err() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Invalid staging_id format"})),
-        ).into_response();
+    // Auth is the staging_id itself — only someone who called prepare_upload
+    // (which requires MCP auth) has the UUID. Validate it exists in the store.
+    {
+        let store = state.staging.read().await;
+        if !store.contains_key(&staging_id) {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "Unknown staging_id — call prepare_upload first"})),
+            ).into_response();
+        }
     }
 
     // Extract the file from multipart
@@ -113,7 +111,7 @@ pub async fn handle_stage_upload(
 
     let size = bytes.len();
 
-    // Store in staging
+    // Replace the pre-registered slot with actual file data
     {
         let mut store = state.staging.write().await;
         store.insert(staging_id.clone(), StagingEntry {

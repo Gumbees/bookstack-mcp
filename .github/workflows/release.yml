@@ -2,9 +2,6 @@ name: Build and Release
 
 on:
   push:
-    branches:
-      - development
-      - release
     tags:
       - 'v*'
 
@@ -37,15 +34,10 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/gumbees/bsmcp-server
           tags: |
-            # dev tag from development branch
-            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/development' }}
-            # latest + release from release branch
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/release' }}
-            type=raw,value=release,enable=${{ github.ref == 'refs/heads/release' }}
-            # semver tags from v* tags
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=raw,value=latest
+            type=raw,value=dev
 
       - name: Build and push server image
         uses: docker/build-push-action@v6
@@ -84,15 +76,10 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/gumbees/bsmcp-embedder
           tags: |
-            # dev tag from development branch
-            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/development' }}
-            # latest + release from release branch
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/release' }}
-            type=raw,value=release,enable=${{ github.ref == 'refs/heads/release' }}
-            # semver tags from v* tags
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=raw,value=latest
+            type=raw,value=dev
 
       - name: Build and push embedder image
         uses: docker/build-push-action@v6

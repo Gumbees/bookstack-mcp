@@ -196,10 +196,7 @@ Migrates: access_tokens, pages, chunks (BLOB→pgvector), relationships, embed_j
 
 ## Branch Info
 
-- `development` - default branch, active work lands here
-- `release` - stable/production branch, merged from development when ready
-- `enhancement/{name}` - branched from development for new functionality
-- `problem/{name}` - branched from development for bug fixes
+- `main` - production branch
 
 ## Breaking Changes Log
 

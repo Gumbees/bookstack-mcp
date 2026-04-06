@@ -776,6 +776,17 @@ fn arg_bool(args: &Value, key: &str, default: bool) -> bool {
     args.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
 }
 
+/// Join a path/URL fragment from a BookStack API response with the base URL.
+/// If the fragment is already absolute (http:// or https://), return it as-is
+/// to avoid producing malformed URLs like `http://bookstack-apphttps://kb.example.com/...`.
+fn join_base_url(base_url: &str, path: &str) -> String {
+    if path.starts_with("http://") || path.starts_with("https://") {
+        path.to_string()
+    } else {
+        format!("{base_url}{path}")
+    }
+}
+
 fn validate_enum(value: &str, allowed: &[&str], name: &str) -> Result<(), String> {
     if allowed.contains(&value) {
         Ok(())
@@ -830,7 +841,7 @@ fn format_search_results(data: &Value, base_url: &str) -> String {
         let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let id = item.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
         let url = item.get("url").and_then(|v| v.as_str())
-            .map(|u| format!("{base_url}{u}"))
+            .map(|u| join_base_url(base_url, u))
             .unwrap_or_default();
         if url.is_empty() {
             lines.push(format!("- [{item_type}] {name} (id: {id})"));
@@ -967,7 +978,7 @@ fn format_page_success(action: &str, result: &Value, base_url: &str) -> String {
     let book_id = result.get("book_id").and_then(|v| v.as_i64()).unwrap_or(0);
     let revision = result.get("revision_count").and_then(|v| v.as_i64()).unwrap_or(0);
     let url = if let Some(rel) = result.get("url").and_then(|v| v.as_str()) {
-        format!("{base_url}{rel}")
+        join_base_url(base_url, rel)
     } else {
         let book_slug = result.get("book_slug").and_then(|v| v.as_str()).unwrap_or("");
         if !book_slug.is_empty() && !slug.is_empty() {

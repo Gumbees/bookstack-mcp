@@ -1412,7 +1412,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             },
             "required": ["chapter_id", "target_book_id"]
         })),
-        tool("move_book_to_shelf", "Move a book to a different shelf. Optionally remove it from a source shelf. Books can appear on multiple shelves — this adds to the target and optionally removes from the source.", json!({
+        tool("move_book_to_shelf", "Move a book to a different shelf. Optionally remove it from a source shelf. Books can appear on multiple shelves — this adds to the target and optionally removes from the source. Note: concurrent calls targeting the same shelf may silently drop book assignments; use sequentially in multi-user environments.", json!({
             "type": "object",
             "properties": {
                 "book_id": { "type": "integer", "description": "The book to move" },

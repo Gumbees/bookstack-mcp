@@ -1,10 +1,31 @@
 use reqwest::Client;
 use serde_json::Value;
+use std::net::IpAddr;
 use url::Url;
 use zeroize::Zeroize;
 
 /// Maximum size for file content fetched from URLs (50MB).
 const MAX_FILE_CONTENT_SIZE: usize = 50 * 1024 * 1024;
+
+/// Check if an IP address is in a private, loopback, or link-local range.
+fn is_restricted_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()             // 127.0.0.0/8
+            || v4.is_private()           // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+            || v4.is_link_local()        // 169.254.0.0/16 (AWS IMDS, etc.)
+            || v4.is_broadcast()         // 255.255.255.255
+            || v4.is_unspecified()       // 0.0.0.0
+            || v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64  // 100.64.0.0/10 (CGN)
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()             // ::1
+            || v6.is_unspecified()       // ::
+            || (v6.segments()[0] & 0xffc0) == 0xfe80  // fe80::/10 link-local
+            || (v6.segments()[0] & 0xfe00) == 0xfc00  // fc00::/7 ULA
+        }
+    }
+}
 
 /// Resolve file content from either a local file path or a URL.
 /// Exactly one of file_path or url must be provided.
@@ -26,13 +47,29 @@ pub async fn resolve_file_content(
             Ok((bytes, filename))
         }
         (None, Some(url)) => {
-            // Validate URL scheme — only http and https are permitted.
-            // Note: private IP ranges (169.254.x.x, 10.x.x.x, etc.) are not blocked here;
-            // that is a known limitation and a future enhancement.
             let parsed = Url::parse(url).map_err(|e| format!("Invalid URL '{}': {}", url, e))?;
+
+            // Only http and https schemes are permitted.
             match parsed.scheme() {
                 "http" | "https" => {}
                 scheme => return Err(format!("URL scheme '{}' is not allowed; only http and https are permitted", scheme)),
+            }
+
+            // Resolve hostname and reject private/loopback/link-local IPs (SSRF protection).
+            let host = parsed.host_str()
+                .ok_or_else(|| format!("URL '{}' has no host", url))?;
+            let port = parsed.port_or_known_default().unwrap_or(80);
+            let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(format!("{}:{}", host, port))
+                .await
+                .map_err(|e| format!("Failed to resolve host '{}': {}", host, e))?
+                .collect();
+            if addrs.is_empty() {
+                return Err(format!("Host '{}' resolved to no addresses", host));
+            }
+            for addr in &addrs {
+                if is_restricted_ip(&addr.ip()) {
+                    return Err(format!("URL host '{}' resolves to restricted IP address {}; private, loopback, and link-local addresses are not allowed", host, addr.ip()));
+                }
             }
 
             let resp = reqwest::get(url)

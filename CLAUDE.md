@@ -105,10 +105,10 @@ All prefixed `BSMCP_`. See `.env.example` for full list. Key ones:
 - **semantic_search** - Natural language vector search (when semantic enabled)
 - **reembed** - Trigger re-embedding of all pages (when semantic enabled)
 - **embed_status** - Check embedding job status (when semantic enabled)
-- **Shelves** - list, get, create, update (assign books), delete (5)
+- **Shelves** - list, get, create, update, delete (5)
 - **Books** - list, get, create, update, delete (5)
-- **Chapters** - list, get, create, update (move between books), delete (5)
-- **Pages** - list, get, create, update (move between chapters/books), delete (5)
+- **Chapters** - list, get, create, update, delete (5)
+- **Pages** - list, get, create, update, delete (5)
 - **Attachments** - list, get, create, upload, update, delete (6)
 - **Exports** - export_page, export_chapter, export_book (3) - markdown, plaintext, or html
 - **Comments** - list, get, create, update, delete (5)

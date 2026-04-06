@@ -99,7 +99,7 @@ All prefixed `BSMCP_`. See `.env.example` for full list. Key ones:
 - `BSMCP_SUMMARY_INTERVAL` — hours between regenerations (0 = only on first startup)
 - `BSMCP_SUMMARY_TOKEN_ID/SECRET` — BookStack token (falls back to BSMCP_EMBED_TOKEN_*)
 
-## Implemented Tools (61)
+## Implemented Tools (58)
 
 - **search_content** - Full-text search with BookStack query operators
 - **semantic_search** - Natural language vector search (when semantic enabled)
@@ -109,7 +109,6 @@ All prefixed `BSMCP_`. See `.env.example` for full list. Key ones:
 - **Books** - list, get, create, update, delete (5)
 - **Chapters** - list, get, create, update (move between books), delete (5)
 - **Pages** - list, get, create, update (move between chapters/books), delete (5)
-- **Move** - move_page, move_chapter, move_book_to_shelf (3) - dedicated move operations
 - **Attachments** - list, get, create, upload, update, delete (6)
 - **Exports** - export_page, export_chapter, export_book (3) - markdown, plaintext, or html
 - **Comments** - list, get, create, update, delete (5)

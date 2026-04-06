@@ -165,16 +165,16 @@ cargo build --release -p bsmcp-embedder
 # Multi-arch Docker
 docker buildx build --builder multiarch --platform linux/amd64,linux/arm64 \
   -f docker/Dockerfile.server \
-  -t ghcr.io/bees-roadhouse/bsmcp-server:VERSION --push .
+  -t ghcr.io/gumbees/bsmcp-server:VERSION --push .
 
 docker buildx build --builder multiarch --platform linux/amd64,linux/arm64 \
   -f docker/Dockerfile.embedder \
-  -t ghcr.io/bees-roadhouse/bsmcp-embedder:VERSION --push .
+  -t ghcr.io/gumbees/bsmcp-embedder:VERSION --push .
 ```
 
 Images:
-- `ghcr.io/bees-roadhouse/bsmcp-server` — MCP server (~35MB)
-- `ghcr.io/bees-roadhouse/bsmcp-embedder` — Embedder with ONNX (~45MB)
+- `ghcr.io/gumbees/bsmcp-server` — MCP server (~35MB)
+- `ghcr.io/gumbees/bsmcp-embedder` — Embedder with ONNX (~45MB)
 
 ## Docker Compose
 
@@ -204,7 +204,7 @@ Migrates: access_tokens, pages, chunks (BLOB→pgvector), relationships, embed_j
 ## Breaking Changes Log
 
 ### v0.3.0 (from v0.2.x)
-- **Two images:** `ghcr.io/bees-roadhouse/bsmcp-server` + `ghcr.io/bees-roadhouse/bsmcp-embedder` (was single `bookstack-mcp`)
+- **Two images:** `ghcr.io/gumbees/bsmcp-server` + `ghcr.io/gumbees/bsmcp-embedder` (was single `bookstack-mcp`)
 - **New env vars:** `BSMCP_DB_BACKEND`, `BSMCP_DATABASE_URL`, `BSMCP_EMBEDDER_URL`, `BSMCP_EMBED_TOKEN_*`, performance tuning vars
 - **Docker service renames:** `postgres` → `bsmcp-postgres`, `bookstack-mcp` → `bsmcp-server`, `pgdata` → `bsmcp-pgdata`
 - **Embedder is separate:** No more in-process ONNX model; embedder runs as its own container/binary

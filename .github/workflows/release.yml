@@ -35,7 +35,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/bees-roadhouse/bsmcp-server
+          images: ${{ env.REGISTRY }}/gumbees/bsmcp-server
           tags: |
             # dev tag from development branch
             type=raw,value=dev,enable=${{ github.ref == 'refs/heads/development' }}
@@ -82,7 +82,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/bees-roadhouse/bsmcp-embedder
+          images: ${{ env.REGISTRY }}/gumbees/bsmcp-embedder
           tags: |
             # dev tag from development branch
             type=raw,value=dev,enable=${{ github.ref == 'refs/heads/development' }}

@@ -75,7 +75,7 @@ GitHub Actions builds Docker images on every push to `development` and `release`
 - Push to `release` ... tags image as `latest`, `release`, plus semver tags
 - Push `v*` tag ... adds immutable semver tags (`x.y.z`, `x.y`, `x`)
 
-Images are published to `ghcr.io/bees-roadhouse/bsmcp-server` and `ghcr.io/bees-roadhouse/bsmcp-embedder` for `linux/amd64` and `linux/arm64`.
+Images are published to `ghcr.io/gumbees/bsmcp-server` and `ghcr.io/gumbees/bsmcp-embedder` for `linux/amd64` and `linux/arm64`.
 
 ## Versioning
 

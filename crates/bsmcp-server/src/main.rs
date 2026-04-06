@@ -4,6 +4,7 @@ mod migrate;
 mod oauth;
 mod semantic;
 mod sse;
+mod staging;
 mod summary;
 
 use std::env;
@@ -234,6 +235,14 @@ async fn main() {
         .route("/token", axum::routing::post(oauth::handle_token))
         .route("/register", axum::routing::post(oauth::handle_register))
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }));
+
+    // Staging upload endpoint for file uploads (50MB limit)
+    app = app.route(
+        "/stage/upload/{staging_id}",
+        axum::routing::post(staging::handle_stage_upload)
+            .layer(DefaultBodyLimit::max(50 * 1024 * 1024)),
+    );
+    eprintln!("Staging: upload endpoint active at POST /stage/upload/:id");
 
     // Conditional webhook + status routes for semantic search
     if state.semantic.is_some() {

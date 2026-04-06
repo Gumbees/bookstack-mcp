@@ -15,6 +15,7 @@ pub async fn handle_request(
     client: &BookStackClient,
     semantic: Option<&SemanticState>,
     summary_cache: &crate::summary::SummaryCache,
+    staging: &crate::staging::StagingStore,
 ) -> Option<Value> {
     let id = request.get("id");
 
@@ -47,7 +48,7 @@ pub async fn handle_request(
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let result = execute_tool(name, &args, client, semantic).await;
+            let result = execute_tool(name, &args, client, semantic, staging).await;
             match result {
                 Ok(text) => Some(json_rpc_result(id, json!({
                     "content": [{ "type": "text", "text": text }],
@@ -78,7 +79,7 @@ fn json_rpc_error(id: Option<&Value>, code: i64, message: &str) -> Value {
     })
 }
 
-async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semantic: Option<&SemanticState>) -> Result<String, String> {
+async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semantic: Option<&SemanticState>, staging: &crate::staging::StagingStore) -> Result<String, String> {
     match name {
         // Semantic Search (conditional)
         "semantic_search" => {
@@ -477,11 +478,24 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
         "upload_attachment" => {
             let name = arg_str(args, "name")?;
             let uploaded_to = arg_i64_required(args, "uploaded_to")?;
-            let mime_type = arg_str_default(args, "mime_type", "application/octet-stream");
+            let mime_type_arg = arg_str_default(args, "mime_type", "application/octet-stream");
+            let staging_id = args.get("staging_id").and_then(|v| v.as_str());
             let file_path = args.get("file_path").and_then(|v| v.as_str());
             let url = args.get("url").and_then(|v| v.as_str());
-            let (bytes, auto_filename) = bookstack::resolve_file_content(file_path, url).await
-                .map_err(|e| e.to_string())?;
+            let (bytes, auto_filename, resolved_mime) = if let Some(sid) = staging_id {
+                let entry = crate::staging::consume_staged(staging, sid).await
+                    .ok_or_else(|| format!("Staging slot '{}' not found or already consumed (slots expire after 5 minutes)", sid))?;
+                (entry.bytes, entry.filename, entry.mime_type)
+            } else {
+                let (b, f) = bookstack::resolve_file_content(file_path, url).await
+                    .map_err(|e| e.to_string())?;
+                (b, f, mime_type_arg.clone())
+            };
+            let mime_type = if staging_id.is_some() && args.get("mime_type").is_none() {
+                resolved_mime
+            } else {
+                mime_type_arg
+            };
             let filename = match args.get("filename").and_then(|v| v.as_str()) {
                 Some(f) if !f.is_empty() => f.to_string(),
                 _ => auto_filename,
@@ -626,16 +640,38 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
             let image_type = arg_str_default(args, "type", "gallery");
             validate_enum(&image_type, &["gallery", "drawio"], "type")?;
             let uploaded_to = arg_i64_required(args, "uploaded_to")?;
-            let mime_type = arg_str_default(args, "mime_type", "image/png");
+            let mime_type_arg = arg_str_default(args, "mime_type", "image/png");
+            let staging_id = args.get("staging_id").and_then(|v| v.as_str());
             let file_path = args.get("file_path").and_then(|v| v.as_str());
             let url = args.get("url").and_then(|v| v.as_str());
-            let (bytes, auto_filename) = bookstack::resolve_file_content(file_path, url).await
-                .map_err(|e| e.to_string())?;
+            let (bytes, auto_filename, resolved_mime) = if let Some(sid) = staging_id {
+                let entry = crate::staging::consume_staged(staging, sid).await
+                    .ok_or_else(|| format!("Staging slot '{}' not found or already consumed (slots expire after 5 minutes)", sid))?;
+                (entry.bytes, entry.filename, entry.mime_type)
+            } else {
+                let (b, f) = bookstack::resolve_file_content(file_path, url).await
+                    .map_err(|e| e.to_string())?;
+                (b, f, mime_type_arg.clone())
+            };
+            let mime_type = if staging_id.is_some() && args.get("mime_type").is_none() {
+                resolved_mime
+            } else {
+                mime_type_arg
+            };
             let filename = match args.get("filename").and_then(|v| v.as_str()) {
                 Some(f) if !f.is_empty() => f.to_string(),
                 _ => auto_filename,
             };
             format_json(&client.upload_image(&name, &image_type, uploaded_to, &filename, bytes, &mime_type).await?)
+        }
+        "prepare_upload" => {
+            let staging_id = uuid::Uuid::new_v4().to_string();
+            format_json(&json!({
+                "staging_id": staging_id,
+                "upload_url": format!("/stage/upload/{staging_id}"),
+                "instructions": "POST a multipart/form-data request with a 'file' field to the upload_url (relative to this server's base URL). Include Authorization header. Then pass the staging_id to upload_image or upload_attachment.",
+                "ttl_seconds": 300
+            }))
         }
 
         // Content Permissions
@@ -1446,11 +1482,12 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             update_schema("attachment_id", &["name", "link"])),
         tool("delete_attachment", "Delete an attachment.",
             id_schema("attachment_id")),
-        tool("upload_attachment", "Upload a file attachment to a page from a local file path or URL.", json!({
+        tool("upload_attachment", "Upload a file attachment to a page from a local file path, URL, or staging slot.", json!({
             "type": "object",
             "properties": {
                 "name": { "type": "string", "description": "Attachment name" },
                 "uploaded_to": { "type": "integer", "description": "Page ID to attach to" },
+                "staging_id": { "type": "string", "description": "Staging slot ID from prepare_upload (use instead of file_path/url when server cannot access local files)" },
                 "file_path": { "type": "string", "description": "Local filesystem path to the file" },
                 "url": { "type": "string", "description": "URL to fetch the file from" },
                 "filename": { "type": "string", "description": "Override the auto-detected filename" },
@@ -1561,11 +1598,12 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
         })),
         tool("delete_image", "Delete an image from the gallery.",
             id_schema("image_id")),
-        tool("upload_image", "Upload an image to the BookStack image gallery from a local file path or URL.", json!({
+        tool("upload_image", "Upload an image to the BookStack image gallery from a local file path, URL, or staging slot.", json!({
             "type": "object",
             "properties": {
                 "name": { "type": "string", "description": "Image name" },
                 "uploaded_to": { "type": "integer", "description": "Page ID the image is associated with" },
+                "staging_id": { "type": "string", "description": "Staging slot ID from prepare_upload (use instead of file_path/url when server cannot access local files)" },
                 "file_path": { "type": "string", "description": "Local filesystem path to the image file" },
                 "url": { "type": "string", "description": "URL to fetch the image from" },
                 "filename": { "type": "string", "description": "Override the auto-detected filename" },
@@ -1573,6 +1611,10 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
                 "mime_type": { "type": "string", "description": "MIME type of the image", "default": "image/png" }
             },
             "required": ["name", "uploaded_to"]
+        })),
+        tool("prepare_upload", "Create a staging slot for file upload. Returns a staging_id and upload_url. Use when the server cannot access local files (e.g. running in Docker). Step 1: call prepare_upload to get a staging_id and upload_url. Step 2: POST a multipart/form-data request with a 'file' field to upload_url (relative to the MCP server base URL), including the same Authorization header. Step 3: call upload_image or upload_attachment with staging_id instead of file_path/url.", json!({
+            "type": "object",
+            "properties": {}
         })),
 
         // Content Permissions

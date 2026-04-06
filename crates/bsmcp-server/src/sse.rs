@@ -44,6 +44,7 @@ pub struct AppState {
     backup_path: PathBuf,
     pub semantic: Option<Arc<SemanticState>>,
     pub summary_cache: crate::summary::SummaryCache,
+    pub staging: crate::staging::StagingStore,
 }
 
 pub(crate) struct RateLimit {
@@ -120,6 +121,7 @@ impl AppState {
             backup_path,
             semantic,
             summary_cache,
+            staging: crate::staging::new_staging_store(),
         }
     }
 
@@ -129,6 +131,7 @@ impl AppState {
         let db = self.db.clone();
         let streamable_rate_limits = self.streamable_rate_limits.clone();
         let streamable_sessions = self.streamable_sessions.clone();
+        let staging_clone = self.staging.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
@@ -159,6 +162,9 @@ impl AppState {
                 {
                     let mut ss = streamable_sessions.write().await;
                     ss.retain(|_, created| created.elapsed() < SESSION_TTL);
+                }
+                {
+                    crate::staging::cleanup_expired_sync(&staging_clone);
                 }
                 if let Err(e) = db.cleanup_expired_tokens().await {
                     eprintln!("Token cleanup error: {e}");
@@ -212,7 +218,7 @@ fn unauthorized(hint: &str, headers: &HeaderMap, known_urls: &[String]) -> Respo
     resp
 }
 
-async fn resolve_credentials(
+pub(crate) async fn resolve_credentials(
     headers: &HeaderMap,
     db: &dyn DbBackend,
     known_urls: &[String],
@@ -404,7 +410,7 @@ pub async fn handle_message(
     };
 
     let semantic = state.semantic.as_deref();
-    let response = mcp::handle_request(&request, &client, semantic, &state.summary_cache).await;
+    let response = mcp::handle_request(&request, &client, semantic, &state.summary_cache, &state.staging).await;
 
     if let Some(response) = response {
         let data = serde_json::to_string(&response).unwrap_or_default();
@@ -480,7 +486,7 @@ pub async fn handle_streamable(
     }
 
     let semantic = state.semantic.as_deref();
-    let response = mcp::handle_request(&request, &client, semantic, &state.summary_cache).await;
+    let response = mcp::handle_request(&request, &client, semantic, &state.summary_cache, &state.staging).await;
 
     match response {
         Some(resp) => {

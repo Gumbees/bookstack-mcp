@@ -405,6 +405,9 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
             let result = client.update_chapter(id, &data).await?;
             Ok(format_chapter_success("Chapter moved successfully.", &result, client.base_url()))
         }
+        // Note: This uses a GET-modify-PUT pattern which has a TOCTOU race if multiple
+        // concurrent sessions modify the same shelf simultaneously. Acceptable for
+        // single-user deployments; a per-shelf mutex would be needed for multi-user.
         "move_book_to_shelf" => {
             let book_id = arg_i64_required(args, "book_id")?;
             let target_shelf_id = arg_i64_required(args, "target_shelf_id")?;

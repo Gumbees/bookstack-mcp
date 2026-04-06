@@ -195,25 +195,6 @@ impl BookStackClient {
         Self::read_json(resp).await
     }
 
-    async fn post_multipart(&self, path: &str, form: reqwest::multipart::Form) -> Result<Value, String> {
-        let resp = self.client
-            .post(format!("{}/api/{}", self.base_url, path))
-            .header("Authorization", self.auth_header())
-            .multipart(form)
-            .send()
-            .await
-            .map_err(|e| { eprintln!("BookStack request error: {e}"); "Request failed".to_string() })?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = Self::read_error_body(resp).await;
-            eprintln!("BookStack API error {status}: {body}");
-            return Err(format!("BookStack API error: {status}"));
-        }
-
-        Self::read_json(resp).await
-    }
-
     async fn put(&self, path: &str, body: &Value) -> Result<Value, String> {
         let resp = self.client
             .put(format!("{}/api/{}", self.base_url, path))
@@ -536,33 +517,6 @@ impl BookStackClient {
 
     pub async fn delete_image(&self, id: i64) -> Result<(), String> {
         self.delete(&format!("image-gallery/{id}")).await
-    }
-
-    pub async fn upload_image(&self, name: &str, image_type: &str, uploaded_to: i64, filename: &str, bytes: Vec<u8>, mime_type: &str) -> Result<Value, String> {
-        let file_part = reqwest::multipart::Part::bytes(bytes)
-            .file_name(filename.to_string())
-            .mime_str(mime_type)
-            .map_err(|e| { eprintln!("Multipart error: {e}"); "Invalid mime type".to_string() })?;
-        let form = reqwest::multipart::Form::new()
-            .text("name", name.to_string())
-            .text("type", image_type.to_string())
-            .text("uploaded_to", uploaded_to.to_string())
-            .part("image", file_part);
-        self.post_multipart("image-gallery", form).await
-    }
-
-    // --- File Attachments ---
-
-    pub async fn create_file_attachment(&self, name: &str, uploaded_to: i64, filename: &str, bytes: Vec<u8>, mime_type: &str) -> Result<Value, String> {
-        let file_part = reqwest::multipart::Part::bytes(bytes)
-            .file_name(filename.to_string())
-            .mime_str(mime_type)
-            .map_err(|e| { eprintln!("Multipart error: {e}"); "Invalid mime type".to_string() })?;
-        let form = reqwest::multipart::Form::new()
-            .text("name", name.to_string())
-            .text("uploaded_to", uploaded_to.to_string())
-            .part("file", file_part);
-        self.post_multipart("attachments", form).await
     }
 
     // --- Content Permissions ---

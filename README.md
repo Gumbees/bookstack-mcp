@@ -38,7 +38,7 @@ docker/
 
 The MCP server handles all client-facing protocol, OAuth, and search. The embedder runs separately, polling a database-backed job queue to embed pages and serving a `/embed` HTTP endpoint for query-time embedding. The embedder supports three backends: local ONNX models (fastembed), Ollama, or OpenAI-compatible APIs.
 
-## Available Tools (56)
+## Available Tools (61)
 
 | Category | Tools |
 |----------|-------|
@@ -48,18 +48,19 @@ The MCP server handles all client-facing protocol, OAuth, and search. The embedd
 | **Books** | `list_books`, `get_book`, `create_book`, `update_book`, `delete_book` |
 | **Chapters** | `list_chapters`, `get_chapter`, `create_chapter`, `update_chapter`, `delete_chapter` |
 | **Pages** | `list_pages`, `get_page`, `create_page`, `update_page`, `delete_page`, `edit_page`, `append_to_page`, `replace_section`, `insert_after` |
-| **Attachments** | `list_attachments`, `get_attachment`, `create_attachment`, `update_attachment`, `delete_attachment` |
+| **Move** | `move_page`, `move_chapter`, `move_book_to_shelf` |
+| **Attachments** | `list_attachments`, `get_attachment`, `create_attachment`, `update_attachment`, `delete_attachment`, `upload_attachment` |
 | **Exports** | `export_page`, `export_chapter`, `export_book` (markdown, plaintext, html) |
 | **Comments** | `list_comments`, `get_comment`, `create_comment`, `update_comment`, `delete_comment` |
 | **Recycle Bin** | `list_recycle_bin`, `restore_recycle_bin_item`, `destroy_recycle_bin_item` |
 | **Users** | `list_users`, `get_user` |
 | **Audit Log** | `list_audit_log` |
 | **System** | `get_system_info` |
-| **Images** | `list_images`, `get_image`, `update_image`, `delete_image` |
+| **Images** | `list_images`, `get_image`, `upload_image`, `update_image`, `delete_image` |
 | **Permissions** | `get_content_permissions`, `update_content_permissions` |
 | **Roles** | `list_roles`, `get_role` |
 
-Semantic tools (`semantic_search`, `reembed`, `embedding_status`) only appear when `BSMCP_SEMANTIC_SEARCH=true` and an embedder is running. Without semantic search: 53 tools.
+Semantic tools (`semantic_search`, `reembed`, `embedding_status`) only appear when `BSMCP_SEMANTIC_SEARCH=true` and an embedder is running. Without semantic search: 58 tools.
 
 ## Setup
 
@@ -272,7 +273,7 @@ v0.5.3 fixes embedding dimension detection, adds Ollama LLM support for summarie
 
 #### What you must do
 
-1. **Pull new images**: `ghcr.io/gumbees/bsmcp-server:0.5.3` + `ghcr.io/gumbees/bsmcp-embedder:0.5.3`
+1. **Pull new images**: `ghcr.io/bees-roadhouse/bsmcp-server:0.5.3` + `ghcr.io/bees-roadhouse/bsmcp-embedder:0.5.3`
 2. **Restart** — dimension mismatch auto-reindexes if needed
 
 ### From v0.5.1 to v0.5.2
@@ -299,7 +300,7 @@ v0.5.2 adds pluggable embedding providers, AI instance summaries, OAuth refresh 
 
 #### What you must do
 
-1. **Pull new images**: `ghcr.io/gumbees/bsmcp-server:0.5.2` + `ghcr.io/gumbees/bsmcp-embedder:0.5.2` (or use `latest`)
+1. **Pull new images**: `ghcr.io/bees-roadhouse/bsmcp-server:0.5.2` + `ghcr.io/bees-roadhouse/bsmcp-embedder:0.5.2` (or use `latest`)
 2. **Restart** — that's it for the base upgrade
 
 **Optional: Enable AI instance summary** — add LLM env vars:
@@ -336,7 +337,7 @@ v0.5.1 switches the default embedding model and adds automatic model change dete
 
 #### What you must do
 
-1. **Pull new images**: `ghcr.io/gumbees/bsmcp-server:0.5.1` + `ghcr.io/gumbees/bsmcp-embedder:0.5.1`
+1. **Pull new images**: `ghcr.io/bees-roadhouse/bsmcp-server:0.5.1` + `ghcr.io/bees-roadhouse/bsmcp-embedder:0.5.1`
 2. **Restart** — the embedder auto-detects the model change and re-indexes. Check progress at `/status`.
 3. **To keep the old model**: Set `BSMCP_EMBED_MODEL=BAAI/bge-large-en-v1.5` in your embedder env.
 
@@ -361,7 +362,7 @@ v0.5.0 is a search quality release — no infrastructure changes, just better re
 
 #### What you must do
 
-1. **Pull new images**: `ghcr.io/gumbees/bsmcp-server:0.5.0` + `ghcr.io/gumbees/bsmcp-embedder:0.5.0`
+1. **Pull new images**: `ghcr.io/bees-roadhouse/bsmcp-server:0.5.0` + `ghcr.io/bees-roadhouse/bsmcp-embedder:0.5.0`
 2. **Restart** — the embedder auto-detects the chunk version change and re-indexes. Check progress at `/status`.
 3. **No env var changes required** — new `hybrid` parameter defaults to `true` in the `semantic_search` tool
 
@@ -397,8 +398,8 @@ v0.4.0 splits the monolithic `bookstack-mcp` container into separate **server** 
 #### What you must do
 
 1. **Replace compose file and images**:
-   - Old: single `ghcr.io/gumbees/bookstack-mcp:latest` container
-   - New: `ghcr.io/gumbees/bsmcp-server:latest` + `ghcr.io/gumbees/bsmcp-embedder:latest`
+   - Old: single `ghcr.io/bees-roadhouse/bookstack-mcp:latest` container
+   - New: `ghcr.io/bees-roadhouse/bsmcp-server:latest` + `ghcr.io/bees-roadhouse/bsmcp-embedder:latest`
    - Use `docker/docker-compose.sqlite.yml` (simple) or `docker/docker-compose.yml` (PostgreSQL)
 
 2. **Add new env vars**:
@@ -477,10 +478,10 @@ This is the largest jump — from a single monolithic container with no encrypti
    ```
 
 3. **Replace compose file entirely**:
-   - Old: `docker-compose.yml` with `ghcr.io/gumbees/bookstack-mcp:latest`
+   - Old: `docker-compose.yml` with `ghcr.io/bees-roadhouse/bookstack-mcp:latest`
    - New (SQLite): `docker/docker-compose.sqlite.yml`
    - New (PostgreSQL): `docker/docker-compose.yml`
-   - Images: `ghcr.io/gumbees/bsmcp-server:latest` + `ghcr.io/gumbees/bsmcp-embedder:latest`
+   - Images: `ghcr.io/bees-roadhouse/bsmcp-server:latest` + `ghcr.io/bees-roadhouse/bsmcp-embedder:latest`
 
 4. **Create a BookStack API token** for the embedder with read access to all content
 
@@ -490,7 +491,7 @@ This is the largest jump — from a single monolithic container with no encrypti
 
 ### From v0.1.2 to v0.1.3
 
-See the [v0.1.3 release notes](https://github.com/gumbees/bookstack-mcp/releases/tag/v0.1.3):
+See the [v0.1.3 release notes](https://github.com/bees-roadhouse/bookstack-mcp/releases/tag/v0.1.3):
 - New required `BSMCP_ENCRYPTION_KEY` env var
 - `BSMCP_PUBLIC_URL` renamed to `BSMCP_PUBLIC_DOMAIN`
 - Docker volume renamed `mcp-data` to `bsmcp-data`

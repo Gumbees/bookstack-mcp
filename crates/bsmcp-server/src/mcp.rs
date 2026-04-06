@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 
 use pulldown_cmark::{html, Options, Parser};
 
-use bsmcp_common::bookstack::{BookStackClient, ContentType, ExportFormat};
+use bsmcp_common::bookstack::{self, BookStackClient, ContentType, ExportFormat};
 use crate::semantic::SemanticState;
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
@@ -191,7 +191,10 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
         }
         "update_chapter" => {
             let id = arg_i64_required(args, "chapter_id")?;
-            let data = filter_string_update_fields(args, &["name", "description"]);
+            let mut data = filter_string_update_fields(args, &["name", "description"]);
+            if let Some(v) = args.get("book_id").and_then(|v| v.as_i64()) {
+                data["book_id"] = json!(v);
+            }
             let result = client.update_chapter(id, &data).await?;
             Ok(format_chapter_success("Chapter updated successfully.", &result, client.base_url()))
         }
@@ -251,6 +254,17 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
                 data["markdown"] = json!(strip_duplicate_title(md, &page_name));
             } else if let Some(v) = args.get("html").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                 data["html"] = json!(strip_duplicate_title(v, &page_name));
+            }
+            let move_chapter_id = args.get("chapter_id").and_then(|v| v.as_i64());
+            let move_book_id = args.get("book_id").and_then(|v| v.as_i64());
+            if move_chapter_id.is_some() && move_book_id.is_some() {
+                return Err("Provide either chapter_id or book_id, not both".to_string());
+            }
+            if let Some(v) = move_chapter_id {
+                data["chapter_id"] = json!(v);
+            }
+            if let Some(v) = move_book_id {
+                data["book_id"] = json!(v);
             }
             let result = client.update_page(id, &data).await?;
             Ok(format_page_success("Page updated successfully.", &result, client.base_url()))
@@ -368,6 +382,70 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
             Ok(format!("Page {id} deleted."))
         }
 
+        // Move operations
+        "move_page" => {
+            let id = arg_i64_required(args, "page_id")?;
+            let chapter_id = args.get("chapter_id").and_then(|v| v.as_i64());
+            let book_id = args.get("book_id").and_then(|v| v.as_i64());
+            if chapter_id.is_none() && book_id.is_none() {
+                return Err("Either chapter_id or book_id is required".to_string());
+            }
+            if chapter_id.is_some() && book_id.is_some() {
+                return Err("Provide either chapter_id or book_id, not both".to_string());
+            }
+            let mut data = json!({});
+            if let Some(v) = chapter_id {
+                data["chapter_id"] = json!(v);
+            }
+            if let Some(v) = book_id {
+                data["book_id"] = json!(v);
+            }
+            let result = client.update_page(id, &data).await?;
+            Ok(format_page_success("Page moved successfully.", &result, client.base_url()))
+        }
+        "move_chapter" => {
+            let id = arg_i64_required(args, "chapter_id")?;
+            let book_id = arg_i64_required(args, "target_book_id")?;
+            let data = json!({ "book_id": book_id });
+            let result = client.update_chapter(id, &data).await?;
+            Ok(format_chapter_success("Chapter moved successfully.", &result, client.base_url()))
+        }
+        // Note: This uses a GET-modify-PUT pattern which has a TOCTOU race if multiple
+        // concurrent sessions modify the same shelf simultaneously. Acceptable for
+        // single-user deployments; a per-shelf mutex would be needed for multi-user.
+        "move_book_to_shelf" => {
+            let book_id = arg_i64_required(args, "book_id")?;
+            let target_shelf_id = arg_i64_required(args, "target_shelf_id")?;
+            let remove_from_shelf_id = args.get("remove_from_shelf_id").and_then(|v| v.as_i64());
+
+            // Add book to target shelf
+            let target_shelf = client.get_shelf(target_shelf_id).await?;
+            let mut target_books: Vec<i64> = target_shelf.get("books")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|b| b.get("id").and_then(|id| id.as_i64())).collect())
+                .unwrap_or_default();
+            if !target_books.contains(&book_id) {
+                target_books.push(book_id);
+            }
+            client.update_shelf(target_shelf_id, &json!({ "books": target_books })).await?;
+
+            // Remove from source shelf if specified
+            let mut removed_from = String::new();
+            if let Some(source_id) = remove_from_shelf_id {
+                let source_shelf = client.get_shelf(source_id).await?;
+                let source_name = source_shelf.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let source_books: Vec<i64> = source_shelf.get("books")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|b| b.get("id").and_then(|id| id.as_i64())).filter(|&id| id != book_id).collect())
+                    .unwrap_or_default();
+                client.update_shelf(source_id, &json!({ "books": source_books })).await?;
+                removed_from = format!("\nRemoved from shelf: {} (ID: {})", source_name, source_id);
+            }
+
+            let target_name = target_shelf.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            Ok(format!("Book {book_id} moved to shelf \"{target_name}\" (ID: {target_shelf_id}).{removed_from}"))
+        }
+
         // Attachments
         "list_attachments" => {
             format_json(&client.list_attachments().await?)
@@ -395,6 +473,20 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
             let id = arg_i64_required(args, "attachment_id")?;
             client.delete_attachment(id).await?;
             Ok(format!("Attachment {id} deleted."))
+        }
+        "upload_attachment" => {
+            let name = arg_str(args, "name")?;
+            let uploaded_to = arg_i64_required(args, "uploaded_to")?;
+            let mime_type = arg_str_default(args, "mime_type", "application/octet-stream");
+            let file_path = args.get("file_path").and_then(|v| v.as_str());
+            let url = args.get("url").and_then(|v| v.as_str());
+            let (bytes, auto_filename) = bookstack::resolve_file_content(file_path, url).await
+                .map_err(|e| e.to_string())?;
+            let filename = match args.get("filename").and_then(|v| v.as_str()) {
+                Some(f) if !f.is_empty() => f.to_string(),
+                _ => auto_filename,
+            };
+            format_json(&client.create_file_attachment(&name, uploaded_to, &filename, bytes, &mime_type).await?)
         }
 
         // Exports
@@ -528,6 +620,22 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
             let id = arg_i64_required(args, "image_id")?;
             client.delete_image(id).await?;
             Ok(format!("Image {id} deleted."))
+        }
+        "upload_image" => {
+            let name = arg_str(args, "name")?;
+            let image_type = arg_str_default(args, "type", "gallery");
+            validate_enum(&image_type, &["gallery", "drawio"], "type")?;
+            let uploaded_to = arg_i64_required(args, "uploaded_to")?;
+            let mime_type = arg_str_default(args, "mime_type", "image/png");
+            let file_path = args.get("file_path").and_then(|v| v.as_str());
+            let url = args.get("url").and_then(|v| v.as_str());
+            let (bytes, auto_filename) = bookstack::resolve_file_content(file_path, url).await
+                .map_err(|e| e.to_string())?;
+            let filename = match args.get("filename").and_then(|v| v.as_str()) {
+                Some(f) if !f.is_empty() => f.to_string(),
+                _ => auto_filename,
+            };
+            format_json(&client.upload_image(&name, &image_type, uploaded_to, &filename, bytes, &mime_type).await?)
         }
 
         // Content Permissions
@@ -1175,7 +1283,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             id_schema("shelf_id")),
         tool("create_shelf", "Create a new shelf.",
             name_desc_schema()),
-        tool("update_shelf", "Update a shelf. Use 'books' to set which books belong to this shelf (replaces existing assignments).", json!({
+        tool("update_shelf", "Update a shelf's name, description, or set which books it contains via the 'books' array (replaces all existing book assignments on this shelf).", json!({
             "type": "object",
             "properties": {
                 "shelf_id": { "type": "integer", "description": "The shelf_id" },
@@ -1212,8 +1320,16 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             },
             "required": ["book_id", "name"]
         })),
-        tool("update_chapter", "Update a chapter.",
-            update_schema("chapter_id", &["name", "description"])),
+        tool("update_chapter", "Update a chapter's name, description, or move it to a different book by providing book_id.", json!({
+            "type": "object",
+            "properties": {
+                "chapter_id": { "type": "integer", "description": "The chapter_id" },
+                "name": { "type": "string", "description": "New name" },
+                "description": { "type": "string", "description": "New description" },
+                "book_id": { "type": "integer", "description": "Move chapter to a different book by providing the target book ID" }
+            },
+            "required": ["chapter_id"]
+        })),
         tool("delete_chapter", "Delete a chapter. Pages inside become book-level pages.",
             id_schema("chapter_id")),
 
@@ -1232,8 +1348,18 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             },
             "required": ["name"]
         })),
-        tool("update_page", "Update a page (full rewrite). Provide content as markdown or html — sent directly to BookStack (no client-side conversion). Use markdown for markdown-editor pages, html for WYSIWYG pages. Do NOT include the page title as a heading — BookStack renders the name as H1 automatically. Prefer edit_page, replace_section, or append_to_page for partial edits.",
-            update_schema("page_id", &["name", "markdown", "html"])),
+        tool("update_page", "Update a page's name, content, or move it to a different chapter (chapter_id) or book (book_id). Full rewrite — provide content as markdown or html sent directly to BookStack. Use markdown for markdown-editor pages, html for WYSIWYG pages. Do NOT include the page title as a heading — BookStack renders the name as H1 automatically. Prefer edit_page, replace_section, or append_to_page for partial edits.", json!({
+            "type": "object",
+            "properties": {
+                "page_id": { "type": "integer", "description": "The page_id" },
+                "name": { "type": "string", "description": "New name" },
+                "markdown": { "type": "string", "description": "New markdown content (for markdown-editor pages)" },
+                "html": { "type": "string", "description": "New HTML content (for WYSIWYG pages)" },
+                "chapter_id": { "type": "integer", "description": "Move page to a different chapter by providing the target chapter ID" },
+                "book_id": { "type": "integer", "description": "Move page to a different book (at book level, not in any chapter) by providing the target book ID" }
+            },
+            "required": ["page_id"]
+        })),
         tool("edit_page", "Performs exact string replacements in a page's native content. For markdown pages, matches against the 'markdown' field. For WYSIWYG pages, matches against the 'html' field. Check the page's 'editor' field from get_page to know which format to use for old_text/new_text. Fails if old_text is not found or is ambiguous (found multiple times without replace_all).", json!({
             "type": "object",
             "properties": {
@@ -1273,6 +1399,34 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
         tool("delete_page", "Delete a page (moves to recycle bin).",
             id_schema("page_id")),
 
+        // Move operations
+        tool("move_page", "Move a page to a different chapter or book. Only moves — does not modify content. Provide chapter_id to move into a chapter, or book_id to move to book level (not in any chapter).", json!({
+            "type": "object",
+            "properties": {
+                "page_id": { "type": "integer", "description": "The page to move" },
+                "chapter_id": { "type": "integer", "description": "Target chapter ID (moves page into this chapter)" },
+                "book_id": { "type": "integer", "description": "Target book ID (moves page to book level, outside any chapter)" }
+            },
+            "required": ["page_id"]
+        })),
+        tool("move_chapter", "Move a chapter (with all its pages) to a different book.", json!({
+            "type": "object",
+            "properties": {
+                "chapter_id": { "type": "integer", "description": "The chapter to move" },
+                "target_book_id": { "type": "integer", "description": "The book to move the chapter into" }
+            },
+            "required": ["chapter_id", "target_book_id"]
+        })),
+        tool("move_book_to_shelf", "Move a book to a different shelf. Optionally remove it from a source shelf. Books can appear on multiple shelves — this adds to the target and optionally removes from the source. Note: concurrent calls targeting the same shelf may silently drop book assignments; use sequentially in multi-user environments.", json!({
+            "type": "object",
+            "properties": {
+                "book_id": { "type": "integer", "description": "The book to move" },
+                "target_shelf_id": { "type": "integer", "description": "The shelf to add the book to" },
+                "remove_from_shelf_id": { "type": "integer", "description": "Optional: shelf to remove the book from (for a true move rather than just adding)" }
+            },
+            "required": ["book_id", "target_shelf_id"]
+        })),
+
         // Attachments
         tool("list_attachments", "List all attachments.", json!({
             "type": "object", "properties": {}
@@ -1292,6 +1446,18 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             update_schema("attachment_id", &["name", "link"])),
         tool("delete_attachment", "Delete an attachment.",
             id_schema("attachment_id")),
+        tool("upload_attachment", "Upload a file attachment to a page from a local file path or URL.", json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Attachment name" },
+                "uploaded_to": { "type": "integer", "description": "Page ID to attach to" },
+                "file_path": { "type": "string", "description": "Local filesystem path to the file" },
+                "url": { "type": "string", "description": "URL to fetch the file from" },
+                "filename": { "type": "string", "description": "Override the auto-detected filename" },
+                "mime_type": { "type": "string", "description": "MIME type of the file", "default": "application/octet-stream" }
+            },
+            "required": ["name", "uploaded_to"]
+        })),
 
         // Exports
         tool("export_page", "Export a page as markdown, plaintext, or html. Returns the raw exported content.", json!({
@@ -1395,6 +1561,19 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
         })),
         tool("delete_image", "Delete an image from the gallery.",
             id_schema("image_id")),
+        tool("upload_image", "Upload an image to the BookStack image gallery from a local file path or URL.", json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Image name" },
+                "uploaded_to": { "type": "integer", "description": "Page ID the image is associated with" },
+                "file_path": { "type": "string", "description": "Local filesystem path to the image file" },
+                "url": { "type": "string", "description": "URL to fetch the image from" },
+                "filename": { "type": "string", "description": "Override the auto-detected filename" },
+                "type": { "type": "string", "enum": ["gallery", "drawio"], "description": "Image type", "default": "gallery" },
+                "mime_type": { "type": "string", "description": "MIME type of the image", "default": "image/png" }
+            },
+            "required": ["name", "uploaded_to"]
+        })),
 
         // Content Permissions
         tool("get_content_permissions", "Get permissions for a content item.", json!({

@@ -99,24 +99,25 @@ All prefixed `BSMCP_`. See `.env.example` for full list. Key ones:
 - `BSMCP_SUMMARY_INTERVAL` — hours between regenerations (0 = only on first startup)
 - `BSMCP_SUMMARY_TOKEN_ID/SECRET` — BookStack token (falls back to BSMCP_EMBED_TOKEN_*)
 
-## Implemented Tools (56)
+## Implemented Tools (61)
 
 - **search_content** - Full-text search with BookStack query operators
 - **semantic_search** - Natural language vector search (when semantic enabled)
 - **reembed** - Trigger re-embedding of all pages (when semantic enabled)
 - **embed_status** - Check embedding job status (when semantic enabled)
-- **Shelves** - list, get, create, update, delete (5)
+- **Shelves** - list, get, create, update (assign books), delete (5)
 - **Books** - list, get, create, update, delete (5)
-- **Chapters** - list, get, create, update, delete (5)
-- **Pages** - list, get, create, update, delete (5)
-- **Attachments** - list, get, create, update, delete (5) - link attachments only
+- **Chapters** - list, get, create, update (move between books), delete (5)
+- **Pages** - list, get, create, update (move between chapters/books), delete (5)
+- **Move** - move_page, move_chapter, move_book_to_shelf (3) - dedicated move operations
+- **Attachments** - list, get, create, upload, update, delete (6)
 - **Exports** - export_page, export_chapter, export_book (3) - markdown, plaintext, or html
 - **Comments** - list, get, create, update, delete (5)
 - **Recycle Bin** - list, restore, destroy (3)
 - **Users** - list, get (2) - read-only
 - **Audit Log** - list (1)
 - **System** - get_system_info (1)
-- **Image Gallery** - list, get, update, delete (4) - no upload (requires multipart)
+- **Image Gallery** - list, get, upload, update, delete (5)
 - **Content Permissions** - get, update (2)
 - **Roles** - list, get (2) - read-only
 
@@ -125,7 +126,7 @@ All prefixed `BSMCP_`. See `.env.example` for full list. Key ones:
 - **Imports** - ZIP file handling doesn't work well over MCP text protocol.
 - **User/Role CRUD** - Creating/deleting users/roles is admin-level; read-only is sufficient.
 - **PDF/ZIP export** - Binary formats can't be returned as MCP text content.
-- **Image upload** - Requires multipart form data, not JSON.
+
 
 ## Adding a New Tool
 
@@ -165,16 +166,16 @@ cargo build --release -p bsmcp-embedder
 # Multi-arch Docker
 docker buildx build --builder multiarch --platform linux/amd64,linux/arm64 \
   -f docker/Dockerfile.server \
-  -t ghcr.io/gumbees/bsmcp-server:VERSION --push .
+  -t ghcr.io/bees-roadhouse/bsmcp-server:VERSION --push .
 
 docker buildx build --builder multiarch --platform linux/amd64,linux/arm64 \
   -f docker/Dockerfile.embedder \
-  -t ghcr.io/gumbees/bsmcp-embedder:VERSION --push .
+  -t ghcr.io/bees-roadhouse/bsmcp-embedder:VERSION --push .
 ```
 
 Images:
-- `ghcr.io/gumbees/bsmcp-server` — MCP server (~35MB)
-- `ghcr.io/gumbees/bsmcp-embedder` — Embedder with ONNX (~45MB)
+- `ghcr.io/bees-roadhouse/bsmcp-server` — MCP server (~35MB)
+- `ghcr.io/bees-roadhouse/bsmcp-embedder` — Embedder with ONNX (~45MB)
 
 ## Docker Compose
 
@@ -196,12 +197,15 @@ Migrates: access_tokens, pages, chunks (BLOB→pgvector), relationships, embed_j
 
 ## Branch Info
 
-- `main` - production branch
+- `development` - default branch, active work lands here
+- `release` - stable/production branch, merged from development when ready
+- `enhancement/{name}` - branched from development for new functionality
+- `problem/{name}` - branched from development for bug fixes
 
 ## Breaking Changes Log
 
 ### v0.3.0 (from v0.2.x)
-- **Two images:** `ghcr.io/gumbees/bsmcp-server` + `ghcr.io/gumbees/bsmcp-embedder` (was single `bookstack-mcp`)
+- **Two images:** `ghcr.io/bees-roadhouse/bsmcp-server` + `ghcr.io/bees-roadhouse/bsmcp-embedder` (was single `bookstack-mcp`)
 - **New env vars:** `BSMCP_DB_BACKEND`, `BSMCP_DATABASE_URL`, `BSMCP_EMBEDDER_URL`, `BSMCP_EMBED_TOKEN_*`, performance tuning vars
 - **Docker service renames:** `postgres` → `bsmcp-postgres`, `bookstack-mcp` → `bsmcp-server`, `pgdata` → `bsmcp-pgdata`
 - **Embedder is separate:** No more in-process ONNX model; embedder runs as its own container/binary

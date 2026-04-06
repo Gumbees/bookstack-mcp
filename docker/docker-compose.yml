@@ -14,7 +14,7 @@ services:
       retries: 5
 
   bsmcp-server:
-    image: ghcr.io/gumbees/bsmcp-server:0.6.0
+    image: ghcr.io/bees-roadhouse/bsmcp-server:0.7.0
     environment:
       BSMCP_DB_BACKEND: postgres
       BSMCP_DATABASE_URL: postgres://bsmcp:${BSMCP_DB_PASSWORD}@bsmcp-postgres/bsmcp
@@ -49,7 +49,7 @@ services:
         condition: service_healthy
 
   bsmcp-embedder:
-    image: ghcr.io/gumbees/bsmcp-embedder:0.6.0
+    image: ghcr.io/bees-roadhouse/bsmcp-embedder:0.7.0
     cpus: ${BSMCP_EMBED_CPUS:-0}
     volumes:
       - bsmcp-models:/data/models

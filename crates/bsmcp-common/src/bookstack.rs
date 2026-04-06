@@ -1,6 +1,125 @@
 use reqwest::Client;
 use serde_json::Value;
+use std::net::IpAddr;
+use url::Url;
 use zeroize::Zeroize;
+
+/// Maximum size for file content fetched from URLs (50MB).
+const MAX_FILE_CONTENT_SIZE: usize = 50 * 1024 * 1024;
+
+/// Check if an IP address is in a private, loopback, or link-local range.
+fn is_restricted_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()             // 127.0.0.0/8
+            || v4.is_private()           // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+            || v4.is_link_local()        // 169.254.0.0/16 (AWS IMDS, etc.)
+            || v4.is_broadcast()         // 255.255.255.255
+            || v4.is_unspecified()       // 0.0.0.0
+            || v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64  // 100.64.0.0/10 (CGN)
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()             // ::1
+            || v6.is_unspecified()       // ::
+            || (v6.segments()[0] & 0xffc0) == 0xfe80  // fe80::/10 link-local
+            || (v6.segments()[0] & 0xfe00) == 0xfc00  // fc00::/7 ULA
+        }
+    }
+}
+
+/// Resolve file content from either a local file path or a URL.
+/// Exactly one of file_path or url must be provided.
+/// Returns (bytes, filename).
+pub async fn resolve_file_content(
+    file_path: Option<&str>,
+    url: Option<&str>,
+) -> Result<(Vec<u8>, String), String> {
+    match (file_path, url) {
+        (Some(path), None) => {
+            let bytes = tokio::fs::read(path)
+                .await
+                .map_err(|e| format!("Failed to read file '{}': {}", path, e))?;
+            let filename = std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file")
+                .to_string();
+            Ok((bytes, filename))
+        }
+        (None, Some(url)) => {
+            let parsed = Url::parse(url).map_err(|e| format!("Invalid URL '{}': {}", url, e))?;
+
+            // Only http and https schemes are permitted.
+            match parsed.scheme() {
+                "http" | "https" => {}
+                scheme => return Err(format!("URL scheme '{}' is not allowed; only http and https are permitted", scheme)),
+            }
+
+            // Resolve hostname, reject private/loopback/link-local IPs, then pin the
+            // validated addresses into the reqwest client to prevent DNS rebinding.
+            let host = parsed.host_str()
+                .ok_or_else(|| format!("URL '{}' has no host", url))?;
+            let port = parsed.port_or_known_default().unwrap_or(80);
+            let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(format!("{}:{}", host, port))
+                .await
+                .map_err(|e| format!("Failed to resolve host '{}': {}", host, e))?
+                .collect();
+            if addrs.is_empty() {
+                return Err(format!("Host '{}' resolved to no addresses", host));
+            }
+            for addr in &addrs {
+                if is_restricted_ip(&addr.ip()) {
+                    return Err(format!("URL host '{}' resolves to restricted IP address {}; private, loopback, and link-local addresses are not allowed", host, addr.ip()));
+                }
+            }
+
+            // Pin validated addresses into the client so reqwest uses them directly
+            // instead of re-resolving DNS (prevents DNS rebinding attacks).
+            let mut client_builder = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(120));
+            for addr in &addrs {
+                client_builder = client_builder.resolve(host, *addr);
+            }
+            let client = client_builder.build()
+                .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+
+            let resp = client.get(url).send()
+                .await
+                .map_err(|e| format!("Failed to fetch URL '{}': {}", url, e))?;
+            if !resp.status().is_success() {
+                return Err(format!("URL returned status {}", resp.status()));
+            }
+
+            // Fast-reject via Content-Length before downloading the body.
+            if let Some(len) = resp.content_length() {
+                if len as usize > MAX_FILE_CONTENT_SIZE {
+                    return Err(format!("Remote file too large: {} bytes (limit {})", len, MAX_FILE_CONTENT_SIZE));
+                }
+            }
+
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| format!("Failed to read URL response: {}", e))?;
+
+            if bytes.len() > MAX_FILE_CONTENT_SIZE {
+                return Err(format!("Remote file too large: {} bytes (limit {})", bytes.len(), MAX_FILE_CONTENT_SIZE));
+            }
+
+            let filename = url
+                .rsplit('/')
+                .next()
+                .and_then(|s| s.split('?').next())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("download")
+                .to_string();
+            Ok((bytes.to_vec(), filename))
+        }
+        (Some(_), Some(_)) => Err("Provide either file_path or url, not both".to_string()),
+        (None, None) => Err("Either file_path or url is required".to_string()),
+    }
+}
 
 // --- Type-safe enums for URL path parameters (defense-in-depth) ---
 
@@ -181,6 +300,25 @@ impl BookStackClient {
             .post(format!("{}/api/{}", self.base_url, path))
             .header("Authorization", self.auth_header())
             .json(body)
+            .send()
+            .await
+            .map_err(|e| { eprintln!("BookStack request error: {e}"); "Request failed".to_string() })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = Self::read_error_body(resp).await;
+            eprintln!("BookStack API error {status}: {body}");
+            return Err(format!("BookStack API error: {status}"));
+        }
+
+        Self::read_json(resp).await
+    }
+
+    async fn post_multipart(&self, path: &str, form: reqwest::multipart::Form) -> Result<Value, String> {
+        let resp = self.client
+            .post(format!("{}/api/{}", self.base_url, path))
+            .header("Authorization", self.auth_header())
+            .multipart(form)
             .send()
             .await
             .map_err(|e| { eprintln!("BookStack request error: {e}"); "Request failed".to_string() })?;
@@ -517,6 +655,33 @@ impl BookStackClient {
 
     pub async fn delete_image(&self, id: i64) -> Result<(), String> {
         self.delete(&format!("image-gallery/{id}")).await
+    }
+
+    pub async fn upload_image(&self, name: &str, image_type: &str, uploaded_to: i64, filename: &str, bytes: Vec<u8>, mime_type: &str) -> Result<Value, String> {
+        let file_part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(filename.to_string())
+            .mime_str(mime_type)
+            .map_err(|e| { eprintln!("Multipart error: {e}"); "Invalid mime type".to_string() })?;
+        let form = reqwest::multipart::Form::new()
+            .text("name", name.to_string())
+            .text("type", image_type.to_string())
+            .text("uploaded_to", uploaded_to.to_string())
+            .part("image", file_part);
+        self.post_multipart("image-gallery", form).await
+    }
+
+    // --- File Attachments ---
+
+    pub async fn create_file_attachment(&self, name: &str, uploaded_to: i64, filename: &str, bytes: Vec<u8>, mime_type: &str) -> Result<Value, String> {
+        let file_part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(filename.to_string())
+            .mime_str(mime_type)
+            .map_err(|e| { eprintln!("Multipart error: {e}"); "Invalid mime type".to_string() })?;
+        let form = reqwest::multipart::Form::new()
+            .text("name", name.to_string())
+            .text("uploaded_to", uploaded_to.to_string())
+            .part("file", file_part);
+        self.post_multipart("attachments", form).await
     }
 
     // --- Content Permissions ---

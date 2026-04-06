@@ -1,0 +1,25 @@
+name: Security Scan
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    steps:
+      - uses: anthropics/claude-code-action@v1
+        with:
+          prompt: |
+            Perform a security-focused review of the changes in this PR.
+            Focus on:
+            - OWASP top 10 (injection, auth flaws, XSS, SSRF, etc.)
+            - Unsafe deserialization or input handling
+            - Secrets, credentials, or API keys in code
+            - Dependency issues or known CVEs
+            - Improper error handling that leaks sensitive info
+            Only flag real vulnerabilities. Do not comment on style or minor improvements.

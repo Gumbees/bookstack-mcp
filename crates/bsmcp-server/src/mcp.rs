@@ -126,7 +126,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
         }
         "create_shelf" => {
             let name = arg_str(args, "name")?;
-            let desc = arg_str_default(args, "description", "");
+            let desc = require_description(args, "shelf")?;
             let result = client.create_shelf(&name, &desc).await?;
             Ok(format_shelf_success("Shelf created successfully.", &result, client.base_url()))
         }
@@ -157,7 +157,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
         }
         "create_book" => {
             let name = arg_str(args, "name")?;
-            let desc = arg_str_default(args, "description", "");
+            let desc = require_description(args, "book")?;
             let result = client.create_book(&name, &desc).await?;
             Ok(format_book_success("Book created successfully.", &result, client.base_url()))
         }
@@ -186,7 +186,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
         "create_chapter" => {
             let book_id = arg_i64_required(args, "book_id")?;
             let name = arg_str(args, "name")?;
-            let desc = arg_str_default(args, "description", "");
+            let desc = require_description(args, "chapter")?;
             let result = client.create_chapter(book_id, &name, &desc).await?;
             Ok(format_chapter_success("Chapter created successfully.", &result, client.base_url()))
         }
@@ -787,6 +787,39 @@ fn join_base_url(base_url: &str, path: &str) -> String {
     }
 }
 
+/// Require a non-empty, meaningful description when creating shelves/books/chapters.
+/// Descriptions are surfaced to AI clients in the server's structure listing on connect,
+/// so missing or placeholder descriptions actively degrade future routing decisions.
+fn require_description(args: &Value, kind: &str) -> Result<String, String> {
+    let raw = args.get("description").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if raw.is_empty() {
+        return Err(format!(
+            "description is required when creating a {kind}. \
+             Descriptions are surfaced to all Claude clients that connect to this BookStack, \
+             so they shape placement decisions for every future page created here. \
+             Provide a 1-2 sentence description that answers (1) what kind of content lives in \
+             this {kind}, and (2) what it's for. Avoid placeholders like 'TODO' or 'description'."
+        ));
+    }
+    if raw.len() < 15 {
+        return Err(format!(
+            "description is too short ({} chars) — write a meaningful 1-2 sentence description \
+             that tells future clients what content belongs in this {kind} and what it's for.",
+            raw.len()
+        ));
+    }
+    let lowered = raw.to_lowercase();
+    let placeholders = ["todo", "tbd", "placeholder", "description", "xxx", "fixme", "n/a"];
+    if placeholders.iter().any(|p| lowered == *p || lowered.starts_with(&format!("{p} "))) {
+        return Err(format!(
+            "description looks like a placeholder ('{raw}'). Write a real description that \
+             describes the {kind}'s purpose and contents — it will be shown to every future \
+             Claude client that connects."
+        ));
+    }
+    Ok(raw.to_string())
+}
+
 fn validate_enum(value: &str, allowed: &[&str], name: &str) -> Result<(), String> {
     if allowed.contains(&value) {
         Ok(())
@@ -1204,6 +1237,17 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool, su
          content. If the user asks to create content in a location that doesn't match the \
          target's purpose, push back and suggest the correct location. When unsure, check the \
          shelf/book/chapter descriptions using get_shelf, get_book, or get_chapter.\n\n\
+         IMPORTANT: Descriptions on shelves, books, and chapters are REQUIRED, not optional. \
+         When you call create_shelf, create_book, or create_chapter, you MUST provide a \
+         meaningful 1-2 sentence description. Descriptions are surfaced to every Claude \
+         client that connects to this BookStack — they literally shape how future content \
+         gets routed. A good description answers: (1) what kind of content lives here, and \
+         (2) what is this container for (so a future AI can decide whether new content \
+         belongs here vs elsewhere). Do NOT use placeholders like 'TODO', 'description', or \
+         'n/a' — the server will reject them. If you don't yet know what the container is \
+         for, ask the user before creating it. When you update existing shelves/books/chapters \
+         via update_shelf, update_book, or update_chapter and notice the description is \
+         missing or weak, offer to improve it.\n\n\
          Markdown content is automatically converted to HTML server-side. \
          You can send markdown via the 'markdown' parameter for pages and comments — \
          the server handles conversion reliably, avoiding JSON escaping issues with \
@@ -1375,7 +1419,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             paginated_schema()),
         tool("get_shelf", "Get a shelf by ID, including its books.",
             id_schema("shelf_id")),
-        tool("create_shelf", "Create a new shelf.",
+        tool("create_shelf", "Create a new shelf. Description is REQUIRED — it tells future Claude clients what belongs here.",
             name_desc_schema()),
         tool("update_shelf", "Update a shelf's name, description, or set which books it contains via the 'books' array (replaces all existing book assignments on this shelf).", json!({
             "type": "object",
@@ -1394,7 +1438,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
         tool("list_books", "List all books.", paginated_schema()),
         tool("get_book", "Get a book by ID, including its chapters and pages.",
             id_schema("book_id")),
-        tool("create_book", "Create a new book.",
+        tool("create_book", "Create a new book. Description is REQUIRED — it tells future Claude clients what belongs here.",
             name_desc_schema()),
         tool("update_book", "Update a book.",
             update_schema("book_id", &["name", "description"])),
@@ -1405,14 +1449,17 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
         tool("list_chapters", "List all chapters across all books.", paginated_schema()),
         tool("get_chapter", "Get a chapter by ID, including its pages.",
             id_schema("chapter_id")),
-        tool("create_chapter", "Create a new chapter within a book.", json!({
+        tool("create_chapter", "Create a new chapter within a book. Description is REQUIRED — it tells future Claude clients what belongs here.", json!({
             "type": "object",
             "properties": {
                 "book_id": { "type": "integer", "description": "Book ID to create chapter in" },
                 "name": { "type": "string", "description": "Chapter name" },
-                "description": { "type": "string", "description": "Chapter description", "default": "" }
+                "description": {
+                    "type": "string",
+                    "description": "REQUIRED. A 1-2 sentence description of what content lives in this chapter and what it's for. Surfaced to every Claude client that connects, so it shapes future routing decisions. Do not use placeholders like 'TODO' or 'description'."
+                }
             },
-            "required": ["book_id", "name"]
+            "required": ["book_id", "name", "description"]
         })),
         tool("update_chapter", "Update a chapter's name, description, or move it to a different book by providing book_id.", json!({
             "type": "object",
@@ -1768,9 +1815,12 @@ fn name_desc_schema() -> Value {
         "type": "object",
         "properties": {
             "name": { "type": "string", "description": "Name" },
-            "description": { "type": "string", "description": "Description", "default": "" }
+            "description": {
+                "type": "string",
+                "description": "REQUIRED. A 1-2 sentence description of what content lives here and what it's for. Surfaced to every Claude client that connects, so it shapes future routing decisions. Do not use placeholders like 'TODO' or 'description'."
+            }
         },
-        "required": ["name"]
+        "required": ["name", "description"]
     })
 }
 

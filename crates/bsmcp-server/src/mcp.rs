@@ -193,7 +193,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
         "update_chapter" => {
             let id = arg_i64_required(args, "chapter_id")?;
             let mut data = filter_string_update_fields(args, &["name", "description"]);
-            if let Some(v) = args.get("book_id").and_then(|v| v.as_i64()) {
+            if let Some(v) = arg_i64_opt(args, "book_id") {
                 data["book_id"] = json!(v);
             }
             let result = client.update_chapter(id, &data).await?;
@@ -217,9 +217,9 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
         }
         "create_page" => {
             let mut data = json!({ "name": arg_str(args, "name")? });
-            if let Some(v) = args.get("chapter_id").and_then(|v| v.as_i64()) {
+            if let Some(v) = arg_i64_opt(args, "chapter_id") {
                 data["chapter_id"] = json!(v);
-            } else if let Some(v) = args.get("book_id").and_then(|v| v.as_i64()) {
+            } else if let Some(v) = arg_i64_opt(args, "book_id") {
                 data["book_id"] = json!(v);
             } else {
                 return Err("Either book_id or chapter_id is required".to_string());
@@ -256,8 +256,8 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
             } else if let Some(v) = args.get("html").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                 data["html"] = json!(strip_duplicate_title(v, &page_name));
             }
-            let move_chapter_id = args.get("chapter_id").and_then(|v| v.as_i64());
-            let move_book_id = args.get("book_id").and_then(|v| v.as_i64());
+            let move_chapter_id = arg_i64_opt(args, "chapter_id");
+            let move_book_id = arg_i64_opt(args, "book_id");
             if move_chapter_id.is_some() && move_book_id.is_some() {
                 return Err("Provide either chapter_id or book_id, not both".to_string());
             }
@@ -386,8 +386,8 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
         // Move operations
         "move_page" => {
             let id = arg_i64_required(args, "page_id")?;
-            let chapter_id = args.get("chapter_id").and_then(|v| v.as_i64());
-            let book_id = args.get("book_id").and_then(|v| v.as_i64());
+            let chapter_id = arg_i64_opt(args, "chapter_id");
+            let book_id = arg_i64_opt(args, "book_id");
             if chapter_id.is_none() && book_id.is_none() {
                 return Err("Either chapter_id or book_id is required".to_string());
             }
@@ -417,7 +417,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
         "move_book_to_shelf" => {
             let book_id = arg_i64_required(args, "book_id")?;
             let target_shelf_id = arg_i64_required(args, "target_shelf_id")?;
-            let remove_from_shelf_id = args.get("remove_from_shelf_id").and_then(|v| v.as_i64());
+            let remove_from_shelf_id = arg_i64_opt(args, "remove_from_shelf_id");
 
             // Add book to target shelf
             let target_shelf = client.get_shelf(target_shelf_id).await?;
@@ -520,7 +520,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
         "list_comments" => {
             let mut query: Vec<(&str, &str)> = vec![];
             let page_id_str;
-            if let Some(v) = args.get("page_id").and_then(|v| v.as_i64()) {
+            if let Some(v) = arg_i64_opt(args, "page_id") {
                 page_id_str = v.to_string();
                 query.push(("filter[page_id]", &page_id_str));
             }
@@ -539,7 +539,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
             } else if let Some(v) = args.get("html").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                 data["html"] = json!(v);
             }
-            if let Some(v) = args.get("parent_id").and_then(|v| v.as_i64()) {
+            if let Some(v) = arg_i64_opt(args, "parent_id") {
                 data["parent_id"] = json!(v);
             }
             format_json(&client.create_comment(&data).await?)
@@ -611,7 +611,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
                 filter.push(("filter[type]", &type_str));
             }
             let uploaded_to_str;
-            if let Some(v) = args.get("uploaded_to").and_then(|v| v.as_i64()) {
+            if let Some(v) = arg_i64_opt(args, "uploaded_to") {
                 uploaded_to_str = v.to_string();
                 filter.push(("filter[uploaded_to]", &uploaded_to_str));
             }
@@ -754,8 +754,25 @@ fn arg_str_default(args: &Value, key: &str, default: &str) -> String {
         .to_string()
 }
 
+/// Extract an integer from a JSON value, accepting both native numbers and
+/// numeric strings (e.g. `1908` or `"1908"`). AI clients commonly serialize
+/// IDs as strings and the server should accept both forms.
+fn value_as_i64(v: &Value) -> Option<i64> {
+    if let Some(n) = v.as_i64() {
+        return Some(n);
+    }
+    if let Some(s) = v.as_str() {
+        return s.trim().parse::<i64>().ok();
+    }
+    None
+}
+
+fn arg_i64_opt(args: &Value, key: &str) -> Option<i64> {
+    args.get(key).and_then(value_as_i64)
+}
+
 fn arg_i64(args: &Value, key: &str, default: i64) -> i64 {
-    args.get(key).and_then(|v| v.as_i64()).unwrap_or(default)
+    arg_i64_opt(args, key).unwrap_or(default)
 }
 
 fn arg_count(args: &Value, default: i64) -> i64 {
@@ -767,8 +784,7 @@ fn arg_offset(args: &Value) -> i64 {
 }
 
 fn arg_i64_required(args: &Value, key: &str) -> Result<i64, String> {
-    args.get(key)
-        .and_then(|v| v.as_i64())
+    arg_i64_opt(args, key)
         .ok_or_else(|| format!("Missing required argument: {key}"))
 }
 

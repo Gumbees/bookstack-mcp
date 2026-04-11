@@ -10,6 +10,7 @@ An MCP (Model Context Protocol) server that gives Claude full access to a [BookS
 - **Pluggable database** — SQLite for simple deployments, PostgreSQL + pgvector for production
 - **Separate embedder** — background embedding service with pluggable backends (local ONNX, Ollama, OpenAI)
 - **Server-side markdown to HTML conversion** — send markdown, server converts before sending to BookStack
+- **Staging upload flow** — upload local images and attachments through a two-step staging endpoint without exposing local paths to the container ([see below](#uploading-local-files-images--attachments))
 - **OAuth 2.1 support** — use as a Claude.ai or Claude Desktop custom connector without config files
 - **Encrypted token storage** — OAuth tokens encrypted at rest with AES-256-GCM
 - **Dual transport** — SSE (MCP 2024-11-05) and Streamable HTTP (MCP 2025-03-26)
@@ -543,6 +544,57 @@ The `search_content` tool supports BookStack's search operators:
 - `{in_name:term}` - Search within names only
 - `{created_by:me}` - Filter by creator
 - `[tag_name=value]` - Filter by tag
+
+## Uploading Local Files (Images & Attachments)
+
+The MCP server runs in a container and cannot read files from the client machine's filesystem directly. To upload local images or file attachments, use the two-step **staging upload flow**:
+
+**Step 1:** Call `prepare_upload` — returns a `staging_id` and a full `upload_url`:
+
+```json
+{
+  "staging_id": "f0103f6c-7c98-46c2-adbe-606ba26937c3",
+  "upload_url": "https://your-mcp-host/stage/upload/f0103f6c-7c98-46c2-adbe-606ba26937c3",
+  "ttl_seconds": 300
+}
+```
+
+**Step 2:** POST the file to `upload_url` as multipart form-data. No auth header needed — the `staging_id` (a UUID that can only be generated via an authenticated MCP call) acts as the auth token for the one-time upload:
+
+```bash
+curl -X POST -F "file=@/path/to/image.jpg" \
+  "https://your-mcp-host/stage/upload/f0103f6c-7c98-46c2-adbe-606ba26937c3"
+```
+
+**Step 3:** Call `upload_image` (or `upload_attachment`) with the `staging_id`:
+
+```json
+{
+  "name": "Banner Logo",
+  "uploaded_to": 1908,
+  "staging_id": "f0103f6c-7c98-46c2-adbe-606ba26937c3",
+  "mime_type": "image/jpeg",
+  "embed": true
+}
+```
+
+The staging slot is **consumed on first use** (destructively removed from the store) and **auto-expires after 5 minutes**. Maximum file size is 50MB.
+
+### The `embed` parameter
+
+`upload_image` accepts an `embed` boolean parameter (default `false`). When `embed=true`, the image is automatically appended to the target page's content after uploading, so you don't need a separate `edit_page` or `append_to_page` call. Works for both markdown and WYSIWYG pages.
+
+### Alternative: `url` parameter
+
+If the file is already hosted at a public URL the MCP server can reach, you can skip the staging flow entirely and pass the `url` parameter directly to `upload_image` or `upload_attachment`. The server will fetch the file and forward it to BookStack.
+
+### Currently Claude Code only
+
+**The staging upload flow currently only works from [Claude Code](https://claude.com/claude-code) (the CLI tool).** It does not work from Claude.ai's web custom connectors or Claude Desktop custom connectors.
+
+The reason: Step 2 requires the MCP client to make an outbound HTTP POST to the MCP server's staging endpoint with the file bytes. Claude Code runs locally and has shell access (via its `Bash` tool), so it can `curl` the file directly. Claude.ai's remote MCP connector runs the MCP client inside Anthropic's sandboxed proxy infrastructure, which does not expose a mechanism for the client to make arbitrary HTTP file uploads to third-party hosts. Claude Desktop has similar limitations today.
+
+If you're using Claude.ai or Claude Desktop, you can still use `upload_image` with the `url` parameter for files that are already web-accessible, or upload through the BookStack web UI directly.
 
 ## License
 

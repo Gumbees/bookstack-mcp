@@ -517,7 +517,7 @@ async fn handle_token_authorization_code(
         (client_id, client_secret)
     };
 
-    issue_tokens(&state, &token_id, &token_secret).await
+    issue_tokens(&state, &token_id, &token_secret, "token").await
 }
 
 async fn handle_token_refresh(state: AppState, form: TokenForm) -> Response {
@@ -533,7 +533,7 @@ async fn handle_token_refresh(state: AppState, form: TokenForm) -> Response {
     };
 
     // Look up the refresh token to get the stored BookStack credentials
-    let (token_id, token_secret) = match state.db.get_refresh_token(&old_refresh).await {
+    let creds = match state.db.get_refresh_token(&old_refresh).await {
         Ok(Some(creds)) => creds,
         Ok(None) => {
             return oauth_error(
@@ -551,6 +551,9 @@ async fn handle_token_refresh(state: AppState, form: TokenForm) -> Response {
             );
         }
     };
+    let token_id = creds.credential1;
+    let token_secret = creds.credential2;
+    let auth_type = creds.auth_type;
 
     // Validate the stored BookStack credentials are still valid
     let bs_client = BookStackClient::new(
@@ -573,16 +576,16 @@ async fn handle_token_refresh(state: AppState, form: TokenForm) -> Response {
     }
 
     eprintln!("OAuth: refreshing token (credentials validated)");
-    issue_tokens(&state, &token_id, &token_secret).await
+    issue_tokens(&state, &token_id, &token_secret, &auth_type).await
 }
 
 /// Issue a new access token + refresh token pair for the given BookStack credentials.
-async fn issue_tokens(state: &AppState, token_id: &str, token_secret: &str) -> Response {
+async fn issue_tokens(state: &AppState, token_id: &str, token_secret: &str, auth_type: &str) -> Response {
     let access_token = uuid::Uuid::new_v4().to_string();
     let refresh_token = uuid::Uuid::new_v4().to_string();
     let expires_in = access_token_ttl().as_secs();
 
-    if let Err(e) = state.db.insert_access_token(&access_token, token_id, token_secret).await {
+    if let Err(e) = state.db.insert_access_token(&access_token, token_id, token_secret, auth_type).await {
         eprintln!("OAuth: failed to persist access token: {e}");
         return oauth_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -591,7 +594,7 @@ async fn issue_tokens(state: &AppState, token_id: &str, token_secret: &str) -> R
         );
     }
 
-    if let Err(e) = state.db.insert_refresh_token(&refresh_token, token_id, token_secret).await {
+    if let Err(e) = state.db.insert_refresh_token(&refresh_token, token_id, token_secret, auth_type).await {
         eprintln!("OAuth: failed to persist refresh token: {e}");
         return oauth_error(
             StatusCode::INTERNAL_SERVER_ERROR,

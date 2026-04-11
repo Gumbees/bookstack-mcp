@@ -222,6 +222,8 @@ async fn main() {
         backup_path,
         semantic,
         summary_cache,
+        None,
+        "auto".to_string(),
     );
     state.spawn_cleanup();
     state.spawn_backup();

@@ -14,9 +14,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use subtle::ConstantTimeEq;
-use zeroize::Zeroize;
-
-use bsmcp_common::bookstack::BookStackClient;
+use bsmcp_common::bookstack::{BookStackAuth, BookStackClient};
 use bsmcp_common::db::DbBackend;
 
 use crate::mcp;
@@ -28,12 +26,24 @@ const MAX_TOTAL_SESSIONS: usize = 1000;
 const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 const MAX_REQUESTS_PER_MINUTE: u32 = 100;
 
+/// OAuth configuration for BookStack's OAuth provider.
+/// Populated at startup when BSMCP_OAUTH_CLIENT_ID is set.
+#[derive(Clone)]
+pub struct OAuthConfig {
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub bookstack_url: String,
     pub http_client: Client,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     pub auth_codes: Arc<RwLock<HashMap<String, AuthCode>>>,
+    /// Pending OAuth authorization flows (maps state param → original Claude authorize params)
+    pub pending_oauth: Arc<RwLock<HashMap<String, PendingOAuth>>>,
     pub db: Arc<dyn DbBackend>,
     pub known_urls: Vec<String>,
     pub authorize_rate_limit: Arc<Mutex<RateLimit>>,
@@ -45,6 +55,21 @@ pub struct AppState {
     pub semantic: Option<Arc<SemanticState>>,
     pub summary_cache: crate::summary::SummaryCache,
     pub staging: crate::staging::StagingStore,
+    /// OAuth config for BookStack's OAuth provider (None = token-only mode)
+    pub oauth_config: Option<OAuthConfig>,
+    /// Auth method: "token", "oauth", or "auto"
+    pub auth_method: String,
+}
+
+/// In-flight OAuth authorization linking MCP's auth flow to BookStack's OAuth flow.
+pub struct PendingOAuth {
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub state: Option<String>,
+    pub code_challenge: Option<String>,
+    pub code_challenge_method: Option<String>,
+    pub pkce_verifier: String,
+    pub created_at: Instant,
 }
 
 pub(crate) struct RateLimit {
@@ -78,17 +103,9 @@ impl RateLimit {
 struct Session {
     tx: mpsc::Sender<Result<Event, Infallible>>,
     client: BookStackClient,
-    token_id: String,
-    token_secret: String,
+    auth: BookStackAuth,
     created_at: Instant,
     rate_limit: Arc<Mutex<RateLimit>>,
-}
-
-impl Drop for Session {
-    fn drop(&mut self) {
-        self.token_id.zeroize();
-        self.token_secret.zeroize();
-    }
 }
 
 impl AppState {
@@ -100,6 +117,8 @@ impl AppState {
         backup_path: PathBuf,
         semantic: Option<Arc<SemanticState>>,
         summary_cache: crate::summary::SummaryCache,
+        oauth_config: Option<OAuthConfig>,
+        auth_method: String,
     ) -> Self {
         let http_client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -111,6 +130,7 @@ impl AppState {
             http_client,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             auth_codes: Arc::new(RwLock::new(HashMap::new())),
+            pending_oauth: Arc::new(RwLock::new(HashMap::new())),
             db,
             known_urls,
             authorize_rate_limit: Arc::new(Mutex::new(RateLimit::new(20))),
@@ -122,6 +142,17 @@ impl AppState {
             semantic,
             summary_cache,
             staging: crate::staging::new_staging_store(),
+            oauth_config,
+            auth_method,
+        }
+    }
+
+    /// Whether the server should use BookStack OAuth for user authentication.
+    pub fn use_oauth(&self) -> bool {
+        match self.auth_method.as_str() {
+            "oauth" => self.oauth_config.is_some(),
+            "auto" => self.oauth_config.is_some(),
+            _ => false,
         }
     }
 
@@ -221,8 +252,9 @@ fn unauthorized(hint: &str, headers: &HeaderMap, known_urls: &[String]) -> Respo
 pub(crate) async fn resolve_credentials(
     headers: &HeaderMap,
     db: &dyn DbBackend,
-    known_urls: &[String],
-) -> Result<(String, String), Response> {
+    state: &AppState,
+) -> Result<BookStackAuth, Response> {
+    let known_urls = &state.known_urls;
     let auth = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -238,14 +270,38 @@ pub(crate) async fn resolve_credentials(
     // Legacy format: token_id:token_secret
     if let Some((id, secret)) = token.split_once(':') {
         eprintln!("Auth: legacy token format (token_id:secret)");
-        return Ok((id.to_string(), secret.to_string()));
+        return Ok(BookStackAuth::Token {
+            token_id: id.to_string(),
+            token_secret: secret.to_string(),
+        });
     }
 
-    // OAuth access token (from database)
+    // MCP access token (from database) — may resolve to Token or OAuth credentials
     match db.get_access_token(token).await {
-        Ok(Some((token_id, token_secret))) => {
-            eprintln!("Auth: OAuth token resolved");
-            return Ok((token_id, token_secret));
+        Ok(Some(creds)) => {
+            if creds.auth_type == "oauth" {
+                eprintln!("Auth: OAuth credentials resolved");
+                // credential1 = BS access_token, credential2 = BS refresh_token
+                if let Some(ref oauth_config) = state.oauth_config {
+                    let tokens = bsmcp_common::bookstack::OAuthTokens::new(
+                        creds.credential1,
+                        creds.credential2,
+                        oauth_config.client_id.clone(),
+                        oauth_config.client_secret.clone(),
+                        oauth_config.token_endpoint.clone(),
+                    );
+                    return Ok(BookStackAuth::OAuth(tokens));
+                } else {
+                    eprintln!("Auth: OAuth credentials found but no OAuth config on server");
+                    return Err(unauthorized("Server not configured for OAuth", headers, known_urls));
+                }
+            } else {
+                eprintln!("Auth: API token credentials resolved");
+                return Ok(BookStackAuth::Token {
+                    token_id: creds.credential1,
+                    token_secret: creds.credential2,
+                });
+            }
         }
         Ok(None) => {}
         Err(e) => {
@@ -262,12 +318,19 @@ pub async fn handle_sse(
     headers: HeaderMap,
 ) -> Response {
     eprintln!("GET /mcp/sse — SSE connection attempt");
-    let (token_id, token_secret) = match resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await {
+    let auth = match resolve_credentials(&headers, state.db.as_ref(), &state).await {
         Ok(creds) => creds,
         Err(resp) => return resp,
     };
 
-    let client = BookStackClient::new(&state.bookstack_url, &token_id, &token_secret, state.http_client.clone());
+    let client = match &auth {
+        BookStackAuth::Token { token_id, token_secret } => {
+            BookStackClient::new(&state.bookstack_url, token_id, token_secret, state.http_client.clone())
+        }
+        BookStackAuth::OAuth(tokens) => {
+            BookStackClient::with_oauth(&state.bookstack_url, tokens.clone(), state.http_client.clone())
+        }
+    };
 
     if let Err(e) = client.validate().await {
         eprintln!("Credential validation failed: {e}");
@@ -278,6 +341,7 @@ pub async fn handle_sse(
         );
     }
 
+    let identity = auth.identity();
     let session_id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(32);
 
@@ -292,7 +356,7 @@ pub async fn handle_sse(
                 .into_response();
         }
 
-        let count = sessions.values().filter(|s| s.token_id == token_id).count();
+        let count = sessions.values().filter(|s| s.auth.identity() == identity).count();
         if count >= MAX_SESSIONS_PER_TOKEN {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -305,8 +369,7 @@ pub async fn handle_sse(
             Session {
                 tx: tx.clone(),
                 client,
-                token_id: token_id.clone(),
-                token_secret: token_secret.clone(),
+                auth,
                 created_at: Instant::now(),
                 rate_limit: Arc::new(Mutex::new(RateLimit::new(MAX_REQUESTS_PER_MINUTE))),
             },
@@ -339,10 +402,11 @@ pub async fn handle_message(
     body: String,
 ) -> Response {
     eprintln!("POST /mcp/messages/ — message request");
-    let (token_id, token_secret) = match resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await {
+    let auth = match resolve_credentials(&headers, state.db.as_ref(), &state).await {
         Ok(creds) => creds,
         Err(resp) => return resp,
     };
+    let identity = auth.identity();
 
     let session_id = match params.get("sessionId") {
         Some(id) => id,
@@ -368,7 +432,7 @@ pub async fn handle_message(
             }
         };
 
-        if !constant_time_eq(&session.token_id, &token_id) || !constant_time_eq(&session.token_secret, &token_secret) {
+        if !constant_time_eq(&session.auth.identity(), &identity) {
             return (
                 StatusCode::FORBIDDEN,
                 Json(serde_json::json!({"error": "token does not match session"})),
@@ -428,14 +492,15 @@ pub async fn handle_streamable(
     body: String,
 ) -> Response {
     eprintln!("POST /mcp/sse — Streamable HTTP request");
-    let (token_id, token_secret) = match resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await {
+    let auth = match resolve_credentials(&headers, state.db.as_ref(), &state).await {
         Ok(creds) => creds,
         Err(resp) => return resp,
     };
+    let identity = auth.identity();
 
     {
         let rate_limits = state.streamable_rate_limits.read().await;
-        if let Some(rl) = rate_limits.get(&token_id) {
+        if let Some(rl) = rate_limits.get(&identity) {
             let mut rl = rl.lock().await;
             if rl.check().is_err() {
                 return (
@@ -448,14 +513,21 @@ pub async fn handle_streamable(
             drop(rate_limits);
             let mut rate_limits = state.streamable_rate_limits.write().await;
             let rl = rate_limits
-                .entry(token_id.clone())
+                .entry(identity.clone())
                 .or_insert_with(|| Arc::new(Mutex::new(RateLimit::new(MAX_REQUESTS_PER_MINUTE))));
             let mut rl = rl.lock().await;
             let _ = rl.check();
         }
     }
 
-    let client = BookStackClient::new(&state.bookstack_url, &token_id, &token_secret, state.http_client.clone());
+    let client = match &auth {
+        BookStackAuth::Token { token_id, token_secret } => {
+            BookStackClient::new(&state.bookstack_url, token_id, token_secret, state.http_client.clone())
+        }
+        BookStackAuth::OAuth(tokens) => {
+            BookStackClient::with_oauth(&state.bookstack_url, tokens.clone(), state.http_client.clone())
+        }
+    };
 
     let request: Value = match serde_json::from_str(&body) {
         Ok(v) => v,

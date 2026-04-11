@@ -11,7 +11,7 @@ use sha2::Digest;
 use zeroize::Zeroizing;
 
 use bsmcp_common::config::{access_token_ttl, refresh_token_ttl};
-use bsmcp_common::db::{DbBackend, SemanticDb};
+use bsmcp_common::db::{DbBackend, SemanticDb, StoredCredentials};
 use bsmcp_common::types::*;
 use bsmcp_common::vector;
 
@@ -34,19 +34,36 @@ impl SqliteDb {
                  token TEXT PRIMARY KEY,
                  token_id TEXT NOT NULL,
                  token_secret TEXT NOT NULL,
-                 created_at INTEGER NOT NULL
+                 created_at INTEGER NOT NULL,
+                 auth_type TEXT NOT NULL DEFAULT 'token'
              );
              CREATE INDEX IF NOT EXISTS idx_tokens_created ON access_tokens(created_at);
              CREATE TABLE IF NOT EXISTS refresh_tokens (
                  token TEXT PRIMARY KEY,
                  token_id TEXT NOT NULL,
                  token_secret TEXT NOT NULL,
-                 created_at INTEGER NOT NULL
+                 created_at INTEGER NOT NULL,
+                 auth_type TEXT NOT NULL DEFAULT 'token'
              );
              CREATE INDEX IF NOT EXISTS idx_refresh_tokens_created ON refresh_tokens(created_at);
              DROP TABLE IF EXISTS registrations;",
         )
         .expect("Failed to initialize database schema");
+
+        // Migrate: add auth_type column if missing (existing DBs)
+        let has_auth_type: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('access_tokens') WHERE name = 'auth_type'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0) > 0;
+        if !has_auth_type {
+            conn.execute_batch(
+                "ALTER TABLE access_tokens ADD COLUMN auth_type TEXT NOT NULL DEFAULT 'token';
+                 ALTER TABLE refresh_tokens ADD COLUMN auth_type TEXT NOT NULL DEFAULT 'token';",
+            ).ok();
+        }
 
         let hash = sha2::Sha256::digest(encryption_key.as_bytes());
         let mut key = Zeroizing::new([0u8; 32]);
@@ -116,11 +133,12 @@ impl SqliteDb {
 
 #[async_trait]
 impl DbBackend for SqliteDb {
-    async fn insert_access_token(&self, token: &str, id: &str, secret: &str) -> Result<(), String> {
+    async fn insert_access_token(&self, token: &str, id: &str, secret: &str, auth_type: &str) -> Result<(), String> {
         let conn = self.conn.clone();
         let token_hash = Self::hash_token(token);
         let enc_id = self.encrypt(id);
         let enc_secret = self.encrypt(secret);
+        let auth_type = auth_type.to_string();
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
@@ -132,8 +150,8 @@ impl DbBackend for SqliteDb {
                 conn.execute("DELETE FROM access_tokens WHERE created_at <= ?1", params![cutoff]).ok();
             }
             conn.execute(
-                "INSERT OR REPLACE INTO access_tokens (token, token_id, token_secret, created_at) VALUES (?1, ?2, ?3, ?4)",
-                params![token_hash, enc_id, enc_secret, SqliteDb::now_secs()],
+                "INSERT OR REPLACE INTO access_tokens (token, token_id, token_secret, created_at, auth_type) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![token_hash, enc_id, enc_secret, SqliteDb::now_secs(), auth_type],
             ).ok();
             Ok(())
         })
@@ -141,7 +159,7 @@ impl DbBackend for SqliteDb {
         .map_err(|e| format!("Task failed: {e}"))?
     }
 
-    async fn get_access_token(&self, token: &str) -> Result<Option<(String, String)>, String> {
+    async fn get_access_token(&self, token: &str) -> Result<Option<StoredCredentials>, String> {
         let conn = self.conn.clone();
         let token_hash = Self::hash_token(token);
         let token_raw = token.to_string();
@@ -152,19 +170,19 @@ impl DbBackend for SqliteDb {
             let cutoff = SqliteDb::cutoff_secs(access_token_ttl());
 
             // Try hashed token first, then fall back to raw token (pre-hash migration)
-            let result: Option<(String, String)> = conn.query_row(
-                "SELECT token_id, token_secret FROM access_tokens WHERE token = ?1 AND created_at > ?2",
+            let result: Option<(String, String, String)> = conn.query_row(
+                "SELECT token_id, token_secret, COALESCE(auth_type, 'token') FROM access_tokens WHERE token = ?1 AND created_at > ?2",
                 params![token_hash, cutoff],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             ).ok().or_else(|| {
                 conn.query_row(
-                    "SELECT token_id, token_secret FROM access_tokens WHERE token = ?1 AND created_at > ?2",
+                    "SELECT token_id, token_secret, COALESCE(auth_type, 'token') FROM access_tokens WHERE token = ?1 AND created_at > ?2",
                     params![token_raw, cutoff],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 ).ok()
             });
 
-            let Some((stored_id, stored_secret)) = result else {
+            let Some((stored_id, stored_secret, auth_type)) = result else {
                 return Ok(None);
             };
 
@@ -180,7 +198,7 @@ impl DbBackend for SqliteDb {
             };
 
             if let (Some(tid), Some(tsec)) = (try_decrypt(&stored_id), try_decrypt(&stored_secret)) {
-                return Ok(Some((tid, tsec)));
+                return Ok(Some(StoredCredentials { credential1: tid, credential2: tsec, auth_type }));
             }
 
             // Decryption failed — treat as plaintext (pre-encryption data)
@@ -199,7 +217,7 @@ impl DbBackend for SqliteDb {
                 params![enc_id, enc_secret, token_raw],
             ).ok();
 
-            Ok(Some((stored_id, stored_secret)))
+            Ok(Some(StoredCredentials { credential1: stored_id, credential2: stored_secret, auth_type }))
         })
         .await
         .map_err(|e| format!("Task failed: {e}"))?
@@ -219,17 +237,18 @@ impl DbBackend for SqliteDb {
         .map_err(|e| format!("Task failed: {e}"))?
     }
 
-    async fn insert_refresh_token(&self, token: &str, id: &str, secret: &str) -> Result<(), String> {
+    async fn insert_refresh_token(&self, token: &str, id: &str, secret: &str, auth_type: &str) -> Result<(), String> {
         let conn = self.conn.clone();
         let token_hash = Self::hash_token(token);
         let enc_id = self.encrypt(id);
         let enc_secret = self.encrypt(secret);
+        let auth_type = auth_type.to_string();
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             conn.execute(
-                "INSERT OR REPLACE INTO refresh_tokens (token, token_id, token_secret, created_at) VALUES (?1, ?2, ?3, ?4)",
-                params![token_hash, enc_id, enc_secret, SqliteDb::now_secs()],
+                "INSERT OR REPLACE INTO refresh_tokens (token, token_id, token_secret, created_at, auth_type) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![token_hash, enc_id, enc_secret, SqliteDb::now_secs(), auth_type],
             ).ok();
             Ok(())
         })
@@ -237,7 +256,7 @@ impl DbBackend for SqliteDb {
         .map_err(|e| format!("Task failed: {e}"))?
     }
 
-    async fn get_refresh_token(&self, token: &str) -> Result<Option<(String, String)>, String> {
+    async fn get_refresh_token(&self, token: &str) -> Result<Option<StoredCredentials>, String> {
         let conn = self.conn.clone();
         let token_hash = Self::hash_token(token);
         let encryption_key = *self.encryption_key;
@@ -246,13 +265,13 @@ impl DbBackend for SqliteDb {
             let conn = conn.lock().unwrap();
             let cutoff = SqliteDb::cutoff_secs(refresh_token_ttl());
 
-            let result: Option<(String, String)> = conn.query_row(
-                "SELECT token_id, token_secret FROM refresh_tokens WHERE token = ?1 AND created_at > ?2",
+            let result: Option<(String, String, String)> = conn.query_row(
+                "SELECT token_id, token_secret, COALESCE(auth_type, 'token') FROM refresh_tokens WHERE token = ?1 AND created_at > ?2",
                 params![token_hash, cutoff],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             ).ok();
 
-            let Some((stored_id, stored_secret)) = result else {
+            let Some((stored_id, stored_secret, auth_type)) = result else {
                 return Ok(None);
             };
 
@@ -267,9 +286,27 @@ impl DbBackend for SqliteDb {
             };
 
             match (try_decrypt(&stored_id), try_decrypt(&stored_secret)) {
-                (Some(tid), Some(tsec)) => Ok(Some((tid, tsec))),
+                (Some(tid), Some(tsec)) => Ok(Some(StoredCredentials { credential1: tid, credential2: tsec, auth_type })),
                 _ => Ok(None),
             }
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn update_access_token_credentials(&self, token: &str, new_id: &str, new_secret: &str) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let token_hash = Self::hash_token(token);
+        let enc_id = self.encrypt(new_id);
+        let enc_secret = self.encrypt(new_secret);
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "UPDATE access_tokens SET token_id = ?1, token_secret = ?2 WHERE token = ?3",
+                params![enc_id, enc_secret, token_hash],
+            ).map_err(|e| format!("update_access_token_credentials failed: {e}"))?;
+            Ok(())
         })
         .await
         .map_err(|e| format!("Task failed: {e}"))?

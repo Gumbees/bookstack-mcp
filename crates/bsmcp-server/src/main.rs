@@ -214,6 +214,51 @@ async fn main() {
         }
     }
 
+    // BookStack OAuth configuration (for per-user authentication via BookStack's OAuth provider)
+    let auth_method = env::var("BSMCP_BOOKSTACK_AUTH_METHOD")
+        .unwrap_or_else(|_| "auto".into())
+        .to_lowercase();
+
+    let oauth_config = {
+        let client_id = env::var("BSMCP_OAUTH_CLIENT_ID").ok();
+        let client_secret = env::var("BSMCP_OAUTH_CLIENT_SECRET").ok();
+
+        if let Some(client_id) = client_id {
+            // Build a temporary HTTP client for discovery
+            let discovery_client = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("Failed to build discovery HTTP client");
+
+            match oauth::discover_bookstack_oauth(&bookstack_url, &discovery_client).await {
+                Ok((authorization_endpoint, token_endpoint)) => {
+                    eprintln!("BookStack OAuth: configured (client_id={client_id})");
+                    Some(sse::OAuthConfig {
+                        client_id,
+                        client_secret,
+                        authorization_endpoint,
+                        token_endpoint,
+                    })
+                }
+                Err(e) => {
+                    eprintln!("BookStack OAuth: discovery failed — {e}");
+                    if auth_method == "oauth" {
+                        panic!("BSMCP_BOOKSTACK_AUTH_METHOD=oauth but OAuth discovery failed: {e}");
+                    }
+                    eprintln!("BookStack OAuth: falling back to API token authentication");
+                    None
+                }
+            }
+        } else {
+            if auth_method == "oauth" {
+                panic!("BSMCP_BOOKSTACK_AUTH_METHOD=oauth requires BSMCP_OAUTH_CLIENT_ID");
+            }
+            eprintln!("BookStack OAuth: not configured (set BSMCP_OAUTH_CLIENT_ID to enable)");
+            None
+        }
+    };
+
     let state = sse::AppState::new(
         bookstack_url,
         db,
@@ -222,8 +267,8 @@ async fn main() {
         backup_path,
         semantic,
         summary_cache,
-        None,
-        "auto".to_string(),
+        oauth_config,
+        auth_method,
     );
     state.spawn_cleanup();
     state.spawn_backup();
@@ -234,6 +279,7 @@ async fn main() {
         .route("/.well-known/oauth-authorization-server", get(oauth::handle_metadata))
         .route("/.well-known/oauth-protected-resource", get(oauth::handle_resource_metadata))
         .route("/authorize", get(oauth::handle_authorize).post(oauth::handle_authorize_submit))
+        .route("/oauth/callback", get(oauth::handle_oauth_callback))
         .route("/token", axum::routing::post(oauth::handle_token))
         .route("/register", axum::routing::post(oauth::handle_register))
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }));

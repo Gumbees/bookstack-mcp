@@ -25,6 +25,8 @@ pub struct AuthCode {
     pub client_id: String,
     pub token_id: Option<String>,
     pub token_secret: Option<String>,
+    /// "token" for API token credentials, "oauth" for BookStack OAuth credentials
+    pub auth_type: String,
     pub created_at: Instant,
 }
 
@@ -287,6 +289,54 @@ pub async fn handle_authorize(
             Some("code_challenge is required (PKCE)"),
         );
     }
+
+    // If BookStack OAuth is configured, redirect to BookStack's authorize endpoint
+    if state.use_oauth() {
+        if let Some(ref oauth_config) = state.oauth_config {
+            // Generate PKCE verifier + challenge for the MCP→BookStack leg
+            let pkce_verifier = uuid::Uuid::new_v4().to_string() + &uuid::Uuid::new_v4().to_string();
+            let bs_challenge = compute_s256_challenge(&pkce_verifier);
+
+            // Store pending OAuth state so we can resume the flow in /oauth/callback
+            let pending_state = uuid::Uuid::new_v4().to_string();
+            {
+                let mut pending = state.pending_oauth.write().await;
+                // Clean up expired entries
+                pending.retain(|_, p| p.created_at.elapsed() < AUTH_CODE_TTL);
+                pending.insert(
+                    pending_state.clone(),
+                    crate::sse::PendingOAuth {
+                        client_id: params.client_id.clone(),
+                        redirect_uri: params.redirect_uri.clone(),
+                        state: params.state.clone(),
+                        code_challenge: params.code_challenge.clone(),
+                        code_challenge_method: params.code_challenge_method.clone(),
+                        pkce_verifier,
+                        created_at: Instant::now(),
+                    },
+                );
+            }
+
+            // Build the callback URL (MCP server's own /oauth/callback)
+            let headers = axum::http::HeaderMap::new();
+            let base = derive_base_url(&headers, &state.known_urls);
+            let callback_url = format!("{base}/oauth/callback");
+
+            // Redirect to BookStack OAuth
+            let bs_auth_url = format!(
+                "{}?response_type=code&client_id={}&redirect_uri={}&code_challenge={}&code_challenge_method=S256&state={}&scope=read+write",
+                oauth_config.authorization_endpoint,
+                urlencoding::encode(&oauth_config.client_id),
+                urlencoding::encode(&callback_url),
+                urlencoding::encode(&bs_challenge),
+                urlencoding::encode(&pending_state),
+            );
+
+            eprintln!("OAuth: redirecting to BookStack OAuth authorize");
+            return (StatusCode::FOUND, [(header::LOCATION, bs_auth_url)]).into_response();
+        }
+    }
+
     Html(render_login_form(&params, &state.bookstack_url, None)).into_response()
 }
 
@@ -350,6 +400,7 @@ pub async fn handle_authorize_submit(
                 redirect_uri: redirect_uri.clone(),
                 token_id: Some(form.token_id.clone()),
                 token_secret: Some(form.token_secret.clone()),
+                auth_type: "token".to_string(),
                 created_at: Instant::now(),
             },
         );
@@ -477,10 +528,12 @@ async fn handle_token_authorization_code(
         }
     }
 
+    let auth_type = auth_code.auth_type.clone();
+
     let (token_id, token_secret) = if let (Some(tid), Some(tsec)) =
         (auth_code.token_id.clone(), auth_code.token_secret.clone())
     {
-        eprintln!("OAuth: using form-authenticated credentials");
+        eprintln!("OAuth: using {} credentials", auth_type);
         (tid, tsec)
     } else {
         let (client_id, client_secret) = match extract_client_credentials(&headers, &form) {
@@ -517,7 +570,7 @@ async fn handle_token_authorization_code(
         (client_id, client_secret)
     };
 
-    issue_tokens(&state, &token_id, &token_secret, "token").await
+    issue_tokens(&state, &token_id, &token_secret, &auth_type).await
 }
 
 async fn handle_token_refresh(state: AppState, form: TokenForm) -> Response {
@@ -712,6 +765,242 @@ pub async fn handle_register(State(state): State<AppState>, body: String) -> Res
         Json(response),
     )
         .into_response()
+}
+
+/// Callback endpoint for BookStack's OAuth redirect.
+/// BookStack redirects here after the user approves. We exchange the BS auth code
+/// for BS tokens, then issue our own MCP auth code and redirect to Claude's callback.
+#[derive(Deserialize)]
+pub struct OAuthCallbackParams {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+pub async fn handle_oauth_callback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<OAuthCallbackParams>,
+) -> Response {
+    // Check for OAuth error from BookStack
+    if let Some(ref err) = params.error {
+        let desc = params.error_description.as_deref().unwrap_or("Unknown error");
+        eprintln!("OAuth callback: BookStack returned error: {err} — {desc}");
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            err,
+            Some(desc),
+        );
+    }
+
+    let bs_code = match &params.code {
+        Some(c) => c.clone(),
+        None => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                Some("Missing authorization code from BookStack"),
+            )
+        }
+    };
+
+    let pending_state = match &params.state {
+        Some(s) => s.clone(),
+        None => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                Some("Missing state parameter"),
+            )
+        }
+    };
+
+    // Look up the pending OAuth flow
+    let pending = {
+        let mut pending_map = state.pending_oauth.write().await;
+        pending_map.remove(&pending_state)
+    };
+
+    let pending = match pending {
+        Some(p) if p.created_at.elapsed() < AUTH_CODE_TTL => p,
+        _ => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                Some("Invalid or expired OAuth state — please try connecting again"),
+            )
+        }
+    };
+
+    let oauth_config = match &state.oauth_config {
+        Some(c) => c,
+        None => {
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                Some("OAuth not configured"),
+            )
+        }
+    };
+
+    // Exchange BookStack auth code for tokens
+    let base = derive_base_url(&headers, &state.known_urls);
+    let callback_url = format!("{base}/oauth/callback");
+
+    let mut form_data = vec![
+        ("grant_type", "authorization_code".to_string()),
+        ("code", bs_code),
+        ("redirect_uri", callback_url),
+        ("client_id", oauth_config.client_id.clone()),
+        ("code_verifier", pending.pkce_verifier.clone()),
+    ];
+    if let Some(ref secret) = oauth_config.client_secret {
+        form_data.push(("client_secret", secret.clone()));
+    }
+
+    let token_resp = state
+        .http_client
+        .post(&oauth_config.token_endpoint)
+        .form(&form_data)
+        .send()
+        .await;
+
+    let token_resp = match token_resp {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("OAuth callback: token exchange request failed: {e}");
+            return oauth_error(
+                StatusCode::BAD_GATEWAY,
+                "server_error",
+                Some("Failed to exchange authorization code with BookStack"),
+            );
+        }
+    };
+
+    if !token_resp.status().is_success() {
+        let status = token_resp.status();
+        let body = token_resp.text().await.unwrap_or_default();
+        eprintln!("OAuth callback: token exchange failed {status}: {body}");
+        return oauth_error(
+            StatusCode::BAD_GATEWAY,
+            "server_error",
+            Some("BookStack rejected the authorization code"),
+        );
+    }
+
+    let token_data: Value = match token_resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("OAuth callback: token response parse failed: {e}");
+            return oauth_error(
+                StatusCode::BAD_GATEWAY,
+                "server_error",
+                Some("Invalid token response from BookStack"),
+            );
+        }
+    };
+
+    let bs_access_token = match token_data["access_token"].as_str() {
+        Some(t) => t.to_string(),
+        None => {
+            return oauth_error(
+                StatusCode::BAD_GATEWAY,
+                "server_error",
+                Some("BookStack token response missing access_token"),
+            )
+        }
+    };
+
+    let bs_refresh_token = token_data["refresh_token"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    eprintln!("OAuth callback: BookStack tokens obtained successfully");
+
+    // Issue our own MCP auth code, storing the BS OAuth tokens
+    let mcp_code = uuid::Uuid::new_v4().to_string();
+    {
+        let mut codes = state.auth_codes.write().await;
+        if codes.len() >= 100 {
+            codes.retain(|_, c| c.created_at.elapsed() < AUTH_CODE_TTL);
+        }
+        codes.insert(
+            mcp_code.clone(),
+            AuthCode {
+                client_id: pending.client_id.clone(),
+                code_challenge: pending.code_challenge.clone(),
+                code_challenge_method: pending.code_challenge_method.clone(),
+                redirect_uri: pending.redirect_uri.clone(),
+                token_id: Some(bs_access_token),
+                token_secret: Some(bs_refresh_token),
+                auth_type: "oauth".to_string(),
+                created_at: Instant::now(),
+            },
+        );
+    }
+
+    // Redirect to Claude's callback with our MCP auth code
+    let code_encoded = urlencoding::encode(&mcp_code);
+    let mut redirect_url = if pending.redirect_uri.contains('?') {
+        format!("{}&code={code_encoded}", pending.redirect_uri)
+    } else {
+        format!("{}?code={code_encoded}", pending.redirect_uri)
+    };
+    if let Some(ref state_param) = pending.state {
+        let state_encoded = urlencoding::encode(state_param);
+        redirect_url.push_str(&format!("&state={state_encoded}"));
+    }
+
+    eprintln!("OAuth callback: issued MCP auth code, redirecting to client");
+    (StatusCode::FOUND, [(header::LOCATION, redirect_url)]).into_response()
+}
+
+/// Discover BookStack's OAuth endpoints from its well-known metadata.
+pub async fn discover_bookstack_oauth(
+    bookstack_url: &str,
+    http_client: &reqwest::Client,
+) -> Result<(String, String), String> {
+    let discovery_url = format!(
+        "{}/.well-known/oauth-authorization-server",
+        bookstack_url.trim_end_matches('/')
+    );
+    eprintln!("OAuth discovery: fetching {discovery_url}");
+
+    let resp = http_client
+        .get(&discovery_url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("OAuth discovery request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!(
+            "OAuth discovery failed: {} (BookStack may not have OAuth enabled)",
+            resp.status()
+        ));
+    }
+
+    let metadata: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("OAuth discovery response parse failed: {e}"))?;
+
+    let authorization_endpoint = metadata["authorization_endpoint"]
+        .as_str()
+        .ok_or("Missing authorization_endpoint in OAuth metadata")?
+        .to_string();
+
+    let token_endpoint = metadata["token_endpoint"]
+        .as_str()
+        .ok_or("Missing token_endpoint in OAuth metadata")?
+        .to_string();
+
+    eprintln!(
+        "OAuth discovery: authorization_endpoint={authorization_endpoint}, token_endpoint={token_endpoint}"
+    );
+    Ok((authorization_endpoint, token_endpoint))
 }
 
 fn oauth_error(status: StatusCode, error: &str, description: Option<&str>) -> Response {

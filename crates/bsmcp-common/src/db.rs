@@ -4,28 +4,45 @@ use async_trait::async_trait;
 
 use crate::types::*;
 
+/// Stored credential type.
+/// - `"token"`: BookStack API token (credential1 = token_id, credential2 = token_secret)
+/// - `"oauth"`: BookStack OAuth tokens (credential1 = access_token, credential2 = refresh_token)
+pub type AuthType = String;
+
+/// Stored credentials with their auth type.
+pub struct StoredCredentials {
+    pub credential1: String,
+    pub credential2: String,
+    pub auth_type: AuthType,
+}
+
 /// Core database operations (auth tokens, backups).
 #[async_trait]
 pub trait DbBackend: Send + Sync + 'static {
     /// Atomically insert an access token if under the 10k limit.
-    /// Encrypts token_id and token_secret at rest.
-    async fn insert_access_token(&self, token: &str, id: &str, secret: &str) -> Result<(), String>;
+    /// Encrypts credential1 and credential2 at rest.
+    /// auth_type: "token" (API token) or "oauth" (OAuth Bearer).
+    async fn insert_access_token(&self, token: &str, id: &str, secret: &str, auth_type: &str) -> Result<(), String>;
 
     /// Retrieve and decrypt an access token's BookStack credentials.
-    async fn get_access_token(&self, token: &str) -> Result<Option<(String, String)>, String>;
+    /// Returns (credential1, credential2, auth_type).
+    async fn get_access_token(&self, token: &str) -> Result<Option<StoredCredentials>, String>;
 
     /// Delete expired access tokens and refresh tokens.
     async fn cleanup_expired_tokens(&self) -> Result<(), String>;
 
     /// Store a refresh token mapped to encrypted BookStack credentials.
-    async fn insert_refresh_token(&self, token: &str, id: &str, secret: &str) -> Result<(), String>;
+    async fn insert_refresh_token(&self, token: &str, id: &str, secret: &str, auth_type: &str) -> Result<(), String>;
 
     /// Retrieve and decrypt a refresh token's BookStack credentials.
     /// Returns None if the token doesn't exist or has expired.
-    async fn get_refresh_token(&self, token: &str) -> Result<Option<(String, String)>, String>;
+    async fn get_refresh_token(&self, token: &str) -> Result<Option<StoredCredentials>, String>;
 
     /// Delete a refresh token (used during rotation — old token is consumed).
     async fn delete_refresh_token(&self, token: &str) -> Result<(), String>;
+
+    /// Update stored credentials for an existing access token (e.g. after OAuth refresh).
+    async fn update_access_token_credentials(&self, token: &str, new_id: &str, new_secret: &str) -> Result<(), String>;
 
     /// Create a database backup. SQLite: VACUUM INTO. Postgres: no-op (use pg_dump).
     async fn backup(&self, path: &Path) -> Result<(), String>;

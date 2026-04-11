@@ -1,6 +1,8 @@
 use reqwest::Client;
 use serde_json::Value;
 use std::net::IpAddr;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use url::Url;
 use zeroize::Zeroize;
 
@@ -179,6 +181,129 @@ impl ContentType {
 const MAX_RESPONSE_SIZE: usize = 50 * 1024 * 1024; // 50MB
 const MAX_ERROR_BODY_SIZE: usize = 4096; // 4KB for error messages
 
+/// OAuth token state shared between the client and the session layer.
+/// The session layer persists updated tokens to the DB after a refresh.
+#[derive(Clone)]
+pub struct OAuthTokens {
+    pub access_token: Arc<RwLock<String>>,
+    pub refresh_token: Arc<RwLock<String>>,
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    pub token_endpoint: String,
+    /// Set to true after a successful refresh so the session layer knows to persist.
+    pub refreshed: Arc<RwLock<bool>>,
+}
+
+impl OAuthTokens {
+    pub fn new(
+        access_token: String,
+        refresh_token: String,
+        client_id: String,
+        client_secret: Option<String>,
+        token_endpoint: String,
+    ) -> Self {
+        Self {
+            access_token: Arc::new(RwLock::new(access_token)),
+            refresh_token: Arc::new(RwLock::new(refresh_token)),
+            client_id,
+            client_secret,
+            token_endpoint,
+            refreshed: Arc::new(RwLock::new(false)),
+        }
+    }
+
+    /// Refresh the access token using the stored refresh token.
+    /// Returns Ok(()) on success, Err on failure.
+    pub async fn refresh(&self, http: &Client) -> Result<(), String> {
+        let refresh_token = self.refresh_token.read().await.clone();
+        let mut form = vec![
+            ("grant_type", "refresh_token".to_string()),
+            ("refresh_token", refresh_token),
+            ("client_id", self.client_id.clone()),
+        ];
+        if let Some(ref secret) = self.client_secret {
+            form.push(("client_secret", secret.clone()));
+        }
+
+        let resp = http
+            .post(&self.token_endpoint)
+            .form(&form)
+            .send()
+            .await
+            .map_err(|e| format!("OAuth refresh request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            eprintln!("OAuth refresh failed {status}: {body}");
+            return Err(format!("OAuth refresh failed: {status}"));
+        }
+
+        let token_resp: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("OAuth refresh response parse failed: {e}"))?;
+
+        let new_access = token_resp["access_token"]
+            .as_str()
+            .ok_or("Missing access_token in refresh response")?;
+        *self.access_token.write().await = new_access.to_string();
+
+        // BookStack may rotate the refresh token
+        if let Some(new_refresh) = token_resp["refresh_token"].as_str() {
+            *self.refresh_token.write().await = new_refresh.to_string();
+        }
+
+        *self.refreshed.write().await = true;
+        eprintln!("OAuth: token refreshed successfully");
+        Ok(())
+    }
+
+    /// Check if tokens were refreshed and reset the flag.
+    /// The session layer calls this to know when to persist updated tokens.
+    pub async fn take_refreshed(&self) -> Option<(String, String)> {
+        let mut refreshed = self.refreshed.write().await;
+        if *refreshed {
+            *refreshed = false;
+            let at = self.access_token.read().await.clone();
+            let rt = self.refresh_token.read().await.clone();
+            Some((at, rt))
+        } else {
+            None
+        }
+    }
+}
+
+/// Authentication method for BookStack API calls.
+#[derive(Clone)]
+pub enum BookStackAuth {
+    /// Legacy API token: `Token {id}:{secret}`
+    Token { token_id: String, token_secret: String },
+    /// OAuth 2.0 Bearer token with auto-refresh
+    OAuth(OAuthTokens),
+}
+
+impl BookStackAuth {
+    /// Identifier for rate limiting and session tracking.
+    /// For Token auth, this is the token_id. For OAuth, it's a hash of the access token.
+    pub fn identity(&self) -> String {
+        match self {
+            BookStackAuth::Token { token_id, .. } => token_id.clone(),
+            BookStackAuth::OAuth(tokens) => {
+                // Use a stable identifier derived from client_id
+                format!("oauth:{}", tokens.client_id)
+            }
+        }
+    }
+
+    pub fn auth_type_str(&self) -> &'static str {
+        match self {
+            BookStackAuth::Token { .. } => "token",
+            BookStackAuth::OAuth(_) => "oauth",
+        }
+    }
+}
+
 /// Note: Zeroize on Drop clears the current String allocation. Intermediate copies
 /// (e.g. from Clone, format!, auth_header()) and reqwest HeaderValue copies may remain
 /// in freed memory until overwritten by the allocator.
@@ -187,24 +312,43 @@ const MAX_ERROR_BODY_SIZE: usize = 4096; // 4KB for error messages
 pub struct BookStackClient {
     client: Client,
     base_url: String,
-    token_id: String,
-    token_secret: String,
+    auth: BookStackAuth,
 }
 
 impl Drop for BookStackClient {
     fn drop(&mut self) {
-        self.token_id.zeroize();
-        self.token_secret.zeroize();
+        match &mut self.auth {
+            BookStackAuth::Token { token_id, token_secret } => {
+                token_id.zeroize();
+                token_secret.zeroize();
+            }
+            BookStackAuth::OAuth(_) => {
+                // OAuth tokens are behind Arc<RwLock<>> — can't zeroize without async.
+                // Best-effort: the Arc will be dropped, reducing refcount.
+            }
+        }
     }
 }
 
 impl BookStackClient {
+    /// Create a client with legacy API token authentication.
     pub fn new(base_url: &str, token_id: &str, token_secret: &str, client: Client) -> Self {
         Self {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
-            token_id: token_id.to_string(),
-            token_secret: token_secret.to_string(),
+            auth: BookStackAuth::Token {
+                token_id: token_id.to_string(),
+                token_secret: token_secret.to_string(),
+            },
+        }
+    }
+
+    /// Create a client with OAuth Bearer token authentication.
+    pub fn with_oauth(base_url: &str, tokens: OAuthTokens, client: Client) -> Self {
+        Self {
+            client,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            auth: BookStackAuth::OAuth(tokens),
         }
     }
 
@@ -213,13 +357,34 @@ impl BookStackClient {
         &self.base_url
     }
 
-    /// Get the token ID (for use as a cache key, not a secret).
-    pub fn token_id(&self) -> &str {
-        &self.token_id
+    /// Get the auth identity (for use as a cache key, not a secret).
+    pub fn token_id(&self) -> String {
+        self.auth.identity()
     }
 
-    fn auth_header(&self) -> String {
-        format!("Token {}:{}", self.token_id, self.token_secret)
+    /// Get a reference to the auth configuration.
+    pub fn auth(&self) -> &BookStackAuth {
+        &self.auth
+    }
+
+    async fn auth_header(&self) -> String {
+        match &self.auth {
+            BookStackAuth::Token { token_id, token_secret } => {
+                format!("Token {token_id}:{token_secret}")
+            }
+            BookStackAuth::OAuth(tokens) => {
+                let at = tokens.access_token.read().await;
+                format!("Bearer {at}")
+            }
+        }
+    }
+
+    /// Try to refresh OAuth tokens after a 401. Returns true if refresh succeeded.
+    async fn try_refresh(&self) -> bool {
+        match &self.auth {
+            BookStackAuth::OAuth(tokens) => tokens.refresh(&self.client).await.is_ok(),
+            BookStackAuth::Token { .. } => false,
+        }
     }
 
     /// Fast-reject via Content-Length header before downloading the body.
@@ -277,13 +442,31 @@ impl BookStackClient {
     }
 
     async fn get(&self, path: &str, query: &[(&str, &str)]) -> Result<Value, String> {
+        let url = format!("{}/api/{}", self.base_url, path);
         let resp = self.client
-            .get(format!("{}/api/{}", self.base_url, path))
-            .header("Authorization", self.auth_header())
+            .get(&url)
+            .header("Authorization", self.auth_header().await)
             .query(query)
             .send()
             .await
             .map_err(|e| { eprintln!("BookStack request error: {e}"); "Request failed".to_string() })?;
+
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED && self.try_refresh().await {
+            let resp = self.client
+                .get(&url)
+                .header("Authorization", self.auth_header().await)
+                .query(query)
+                .send()
+                .await
+                .map_err(|e| { eprintln!("BookStack retry error: {e}"); "Request failed".to_string() })?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = Self::read_error_body(resp).await;
+                eprintln!("BookStack API error {status}: {body}");
+                return Err(format!("BookStack API error: {status}"));
+            }
+            return Self::read_json(resp).await;
+        }
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -296,13 +479,31 @@ impl BookStackClient {
     }
 
     async fn post(&self, path: &str, body: &Value) -> Result<Value, String> {
+        let url = format!("{}/api/{}", self.base_url, path);
         let resp = self.client
-            .post(format!("{}/api/{}", self.base_url, path))
-            .header("Authorization", self.auth_header())
+            .post(&url)
+            .header("Authorization", self.auth_header().await)
             .json(body)
             .send()
             .await
             .map_err(|e| { eprintln!("BookStack request error: {e}"); "Request failed".to_string() })?;
+
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED && self.try_refresh().await {
+            let resp = self.client
+                .post(&url)
+                .header("Authorization", self.auth_header().await)
+                .json(body)
+                .send()
+                .await
+                .map_err(|e| { eprintln!("BookStack retry error: {e}"); "Request failed".to_string() })?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = Self::read_error_body(resp).await;
+                eprintln!("BookStack API error {status}: {body}");
+                return Err(format!("BookStack API error: {status}"));
+            }
+            return Self::read_json(resp).await;
+        }
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -315,9 +516,11 @@ impl BookStackClient {
     }
 
     async fn post_multipart(&self, path: &str, form: reqwest::multipart::Form) -> Result<Value, String> {
+        // Note: multipart forms can't be cloned, so no retry on 401 for multipart.
+        // This is acceptable since multipart uploads are rare and the user can retry.
         let resp = self.client
             .post(format!("{}/api/{}", self.base_url, path))
-            .header("Authorization", self.auth_header())
+            .header("Authorization", self.auth_header().await)
             .multipart(form)
             .send()
             .await
@@ -334,13 +537,31 @@ impl BookStackClient {
     }
 
     async fn put(&self, path: &str, body: &Value) -> Result<Value, String> {
+        let url = format!("{}/api/{}", self.base_url, path);
         let resp = self.client
-            .put(format!("{}/api/{}", self.base_url, path))
-            .header("Authorization", self.auth_header())
+            .put(&url)
+            .header("Authorization", self.auth_header().await)
             .json(body)
             .send()
             .await
             .map_err(|e| { eprintln!("BookStack request error: {e}"); "Request failed".to_string() })?;
+
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED && self.try_refresh().await {
+            let resp = self.client
+                .put(&url)
+                .header("Authorization", self.auth_header().await)
+                .json(body)
+                .send()
+                .await
+                .map_err(|e| { eprintln!("BookStack retry error: {e}"); "Request failed".to_string() })?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = Self::read_error_body(resp).await;
+                eprintln!("BookStack API error {status}: {body}");
+                return Err(format!("BookStack API error: {status}"));
+            }
+            return Self::read_json(resp).await;
+        }
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -353,12 +574,29 @@ impl BookStackClient {
     }
 
     async fn get_text(&self, path: &str) -> Result<String, String> {
+        let url = format!("{}/api/{}", self.base_url, path);
         let resp = self.client
-            .get(format!("{}/api/{}", self.base_url, path))
-            .header("Authorization", self.auth_header())
+            .get(&url)
+            .header("Authorization", self.auth_header().await)
             .send()
             .await
             .map_err(|e| { eprintln!("BookStack request error: {e}"); "Request failed".to_string() })?;
+
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED && self.try_refresh().await {
+            let resp = self.client
+                .get(&url)
+                .header("Authorization", self.auth_header().await)
+                .send()
+                .await
+                .map_err(|e| { eprintln!("BookStack retry error: {e}"); "Request failed".to_string() })?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = Self::read_error_body(resp).await;
+                eprintln!("BookStack API error {status}: {body}");
+                return Err(format!("BookStack API error: {status}"));
+            }
+            return Self::read_text(resp).await;
+        }
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -371,12 +609,29 @@ impl BookStackClient {
     }
 
     async fn delete(&self, path: &str) -> Result<(), String> {
+        let url = format!("{}/api/{}", self.base_url, path);
         let resp = self.client
-            .delete(format!("{}/api/{}", self.base_url, path))
-            .header("Authorization", self.auth_header())
+            .delete(&url)
+            .header("Authorization", self.auth_header().await)
             .send()
             .await
             .map_err(|e| { eprintln!("BookStack request error: {e}"); "Request failed".to_string() })?;
+
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED && self.try_refresh().await {
+            let resp = self.client
+                .delete(&url)
+                .header("Authorization", self.auth_header().await)
+                .send()
+                .await
+                .map_err(|e| { eprintln!("BookStack retry error: {e}"); "Request failed".to_string() })?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = Self::read_error_body(resp).await;
+                eprintln!("BookStack API error {status}: {body}");
+                return Err(format!("BookStack API error: {status}"));
+            }
+            return Ok(());
+        }
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -402,7 +657,7 @@ impl BookStackClient {
     pub async fn can_access_page(&self, page_id: i64) -> bool {
         let resp = self.client
             .get(format!("{}/api/pages/{page_id}", self.base_url))
-            .header("Authorization", self.auth_header())
+            .header("Authorization", self.auth_header().await)
             .send()
             .await;
         match resp {

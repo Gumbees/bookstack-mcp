@@ -12,7 +12,7 @@ use sqlx::{PgPool, Row};
 use zeroize::Zeroizing;
 
 use bsmcp_common::config::{access_token_ttl, refresh_token_ttl};
-use bsmcp_common::db::{DbBackend, SemanticDb};
+use bsmcp_common::db::{DbBackend, SemanticDb, StoredCredentials};
 use bsmcp_common::types::*;
 
 const BASE64: base64::engine::general_purpose::GeneralPurpose =
@@ -42,7 +42,8 @@ impl PostgresDb {
                 token TEXT PRIMARY KEY,
                 token_id TEXT NOT NULL,
                 token_secret TEXT NOT NULL,
-                created_at BIGINT NOT NULL
+                created_at BIGINT NOT NULL,
+                auth_type TEXT NOT NULL DEFAULT 'token'
             )"
         )
         .execute(&pool)
@@ -59,7 +60,8 @@ impl PostgresDb {
                 token TEXT PRIMARY KEY,
                 token_id TEXT NOT NULL,
                 token_secret TEXT NOT NULL,
-                created_at BIGINT NOT NULL
+                created_at BIGINT NOT NULL,
+                auth_type TEXT NOT NULL DEFAULT 'token'
             )"
         )
         .execute(&pool)
@@ -70,6 +72,12 @@ impl PostgresDb {
             .execute(&pool)
             .await
             .ok();
+
+        // Migrate: add auth_type column if missing (existing DBs)
+        sqlx::query("ALTER TABLE access_tokens ADD COLUMN IF NOT EXISTS auth_type TEXT NOT NULL DEFAULT 'token'")
+            .execute(&pool).await.ok();
+        sqlx::query("ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS auth_type TEXT NOT NULL DEFAULT 'token'")
+            .execute(&pool).await.ok();
 
         let hash = sha2::Sha256::digest(encryption_key.as_bytes());
         let mut key = Zeroizing::new([0u8; 32]);
@@ -117,7 +125,7 @@ impl PostgresDb {
 
 #[async_trait]
 impl DbBackend for PostgresDb {
-    async fn insert_access_token(&self, token: &str, id: &str, secret: &str) -> Result<(), String> {
+    async fn insert_access_token(&self, token: &str, id: &str, secret: &str, auth_type: &str) -> Result<(), String> {
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM access_tokens")
             .fetch_one(&self.pool)
             .await
@@ -134,27 +142,28 @@ impl DbBackend for PostgresDb {
         let enc_id = self.encrypt(id);
         let enc_secret = self.encrypt(secret);
         sqlx::query(
-            "INSERT INTO access_tokens (token, token_id, token_secret, created_at)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (token) DO UPDATE SET token_id = $2, token_secret = $3, created_at = $4"
+            "INSERT INTO access_tokens (token, token_id, token_secret, created_at, auth_type)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (token) DO UPDATE SET token_id = $2, token_secret = $3, created_at = $4, auth_type = $5"
         )
         .bind(&token_hash)
         .bind(&enc_id)
         .bind(&enc_secret)
         .bind(Self::now_secs())
+        .bind(auth_type)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("insert_access_token failed: {e}"))?;
         Ok(())
     }
 
-    async fn get_access_token(&self, token: &str) -> Result<Option<(String, String)>, String> {
+    async fn get_access_token(&self, token: &str) -> Result<Option<StoredCredentials>, String> {
         let cutoff = Self::now_secs() - access_token_ttl().as_secs() as i64;
         let token_hash = Self::hash_token(token);
 
         // Try hashed token first, then fall back to raw token (pre-hash migration)
         let row = sqlx::query(
-            "SELECT token_id, token_secret FROM access_tokens WHERE token = $1 AND created_at > $2"
+            "SELECT token_id, token_secret, COALESCE(auth_type, 'token') as auth_type FROM access_tokens WHERE token = $1 AND created_at > $2"
         )
         .bind(&token_hash)
         .bind(cutoff)
@@ -167,7 +176,7 @@ impl DbBackend for PostgresDb {
             None => {
                 // Fallback: try raw token (pre-hash tokens from migration or older versions)
                 match sqlx::query(
-                    "SELECT token_id, token_secret FROM access_tokens WHERE token = $1 AND created_at > $2"
+                    "SELECT token_id, token_secret, COALESCE(auth_type, 'token') as auth_type FROM access_tokens WHERE token = $1 AND created_at > $2"
                 )
                 .bind(token)
                 .bind(cutoff)
@@ -182,9 +191,10 @@ impl DbBackend for PostgresDb {
 
         let stored_id: String = row.get("token_id");
         let stored_secret: String = row.get("token_secret");
+        let auth_type: String = row.get("auth_type");
 
         if let (Some(tid), Some(tsec)) = (self.decrypt(&stored_id), self.decrypt(&stored_secret)) {
-            return Ok(Some((tid, tsec)));
+            return Ok(Some(StoredCredentials { credential1: tid, credential2: tsec, auth_type }));
         }
 
         // Plaintext fallback — re-encrypt in place
@@ -198,7 +208,7 @@ impl DbBackend for PostgresDb {
             .await
             .ok();
 
-        Ok(Some((stored_id, stored_secret)))
+        Ok(Some(StoredCredentials { credential1: stored_id, credential2: stored_secret, auth_type }))
     }
 
     async fn cleanup_expired_tokens(&self) -> Result<(), String> {
@@ -217,30 +227,31 @@ impl DbBackend for PostgresDb {
         Ok(())
     }
 
-    async fn insert_refresh_token(&self, token: &str, id: &str, secret: &str) -> Result<(), String> {
+    async fn insert_refresh_token(&self, token: &str, id: &str, secret: &str, auth_type: &str) -> Result<(), String> {
         let token_hash = Self::hash_token(token);
         let enc_id = self.encrypt(id);
         let enc_secret = self.encrypt(secret);
         sqlx::query(
-            "INSERT INTO refresh_tokens (token, token_id, token_secret, created_at)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (token) DO UPDATE SET token_id = $2, token_secret = $3, created_at = $4"
+            "INSERT INTO refresh_tokens (token, token_id, token_secret, created_at, auth_type)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (token) DO UPDATE SET token_id = $2, token_secret = $3, created_at = $4, auth_type = $5"
         )
         .bind(&token_hash)
         .bind(&enc_id)
         .bind(&enc_secret)
         .bind(Self::now_secs())
+        .bind(auth_type)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("insert_refresh_token failed: {e}"))?;
         Ok(())
     }
 
-    async fn get_refresh_token(&self, token: &str) -> Result<Option<(String, String)>, String> {
+    async fn get_refresh_token(&self, token: &str) -> Result<Option<StoredCredentials>, String> {
         let cutoff = Self::now_secs() - refresh_token_ttl().as_secs() as i64;
         let token_hash = Self::hash_token(token);
         let row = sqlx::query(
-            "SELECT token_id, token_secret FROM refresh_tokens WHERE token = $1 AND created_at > $2"
+            "SELECT token_id, token_secret, COALESCE(auth_type, 'token') as auth_type FROM refresh_tokens WHERE token = $1 AND created_at > $2"
         )
         .bind(&token_hash)
         .bind(cutoff)
@@ -255,9 +266,10 @@ impl DbBackend for PostgresDb {
 
         let stored_id: String = row.get("token_id");
         let stored_secret: String = row.get("token_secret");
+        let auth_type: String = row.get("auth_type");
 
         match (self.decrypt(&stored_id), self.decrypt(&stored_secret)) {
-            (Some(tid), Some(tsec)) => Ok(Some((tid, tsec))),
+            (Some(tid), Some(tsec)) => Ok(Some(StoredCredentials { credential1: tid, credential2: tsec, auth_type })),
             _ => Ok(None),
         }
     }
@@ -269,6 +281,20 @@ impl DbBackend for PostgresDb {
             .execute(&self.pool)
             .await
             .map_err(|e| format!("delete_refresh_token failed: {e}"))?;
+        Ok(())
+    }
+
+    async fn update_access_token_credentials(&self, token: &str, new_id: &str, new_secret: &str) -> Result<(), String> {
+        let token_hash = Self::hash_token(token);
+        let enc_id = self.encrypt(new_id);
+        let enc_secret = self.encrypt(new_secret);
+        sqlx::query("UPDATE access_tokens SET token_id = $1, token_secret = $2 WHERE token = $3")
+            .bind(&enc_id)
+            .bind(&enc_secret)
+            .bind(&token_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("update_access_token_credentials failed: {e}"))?;
         Ok(())
     }
 

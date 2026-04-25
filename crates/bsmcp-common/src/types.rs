@@ -68,3 +68,35 @@ pub struct EmbedStats {
     pub total_chunks: i64,
     pub latest_job: Option<EmbedJob>,
 }
+
+/// One write/read record from the /remember protocol audit log.
+#[derive(Clone, Debug)]
+pub struct AuditEntry {
+    pub id: i64,
+    pub token_id_hash: String,
+    pub ai_identity_ouid: Option<String>,
+    pub user_id: Option<String>,
+    pub resource: String,
+    pub action: String,
+    pub target_page_id: Option<i64>,
+    pub target_key: Option<String>,
+    pub success: bool,
+    pub error: Option<String>,
+    pub trace_id: Option<String>,
+    pub occurred_at: i64,
+}
+
+/// Insert payload for an audit entry — same fields as AuditEntry minus id.
+#[derive(Clone, Debug)]
+pub struct AuditEntryInsert {
+    pub token_id_hash: String,
+    pub ai_identity_ouid: Option<String>,
+    pub user_id: Option<String>,
+    pub resource: String,
+    pub action: String,
+    pub target_page_id: Option<i64>,
+    pub target_key: Option<String>,
+    pub success: bool,
+    pub error: Option<String>,
+    pub trace_id: Option<String>,
+}

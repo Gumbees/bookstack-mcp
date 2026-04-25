@@ -2,7 +2,9 @@ mod llm;
 mod mcp;
 mod migrate;
 mod oauth;
+mod remember;
 mod semantic;
+mod settings_ui;
 mod sse;
 mod staging;
 mod summary;
@@ -12,8 +14,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::{DefaultBodyLimit, Query, State};
-use axum::http::{HeaderName, Method, StatusCode};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::http::{HeaderMap, HeaderName, Method, StatusCode};
 use axum::response::{Html, IntoResponse, Json};
 use axum::{Router, routing::get};
 use serde_json::json;
@@ -225,6 +227,7 @@ async fn main() {
     );
     state.spawn_cleanup();
     state.spawn_backup();
+    settings_ui::spawn_settings_cleanup(state.settings_sessions.clone());
 
     let mut app = Router::new()
         .route("/mcp/sse", get(sse::handle_sse).post(sse::handle_streamable))
@@ -234,7 +237,17 @@ async fn main() {
         .route("/authorize", get(oauth::handle_authorize).post(oauth::handle_authorize_submit))
         .route("/token", axum::routing::post(oauth::handle_token))
         .route("/register", axum::routing::post(oauth::handle_register))
+        .route(
+            "/settings",
+            get(settings_ui::handle_settings_get).post(settings_ui::handle_settings_post),
+        )
+        .route(
+            "/remember/v1/{resource}/{action}",
+            axum::routing::post(handle_remember_http),
+        )
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }));
+    eprintln!("Remember: HTTP endpoint active at POST /remember/v1/{{resource}}/{{action}}");
+    eprintln!("Settings: UI active at GET/POST /settings");
 
     // Staging upload endpoint for file uploads (50MB limit)
     app = app.route(
@@ -278,6 +291,73 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+/// HTTP handler for /remember/v1/{resource}/{action}. Resolves the caller's
+/// BookStack credentials via the same Bearer-token logic the MCP endpoints use,
+/// then dispatches into the `remember` module.
+async fn handle_remember_http(
+    State(state): State<sse::AppState>,
+    Path((resource, action)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: String,
+) -> impl IntoResponse {
+    let (token_id, token_secret) = match sse::resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+
+    let body_value: serde_json::Value = if body.is_empty() {
+        serde_json::Value::Object(Default::default())
+    } else {
+        match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"ok": false, "error": {"code": "invalid_argument", "message": "request body must be JSON"}})),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    let client = bsmcp_common::bookstack::BookStackClient::new(
+        &state.bookstack_url,
+        &token_id,
+        &token_secret,
+        state.http_client.clone(),
+    );
+
+    let envelope = remember::dispatch(
+        &resource,
+        &action,
+        body_value,
+        &token_id,
+        &client,
+        state.db.clone(),
+        state.semantic.clone(),
+    )
+    .await;
+
+    let status = if envelope.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+        StatusCode::OK
+    } else {
+        // Map error code → HTTP status. Conservative: 400 for client errors, 500 for server.
+        envelope
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(|c| c.as_str())
+            .map(|code| match code {
+                "settings_not_configured" | "invalid_argument" | "unknown_action" => StatusCode::BAD_REQUEST,
+                "not_found" => StatusCode::NOT_FOUND,
+                "semantic_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            })
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+    };
+
+    (status, Json(envelope)).into_response()
 }
 
 /// Webhook handler for BookStack page change events.

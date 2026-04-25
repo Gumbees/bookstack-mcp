@@ -2,9 +2,10 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
+use crate::settings::UserSettings;
 use crate::types::*;
 
-/// Core database operations (auth tokens, backups).
+/// Core database operations (auth tokens, backups, user settings).
 #[async_trait]
 pub trait DbBackend: Send + Sync + 'static {
     /// Atomically insert an access token if under the 10k limit.
@@ -29,6 +30,32 @@ pub trait DbBackend: Send + Sync + 'static {
 
     /// Create a database backup. SQLite: VACUUM INTO. Postgres: no-op (use pg_dump).
     async fn backup(&self, path: &Path) -> Result<(), String>;
+
+    // --- User settings (Hive memory flow config) ---
+
+    /// Load user settings keyed by `token_id_hash` (SHA-256 of raw token_id).
+    /// Returns Ok(None) when no row exists for this user. Default settings are
+    /// applied by the caller (UserSettings::default()) so v1 callers and
+    /// pre-existing users behave identically.
+    async fn get_user_settings(&self, token_id_hash: &str) -> Result<Option<UserSettings>, String>;
+
+    /// Upsert user settings for `token_id_hash`. Replaces the entire row.
+    async fn save_user_settings(&self, token_id_hash: &str, settings: &UserSettings) -> Result<(), String>;
+
+    // --- Remember audit log ---
+
+    /// Insert one audit entry. Failures are logged but do not propagate (audit
+    /// logging is best-effort; never blocks the user-facing call).
+    async fn insert_audit_entry(&self, entry: &AuditEntryInsert) -> Result<i64, String>;
+
+    /// List audit entries for one user, newest first, paginated.
+    async fn list_audit_entries(
+        &self,
+        token_id_hash: &str,
+        limit: i64,
+        offset: i64,
+        since_unix: Option<i64>,
+    ) -> Result<Vec<AuditEntry>, String>;
 }
 
 /// Semantic search database operations.

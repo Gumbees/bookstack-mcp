@@ -1,14 +1,26 @@
 use std::collections::HashMap;
 use std::env;
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 
 use pulldown_cmark::{html, Options, Parser};
 
 use bsmcp_common::bookstack::{self, BookStackClient, ContentType, ExportFormat};
+use bsmcp_common::db::DbBackend;
+use crate::remember;
 use crate::semantic::SemanticState;
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
+
+/// Dependencies the `remember_*` tools need beyond the BookStack client.
+/// Bundled into one struct to keep `handle_request` / `execute_tool` signatures
+/// from sprouting more positional args.
+pub struct RememberDeps {
+    pub db: Arc<dyn DbBackend>,
+    pub semantic: Option<Arc<SemanticState>>,
+    pub token_id: String,
+}
 
 pub async fn handle_request(
     request: &Value,
@@ -16,6 +28,7 @@ pub async fn handle_request(
     semantic: Option<&SemanticState>,
     summary_cache: &crate::summary::SummaryCache,
     staging: &crate::staging::StagingStore,
+    remember_deps: &RememberDeps,
 ) -> Option<Value> {
     let id = request.get("id");
 
@@ -48,7 +61,7 @@ pub async fn handle_request(
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let result = execute_tool(name, &args, client, semantic, staging).await;
+            let result = execute_tool(name, &args, client, semantic, staging, remember_deps).await;
             match result {
                 Ok(text) => Some(json_rpc_result(id, json!({
                     "content": [{ "type": "text", "text": text }],
@@ -79,7 +92,35 @@ fn json_rpc_error(id: Option<&Value>, code: i64, message: &str) -> Value {
     })
 }
 
-async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semantic: Option<&SemanticState>, staging: &crate::staging::StagingStore) -> Result<String, String> {
+async fn execute_tool(
+    name: &str,
+    args: &Value,
+    client: &BookStackClient,
+    semantic: Option<&SemanticState>,
+    staging: &crate::staging::StagingStore,
+    remember_deps: &RememberDeps,
+) -> Result<String, String> {
+    // Remember tools share one dispatch path: tool name = "remember_{resource}",
+    // action carried as an arg. Keeps the MCP tool count manageable.
+    if let Some(resource) = name.strip_prefix("remember_") {
+        let action = arg_str_default(args, "action", "read");
+        let mut body = args.clone();
+        if let Value::Object(ref mut map) = body {
+            map.remove("action");
+        }
+        let envelope = remember::dispatch(
+            resource,
+            &action,
+            body,
+            &remember_deps.token_id,
+            client,
+            remember_deps.db.clone(),
+            remember_deps.semantic.clone(),
+        )
+        .await;
+        return Ok(serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| envelope.to_string()));
+    }
+
     match name {
         // Semantic Search (conditional)
         "semantic_search" => {
@@ -1795,7 +1836,175 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             })));
     }
 
+    // Remember protocol tools — one per resource. The `action` arg picks the
+    // operation (read | write | search | delete depending on resource).
+    // All return the same JSON envelope: { ok, data, meta, error }.
+    add_remember_tools(&mut tools);
+
     tools
+}
+
+fn add_remember_tools(tools: &mut Vec<Value>) {
+    fn remember_tool(resource: &str, description: &str, actions: &[&str], extra_props: Value) -> Value {
+        let mut props = json!({
+            "action": {
+                "type": "string",
+                "enum": actions,
+                "description": "Operation to perform on this resource",
+                "default": actions.first().copied().unwrap_or("read"),
+            }
+        });
+        if let Value::Object(extra) = extra_props {
+            if let Value::Object(ref mut p) = props {
+                for (k, v) in extra { p.insert(k, v); }
+            }
+        }
+        tool(
+            &format!("remember_{resource}"),
+            description,
+            json!({ "type": "object", "properties": props }),
+        )
+    }
+
+    let common_collection_props = json!({
+        "id": { "type": ["integer", "string"], "description": "BookStack page ID (for read/write/delete by id)" },
+        "key": { "type": "string", "description": "Natural key (date YYYY-MM-DD for journals, slug for topics, lowercase name for subagents)" },
+        "body": { "type": "string", "description": "Markdown body for write" },
+        "query": { "type": "string", "description": "Search query for action=search" },
+        "limit": { "type": "integer", "default": 25 },
+        "offset": { "type": "integer", "default": 0 },
+        "reason": { "type": "string", "description": "Optional reason for delete (recorded in tombstone)" },
+        "trace_id": { "type": "string", "description": "Optional correlation ID for the audit log" },
+    });
+
+    // Singletons
+    tools.push(remember_tool(
+        "briefing",
+        "Reconstitution dossier — one structured pull replacing the multi-call AI bootstrap. Returns identity manifest, user identity, recent journals, active topics, semantic matches against the user_prompt, and config metadata.",
+        &["read"],
+        json!({
+            "user_prompt": { "type": "string", "description": "First user message — drives semantic prioritization" },
+            "recent_journal_count": { "type": "integer", "description": "Override the configured recent_journal_count" },
+            "active_collage_count": { "type": "integer", "description": "Override the configured active_collage_count" },
+        }),
+    ));
+
+    tools.push(remember_tool(
+        "whoami",
+        "AI agent identity. read returns the manifest page + subagent list + book/chapter pointers. write replaces the manifest page body (frontmatter auto-stamped).",
+        &["read", "write"],
+        json!({
+            "body": { "type": "string", "description": "New manifest markdown for write" },
+        }),
+    ));
+
+    tools.push(remember_tool(
+        "user",
+        "Human user identity. read returns the user's identity page + journal pointer. write replaces the user identity page body.",
+        &["read", "write"],
+        json!({
+            "body": { "type": "string", "description": "New user identity markdown for write" },
+        }),
+    ));
+
+    tools.push(remember_tool(
+        "config",
+        "Per-user settings (the same object the /settings UI manages). read returns the current settings. write replaces them — pass the full UserSettings object as `settings`.",
+        &["read", "write"],
+        json!({
+            "settings": { "type": "object", "description": "Full UserSettings object for write" },
+        }),
+    ));
+
+    // Collections
+    tools.push(remember_tool(
+        "journal",
+        "AI agent's daily journal entries (book of pages, monthly chapters auto-managed). Key = date YYYY-MM-DD; defaults to today on write if omitted.",
+        &["read", "write", "search", "delete"],
+        common_collection_props.clone(),
+    ));
+
+    tools.push(remember_tool(
+        "collage",
+        "AI agent's active topics. Key = topic slug. Pages live directly in the configured Topics book.",
+        &["read", "write", "search", "delete"],
+        common_collection_props.clone(),
+    ));
+
+    tools.push(remember_tool(
+        "shared_collage",
+        "Cross-agent shared topics. Same shape as collage but a different parent book.",
+        &["read", "write", "search", "delete"],
+        common_collection_props.clone(),
+    ));
+
+    tools.push(remember_tool(
+        "user_journal",
+        "Human user's journal (when configured by the user). Key = date YYYY-MM-DD with monthly chapters auto-managed.",
+        &["read", "write", "search", "delete"],
+        common_collection_props.clone(),
+    ));
+
+    tools.push(remember_tool(
+        "connections",
+        "People and agents the AI has met. Lives as a chapter inside the Identity book. Key = name slug.",
+        &["read", "write", "search", "delete"],
+        common_collection_props.clone(),
+    ));
+
+    tools.push(remember_tool(
+        "opportunities",
+        "Financial / actionable opportunities the AI is tracking. Lives as a chapter inside the Identity book. Key = name slug.",
+        &["read", "write", "search", "delete"],
+        common_collection_props.clone(),
+    ));
+
+    tools.push(remember_tool(
+        "subagent",
+        "Subagent definition pages. Lives as a chapter inside the Identity book. Key = lowercase agent name. The read response includes expected_local_path = agents/{name}.md to guide client-side file sync.",
+        &["read", "write", "delete"],
+        common_collection_props.clone(),
+    ));
+
+    // Activity (append-only)
+    tools.push(remember_tool(
+        "activity",
+        "Append-only feed of conversations, social events, etc. Lives as a chapter inside the Journal book (before the date chapters). Each write creates a new page.",
+        &["read", "write", "search"],
+        json!({
+            "id": { "type": ["integer", "string"], "description": "Page id (for read by id)" },
+            "body": { "type": "string", "description": "Activity entry markdown for write" },
+            "source": { "type": "string", "description": "Optional source tag (e.g., 'moltbook', 'discord', 'conversation')" },
+            "title": { "type": "string", "description": "Optional title suffix appended to the auto-generated page name" },
+            "query": { "type": "string", "description": "Search query for action=search" },
+            "limit": { "type": "integer", "default": 25 },
+            "offset": { "type": "integer", "default": 0 },
+        }),
+    ));
+
+    // Audit (read only)
+    tools.push(remember_tool(
+        "audit",
+        "Read the server-side audit log of every /remember write performed by this user. Always scoped to the calling user.",
+        &["read"],
+        json!({
+            "limit": { "type": "integer", "default": 50 },
+            "offset": { "type": "integer", "default": 0 },
+            "since_unix": { "type": "integer", "description": "Only return entries with occurred_at >= this unix timestamp" },
+        }),
+    ));
+
+    // Cross-resource search
+    tools.push(remember_tool(
+        "search",
+        "Cross-resource semantic + keyword search across multiple Hive scopes (journal, collage, connections, etc.) in one call. Returns results partitioned by scope.",
+        &["read"],
+        json!({
+            "query": { "type": "string", "description": "Search query (required)" },
+            "scopes": { "type": "array", "items": { "type": "string" }, "description": "Resource names to include (e.g., ['journal','collage']). Defaults to all configured." },
+            "limit": { "type": "integer", "default": 10, "description": "Per-scope result cap" },
+        }),
+    ));
 }
 
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {

@@ -12,6 +12,7 @@ use zeroize::Zeroizing;
 
 use bsmcp_common::config::{access_token_ttl, refresh_token_ttl};
 use bsmcp_common::db::{DbBackend, SemanticDb};
+use bsmcp_common::settings::UserSettings;
 use bsmcp_common::types::*;
 use bsmcp_common::vector;
 
@@ -44,6 +45,27 @@ impl SqliteDb {
                  created_at INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_refresh_tokens_created ON refresh_tokens(created_at);
+             CREATE TABLE IF NOT EXISTS user_settings (
+                 token_id_hash TEXT PRIMARY KEY,
+                 settings_json TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS remember_audit (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 token_id_hash TEXT NOT NULL,
+                 ai_identity_ouid TEXT,
+                 user_id TEXT,
+                 resource TEXT NOT NULL,
+                 action TEXT NOT NULL,
+                 target_page_id INTEGER,
+                 target_key TEXT,
+                 success INTEGER NOT NULL,
+                 error TEXT,
+                 trace_id TEXT,
+                 occurred_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_audit_user_time ON remember_audit(token_id_hash, occurred_at DESC);
+             CREATE INDEX IF NOT EXISTS idx_audit_resource_time ON remember_audit(resource, occurred_at DESC);
              DROP TABLE IF EXISTS registrations;",
         )
         .expect("Failed to initialize database schema");
@@ -283,6 +305,119 @@ impl DbBackend for SqliteDb {
             let conn = conn.lock().unwrap();
             conn.execute("DELETE FROM refresh_tokens WHERE token = ?1", params![token_hash]).ok();
             Ok(())
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn get_user_settings(&self, token_id_hash: &str) -> Result<Option<UserSettings>, String> {
+        let conn = self.conn.clone();
+        let token_id_hash = token_id_hash.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Option<UserSettings>, String> {
+            let conn = conn.lock().unwrap();
+            let json: Option<String> = conn.query_row(
+                "SELECT settings_json FROM user_settings WHERE token_id_hash = ?1",
+                params![token_id_hash],
+                |row| row.get(0),
+            ).ok();
+            match json {
+                Some(s) => serde_json::from_str(&s)
+                    .map(Some)
+                    .map_err(|e| format!("user_settings JSON parse: {e}")),
+                None => Ok(None),
+            }
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn save_user_settings(&self, token_id_hash: &str, settings: &UserSettings) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let token_id_hash = token_id_hash.to_string();
+        let json = serde_json::to_string(settings)
+            .map_err(|e| format!("user_settings serialize: {e}"))?;
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO user_settings (token_id_hash, settings_json, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(token_id_hash) DO UPDATE SET
+                    settings_json = excluded.settings_json,
+                    updated_at = excluded.updated_at",
+                params![token_id_hash, json, SqliteDb::now_secs()],
+            ).map_err(|e| format!("save_user_settings: {e}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn insert_audit_entry(&self, entry: &AuditEntryInsert) -> Result<i64, String> {
+        let conn = self.conn.clone();
+        let entry = entry.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO remember_audit
+                    (token_id_hash, ai_identity_ouid, user_id, resource, action,
+                     target_page_id, target_key, success, error, trace_id, occurred_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    entry.token_id_hash,
+                    entry.ai_identity_ouid,
+                    entry.user_id,
+                    entry.resource,
+                    entry.action,
+                    entry.target_page_id,
+                    entry.target_key,
+                    if entry.success { 1 } else { 0 },
+                    entry.error,
+                    entry.trace_id,
+                    SqliteDb::now_secs(),
+                ],
+            ).map_err(|e| format!("insert_audit_entry: {e}"))?;
+            Ok(conn.last_insert_rowid())
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn list_audit_entries(
+        &self,
+        token_id_hash: &str,
+        limit: i64,
+        offset: i64,
+        since_unix: Option<i64>,
+    ) -> Result<Vec<AuditEntry>, String> {
+        let conn = self.conn.clone();
+        let token_id_hash = token_id_hash.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let sql = "SELECT id, token_id_hash, ai_identity_ouid, user_id, resource, action,
+                              target_page_id, target_key, success, error, trace_id, occurred_at
+                       FROM remember_audit
+                       WHERE token_id_hash = ?1 AND occurred_at >= ?2
+                       ORDER BY occurred_at DESC
+                       LIMIT ?3 OFFSET ?4";
+            let mut stmt = conn.prepare(sql).map_err(|e| format!("audit prepare: {e}"))?;
+            let rows = stmt.query_map(
+                params![token_id_hash, since_unix.unwrap_or(0), limit, offset],
+                |row| Ok(AuditEntry {
+                    id: row.get(0)?,
+                    token_id_hash: row.get(1)?,
+                    ai_identity_ouid: row.get(2)?,
+                    user_id: row.get(3)?,
+                    resource: row.get(4)?,
+                    action: row.get(5)?,
+                    target_page_id: row.get(6)?,
+                    target_key: row.get(7)?,
+                    success: { let n: i64 = row.get(8)?; n != 0 },
+                    error: row.get(9)?,
+                    trace_id: row.get(10)?,
+                    occurred_at: row.get(11)?,
+                }),
+            ).map_err(|e| format!("audit query: {e}"))?;
+            Ok(rows.filter_map(|r| r.ok()).collect())
         })
         .await
         .map_err(|e| format!("Task failed: {e}"))?

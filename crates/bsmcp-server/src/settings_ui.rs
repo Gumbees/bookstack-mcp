@@ -433,9 +433,6 @@ pub async fn handle_settings_post(
         provision_log.push(r.human(NamedResource::JournalBook));
         if let Some(id) = r.id() {
             settings.ai_hive_journal_book_id = Some(id);
-            if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
-                provision::lock_to_admin_only(&client, ContentType::Book, id, role).await;
-            }
         }
     }
     if settings.ai_collage_book_id.is_none() && checkbox_on(form.create_ai_collage_book) {
@@ -492,6 +489,15 @@ pub async fn handle_settings_post(
         settings.ai_hive_shelf_id = Some(id);
     }
 
+    // Lock journal books to owner-only — applies to both freshly auto-created
+    // books and previously-existing books the user selected. Idempotent.
+    provision::lock_journal_books_to_owner(
+        &client,
+        settings.ai_hive_journal_book_id,
+        settings.user_journal_book_id,
+    )
+    .await;
+
     // Persist.
     if let Err(e) = state.db.save_global_settings(&globals, &token_id_hash).await {
         eprintln!("Settings: save_global_settings failed: {e}");
@@ -543,11 +549,12 @@ pub async fn handle_settings_probe_post(
     headers: HeaderMap,
     Form(form): Form<ProbeAcceptForm>,
 ) -> Response {
-    let (token_id, _) = match resolve_session(&headers, &state.settings_sessions).await {
+    let (token_id, token_secret) = match resolve_session(&headers, &state.settings_sessions).await {
         Some(c) => c,
         None => return Redirect::to("/authorize?response_type=code&client_id=settings-ui&redirect_uri=/settings&return_to=/settings").into_response(),
     };
     let token_id_hash = hash_token_id(&token_id);
+    let client = BookStackClient::new(&state.bookstack_url, &token_id, &token_secret, state.http_client.clone());
     let mut settings = state.db.get_user_settings(&token_id_hash).await.ok().flatten().unwrap_or_default();
 
     let assign = |checked: Option<String>, id: Option<String>| -> Option<i64> {
@@ -558,6 +565,13 @@ pub async fn handle_settings_probe_post(
     if let Some(v) = assign(form.accept_ai_hive_journal_book_id, form.ai_hive_journal_book_id) { settings.ai_hive_journal_book_id = Some(v); }
     if let Some(v) = assign(form.accept_ai_collage_book_id, form.ai_collage_book_id) { settings.ai_collage_book_id = Some(v); }
     if let Some(v) = assign(form.accept_ai_shared_collage_book_id, form.ai_shared_collage_book_id) { settings.ai_shared_collage_book_id = Some(v); }
+
+    provision::lock_journal_books_to_owner(
+        &client,
+        settings.ai_hive_journal_book_id,
+        settings.user_journal_book_id,
+    )
+    .await;
 
     if let Err(e) = state.db.save_user_settings(&token_id_hash, &settings).await {
         eprintln!("Probe: save failed: {e}");

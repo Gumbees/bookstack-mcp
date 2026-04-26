@@ -275,10 +275,20 @@ pub async fn write_config(ctx: &Context) -> Outcome {
             );
         }
 
-        // Enforce first-write-wins server-side: only fields that are currently
-        // null may be set; pre-existing values are preserved silently.
+        // Two policies merged in one pass:
+        //   - Shelf IDs are STRUCTURAL: first-write-wins. Once set they're
+        //     locked against change because the data hangs off of them and
+        //     swapping a shelf out from under it isn't supported.
+        //   - Org policy/instruction lists and house-identity defaults are
+        //     TUNABLE: admins can update them as policy evolves. The
+        //     proposed value replaces the existing one (no append; the list
+        //     is meant to be small and curated).
+        // A field omitted from `proposed` (None / empty Vec) is left alone —
+        // partial updates work without re-sending the whole struct.
         let existing = ctx.db.get_global_settings().await.unwrap_or_default();
         let mut merged = existing.clone();
+
+        // Shelf IDs — first-write-wins, warn on attempted change.
         if existing.hive_shelf_id.is_none() {
             if let Some(v) = proposed.hive_shelf_id {
                 merged.hive_shelf_id = Some(v);
@@ -302,6 +312,31 @@ pub async fn write_config(ctx: &Context) -> Outcome {
                 "global_locked",
                 "user_journals_shelf_id is already set; ignoring requested change (first-write-wins).",
             ));
+        }
+
+        // Tunable: house-identity defaults. Admins can re-point these.
+        if proposed.default_ai_identity_page_id.is_some() {
+            merged.default_ai_identity_page_id = proposed.default_ai_identity_page_id;
+        }
+        if proposed.default_ai_identity_name.is_some() {
+            merged.default_ai_identity_name = proposed.default_ai_identity_name.clone();
+        }
+        if proposed.default_ai_identity_ouid.is_some() {
+            merged.default_ai_identity_ouid = proposed.default_ai_identity_ouid.clone();
+        }
+
+        // Tunable: org-mandated instruction / policy page lists. A non-empty
+        // proposed list replaces the current one. To clear, callers can write
+        // a new empty list explicitly via the dedicated `clear_*` flags in a
+        // future API; for now an empty list is treated as "unchanged" so a
+        // partial update (e.g., changing only shelf IDs) doesn't wipe them.
+        if !proposed.org_required_instructions_page_ids.is_empty() {
+            merged.org_required_instructions_page_ids =
+                proposed.org_required_instructions_page_ids.clone();
+        }
+        if !proposed.org_ai_usage_policy_page_ids.is_empty() {
+            merged.org_ai_usage_policy_page_ids =
+                proposed.org_ai_usage_policy_page_ids.clone();
         }
 
         if let Err(e) = ctx.db.save_global_settings(&merged, &ctx.token_id_hash).await {

@@ -62,9 +62,19 @@ pub async fn read(ctx: &Context) -> Outcome {
     );
 
     // Semantic search fan-out — one per configured target.
-    let prompt_for_semantic = user_prompt.clone();
+    //
+    // The query string we send to `sem.search` is the user's prompt prefixed
+    // with a `[Context: ...]` block carrying current time, timezone, user
+    // identity, and AI identity. Both halves of hybrid search benefit:
+    //   - Embedding side: the query vector is enriched with date / user
+    //     signal so prompts like "what was I working on yesterday" can match
+    //     pages dated relative to *today*, not relative to whenever the
+    //     embedding model was trained.
+    //   - Keyword side: the user_id and identity name appear in pages that
+    //     mention the same person, biasing relevance toward their content.
+    let prompt_for_semantic = build_semantic_query(&user_prompt, ctx);
     let semantic_fut = async {
-        if prompt_for_semantic.is_empty() {
+        if user_prompt.is_empty() {
             return SemanticSlice::default();
         }
         let Some(sem) = &ctx.semantic else {
@@ -244,9 +254,38 @@ pub async fn read(ctx: &Context) -> Outcome {
     }))
 }
 
+/// Build the semantic-search query string by prefixing the user's prompt
+/// with a `[Context: ...]` block carrying current time, timezone, user
+/// identity, and AI identity. The whole string is used for both vector
+/// embedding and the hybrid keyword pass.
+fn build_semantic_query(user_prompt: &str, ctx: &Context) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(format!("time={}", frontmatter::now_iso_utc()));
+    if let Some(tz) = &ctx.settings.timezone {
+        parts.push(format!("tz={tz}"));
+    }
+    if let Some(uid) = &ctx.settings.user_id {
+        parts.push(format!("user={uid}"));
+    }
+    if let Some(name) = &ctx.settings.ai_identity_name {
+        parts.push(format!("ai={name}"));
+    }
+    if parts.is_empty() {
+        user_prompt.to_string()
+    } else {
+        format!("[Context: {}]\n{}", parts.join(", "), user_prompt)
+    }
+}
+
 /// Fetch the markdown for every page in `page_ids` concurrently. Each result
 /// is tagged with the given `source` so the AI knows where the content came
 /// from (`user`, `org_instructions`, or `org_policy`).
+///
+/// **Invariant: no truncation.** System prompts and org policies are
+/// load-bearing — every word matters. The body returned here is the full
+/// page markdown with only the leading YAML frontmatter (provenance metadata)
+/// stripped. Do not add length caps, summarization, or chunking. If the body
+/// is too large for some downstream consumer, fix the consumer.
 async fn fetch_pages_with_source(
     client: &BookStackClient,
     page_ids: &[i64],

@@ -1963,43 +1963,6 @@ fn add_remember_tools(tools: &mut Vec<Value>) {
         common_collection_props.clone(),
     ));
 
-    tools.push(remember_tool(
-        "connections",
-        "People and agents the AI has met. Lives as a chapter inside the Identity book. Key = name slug.",
-        &["read", "write", "search", "delete"],
-        common_collection_props.clone(),
-    ));
-
-    tools.push(remember_tool(
-        "opportunities",
-        "Financial / actionable opportunities the AI is tracking. Lives as a chapter inside the Identity book. Key = name slug.",
-        &["read", "write", "search", "delete"],
-        common_collection_props.clone(),
-    ));
-
-    tools.push(remember_tool(
-        "subagent",
-        "Subagent definition pages. Lives as a chapter inside the Identity book. Key = lowercase agent name. The read response includes expected_local_path = agents/{name}.md to guide client-side file sync.",
-        &["read", "write", "delete"],
-        common_collection_props.clone(),
-    ));
-
-    // Activity (append-only)
-    tools.push(remember_tool(
-        "activity",
-        "Append-only feed of conversations, social events, etc. Lives as a chapter inside the Journal book (before the date chapters). Each write creates a new page.",
-        &["read", "write", "search"],
-        json!({
-            "id": { "type": ["integer", "string"], "description": "Page id (for read by id)" },
-            "body": { "type": "string", "description": "Activity entry markdown for write" },
-            "source": { "type": "string", "description": "Optional source tag (e.g., 'moltbook', 'discord', 'conversation')" },
-            "title": { "type": "string", "description": "Optional title suffix appended to the auto-generated page name" },
-            "query": { "type": "string", "description": "Search query for action=search" },
-            "limit": { "type": "integer", "default": 25 },
-            "offset": { "type": "integer", "default": 0 },
-        }),
-    ));
-
     // Audit (read only)
     tools.push(remember_tool(
         "audit",
@@ -2015,7 +1978,7 @@ fn add_remember_tools(tools: &mut Vec<Value>) {
     // Cross-resource search
     tools.push(remember_tool(
         "search",
-        "Cross-resource semantic + keyword search across multiple Hive scopes (journal, collage, connections, etc.) in one call. Returns results partitioned by scope.",
+        "Cross-resource semantic + keyword search across multiple Hive scopes (journal, collage, shared_collage, user_journal) in one call. Returns results partitioned by scope.",
         &["read"],
         json!({
             "query": { "type": "string", "description": "Search query (required)" },
@@ -2027,7 +1990,7 @@ fn add_remember_tools(tools: &mut Vec<Value>) {
     // Identity discovery + creation
     tools.push(remember_tool(
         "identity",
-        "List or create AI identities under the global Hive shelf. action=list enumerates existing identities (book + manifest page + OUID per agent). action=create scaffolds a new Identity book + manifest page from a prompt template, optionally provisioning the standard chapter set (Subagents, Connections, Opportunities).",
+        "List or create AI identities under the global Hive shelf. action=list enumerates existing identities (book + manifest page + OUID per agent). action=create scaffolds a new Identity book + manifest page from a prompt template.",
         &["list", "create"],
         json!({
             "name": { "type": "string", "description": "Display name for the new agent (e.g., 'Pia')" },
@@ -2038,7 +2001,6 @@ fn add_remember_tools(tools: &mut Vec<Value>) {
                 "type": "object",
                 "description": "Free-form details merged into the default template (role, focus_areas, voice, notes, etc.)",
             },
-            "auto_provision_chapters": { "type": "boolean", "default": true, "description": "Also create Subagents/Connections/Opportunities chapters in the new book" },
         }),
     ));
 

@@ -31,8 +31,7 @@ pub struct UserSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_identity_ouid: Option<String>,
 
-    /// BookStack book ID for the AI's Identity book. Container for the manifest page
-    /// plus the Connections, Opportunities, and Subagents chapters.
+    /// BookStack book ID for the AI's Identity book. Container for the manifest page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_identity_book_id: Option<i64>,
 
@@ -43,18 +42,6 @@ pub struct UserSettings {
     /// Optional friendly name for the AI agent (defaults to the manifest page name if unset).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_identity_name: Option<String>,
-
-    /// BookStack chapter ID containing subagent definition pages (inside Identity book).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ai_subagents_chapter_id: Option<i64>,
-
-    /// BookStack chapter ID containing connection pages (people/agents met). Inside Identity book.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ai_connections_chapter_id: Option<i64>,
-
-    /// BookStack chapter ID containing opportunity pages. Inside Identity book.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ai_opportunities_chapter_id: Option<i64>,
 
     /// BookStack shelf ID containing the AI's Hive (informational; surfaced in config).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -71,12 +58,6 @@ pub struct UserSettings {
     /// BookStack book ID for the AI's journal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_hive_journal_book_id: Option<i64>,
-
-    /// BookStack chapter ID for the activity feed — sits inside the Journal book,
-    /// listed *before* the YYYY-MM date chapters. Conversations, social events,
-    /// and other append-only activity entries land here.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ai_activity_chapter_id: Option<i64>,
 
     // --- User identity ---
 

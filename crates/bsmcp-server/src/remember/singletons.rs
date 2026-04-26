@@ -33,20 +33,6 @@ pub async fn read_whoami(ctx: &Context) -> Outcome {
         Err(e) => return Outcome::error(ErrorCode::NotFound, e, Some("ai_identity_page_id")),
     };
 
-    // Subagent listing (if chapter configured) — best-effort, runs after the manifest
-    // because we need it to assemble the full whoami picture.
-    let subagents = if let Some(chapter_id) = ctx.settings.ai_subagents_chapter_id {
-        match list_pages_in_chapter(chapter_id, ctx).await {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("Remember: subagent list failed (non-fatal): {e}");
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
-
     let raw_md = page.get("markdown").and_then(|v| v.as_str()).unwrap_or("");
     let body = frontmatter::strip(raw_md).to_string();
 
@@ -64,18 +50,10 @@ pub async fn read_whoami(ctx: &Context) -> Outcome {
         },
         "shelf_id": ctx.settings.ai_hive_shelf_id,
         "identity_book_id": ctx.settings.ai_identity_book_id,
-        "subagents_chapter_id": ctx.settings.ai_subagents_chapter_id,
-        "subagents": subagents,
         "books": {
             "journal": ctx.settings.ai_hive_journal_book_id,
             "collage": ctx.settings.ai_collage_book_id,
             "shared_collage": ctx.settings.ai_shared_collage_book_id,
-        },
-        "chapters": {
-            "subagents": ctx.settings.ai_subagents_chapter_id,
-            "connections": ctx.settings.ai_connections_chapter_id,
-            "opportunities": ctx.settings.ai_opportunities_chapter_id,
-            "activity": ctx.settings.ai_activity_chapter_id,
         },
     }))
 }
@@ -363,28 +341,3 @@ pub async fn dismiss_setup_nudge(ctx: &Context) -> Outcome {
     }))
 }
 
-// --- helpers ---
-
-pub(super) async fn list_pages_in_chapter(
-    chapter_id: i64,
-    ctx: &Context,
-) -> Result<Vec<Value>, String> {
-    let query = format!("{{type:page}} {{in_chapter:{chapter_id}}}");
-    let resp = ctx.client.search(&query, 1, 200).await?;
-    let data = resp.get("data").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    let pages: Vec<Value> = data
-        .into_iter()
-        .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("page"))
-        .map(|item| {
-            let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
-            json!({
-                "id": item.get("id").cloned().unwrap_or(Value::Null),
-                "name": name.clone(),
-                "expected_local_path": format!("agents/{}.md", super::frontmatter::slugify(&name)),
-                "url": item.get("url").cloned().unwrap_or(Value::Null),
-                "updated_at": item.get("updated_at").cloned().unwrap_or(Value::Null),
-            })
-        })
-        .collect();
-    Ok(pages)
-}

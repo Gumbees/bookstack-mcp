@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use bsmcp_common::bookstack::BookStackClient;
 
 use super::envelope::ErrorCode;
-use super::{frontmatter, singletons, Context, Outcome};
+use super::{frontmatter, Context, Outcome};
 
 pub async fn read(ctx: &Context) -> Outcome {
     let user_prompt = ctx.body_str("user_prompt").unwrap_or_default();
@@ -35,15 +35,6 @@ pub async fn read(ctx: &Context) -> Outcome {
     // Identity manifest (page) + user manifest (page) — fetch in parallel.
     let identity_fut = fetch_optional_page(&ctx.client, resolved.page_id);
     let user_fut = fetch_optional_page(&ctx.client, ctx.settings.user_identity_page_id);
-
-    // Subagents (chapter listing).
-    let subagents_fut = async {
-        if let Some(chapter_id) = ctx.settings.ai_subagents_chapter_id {
-            singletons::list_pages_in_chapter(chapter_id, ctx).await.unwrap_or_default()
-        } else {
-            Vec::new()
-        }
-    };
 
     // Recent journals (newest pages in the journal book).
     let recent_journals_fut = list_recent_pages(
@@ -125,10 +116,9 @@ pub async fn read(ctx: &Context) -> Outcome {
         "org_policy",
     );
 
-    let (identity, user_page, subagents, recent_journals, active_collage, shared_collage, semantic, user_pages, org_instructions, org_policy) = tokio::join!(
+    let (identity, user_page, recent_journals, active_collage, shared_collage, semantic, user_pages, org_instructions, org_policy) = tokio::join!(
         identity_fut,
         user_fut,
-        subagents_fut,
         recent_journals_fut,
         active_collage_fut,
         shared_collage_fut,
@@ -222,7 +212,6 @@ pub async fn read(ctx: &Context) -> Outcome {
                 "identity_page": Value::Null,
             }),
         },
-        "subagents": subagents,
         "journal_recent": recent_journals,
         "journal_semantic_matches": semantic.journal_matches,
         "collage_active": active_collage,

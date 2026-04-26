@@ -62,15 +62,10 @@ pub async fn read(ctx: &Context) -> Outcome {
     };
 
     let mut by_scope: HashMap<String, Vec<Value>> = HashMap::new();
-    for (scope_name, target) in &scope_targets {
+    for (scope_name, book_id) in &scope_targets {
         let filtered: Vec<Value> = raw_hits
             .iter()
-            .filter(|h| match target {
-                ScopeTarget::Book(id) => h.get("book_id").and_then(|v| v.as_i64()) == Some(*id),
-                ScopeTarget::Chapter(id) => {
-                    h.get("chapter_id").and_then(|v| v.as_i64()) == Some(*id)
-                }
-            })
+            .filter(|h| h.get("book_id").and_then(|v| v.as_i64()) == Some(*book_id))
             .take(limit)
             .cloned()
             .collect();
@@ -78,11 +73,8 @@ pub async fn read(ctx: &Context) -> Outcome {
     }
 
     // Run keyword search per-scope to augment when semantic is empty.
-    for (scope_name, target) in &scope_targets {
-        let filter = match target {
-            ScopeTarget::Book(id) => format!("{{in_book:{id}}}"),
-            ScopeTarget::Chapter(id) => format!("{{in_chapter:{id}}}"),
-        };
+    for (scope_name, book_id) in &scope_targets {
+        let filter = format!("{{in_book:{book_id}}}");
         let q = format!("{query} {{type:page}} {filter}");
         let kw = match ctx.client.search(&q, 1, limit as i64).await {
             Ok(v) => v.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default(),
@@ -121,29 +113,19 @@ pub async fn read(ctx: &Context) -> Outcome {
     outcome
 }
 
-#[derive(Clone, Copy)]
-enum ScopeTarget {
-    Book(i64),
-    Chapter(i64),
-}
-
-fn collect_scope_targets(scopes: &[String], ctx: &Context) -> Vec<(String, ScopeTarget)> {
+fn collect_scope_targets(scopes: &[String], ctx: &Context) -> Vec<(String, i64)> {
     let s = &ctx.settings;
     let mut out = Vec::new();
     for scope in scopes {
-        let target = match scope.as_str() {
-            "journal" => s.ai_hive_journal_book_id.map(ScopeTarget::Book),
-            "collage" => s.ai_collage_book_id.map(ScopeTarget::Book),
-            "shared_collage" => s.ai_shared_collage_book_id.map(ScopeTarget::Book),
-            "user_journal" => s.user_journal_book_id.map(ScopeTarget::Book),
-            "connections" => s.ai_connections_chapter_id.map(ScopeTarget::Chapter),
-            "opportunities" => s.ai_opportunities_chapter_id.map(ScopeTarget::Chapter),
-            "subagent" => s.ai_subagents_chapter_id.map(ScopeTarget::Chapter),
-            "activity" => s.ai_activity_chapter_id.map(ScopeTarget::Chapter),
+        let book_id = match scope.as_str() {
+            "journal" => s.ai_hive_journal_book_id,
+            "collage" => s.ai_collage_book_id,
+            "shared_collage" => s.ai_shared_collage_book_id,
+            "user_journal" => s.user_journal_book_id,
             _ => None,
         };
-        if let Some(t) = target {
-            out.push((scope.clone(), t));
+        if let Some(id) = book_id {
+            out.push((scope.clone(), id));
         }
     }
     out
@@ -155,8 +137,5 @@ fn default_scopes() -> Vec<String> {
         "collage".into(),
         "shared_collage".into(),
         "user_journal".into(),
-        "connections".into(),
-        "opportunities".into(),
-        "activity".into(),
     ]
 }

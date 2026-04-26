@@ -104,24 +104,6 @@ pub async fn create_book(
     }
 }
 
-/// Create a chapter inside a book.
-pub async fn create_chapter(
-    client: &BookStackClient,
-    resource: NamedResource,
-    parent_book_id: i64,
-) -> ProvisionResult {
-    match client.create_chapter(parent_book_id, resource.default_name(), resource.default_description()).await {
-        Ok(v) => match v.get("id").and_then(|i| i.as_i64()) {
-            Some(id) => ProvisionResult::Created {
-                id,
-                name: resource.default_name().to_string(),
-            },
-            None => ProvisionResult::Failed { reason: "create_chapter returned no id".to_string() },
-        },
-        Err(e) => classify_error(&e),
-    }
-}
-
 /// Lock a piece of Hive content (shelf/book/chapter/page) so only the Admin
 /// role plus the page owner can edit it; everyone else gets read-only.
 ///

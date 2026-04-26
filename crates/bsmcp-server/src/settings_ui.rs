@@ -164,19 +164,17 @@ pub async fn handle_settings_get(
         state.http_client.clone(),
     );
 
-    let (shelves_res, books_res, chapters_res, admin_res) = tokio::join!(
+    let (shelves_res, books_res, admin_res) = tokio::join!(
         client.list_shelves(500, 0),
         client.list_books(500, 0),
-        client.list_chapters(500, 0),
         client.is_admin(),
     );
 
     let shelves = extract_named_list(shelves_res.ok().as_ref());
     let books = extract_named_list(books_res.ok().as_ref());
-    let chapters = extract_named_list(chapters_res.ok().as_ref());
     let is_admin = admin_res.unwrap_or(false);
 
-    Html(render_settings_page(&settings, &globals, &shelves, &books, &chapters, is_admin)).into_response()
+    Html(render_settings_page(&settings, &globals, &shelves, &books, is_admin)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -187,14 +185,10 @@ pub struct SettingsForm {
     pub ai_identity_book_id: Option<String>,
     pub ai_identity_page_id: Option<String>,
     pub ai_identity_name: Option<String>,
-    pub ai_subagents_chapter_id: Option<String>,
-    pub ai_connections_chapter_id: Option<String>,
-    pub ai_opportunities_chapter_id: Option<String>,
     pub ai_hive_shelf_id: Option<String>,
     pub ai_collage_book_id: Option<String>,
     pub ai_shared_collage_book_id: Option<String>,
     pub ai_hive_journal_book_id: Option<String>,
-    pub ai_activity_chapter_id: Option<String>,
     pub user_id: Option<String>,
     pub user_identity_page_id: Option<String>,
     pub user_journal_book_id: Option<String>,
@@ -220,10 +214,6 @@ pub struct SettingsForm {
     pub create_ai_collage_book: Option<String>,
     pub create_ai_shared_collage_book: Option<String>,
     pub create_user_journal_book: Option<String>,
-    pub create_ai_subagents_chapter: Option<String>,
-    pub create_ai_connections_chapter: Option<String>,
-    pub create_ai_opportunities_chapter: Option<String>,
-    pub create_ai_activity_chapter: Option<String>,
 
     // Org-default AI identity (admins only).
     pub default_ai_identity_page_id: Option<String>,
@@ -285,14 +275,10 @@ pub async fn handle_settings_post(
         ai_identity_book_id: parse_id(form.ai_identity_book_id),
         ai_identity_page_id: parse_id(form.ai_identity_page_id),
         ai_identity_name: empty_to_none(form.ai_identity_name),
-        ai_subagents_chapter_id: parse_id(form.ai_subagents_chapter_id),
-        ai_connections_chapter_id: parse_id(form.ai_connections_chapter_id),
-        ai_opportunities_chapter_id: parse_id(form.ai_opportunities_chapter_id),
         ai_hive_shelf_id: parse_id(form.ai_hive_shelf_id),
         ai_collage_book_id: parse_id(form.ai_collage_book_id),
         ai_shared_collage_book_id: parse_id(form.ai_shared_collage_book_id),
         ai_hive_journal_book_id: parse_id(form.ai_hive_journal_book_id),
-        ai_activity_chapter_id: parse_id(form.ai_activity_chapter_id),
         user_id: empty_to_none(form.user_id.clone()),
         user_identity_page_id: parse_id(form.user_identity_page_id),
         user_journal_book_id: parse_id(form.user_journal_book_id),
@@ -500,53 +486,6 @@ pub async fn handle_settings_post(
         }
     }
 
-    // Chapters inside the Identity book.
-    if let Some(book_id) = settings.ai_identity_book_id {
-        if settings.ai_subagents_chapter_id.is_none() && checkbox_on(form.create_ai_subagents_chapter) {
-            let r = provision::create_chapter(&client, NamedResource::SubagentsChapter, book_id).await;
-            provision_log.push(r.human(NamedResource::SubagentsChapter));
-            if let Some(id) = r.id() {
-                settings.ai_subagents_chapter_id = Some(id);
-                if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
-                    provision::lock_to_admin_only(&client, ContentType::Chapter, id, role).await;
-                }
-            }
-        }
-        if settings.ai_connections_chapter_id.is_none() && checkbox_on(form.create_ai_connections_chapter) {
-            let r = provision::create_chapter(&client, NamedResource::ConnectionsChapter, book_id).await;
-            provision_log.push(r.human(NamedResource::ConnectionsChapter));
-            if let Some(id) = r.id() {
-                settings.ai_connections_chapter_id = Some(id);
-                if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
-                    provision::lock_to_admin_only(&client, ContentType::Chapter, id, role).await;
-                }
-            }
-        }
-        if settings.ai_opportunities_chapter_id.is_none() && checkbox_on(form.create_ai_opportunities_chapter) {
-            let r = provision::create_chapter(&client, NamedResource::OpportunitiesChapter, book_id).await;
-            provision_log.push(r.human(NamedResource::OpportunitiesChapter));
-            if let Some(id) = r.id() {
-                settings.ai_opportunities_chapter_id = Some(id);
-                if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
-                    provision::lock_to_admin_only(&client, ContentType::Chapter, id, role).await;
-                }
-            }
-        }
-    }
-    // Activity chapter inside the Journal book.
-    if let Some(journal_book_id) = settings.ai_hive_journal_book_id {
-        if settings.ai_activity_chapter_id.is_none() && checkbox_on(form.create_ai_activity_chapter) {
-            let r = provision::create_chapter(&client, NamedResource::ActivityChapter, journal_book_id).await;
-            provision_log.push(r.human(NamedResource::ActivityChapter));
-            if let Some(id) = r.id() {
-                settings.ai_activity_chapter_id = Some(id);
-                if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
-                    provision::lock_to_admin_only(&client, ContentType::Chapter, id, role).await;
-                }
-            }
-        }
-    }
-
     // Mirror the global hive_shelf_id into the per-user setting so existing
     // briefing code paths that read `settings.ai_hive_shelf_id` still work.
     if let Some(id) = globals.hive_shelf_id {
@@ -619,10 +558,6 @@ pub async fn handle_settings_probe_post(
     if let Some(v) = assign(form.accept_ai_hive_journal_book_id, form.ai_hive_journal_book_id) { settings.ai_hive_journal_book_id = Some(v); }
     if let Some(v) = assign(form.accept_ai_collage_book_id, form.ai_collage_book_id) { settings.ai_collage_book_id = Some(v); }
     if let Some(v) = assign(form.accept_ai_shared_collage_book_id, form.ai_shared_collage_book_id) { settings.ai_shared_collage_book_id = Some(v); }
-    if let Some(v) = assign(form.accept_ai_subagents_chapter_id, form.ai_subagents_chapter_id) { settings.ai_subagents_chapter_id = Some(v); }
-    if let Some(v) = assign(form.accept_ai_connections_chapter_id, form.ai_connections_chapter_id) { settings.ai_connections_chapter_id = Some(v); }
-    if let Some(v) = assign(form.accept_ai_opportunities_chapter_id, form.ai_opportunities_chapter_id) { settings.ai_opportunities_chapter_id = Some(v); }
-    if let Some(v) = assign(form.accept_ai_activity_chapter_id, form.ai_activity_chapter_id) { settings.ai_activity_chapter_id = Some(v); }
 
     if let Err(e) = state.db.save_user_settings(&token_id_hash, &settings).await {
         eprintln!("Probe: save failed: {e}");
@@ -643,14 +578,6 @@ pub struct ProbeAcceptForm {
     pub ai_collage_book_id: Option<String>,
     pub accept_ai_shared_collage_book_id: Option<String>,
     pub ai_shared_collage_book_id: Option<String>,
-    pub accept_ai_subagents_chapter_id: Option<String>,
-    pub ai_subagents_chapter_id: Option<String>,
-    pub accept_ai_connections_chapter_id: Option<String>,
-    pub ai_connections_chapter_id: Option<String>,
-    pub accept_ai_opportunities_chapter_id: Option<String>,
-    pub ai_opportunities_chapter_id: Option<String>,
-    pub accept_ai_activity_chapter_id: Option<String>,
-    pub ai_activity_chapter_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -660,10 +587,6 @@ struct ProbeMatches {
     journal_book: Option<NamedItem>,
     collage_book: Option<NamedItem>,
     shared_collage_book: Option<NamedItem>,
-    subagents_chapter: Option<NamedItem>,
-    connections_chapter: Option<NamedItem>,
-    opportunities_chapter: Option<NamedItem>,
-    activity_chapter: Option<NamedItem>,
 }
 
 async fn probe_hive(client: &BookStackClient, hive_shelf_id: i64) -> Result<ProbeMatches, String> {
@@ -686,7 +609,7 @@ async fn probe_hive(client: &BookStackClient, hive_shelf_id: i64) -> Result<Prob
     out.collage_book = books_on_shelf.iter().find(|b| NamedResource::CollageBook.matches(&b.name)).cloned();
     out.shared_collage_book = books_on_shelf.iter().find(|b| NamedResource::SharedCollageBook.matches(&b.name)).cloned();
 
-    // Identity manifest page + chapters inside the Identity book
+    // Identity manifest page inside the Identity book
     if let Some(ref ib) = out.identity_book {
         let q = format!("{{type:page}} {{in_book:{}}}", ib.id);
         if let Ok(resp) = client.search(&q, 1, 100).await {
@@ -701,35 +624,6 @@ async fn probe_hive(client: &BookStackClient, hive_shelf_id: i64) -> Result<Prob
                     None
                 }
             });
-        }
-        let cq = format!("{{type:chapter}} {{in_book:{}}}", ib.id);
-        if let Ok(resp) = client.search(&cq, 1, 100).await {
-            let chapters = resp.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default();
-            for c in chapters.iter() {
-                if c.get("type").and_then(|t| t.as_str()) != Some("chapter") { continue; }
-                let id = match c.get("id").and_then(|i| i.as_i64()) { Some(v) => v, None => continue };
-                let name = c.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
-                let item = NamedItem { id, name: name.clone() };
-                if NamedResource::SubagentsChapter.matches(&name) { out.subagents_chapter = Some(item.clone()); }
-                if NamedResource::ConnectionsChapter.matches(&name) { out.connections_chapter = Some(item.clone()); }
-                if NamedResource::OpportunitiesChapter.matches(&name) { out.opportunities_chapter = Some(item.clone()); }
-            }
-        }
-    }
-    // Activity chapter inside the Journal book
-    if let Some(ref jb) = out.journal_book {
-        let cq = format!("{{type:chapter}} {{in_book:{}}}", jb.id);
-        if let Ok(resp) = client.search(&cq, 1, 100).await {
-            let chapters = resp.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default();
-            for c in chapters {
-                if c.get("type").and_then(|t| t.as_str()) != Some("chapter") { continue; }
-                let id = match c.get("id").and_then(|i| i.as_i64()) { Some(v) => v, None => continue };
-                let name = c.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
-                if NamedResource::ActivityChapter.matches(&name) {
-                    out.activity_chapter = Some(NamedItem { id, name });
-                    break;
-                }
-            }
         }
     }
 
@@ -781,7 +675,7 @@ code{{background:#0f1a30;padding:.1rem .3rem;border-radius:3px;}}
 <form method="POST" action="/settings/probe">
 <div class="card">
 <table>
-{r1}{r2}{r3}{r4}{r5}{r6}{r7}{r8}{r9}
+{r1}{r2}{r3}{r4}{r5}
 </table>
 </div>
 <button type="submit">Apply selected</button>
@@ -794,10 +688,6 @@ code{{background:#0f1a30;padding:.1rem .3rem;border-radius:3px;}}
         r3 = row("ai_hive_journal_book_id", "Journal book", &m.journal_book),
         r4 = row("ai_collage_book_id", "Topics / Collage book", &m.collage_book),
         r5 = row("ai_shared_collage_book_id", "Shared collage book", &m.shared_collage_book),
-        r6 = row("ai_subagents_chapter_id", "Subagents chapter", &m.subagents_chapter),
-        r7 = row("ai_connections_chapter_id", "Connections chapter", &m.connections_chapter),
-        r8 = row("ai_opportunities_chapter_id", "Opportunities chapter", &m.opportunities_chapter),
-        r9 = row("ai_activity_chapter_id", "Activity chapter", &m.activity_chapter),
     )
 }
 
@@ -875,7 +765,6 @@ fn render_settings_page(
     g: &GlobalSettings,
     shelves: &[NamedItem],
     books: &[NamedItem],
-    chapters: &[NamedItem],
     is_admin: bool,
 ) -> String {
     let css = r#"
@@ -998,30 +887,13 @@ a.reauth:hover { color: #cbd5e1; text-decoration: underline; }
 <div class="field">
   <label for="ai_identity_book_id">Identity book</label>
   {ai_identity_book_select}
-  <div class="hint">Container for the manifest page + Connections / Opportunities / Subagents chapters.</div>
+  <div class="hint">Container for the manifest page.</div>
 </div>
 </div>
 <div class="field">
   <label for="ai_identity_page_id">Identity manifest page ID</label>
   {ai_page_input}
   <div class="hint">The page (inside the Identity book) that defines who the AI is.</div>
-</div>
-<p class="subtitle" style="margin: 1rem 0 0.5rem;">Chapters inside the Identity book — leave blank if not used:</p>
-<div class="row2">
-<div class="field">
-  <label for="ai_subagents_chapter_id">Subagents chapter</label>
-  {ai_subagents_select}
-</div>
-<div class="field">
-  <label for="ai_connections_chapter_id">Connections chapter</label>
-  {ai_connections_select}
-  <div class="hint">People and agents the AI has met.</div>
-</div>
-</div>
-<div class="field">
-  <label for="ai_opportunities_chapter_id">Opportunities chapter</label>
-  {ai_opportunities_select}
-  <div class="hint">Financial / actionable items the AI tracks.</div>
 </div>
 </div>
 
@@ -1034,21 +906,14 @@ a.reauth:hover { color: #cbd5e1; text-decoration: underline; }
   <div class="hint">Daily entries organized by YYYY-MM chapters.</div>
 </div>
 <div class="field">
-  <label for="ai_activity_chapter_id">Activity chapter (in Journal book)</label>
-  {ai_activity_select}
-  <div class="hint">Sits before the date chapters. Conversations, social events, etc.</div>
-</div>
-</div>
-<div class="row2">
-<div class="field">
   <label for="ai_collage_book_id">Topics / Collage book</label>
   {ai_collage_select}
+</div>
 </div>
 <div class="field">
   <label for="ai_shared_collage_book_id">Shared collage book (optional)</label>
   {ai_shared_collage_select}
   <div class="hint">Cross-agent shared topics.</div>
-</div>
 </div>
 </div>
 
@@ -1109,10 +974,6 @@ a.reauth:hover { color: #cbd5e1; text-decoration: underline; }
 {create_ai_collage_book_cb}
 {create_ai_shared_collage_book_cb}
 {create_user_journal_book_cb}
-{create_ai_subagents_chapter_cb}
-{create_ai_connections_chapter_cb}
-{create_ai_opportunities_chapter_cb}
-{create_ai_activity_chapter_cb}
 </div>
 
 <div class="actions">
@@ -1132,14 +993,10 @@ a.reauth:hover { color: #cbd5e1; text-decoration: underline; }
         ai_ouid_input = render_text("ai_identity_ouid", s.ai_identity_ouid.as_deref(), "019dc66e4dd87ea080ebf5d5e2985d91"),
         ai_page_input = render_id_input("ai_identity_page_id", s.ai_identity_page_id),
         ai_shelf_select = render_select("ai_hive_shelf_id", shelves, s.ai_hive_shelf_id, true),
-        ai_subagents_select = render_select("ai_subagents_chapter_id", chapters, s.ai_subagents_chapter_id, true),
         ai_journal_select = render_select("ai_hive_journal_book_id", books, s.ai_hive_journal_book_id, true),
         ai_collage_select = render_select("ai_collage_book_id", books, s.ai_collage_book_id, true),
         ai_shared_collage_select = render_select("ai_shared_collage_book_id", books, s.ai_shared_collage_book_id, true),
         ai_identity_book_select = render_select("ai_identity_book_id", books, s.ai_identity_book_id, true),
-        ai_connections_select = render_select("ai_connections_chapter_id", chapters, s.ai_connections_chapter_id, true),
-        ai_opportunities_select = render_select("ai_opportunities_chapter_id", chapters, s.ai_opportunities_chapter_id, true),
-        ai_activity_select = render_select("ai_activity_chapter_id", chapters, s.ai_activity_chapter_id, true),
         user_id_input = render_text("user_id", s.user_id.as_deref(), "you@example.com"),
         user_page_input = render_id_input("user_identity_page_id", s.user_identity_page_id),
         user_journal_select = render_select("user_journal_book_id", books, s.user_journal_book_id, true),
@@ -1187,10 +1044,6 @@ a.reauth:hover { color: #cbd5e1; text-decoration: underline; }
         create_ai_collage_book_cb = create_row("create_ai_collage_book", "Create Topics / Collage book under the Hive shelf if blank above", s.ai_collage_book_id.is_some()),
         create_ai_shared_collage_book_cb = create_row("create_ai_shared_collage_book", "Create Shared Topics book under the Hive shelf if blank above", s.ai_shared_collage_book_id.is_some()),
         create_user_journal_book_cb = create_row("create_user_journal_book", "Create your personal journal book under the User Journals shelf if blank above", s.user_journal_book_id.is_some()),
-        create_ai_subagents_chapter_cb = create_row("create_ai_subagents_chapter", "Create Subagents chapter inside the Identity book if blank above", s.ai_subagents_chapter_id.is_some()),
-        create_ai_connections_chapter_cb = create_row("create_ai_connections_chapter", "Create Connections chapter inside the Identity book if blank above", s.ai_connections_chapter_id.is_some()),
-        create_ai_opportunities_chapter_cb = create_row("create_ai_opportunities_chapter", "Create Opportunities chapter inside the Identity book if blank above", s.ai_opportunities_chapter_id.is_some()),
-        create_ai_activity_chapter_cb = create_row("create_ai_activity_chapter", "Create Activity chapter inside the Journal book if blank above", s.ai_activity_chapter_id.is_some()),
     )
 }
 

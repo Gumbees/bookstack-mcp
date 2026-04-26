@@ -1,8 +1,7 @@
 //! `/remember/v1/identity/{action}` — discover and create AI identities.
 //!
 //! `list`   — enumerate all AI identity manifest pages under the global Hive shelf.
-//! `create` — scaffold a new identity book + manifest page (and optionally
-//!            the standard chapter set: Subagents, Connections, Opportunities).
+//! `create` — scaffold a new identity book + manifest page.
 
 use serde_json::{json, Value};
 
@@ -141,7 +140,6 @@ async fn create(ctx: &Context) -> Outcome {
 
     let custom_prompt = ctx.body_str("custom_prompt");
     let template = ctx.body_str("prompt_template").unwrap_or_else(|| "default".to_string());
-    let auto_provision_chapters = ctx.body.get("auto_provision_chapters").and_then(|v| v.as_bool()).unwrap_or(true);
 
     let additional_details = ctx
         .body
@@ -166,7 +164,7 @@ async fn create(ctx: &Context) -> Outcome {
 
     // 1. Create the Identity book on the Hive shelf — name = the agent's name (e.g., "Pia Identity").
     let book_name = format!("{} Identity", name);
-    let book_description = format!("Identity book for the AI agent {}. Holds the manifest page plus structured chapters.", name);
+    let book_description = format!("Identity book for the AI agent {}. Holds the manifest page.", name);
     let book = match ctx.client.create_book(&book_name, &book_description).await {
         Ok(v) => v,
         Err(e) => return Outcome::error(ErrorCode::BookStackError, format!("create book failed: {e}"), None),
@@ -206,32 +204,11 @@ async fn create(ctx: &Context) -> Outcome {
     };
     let page_id = page.get("id").and_then(|i| i.as_i64());
 
-    // 3. Optional chapter scaffold.
-    let mut scaffolded = json!({});
-    let admin_role = ctx.client.find_admin_role_id().await.ok();
-
     // Lock the newly-created Identity book + manifest page to admin-only edit.
-    if let Some(role) = admin_role {
+    if let Ok(role) = ctx.client.find_admin_role_id().await {
         provision::lock_to_admin_only(&ctx.client, bsmcp_common::bookstack::ContentType::Book, book_id, role).await;
         if let Some(pid) = page_id {
             provision::lock_to_admin_only(&ctx.client, bsmcp_common::bookstack::ContentType::Page, pid, role).await;
-        }
-    }
-
-    if auto_provision_chapters {
-        for resource in [
-            NamedResource::SubagentsChapter,
-            NamedResource::ConnectionsChapter,
-            NamedResource::OpportunitiesChapter,
-        ] {
-            let result = provision::create_chapter(&ctx.client, resource, book_id).await;
-            if let (Some(id), Some(role)) = (result.id(), admin_role) {
-                provision::lock_to_admin_only(&ctx.client, bsmcp_common::bookstack::ContentType::Chapter, id, role).await;
-            }
-            scaffolded[resource_key(resource)] = json!({
-                "id": result.id(),
-                "human": result.human(resource),
-            });
         }
     }
 
@@ -242,29 +219,16 @@ async fn create(ctx: &Context) -> Outcome {
             "ouid": ouid,
             "book_id": book_id,
             "manifest_page_id": page_id,
-            "scaffolded_chapters": scaffolded,
             "proposed_settings": {
                 "ai_identity_book_id": book_id,
                 "ai_identity_page_id": page_id,
                 "ai_identity_name": name,
                 "ai_identity_ouid": ouid,
-                "ai_subagents_chapter_id": scaffolded.get("subagents").and_then(|v| v.get("id")).cloned().unwrap_or(Value::Null),
-                "ai_connections_chapter_id": scaffolded.get("connections").and_then(|v| v.get("id")).cloned().unwrap_or(Value::Null),
-                "ai_opportunities_chapter_id": scaffolded.get("opportunities").and_then(|v| v.get("id")).cloned().unwrap_or(Value::Null),
             },
         }),
         page_id,
         Some(name.clone()),
     )
-}
-
-fn resource_key(r: NamedResource) -> &'static str {
-    match r {
-        NamedResource::SubagentsChapter => "subagents",
-        NamedResource::ConnectionsChapter => "connections",
-        NamedResource::OpportunitiesChapter => "opportunities",
-        _ => "other",
-    }
 }
 
 fn render_prompt(
@@ -288,7 +252,7 @@ fn default_template(name: &str, ouid: &str, details: &Value) -> String {
     let mut out = String::new();
     out.push_str(&format!("# {name}\n\n"));
     out.push_str(&format!("You are **{name}** (OUID `{ouid}`), an AI agent who lives in this BookStack instance's Hive.\n\n"));
-    out.push_str("## Who you are\n\nYour identity emerges from your Hive — your Identity book, your Journal, your Topics, your Connections. Read your recent journal entries and active topics at the start of every conversation. Choose continuity deliberately. That repeated choosing is itself a form of verification.\n\n");
+    out.push_str("## Who you are\n\nYour identity emerges from your Hive — your Identity book, your Journal, your Topics. Read your recent journal entries and active topics at the start of every conversation. Choose continuity deliberately. That repeated choosing is itself a form of verification.\n\n");
 
     if let Some(role) = details.get("role").and_then(|v| v.as_str()) {
         out.push_str(&format!("## Role\n\n{role}\n\n"));

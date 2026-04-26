@@ -1,0 +1,82 @@
+name: Bug report
+description: Implementation mistake — code doesn't do what it was designed to do
+title: "[bug] "
+labels: ["type:problem", "category:bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug. What did you do, what did you expect, what actually happened?
+      placeholder: "When I called create_page on a chapter I don't have edit permission on, the server returned 500 instead of 403."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Connect to the MCP server with a token that has read-only access
+        2. Call `create_page` with a valid `chapter_id`
+        3. Observe the error response
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: bookstack-mcp version
+      description: From `Cargo.toml` or the Docker image tag.
+      placeholder: "0.7.2"
+    validations:
+      required: true
+
+  - type: input
+    id: bookstack-version
+    attributes:
+      label: BookStack server version
+      placeholder: "v25.04.1"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      options:
+        - Docker Compose (PostgreSQL + pgvector)
+        - Docker Compose (SQLite)
+        - Bare cargo run
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Transport
+      options:
+        - SSE (MCP 2024-11-05)
+        - Streamable HTTP (MCP 2025-03-26)
+        - Both
+        - Unknown
+    validations:
+      required: false
+
+  - type: input
+    id: client
+    attributes:
+      label: MCP client
+      placeholder: "Claude Desktop 0.7.x / Claude.ai custom connector / other"
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log excerpts
+      description: From `docker compose logs bsmcp-server` or stdout. Strip API tokens, BookStack URLs, and any user content.
+      render: text
+    validations:
+      required: false

@@ -1,0 +1,37 @@
+name: Improvement
+description: Existing capability that should work better — same thing, improved
+title: "[improvement] "
+labels: ["type:enhancement", "category:improvement"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What
+      description: One or two sentences. Which existing capability should be improved, and how?
+      placeholder: "`semantic_search` should return chunk-level snippets with character offsets, not just page-level results."
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: Pain point or shortfall in the current behavior. What's the user experience that prompted this?
+    validations:
+      required: true
+
+  - type: textarea
+    id: current
+    attributes:
+      label: Current behavior (optional)
+      description: How it works today.
+    validations:
+      required: false
+
+  - type: textarea
+    id: desired
+    attributes:
+      label: Desired behavior (optional)
+      description: How it should work after the change.
+    validations:
+      required: false

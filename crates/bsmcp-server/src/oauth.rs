@@ -48,6 +48,10 @@ pub struct AuthorizeParams {
     state: Option<String>,
     code_challenge: Option<String>,
     code_challenge_method: Option<String>,
+    /// When set to "/settings", short-circuits the OAuth code flow: after validating
+    /// the BookStack token, the server issues a settings-session cookie and redirects
+    /// the browser directly to /settings. Used by the in-server settings UI.
+    return_to: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -60,6 +64,7 @@ pub struct AuthorizeFormSubmit {
     state: Option<String>,
     code_challenge: Option<String>,
     code_challenge_method: Option<String>,
+    return_to: Option<String>,
 }
 
 impl Drop for AuthorizeFormSubmit {
@@ -138,6 +143,11 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#x27;")
 }
 
+/// Returns true if the given path is a safe in-server redirect (no scheme/host).
+fn is_safe_internal_path(s: &str) -> bool {
+    s.starts_with('/') && !s.starts_with("//") && !s.contains(':')
+}
+
 fn render_login_form(
     params: &AuthorizeParams,
     bookstack_url: &str,
@@ -177,6 +187,11 @@ fn render_login_form(
     }
     if let Some(ref m) = params.code_challenge_method {
         hidden_fields.push(hidden("code_challenge_method", m));
+    }
+    if let Some(ref r) = params.return_to {
+        if is_safe_internal_path(r) {
+            hidden_fields.push(hidden("return_to", r));
+        }
     }
 
     let bs_url = html_escape(bookstack_url.trim_end_matches('/'));
@@ -273,19 +288,30 @@ pub async fn handle_authorize(
     State(state): State<AppState>,
     Query(params): Query<AuthorizeParams>,
 ) -> Response {
-    if params.response_type != "code" {
-        return oauth_error(
-            StatusCode::BAD_REQUEST,
-            "unsupported_response_type",
-            Some("Only response_type=code is supported"),
-        );
-    }
-    if params.code_challenge.is_none() {
-        return oauth_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            Some("code_challenge is required (PKCE)"),
-        );
+    // Browser settings flow bypasses the OAuth code dance entirely — no PKCE required,
+    // no response_type check. The form renders, the user enters their token, and on
+    // success the server sets a session cookie and redirects to the return_to path.
+    let is_settings_flow = params
+        .return_to
+        .as_deref()
+        .map(|p| p == "/settings")
+        .unwrap_or(false);
+
+    if !is_settings_flow {
+        if params.response_type != "code" {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "unsupported_response_type",
+                Some("Only response_type=code is supported"),
+            );
+        }
+        if params.code_challenge.is_none() {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                Some("code_challenge is required (PKCE)"),
+            );
+        }
     }
     Html(render_login_form(&params, &state.bookstack_url, None)).into_response()
 }
@@ -305,7 +331,13 @@ pub async fn handle_authorize_submit(
         }
     }
 
-    if form.response_type != "code" {
+    let is_settings_flow = form
+        .return_to
+        .as_deref()
+        .map(|p| p == "/settings")
+        .unwrap_or(false);
+
+    if !is_settings_flow && form.response_type != "code" {
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "unsupported_response_type",
@@ -323,6 +355,7 @@ pub async fn handle_authorize_submit(
             state: form.state.clone(),
             code_challenge: form.code_challenge.clone(),
             code_challenge_method: form.code_challenge_method.clone(),
+            return_to: form.return_to.clone(),
         };
         return Html(render_login_form(
             &params,
@@ -330,6 +363,27 @@ pub async fn handle_authorize_submit(
             Some("Invalid API token. Check your Token ID and Secret."),
         ))
         .into_response();
+    }
+
+    // Browser settings flow: skip the OAuth code dance entirely. Issue a settings
+    // session, set the cookie, and redirect to the return path.
+    if is_settings_flow {
+        let session_id = crate::settings_ui::issue_settings_session(
+            &state.settings_sessions,
+            &form.token_id,
+            &form.token_secret,
+        )
+        .await;
+        let cookie = crate::settings_ui::build_session_cookie(&session_id);
+        eprintln!("OAuth: issued settings-UI session for /settings flow");
+        return (
+            StatusCode::FOUND,
+            [
+                (header::SET_COOKIE, cookie),
+                (header::LOCATION, "/settings".to_string()),
+            ],
+        )
+            .into_response();
     }
 
     let code = uuid::Uuid::new_v4().to_string();

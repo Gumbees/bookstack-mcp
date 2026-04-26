@@ -99,7 +99,69 @@ All prefixed `BSMCP_`. See `.env.example` for full list. Key ones:
 - `BSMCP_SUMMARY_INTERVAL` — hours between regenerations (0 = only on first startup)
 - `BSMCP_SUMMARY_TOKEN_ID/SECRET` — BookStack token (falls back to BSMCP_EMBED_TOKEN_*)
 
-## Implemented Tools (61)
+## Hive memory flow (`/remember`)
+
+Server-side reconstitution + memory CRUD. Replaces the multi-call AI bootstrap with structured endpoints. Per-user settings (book/chapter pointers + toggles) live in the `user_settings` table; every write is audited in `remember_audit`. Both tables are auto-created on startup in SQLite and Postgres.
+
+**HTTP:** `POST /remember/v1/{resource}/{action}` — JSON body in, JSON envelope out (`{ok, data, meta, error}`). Auth via the same Bearer token as `/mcp/sse`.
+
+**MCP:** one tool per resource (`remember_briefing`, `remember_journal`, etc.) with an `action` arg picking the operation. 14 tools total.
+
+**Resources:**
+
+| Resource | Kind | Actions | Backed by |
+|---|---|---|---|
+| `briefing` | singleton (derived) | read | parallel pull of identity + journals + topics + semantic matches |
+| `whoami` | singleton | read, write | `ai_identity_page_id` |
+| `user` | singleton | read, write | `user_identity_page_id` |
+| `config` | singleton | read, write | `user_settings` row |
+| `identity` | singleton | list, create | global Hive shelf |
+| `directory` | singleton | read | global Hive / User Journals shelves |
+| `journal` | collection (book) | read, write, search, delete | `ai_hive_journal_book_id` (auto-creates YYYY-MM chapters) |
+| `collage` | collection (book) | read, write, search, delete | `ai_collage_book_id` |
+| `shared_collage` | collection (book) | read, write, search, delete | `ai_shared_collage_book_id` |
+| `user_journal` | collection (book) | read, write, search, delete | `user_journal_book_id` (auto-creates YYYY-MM chapters) |
+| `connections` | collection (chapter in Identity book) | read, write, search, delete | `ai_connections_chapter_id` |
+| `opportunities` | collection (chapter in Identity book) | read, write, search, delete | `ai_opportunities_chapter_id` |
+| `subagent` | collection (chapter in Identity book) | read, write, delete | `ai_subagents_chapter_id` |
+| `activity` | append-only chapter (in Journal book) | read, write, search | `ai_activity_chapter_id` |
+| `audit` | server-side log | read | `remember_audit` table (per-user) |
+| `search` | cross-resource | read | semantic + keyword across configured scopes |
+
+Null settings disable the affected section/resource — the call returns `settings_not_configured` instead of crashing. The `briefing` response just omits sections whose IDs are unset.
+
+Every collection write stamps a leading YAML frontmatter block with provenance (`written_by`, `ai_identity_ouid`, `user_id`, `written_at`, `trace_id`, `resource`, `key`, `supersedes_page`). BookStack ignores leading YAML in markdown; the block is invisible in the UI.
+
+**Soft delete:** prepends `[archived]` to the page name and stamps `deleted: true` in the frontmatter. Hard delete still requires the existing `delete_page` MCP tool.
+
+**Always-on context:** `system_prompt_page_ids` setting holds an array of page IDs whose full markdown is included in every `briefing` response under `system_prompt_additions`. Intended for short, durable context (writing style guides, formatting rules, etc).
+
+## Settings UI (`/settings`)
+
+Browser-based config page. Token-gated via the same `/authorize` form, but skips the OAuth code dance — when `?return_to=/settings` is set, the server validates the token, issues a settings-session cookie (HttpOnly, 8h TTL, in-memory store), and redirects.
+
+The page lets users pick their book/chapter IDs from dropdowns (populated from BookStack's list APIs), toggle the semantic-search targets, and configure recent-counts. Save → upserts the `user_settings` row. Re-auth button at the bottom redirects back through `/authorize` with the same return_to flow.
+
+**Global shelves:** the Hive shelf and User Journals shelf are stored in a separate `global_settings` table (single row) and shared across every user on the same BookStack instance. First user to set them wins; subsequent users see the dropdowns rendered as locked. Per-user `ai_hive_shelf_id` is auto-mirrored from the global value.
+
+**Auto-create:** every book/chapter setting has a "Create if missing" checkbox. On save, the server creates absent structure in dependency order (shelves → books → chapters) using sensible default names from the naming module. Permission denials surface as warnings rather than blocking the save.
+
+**Probe (`/settings/probe`):** scans the configured Hive shelf for known structure by name (Identity, Journal, Topics, Subagents, Connections, Opportunities, Activity), shows matches with checkboxes, lets the user accept some/all into their settings without typing IDs.
+
+## Auth-gated `/status`
+
+The semantic-search status page accepts either a Bearer token (programmatic) or a settings-session cookie (browser). Unauthenticated requests get a 401 with a link to `/settings`.
+
+## Global settings (`global_settings` table)
+
+Single-row table holding instance-wide pointers:
+- `hive_shelf_id` — shared shelf containing every AI agent's Identity book
+- `user_journals_shelf_id` — shared shelf containing each human user's journal book
+- `set_by_token_hash` — the first user who configured them (informational; does not gate writes)
+
+Used by `remember_identity action=list`, `remember_directory`, and the settings UI lock-after-set behaviour.
+
+## Implemented Tools (61 + 14 remember)
 
 - **search_content** - Full-text search with BookStack query operators
 - **semantic_search** - Natural language vector search (when semantic enabled)

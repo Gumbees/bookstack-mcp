@@ -45,6 +45,7 @@ pub struct AppState {
     pub semantic: Option<Arc<SemanticState>>,
     pub summary_cache: crate::summary::SummaryCache,
     pub staging: crate::staging::StagingStore,
+    pub settings_sessions: crate::settings_ui::SettingsSessionStore,
 }
 
 pub(crate) struct RateLimit {
@@ -122,6 +123,7 @@ impl AppState {
             semantic,
             summary_cache,
             staging: crate::staging::new_staging_store(),
+            settings_sessions: crate::settings_ui::new_settings_store(),
         }
     }
 
@@ -218,7 +220,7 @@ fn unauthorized(hint: &str, headers: &HeaderMap, known_urls: &[String]) -> Respo
     resp
 }
 
-pub(crate) async fn resolve_credentials(
+pub async fn resolve_credentials(
     headers: &HeaderMap,
     db: &dyn DbBackend,
     known_urls: &[String],
@@ -410,7 +412,12 @@ pub async fn handle_message(
     };
 
     let semantic = state.semantic.as_deref();
-    let response = mcp::handle_request(&request, &client, semantic, &state.summary_cache, &state.staging).await;
+    let remember_deps = mcp::RememberDeps {
+        db: state.db.clone(),
+        semantic: state.semantic.clone(),
+        token_id: token_id.clone(),
+    };
+    let response = mcp::handle_request(&request, &client, semantic, &state.summary_cache, &state.staging, &remember_deps).await;
 
     if let Some(response) = response {
         let data = serde_json::to_string(&response).unwrap_or_default();
@@ -486,7 +493,12 @@ pub async fn handle_streamable(
     }
 
     let semantic = state.semantic.as_deref();
-    let response = mcp::handle_request(&request, &client, semantic, &state.summary_cache, &state.staging).await;
+    let remember_deps = mcp::RememberDeps {
+        db: state.db.clone(),
+        semantic: state.semantic.clone(),
+        token_id: token_id.clone(),
+    };
+    let response = mcp::handle_request(&request, &client, semantic, &state.summary_cache, &state.staging, &remember_deps).await;
 
     match response {
         Some(resp) => {

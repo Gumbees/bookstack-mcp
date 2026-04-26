@@ -115,6 +115,8 @@ Server-side reconstitution + memory CRUD. Replaces the multi-call AI bootstrap w
 | `whoami` | singleton | read, write | `ai_identity_page_id` |
 | `user` | singleton | read, write | `user_identity_page_id` |
 | `config` | singleton | read, write | `user_settings` row |
+| `identity` | singleton | list, create | global Hive shelf |
+| `directory` | singleton | read | global Hive / User Journals shelves |
 | `journal` | collection (book) | read, write, search, delete | `ai_hive_journal_book_id` (auto-creates YYYY-MM chapters) |
 | `collage` | collection (book) | read, write, search, delete | `ai_collage_book_id` |
 | `shared_collage` | collection (book) | read, write, search, delete | `ai_shared_collage_book_id` |
@@ -139,6 +141,25 @@ Every collection write stamps a leading YAML frontmatter block with provenance (
 Browser-based config page. Token-gated via the same `/authorize` form, but skips the OAuth code dance — when `?return_to=/settings` is set, the server validates the token, issues a settings-session cookie (HttpOnly, 8h TTL, in-memory store), and redirects.
 
 The page lets users pick their book/chapter IDs from dropdowns (populated from BookStack's list APIs), toggle the semantic-search targets, and configure recent-counts. Save → upserts the `user_settings` row. Re-auth button at the bottom redirects back through `/authorize` with the same return_to flow.
+
+**Global shelves:** the Hive shelf and User Journals shelf are stored in a separate `global_settings` table (single row) and shared across every user on the same BookStack instance. First user to set them wins; subsequent users see the dropdowns rendered as locked. Per-user `ai_hive_shelf_id` is auto-mirrored from the global value.
+
+**Auto-create:** every book/chapter setting has a "Create if missing" checkbox. On save, the server creates absent structure in dependency order (shelves → books → chapters) using sensible default names from the naming module. Permission denials surface as warnings rather than blocking the save.
+
+**Probe (`/settings/probe`):** scans the configured Hive shelf for known structure by name (Identity, Journal, Topics, Subagents, Connections, Opportunities, Activity), shows matches with checkboxes, lets the user accept some/all into their settings without typing IDs.
+
+## Auth-gated `/status`
+
+The semantic-search status page accepts either a Bearer token (programmatic) or a settings-session cookie (browser). Unauthenticated requests get a 401 with a link to `/settings`.
+
+## Global settings (`global_settings` table)
+
+Single-row table holding instance-wide pointers:
+- `hive_shelf_id` — shared shelf containing every AI agent's Identity book
+- `user_journals_shelf_id` — shared shelf containing each human user's journal book
+- `set_by_token_hash` — the first user who configured them (informational; does not gate writes)
+
+Used by `remember_identity action=list`, `remember_directory`, and the settings UI lock-after-set behaviour.
 
 ## Implemented Tools (61 + 14 remember)
 

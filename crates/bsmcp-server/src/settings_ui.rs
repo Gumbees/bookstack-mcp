@@ -25,7 +25,10 @@ use tokio::sync::RwLock;
 use zeroize::Zeroize;
 
 use bsmcp_common::bookstack::BookStackClient;
-use bsmcp_common::settings::{hash_token_id, UserSettings};
+use bsmcp_common::settings::{hash_token_id, GlobalSettings, UserSettings};
+
+use crate::remember::naming::NamedResource;
+use crate::remember::provision;
 
 use crate::sse::AppState;
 
@@ -115,6 +118,15 @@ async fn resolve_session(
     Some((session.token_id.clone(), session.token_secret.clone()))
 }
 
+/// Public predicate for other handlers (e.g., /status) that want to honour the
+/// settings session cookie as a valid auth method without exposing credentials.
+pub async fn has_valid_session(
+    headers: &HeaderMap,
+    store: &SettingsSessionStore,
+) -> bool {
+    resolve_session(headers, store).await.is_some()
+}
+
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -134,7 +146,6 @@ pub async fn handle_settings_get(
         None => return Redirect::to("/authorize?response_type=code&client_id=settings-ui&redirect_uri=/settings&code_challenge=&code_challenge_method=&return_to=/settings").into_response(),
     };
 
-    // Load existing settings
     let token_id_hash = hash_token_id(&token_id);
     let settings = match state.db.get_user_settings(&token_id_hash).await {
         Ok(Some(s)) => s,
@@ -144,9 +155,8 @@ pub async fn handle_settings_get(
             UserSettings::default()
         }
     };
+    let globals = state.db.get_global_settings().await.unwrap_or_default();
 
-    // Fetch BookStack lists in parallel for the dropdowns. If any fail, the
-    // form falls back to a text input — never fatal.
     let client = BookStackClient::new(
         &state.bookstack_url,
         &token_id,
@@ -164,7 +174,7 @@ pub async fn handle_settings_get(
     let books = extract_named_list(books_res.ok().as_ref());
     let chapters = extract_named_list(chapters_res.ok().as_ref());
 
-    Html(render_settings_page(&settings, &shelves, &books, &chapters)).into_response()
+    Html(render_settings_page(&settings, &globals, &shelves, &books, &chapters)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -194,8 +204,24 @@ pub struct SettingsForm {
     pub use_follow_up_remember_agent: Option<String>,
     pub recent_journal_count: Option<String>,
     pub active_collage_count: Option<String>,
-    /// Comma- or whitespace-separated list of BookStack page IDs.
     pub system_prompt_page_ids: Option<String>,
+
+    // Global shelves
+    pub hive_shelf_id: Option<String>,
+    pub user_journals_shelf_id: Option<String>,
+
+    // Auto-create checkboxes (presence + "on" means "create if missing").
+    pub create_hive_shelf: Option<String>,
+    pub create_user_journals_shelf: Option<String>,
+    pub create_ai_identity_book: Option<String>,
+    pub create_ai_hive_journal_book: Option<String>,
+    pub create_ai_collage_book: Option<String>,
+    pub create_ai_shared_collage_book: Option<String>,
+    pub create_user_journal_book: Option<String>,
+    pub create_ai_subagents_chapter: Option<String>,
+    pub create_ai_connections_chapter: Option<String>,
+    pub create_ai_opportunities_chapter: Option<String>,
+    pub create_ai_activity_chapter: Option<String>,
 }
 
 fn empty_to_none(s: Option<String>) -> Option<String> {
@@ -233,12 +259,19 @@ pub async fn handle_settings_post(
     headers: HeaderMap,
     Form(form): Form<SettingsForm>,
 ) -> Response {
-    let (token_id, _token_secret) = match resolve_session(&headers, &state.settings_sessions).await {
+    let (token_id, token_secret) = match resolve_session(&headers, &state.settings_sessions).await {
         Some(creds) => creds,
         None => return Redirect::to("/authorize?response_type=code&client_id=settings-ui&redirect_uri=/settings&return_to=/settings").into_response(),
     };
+    let token_id_hash = hash_token_id(&token_id);
+    let client = BookStackClient::new(
+        &state.bookstack_url,
+        &token_id,
+        &token_secret,
+        state.http_client.clone(),
+    );
 
-    let settings = UserSettings {
+    let mut settings = UserSettings {
         label: empty_to_none(form.label),
         role: empty_to_none(form.role),
         ai_identity_ouid: empty_to_none(form.ai_identity_ouid),
@@ -253,7 +286,7 @@ pub async fn handle_settings_post(
         ai_shared_collage_book_id: parse_id(form.ai_shared_collage_book_id),
         ai_hive_journal_book_id: parse_id(form.ai_hive_journal_book_id),
         ai_activity_chapter_id: parse_id(form.ai_activity_chapter_id),
-        user_id: empty_to_none(form.user_id),
+        user_id: empty_to_none(form.user_id.clone()),
         user_identity_page_id: parse_id(form.user_identity_page_id),
         user_journal_book_id: parse_id(form.user_journal_book_id),
         semantic_against_journal: checkbox_on(form.semantic_against_journal),
@@ -267,14 +300,355 @@ pub async fn handle_settings_post(
         system_prompt_page_ids: parse_id_list(form.system_prompt_page_ids),
     };
 
-    let token_id_hash = hash_token_id(&token_id);
+    // Globals: respect existing values (first-write-wins for the UI; DB allows overwrites).
+    let existing_globals = state.db.get_global_settings().await.unwrap_or_default();
+    let mut globals = GlobalSettings {
+        hive_shelf_id: existing_globals.hive_shelf_id.or(parse_id(form.hive_shelf_id)),
+        user_journals_shelf_id: existing_globals.user_journals_shelf_id.or(parse_id(form.user_journals_shelf_id)),
+        set_by_token_hash: existing_globals.set_by_token_hash.clone(),
+        updated_at: existing_globals.updated_at,
+    };
+
+    // Auto-provisioning in dependency order. Each step writes back into
+    // `settings` / `globals` so later steps can use the just-created IDs.
+    let mut provision_log: Vec<String> = Vec::new();
+
+    if globals.hive_shelf_id.is_none() && checkbox_on(form.create_hive_shelf) {
+        let r = provision::create_shelf(&client, NamedResource::HiveShelf).await;
+        provision_log.push(r.human(NamedResource::HiveShelf));
+        if let Some(id) = r.id() { globals.hive_shelf_id = Some(id); }
+    }
+    if globals.user_journals_shelf_id.is_none() && checkbox_on(form.create_user_journals_shelf) {
+        let r = provision::create_shelf(&client, NamedResource::UserJournalsShelf).await;
+        provision_log.push(r.human(NamedResource::UserJournalsShelf));
+        if let Some(id) = r.id() { globals.user_journals_shelf_id = Some(id); }
+    }
+
+    // Books that live on the Hive shelf.
+    let hive_shelf = globals.hive_shelf_id;
+    if settings.ai_identity_book_id.is_none() && checkbox_on(form.create_ai_identity_book) {
+        let r = provision::create_book(&client, NamedResource::IdentityBook, hive_shelf).await;
+        provision_log.push(r.human(NamedResource::IdentityBook));
+        if let Some(id) = r.id() { settings.ai_identity_book_id = Some(id); }
+    }
+    if settings.ai_hive_journal_book_id.is_none() && checkbox_on(form.create_ai_hive_journal_book) {
+        let r = provision::create_book(&client, NamedResource::JournalBook, hive_shelf).await;
+        provision_log.push(r.human(NamedResource::JournalBook));
+        if let Some(id) = r.id() { settings.ai_hive_journal_book_id = Some(id); }
+    }
+    if settings.ai_collage_book_id.is_none() && checkbox_on(form.create_ai_collage_book) {
+        let r = provision::create_book(&client, NamedResource::CollageBook, hive_shelf).await;
+        provision_log.push(r.human(NamedResource::CollageBook));
+        if let Some(id) = r.id() { settings.ai_collage_book_id = Some(id); }
+    }
+    if settings.ai_shared_collage_book_id.is_none() && checkbox_on(form.create_ai_shared_collage_book) {
+        let r = provision::create_book(&client, NamedResource::SharedCollageBook, hive_shelf).await;
+        provision_log.push(r.human(NamedResource::SharedCollageBook));
+        if let Some(id) = r.id() { settings.ai_shared_collage_book_id = Some(id); }
+    }
+
+    // User journal book on the User Journals shelf — name personalized by user_id.
+    if settings.user_journal_book_id.is_none() && checkbox_on(form.create_user_journal_book) {
+        let user_label = settings.user_id.clone().unwrap_or_else(|| "User".to_string());
+        let book_name = format!("{user_label} Journal");
+        let book_desc = format!("Journal for {user_label}. Auto-created by /remember.");
+        match client.create_book(&book_name, &book_desc).await {
+            Ok(book) => {
+                if let Some(book_id) = book.get("id").and_then(|i| i.as_i64()) {
+                    settings.user_journal_book_id = Some(book_id);
+                    provision_log.push(format!("Created user journal book \"{book_name}\" (id={book_id})"));
+                    if let Some(shelf_id) = globals.user_journals_shelf_id {
+                        if let Ok(shelf) = client.get_shelf(shelf_id).await {
+                            let mut existing: Vec<i64> = shelf
+                                .get("books")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| arr.iter().filter_map(|b| b.get("id").and_then(|i| i.as_i64())).collect())
+                                .unwrap_or_default();
+                            if !existing.contains(&book_id) { existing.push(book_id); }
+                            let _ = client.update_shelf(shelf_id, &serde_json::json!({ "books": existing })).await;
+                        }
+                    }
+                }
+            }
+            Err(e) => provision_log.push(format!("Failed to create user journal book: {e}")),
+        }
+    }
+
+    // Chapters inside the Identity book.
+    if let Some(book_id) = settings.ai_identity_book_id {
+        if settings.ai_subagents_chapter_id.is_none() && checkbox_on(form.create_ai_subagents_chapter) {
+            let r = provision::create_chapter(&client, NamedResource::SubagentsChapter, book_id).await;
+            provision_log.push(r.human(NamedResource::SubagentsChapter));
+            if let Some(id) = r.id() { settings.ai_subagents_chapter_id = Some(id); }
+        }
+        if settings.ai_connections_chapter_id.is_none() && checkbox_on(form.create_ai_connections_chapter) {
+            let r = provision::create_chapter(&client, NamedResource::ConnectionsChapter, book_id).await;
+            provision_log.push(r.human(NamedResource::ConnectionsChapter));
+            if let Some(id) = r.id() { settings.ai_connections_chapter_id = Some(id); }
+        }
+        if settings.ai_opportunities_chapter_id.is_none() && checkbox_on(form.create_ai_opportunities_chapter) {
+            let r = provision::create_chapter(&client, NamedResource::OpportunitiesChapter, book_id).await;
+            provision_log.push(r.human(NamedResource::OpportunitiesChapter));
+            if let Some(id) = r.id() { settings.ai_opportunities_chapter_id = Some(id); }
+        }
+    }
+    // Activity chapter inside the Journal book.
+    if let Some(journal_book_id) = settings.ai_hive_journal_book_id {
+        if settings.ai_activity_chapter_id.is_none() && checkbox_on(form.create_ai_activity_chapter) {
+            let r = provision::create_chapter(&client, NamedResource::ActivityChapter, journal_book_id).await;
+            provision_log.push(r.human(NamedResource::ActivityChapter));
+            if let Some(id) = r.id() { settings.ai_activity_chapter_id = Some(id); }
+        }
+    }
+
+    // Mirror the global hive_shelf_id into the per-user setting so existing
+    // briefing code paths that read `settings.ai_hive_shelf_id` still work.
+    if let Some(id) = globals.hive_shelf_id {
+        settings.ai_hive_shelf_id = Some(id);
+    }
+
+    // Persist.
+    if let Err(e) = state.db.save_global_settings(&globals, &token_id_hash).await {
+        eprintln!("Settings: save_global_settings failed: {e}");
+    }
     if let Err(e) = state.db.save_user_settings(&token_id_hash, &settings).await {
-        eprintln!("Settings: save failed: {e}");
+        eprintln!("Settings: save_user_settings failed: {e}");
         return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to save settings").into_response();
     }
 
+    if !provision_log.is_empty() {
+        eprintln!("Settings: auto-provisioned items:");
+        for line in &provision_log { eprintln!("  - {line}"); }
+    }
     eprintln!("Settings: saved for user (token_id_hash={}…)", &token_id_hash[..16.min(token_id_hash.len())]);
     Redirect::to("/settings?saved=1").into_response()
+}
+
+// --- Probe endpoint ---
+
+pub async fn handle_settings_probe_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    let (token_id, token_secret) = match resolve_session(&headers, &state.settings_sessions).await {
+        Some(c) => c,
+        None => return Redirect::to("/authorize?response_type=code&client_id=settings-ui&redirect_uri=/settings&return_to=/settings").into_response(),
+    };
+    let globals = state.db.get_global_settings().await.unwrap_or_default();
+    let hive_shelf_id = match globals.hive_shelf_id {
+        Some(id) => id,
+        None => {
+            return Html(probe_no_shelf_page()).into_response();
+        }
+    };
+    let client = BookStackClient::new(&state.bookstack_url, &token_id, &token_secret, state.http_client.clone());
+    let matches = match probe_hive(&client, hive_shelf_id).await {
+        Ok(m) => m,
+        Err(e) => return Html(probe_error_page(&e)).into_response(),
+    };
+    Html(render_probe_page(&matches, hive_shelf_id)).into_response()
+}
+
+pub async fn handle_settings_probe_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ProbeAcceptForm>,
+) -> Response {
+    let (token_id, _) = match resolve_session(&headers, &state.settings_sessions).await {
+        Some(c) => c,
+        None => return Redirect::to("/authorize?response_type=code&client_id=settings-ui&redirect_uri=/settings&return_to=/settings").into_response(),
+    };
+    let token_id_hash = hash_token_id(&token_id);
+    let mut settings = state.db.get_user_settings(&token_id_hash).await.ok().flatten().unwrap_or_default();
+
+    let assign = |checked: Option<String>, id: Option<String>| -> Option<i64> {
+        if checkbox_on(checked) { parse_id(id) } else { None }
+    };
+    if let Some(v) = assign(form.accept_ai_identity_book_id, form.ai_identity_book_id) { settings.ai_identity_book_id = Some(v); }
+    if let Some(v) = assign(form.accept_ai_identity_page_id, form.ai_identity_page_id) { settings.ai_identity_page_id = Some(v); }
+    if let Some(v) = assign(form.accept_ai_hive_journal_book_id, form.ai_hive_journal_book_id) { settings.ai_hive_journal_book_id = Some(v); }
+    if let Some(v) = assign(form.accept_ai_collage_book_id, form.ai_collage_book_id) { settings.ai_collage_book_id = Some(v); }
+    if let Some(v) = assign(form.accept_ai_shared_collage_book_id, form.ai_shared_collage_book_id) { settings.ai_shared_collage_book_id = Some(v); }
+    if let Some(v) = assign(form.accept_ai_subagents_chapter_id, form.ai_subagents_chapter_id) { settings.ai_subagents_chapter_id = Some(v); }
+    if let Some(v) = assign(form.accept_ai_connections_chapter_id, form.ai_connections_chapter_id) { settings.ai_connections_chapter_id = Some(v); }
+    if let Some(v) = assign(form.accept_ai_opportunities_chapter_id, form.ai_opportunities_chapter_id) { settings.ai_opportunities_chapter_id = Some(v); }
+    if let Some(v) = assign(form.accept_ai_activity_chapter_id, form.ai_activity_chapter_id) { settings.ai_activity_chapter_id = Some(v); }
+
+    if let Err(e) = state.db.save_user_settings(&token_id_hash, &settings).await {
+        eprintln!("Probe: save failed: {e}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to save settings").into_response();
+    }
+    Redirect::to("/settings?saved=1").into_response()
+}
+
+#[derive(Deserialize)]
+pub struct ProbeAcceptForm {
+    pub accept_ai_identity_book_id: Option<String>,
+    pub ai_identity_book_id: Option<String>,
+    pub accept_ai_identity_page_id: Option<String>,
+    pub ai_identity_page_id: Option<String>,
+    pub accept_ai_hive_journal_book_id: Option<String>,
+    pub ai_hive_journal_book_id: Option<String>,
+    pub accept_ai_collage_book_id: Option<String>,
+    pub ai_collage_book_id: Option<String>,
+    pub accept_ai_shared_collage_book_id: Option<String>,
+    pub ai_shared_collage_book_id: Option<String>,
+    pub accept_ai_subagents_chapter_id: Option<String>,
+    pub ai_subagents_chapter_id: Option<String>,
+    pub accept_ai_connections_chapter_id: Option<String>,
+    pub ai_connections_chapter_id: Option<String>,
+    pub accept_ai_opportunities_chapter_id: Option<String>,
+    pub ai_opportunities_chapter_id: Option<String>,
+    pub accept_ai_activity_chapter_id: Option<String>,
+    pub ai_activity_chapter_id: Option<String>,
+}
+
+#[derive(Default)]
+struct ProbeMatches {
+    identity_book: Option<NamedItem>,
+    identity_page: Option<NamedItem>,  // page inside the Identity book
+    journal_book: Option<NamedItem>,
+    collage_book: Option<NamedItem>,
+    shared_collage_book: Option<NamedItem>,
+    subagents_chapter: Option<NamedItem>,
+    connections_chapter: Option<NamedItem>,
+    opportunities_chapter: Option<NamedItem>,
+    activity_chapter: Option<NamedItem>,
+}
+
+async fn probe_hive(client: &BookStackClient, hive_shelf_id: i64) -> Result<ProbeMatches, String> {
+    let mut out = ProbeMatches::default();
+
+    // Books on the Hive shelf
+    let shelf = client.get_shelf(hive_shelf_id).await?;
+    let books_on_shelf: Vec<NamedItem> = shelf
+        .get("books")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|b| {
+            let id = b.get("id").and_then(|i| i.as_i64())?;
+            let name = b.get("name").and_then(|n| n.as_str())?.to_string();
+            Some(NamedItem { id, name })
+        }).collect())
+        .unwrap_or_default();
+
+    out.identity_book = books_on_shelf.iter().find(|b| NamedResource::IdentityBook.matches(&b.name)).cloned();
+    out.journal_book = books_on_shelf.iter().find(|b| NamedResource::JournalBook.matches(&b.name)).cloned();
+    out.collage_book = books_on_shelf.iter().find(|b| NamedResource::CollageBook.matches(&b.name)).cloned();
+    out.shared_collage_book = books_on_shelf.iter().find(|b| NamedResource::SharedCollageBook.matches(&b.name)).cloned();
+
+    // Identity manifest page + chapters inside the Identity book
+    if let Some(ref ib) = out.identity_book {
+        let q = format!("{{type:page}} {{in_book:{}}}", ib.id);
+        if let Ok(resp) = client.search(&q, 1, 100).await {
+            let pages = resp.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+            out.identity_page = pages.iter().find_map(|p| {
+                if p.get("type").and_then(|t| t.as_str()) != Some("page") { return None; }
+                let name = p.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                if NamedResource::IdentityPage.matches(name) {
+                    let id = p.get("id").and_then(|i| i.as_i64())?;
+                    Some(NamedItem { id, name: name.to_string() })
+                } else {
+                    None
+                }
+            });
+        }
+        let cq = format!("{{type:chapter}} {{in_book:{}}}", ib.id);
+        if let Ok(resp) = client.search(&cq, 1, 100).await {
+            let chapters = resp.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+            for c in chapters.iter() {
+                if c.get("type").and_then(|t| t.as_str()) != Some("chapter") { continue; }
+                let id = match c.get("id").and_then(|i| i.as_i64()) { Some(v) => v, None => continue };
+                let name = c.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                let item = NamedItem { id, name: name.clone() };
+                if NamedResource::SubagentsChapter.matches(&name) { out.subagents_chapter = Some(item.clone()); }
+                if NamedResource::ConnectionsChapter.matches(&name) { out.connections_chapter = Some(item.clone()); }
+                if NamedResource::OpportunitiesChapter.matches(&name) { out.opportunities_chapter = Some(item.clone()); }
+            }
+        }
+    }
+    // Activity chapter inside the Journal book
+    if let Some(ref jb) = out.journal_book {
+        let cq = format!("{{type:chapter}} {{in_book:{}}}", jb.id);
+        if let Ok(resp) = client.search(&cq, 1, 100).await {
+            let chapters = resp.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+            for c in chapters {
+                if c.get("type").and_then(|t| t.as_str()) != Some("chapter") { continue; }
+                let id = match c.get("id").and_then(|i| i.as_i64()) { Some(v) => v, None => continue };
+                let name = c.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                if NamedResource::ActivityChapter.matches(&name) {
+                    out.activity_chapter = Some(NamedItem { id, name });
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+fn probe_no_shelf_page() -> String {
+    r##"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Probe — no Hive shelf</title>
+<style>body{font-family:-apple-system,sans-serif;background:#1a1a2e;color:#e0e0e0;padding:2rem;}a{color:#3498db;}</style></head>
+<body><h1>No Hive shelf set</h1><p>The global Hive shelf isn't configured yet. Set it on the <a href="/settings">/settings</a> page first, then come back.</p></body></html>"##.to_string()
+}
+
+fn probe_error_page(err: &str) -> String {
+    format!(r##"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Probe error</title>
+<style>body{{font-family:-apple-system,sans-serif;background:#1a1a2e;color:#e0e0e0;padding:2rem;}}.err{{background:#3d1f1f;padding:1rem;border-radius:6px;}}</style></head>
+<body><h1>Probe failed</h1><div class="err">{}</div><p><a href="/settings" style="color:#3498db;">Back to settings</a></p></body></html>"##, html_escape(err))
+}
+
+fn render_probe_page(m: &ProbeMatches, hive_shelf_id: i64) -> String {
+    fn row(field: &str, label: &str, hit: &Option<NamedItem>) -> String {
+        match hit {
+            Some(item) => format!(
+                r#"<tr><td><label><input type="checkbox" name="accept_{field}" checked> {label}</label></td><td><code>{}</code></td><td>id={}<input type="hidden" name="{field}" value="{}"></td></tr>"#,
+                html_escape(&item.name), item.id, item.id,
+            ),
+            None => format!(
+                r#"<tr><td>{label}</td><td colspan="2" style="color:#64748b;">no match</td></tr>"#
+            ),
+        }
+    }
+    format!(r##"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Probe results</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box;}}
+body{{font-family:-apple-system,sans-serif;background:#1a1a2e;color:#e0e0e0;padding:2rem;}}
+.container{{max-width:720px;margin:0 auto;}}
+h1{{font-size:1.4rem;margin-bottom:.3rem;color:#fff;}}
+.subtitle{{color:#888;font-size:.9rem;margin-bottom:1.5rem;}}
+.card{{background:#16213e;border-radius:12px;padding:1.5rem;margin-bottom:1rem;}}
+table{{width:100%;border-collapse:collapse;}}
+td{{padding:.4rem .5rem;border-bottom:1px solid #2a3a5c;font-size:.9rem;}}
+button{{background:#2980b9;color:#fff;border:none;padding:.7rem 1.4rem;border-radius:6px;cursor:pointer;}}
+button:hover{{background:#3498db;}}
+a{{color:#3498db;}}
+code{{background:#0f1a30;padding:.1rem .3rem;border-radius:3px;}}
+</style></head>
+<body><div class="container">
+<h1>Probe results</h1>
+<p class="subtitle">Scanned the Hive shelf (id={hive_shelf_id}) for known resources by name. Check the boxes for matches you want to assign to your settings, then save.</p>
+<form method="POST" action="/settings/probe">
+<div class="card">
+<table>
+{r1}{r2}{r3}{r4}{r5}{r6}{r7}{r8}{r9}
+</table>
+</div>
+<button type="submit">Apply selected</button>
+&nbsp;&nbsp;<a href="/settings">Back to settings</a>
+</form>
+</div></body></html>"##,
+        hive_shelf_id = hive_shelf_id,
+        r1 = row("ai_identity_book_id", "Identity book", &m.identity_book),
+        r2 = row("ai_identity_page_id", "Identity manifest page", &m.identity_page),
+        r3 = row("ai_hive_journal_book_id", "Journal book", &m.journal_book),
+        r4 = row("ai_collage_book_id", "Topics / Collage book", &m.collage_book),
+        r5 = row("ai_shared_collage_book_id", "Shared collage book", &m.shared_collage_book),
+        r6 = row("ai_subagents_chapter_id", "Subagents chapter", &m.subagents_chapter),
+        r7 = row("ai_connections_chapter_id", "Connections chapter", &m.connections_chapter),
+        r8 = row("ai_opportunities_chapter_id", "Opportunities chapter", &m.opportunities_chapter),
+        r9 = row("ai_activity_chapter_id", "Activity chapter", &m.activity_chapter),
+    )
 }
 
 // --- Helpers ---
@@ -348,6 +722,7 @@ fn render_checkbox(name: &str, checked: bool, label: &str) -> String {
 
 fn render_settings_page(
     s: &UserSettings,
+    g: &GlobalSettings,
     shelves: &[NamedItem],
     books: &[NamedItem],
     chapters: &[NamedItem],
@@ -390,9 +765,28 @@ a.reauth:hover { color: #cbd5e1; text-decoration: underline; }
 <body>
 <div class="container">
 <h1>Hive Memory Settings</h1>
-<p class="subtitle">Configure where your AI agent's memory lives in this BookStack. Empty fields disable that part of the <code>remember</code> response — they don't break it.</p>
+<p class="subtitle">Configure where your AI agent's memory lives in this BookStack. Empty fields disable that part of the <code>remember</code> response — they don't break it. <a href="/settings/probe" style="color:#3498db;">Probe existing Hive shelf</a> to auto-detect IDs from page names.</p>
 {saved_banner}
 <form method="POST" action="/settings">
+
+<div class="card">
+<h2>Global shelves <span style="font-weight:400;font-size:.78rem;color:#94a3b8;">{global_lock_note}</span></h2>
+<p class="subtitle" style="margin-bottom:.75rem;">Shared by every user on this BookStack. First-write-wins for the UI; once set, the dropdown is locked here.</p>
+<div class="row2">
+<div class="field">
+  <label for="hive_shelf_id">Hive shelf</label>
+  {hive_shelf_select}
+  <div class="hint">Contains every AI agent's Identity book.</div>
+  {hive_shelf_create}
+</div>
+<div class="field">
+  <label for="user_journals_shelf_id">User Journals shelf</label>
+  {user_journals_shelf_select}
+  <div class="hint">Contains every human user's journal book.</div>
+  {user_journals_shelf_create}
+</div>
+</div>
+</div>
 
 <div class="card">
 <h2>Instance</h2>
@@ -536,6 +930,20 @@ a.reauth:hover { color: #cbd5e1; text-decoration: underline; }
 </div>
 </div>
 
+<div class="card">
+<h2>Auto-create missing structure</h2>
+<p class="subtitle" style="margin-bottom:.75rem;">For each blank field above, check the box to have the server create the book or chapter on save (with sensible default name and description). Permission denials surface as a warning — they don't block the rest of the save.</p>
+{create_ai_identity_book_cb}
+{create_ai_hive_journal_book_cb}
+{create_ai_collage_book_cb}
+{create_ai_shared_collage_book_cb}
+{create_user_journal_book_cb}
+{create_ai_subagents_chapter_cb}
+{create_ai_connections_chapter_cb}
+{create_ai_opportunities_chapter_cb}
+{create_ai_activity_chapter_cb}
+</div>
+
 <div class="actions">
   <button type="submit" class="primary">Save settings</button>
   <a href="/authorize?response_type=code&client_id=settings-ui&redirect_uri=/settings&return_to=/settings" class="reauth">Re-authenticate with new BookStack token →</a>
@@ -573,5 +981,59 @@ a.reauth:hover { color: #cbd5e1; text-decoration: underline; }
         recent_count = s.recent_journal_count,
         collage_count = s.active_collage_count,
         system_prompt_ids = html_escape(&format_id_list(&s.system_prompt_page_ids)),
+
+        global_lock_note = if g.updated_at > 0 { "(set globally — locked here)" } else { "" },
+        hive_shelf_select = render_select_locked("hive_shelf_id", shelves, g.hive_shelf_id, g.hive_shelf_id.is_some()),
+        user_journals_shelf_select = render_select_locked("user_journals_shelf_id", shelves, g.user_journals_shelf_id, g.user_journals_shelf_id.is_some()),
+        hive_shelf_create = if g.hive_shelf_id.is_some() { String::new() } else { create_inline("create_hive_shelf", "Create \"Hive\" shelf if missing") },
+        user_journals_shelf_create = if g.user_journals_shelf_id.is_some() { String::new() } else { create_inline("create_user_journals_shelf", "Create \"User Journals\" shelf if missing") },
+
+        create_ai_identity_book_cb = create_row("create_ai_identity_book", "Create Identity book under the Hive shelf if blank above", s.ai_identity_book_id.is_some()),
+        create_ai_hive_journal_book_cb = create_row("create_ai_hive_journal_book", "Create Journal book under the Hive shelf if blank above", s.ai_hive_journal_book_id.is_some()),
+        create_ai_collage_book_cb = create_row("create_ai_collage_book", "Create Topics / Collage book under the Hive shelf if blank above", s.ai_collage_book_id.is_some()),
+        create_ai_shared_collage_book_cb = create_row("create_ai_shared_collage_book", "Create Shared Topics book under the Hive shelf if blank above", s.ai_shared_collage_book_id.is_some()),
+        create_user_journal_book_cb = create_row("create_user_journal_book", "Create your personal journal book under the User Journals shelf if blank above", s.user_journal_book_id.is_some()),
+        create_ai_subagents_chapter_cb = create_row("create_ai_subagents_chapter", "Create Subagents chapter inside the Identity book if blank above", s.ai_subagents_chapter_id.is_some()),
+        create_ai_connections_chapter_cb = create_row("create_ai_connections_chapter", "Create Connections chapter inside the Identity book if blank above", s.ai_connections_chapter_id.is_some()),
+        create_ai_opportunities_chapter_cb = create_row("create_ai_opportunities_chapter", "Create Opportunities chapter inside the Identity book if blank above", s.ai_opportunities_chapter_id.is_some()),
+        create_ai_activity_chapter_cb = create_row("create_ai_activity_chapter", "Create Activity chapter inside the Journal book if blank above", s.ai_activity_chapter_id.is_some()),
     )
+}
+
+fn create_row(field_name: &str, label: &str, already_set: bool) -> String {
+    if already_set {
+        format!(r#"<div class="cb" style="color:#64748b;">✓ {label} (already configured)</div>"#, label = html_escape(label))
+    } else {
+        format!(
+            r#"<label class="cb"><input type="checkbox" name="{name}" value="on"> {label}</label>"#,
+            name = html_escape(field_name),
+            label = html_escape(label),
+        )
+    }
+}
+
+fn create_inline(field_name: &str, label: &str) -> String {
+    format!(
+        r#"<label class="cb" style="margin-top:.3rem;"><input type="checkbox" name="{name}" value="on"> {label}</label>"#,
+        name = html_escape(field_name),
+        label = html_escape(label),
+    )
+}
+
+fn render_select_locked(name: &str, items: &[NamedItem], current: Option<i64>, locked: bool) -> String {
+    if locked {
+        let current_name = current
+            .and_then(|id| items.iter().find(|i| i.id == id))
+            .map(|i| i.name.clone())
+            .unwrap_or_else(|| String::from("(unknown)"));
+        format!(
+            r#"<input type="hidden" name="{name}" value="{value}"><div style="padding:.55rem .7rem;border:1px solid #2a3a5c;border-radius:6px;background:#0a0f1f;color:#94a3b8;font-size:.9rem;">{disp} <code style="font-size:.75rem;">id={id}</code></div>"#,
+            name = html_escape(name),
+            value = current.map(|v| v.to_string()).unwrap_or_default(),
+            disp = html_escape(&current_name),
+            id = current.map(|v| v.to_string()).unwrap_or_default(),
+        )
+    } else {
+        render_select(name, items, current, true)
+    }
 }

@@ -168,3 +168,28 @@ pub fn hash_token_id(token_id: &str) -> String {
     let hash = sha2::Sha256::digest(token_id.as_bytes());
     format!("{hash:x}")
 }
+
+/// Server-instance-level settings shared by all users on the same BookStack.
+///
+/// Stored as a single-row table. `set_by_token_hash` records the first user who
+/// configured the field; the UI uses this to render pre-set values as read-only
+/// for subsequent users (first-write-wins; DB allows overwrites).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GlobalSettings {
+    /// Shared shelf containing every AI agent's Identity book.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hive_shelf_id: Option<i64>,
+
+    /// Shared shelf containing every human user's journal book.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_journals_shelf_id: Option<i64>,
+
+    /// Hash of the first token_id that set these values (informational; does
+    /// not gate writes — UI handles the lock-after-set semantics).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set_by_token_hash: Option<String>,
+
+    /// Unix epoch seconds of last update. 0 = never set.
+    #[serde(default)]
+    pub updated_at: i64,
+}

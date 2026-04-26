@@ -13,7 +13,7 @@ use zeroize::Zeroizing;
 
 use bsmcp_common::config::{access_token_ttl, refresh_token_ttl};
 use bsmcp_common::db::{DbBackend, SemanticDb};
-use bsmcp_common::settings::UserSettings;
+use bsmcp_common::settings::{GlobalSettings, UserSettings};
 use bsmcp_common::types::*;
 
 const BASE64: base64::engine::general_purpose::GeneralPurpose =
@@ -106,6 +106,22 @@ impl PostgresDb {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_user_time ON remember_audit(token_id_hash, occurred_at DESC)")
             .execute(&pool).await.ok();
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_resource_time ON remember_audit(resource, occurred_at DESC)")
+            .execute(&pool).await.ok();
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS global_settings (
+                id INT PRIMARY KEY CHECK (id = 1),
+                hive_shelf_id BIGINT,
+                user_journals_shelf_id BIGINT,
+                set_by_token_hash TEXT,
+                updated_at BIGINT NOT NULL DEFAULT 0
+            )"
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("Failed to create global_settings table: {e}"))?;
+
+        sqlx::query("INSERT INTO global_settings (id, updated_at) VALUES (1, 0) ON CONFLICT (id) DO NOTHING")
             .execute(&pool).await.ok();
 
         let hash = sha2::Sha256::digest(encryption_key.as_bytes());
@@ -373,6 +389,55 @@ impl DbBackend for PostgresDb {
         .await
         .map_err(|e| format!("insert_audit_entry: {e}"))?;
         Ok(row.get("id"))
+    }
+
+    async fn get_global_settings(&self) -> Result<GlobalSettings, String> {
+        let row = sqlx::query(
+            "SELECT hive_shelf_id, user_journals_shelf_id, set_by_token_hash, updated_at
+             FROM global_settings WHERE id = 1"
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("get_global_settings: {e}"))?;
+
+        Ok(row.map(|r| GlobalSettings {
+            hive_shelf_id: r.get("hive_shelf_id"),
+            user_journals_shelf_id: r.get("user_journals_shelf_id"),
+            set_by_token_hash: r.get("set_by_token_hash"),
+            updated_at: r.get("updated_at"),
+        }).unwrap_or_default())
+    }
+
+    async fn save_global_settings(
+        &self,
+        settings: &GlobalSettings,
+        set_by_token_hash: &str,
+    ) -> Result<(), String> {
+        let existing_setter: Option<String> = sqlx::query_scalar(
+            "SELECT set_by_token_hash FROM global_settings WHERE id = 1 AND updated_at > 0"
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("save_global_settings preflight: {e}"))?
+        .flatten();
+        let final_setter = existing_setter.unwrap_or_else(|| set_by_token_hash.to_string());
+
+        sqlx::query(
+            "UPDATE global_settings
+             SET hive_shelf_id = $1,
+                 user_journals_shelf_id = $2,
+                 set_by_token_hash = $3,
+                 updated_at = $4
+             WHERE id = 1"
+        )
+        .bind(settings.hive_shelf_id)
+        .bind(settings.user_journals_shelf_id)
+        .bind(&final_setter)
+        .bind(Self::now_secs())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("save_global_settings: {e}"))?;
+        Ok(())
     }
 
     async fn list_audit_entries(

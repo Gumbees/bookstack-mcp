@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 
 use bsmcp_common::config::{access_token_ttl, refresh_token_ttl};
 use bsmcp_common::db::{DbBackend, SemanticDb};
-use bsmcp_common::settings::UserSettings;
+use bsmcp_common::settings::{GlobalSettings, UserSettings};
 use bsmcp_common::types::*;
 use bsmcp_common::vector;
 
@@ -66,6 +66,14 @@ impl SqliteDb {
              );
              CREATE INDEX IF NOT EXISTS idx_audit_user_time ON remember_audit(token_id_hash, occurred_at DESC);
              CREATE INDEX IF NOT EXISTS idx_audit_resource_time ON remember_audit(resource, occurred_at DESC);
+             CREATE TABLE IF NOT EXISTS global_settings (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 hive_shelf_id INTEGER,
+                 user_journals_shelf_id INTEGER,
+                 set_by_token_hash TEXT,
+                 updated_at INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT OR IGNORE INTO global_settings (id, updated_at) VALUES (1, 0);
              DROP TABLE IF EXISTS registrations;",
         )
         .expect("Failed to initialize database schema");
@@ -377,6 +385,59 @@ impl DbBackend for SqliteDb {
                 ],
             ).map_err(|e| format!("insert_audit_entry: {e}"))?;
             Ok(conn.last_insert_rowid())
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn get_global_settings(&self) -> Result<GlobalSettings, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<GlobalSettings, String> {
+            let conn = conn.lock().unwrap();
+            let row = conn.query_row(
+                "SELECT hive_shelf_id, user_journals_shelf_id, set_by_token_hash, updated_at FROM global_settings WHERE id = 1",
+                [],
+                |row| Ok(GlobalSettings {
+                    hive_shelf_id: row.get::<_, Option<i64>>(0)?,
+                    user_journals_shelf_id: row.get::<_, Option<i64>>(1)?,
+                    set_by_token_hash: row.get::<_, Option<String>>(2)?,
+                    updated_at: row.get::<_, i64>(3)?,
+                }),
+            ).unwrap_or_default();
+            Ok(row)
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn save_global_settings(
+        &self,
+        settings: &GlobalSettings,
+        set_by_token_hash: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let s = settings.clone();
+        let setter = set_by_token_hash.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            // If the row was never set (updated_at == 0), record this writer as the original setter.
+            // Otherwise preserve the existing set_by_token_hash.
+            let existing_setter: Option<String> = conn.query_row(
+                "SELECT set_by_token_hash FROM global_settings WHERE id = 1 AND updated_at > 0",
+                [],
+                |row| row.get(0),
+            ).ok().flatten();
+            let final_setter = existing_setter.unwrap_or(setter);
+            conn.execute(
+                "UPDATE global_settings
+                 SET hive_shelf_id = ?1,
+                     user_journals_shelf_id = ?2,
+                     set_by_token_hash = ?3,
+                     updated_at = ?4
+                 WHERE id = 1",
+                params![s.hive_shelf_id, s.user_journals_shelf_id, final_setter, SqliteDb::now_secs()],
+            ).map_err(|e| format!("save_global_settings: {e}"))?;
+            Ok(())
         })
         .await
         .map_err(|e| format!("Task failed: {e}"))?

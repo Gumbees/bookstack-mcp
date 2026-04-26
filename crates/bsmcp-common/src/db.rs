@@ -2,7 +2,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
-use crate::settings::UserSettings;
+use crate::settings::{GlobalSettings, UserSettings};
 use crate::types::*;
 
 /// Core database operations (auth tokens, backups, user settings).
@@ -56,6 +56,18 @@ pub trait DbBackend: Send + Sync + 'static {
         offset: i64,
         since_unix: Option<i64>,
     ) -> Result<Vec<AuditEntry>, String>;
+
+    // --- Global settings (server-instance-wide) ---
+
+    /// Load the singleton global settings row. Returns defaults if never set.
+    async fn get_global_settings(&self) -> Result<GlobalSettings, String>;
+
+    /// Upsert the singleton global settings row. Records the writer's token hash.
+    async fn save_global_settings(
+        &self,
+        settings: &GlobalSettings,
+        set_by_token_hash: &str,
+    ) -> Result<(), String>;
 }
 
 /// Semantic search database operations.

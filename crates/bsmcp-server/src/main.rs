@@ -242,6 +242,10 @@ async fn main() {
             get(settings_ui::handle_settings_get).post(settings_ui::handle_settings_post),
         )
         .route(
+            "/settings/probe",
+            get(settings_ui::handle_settings_probe_get).post(settings_ui::handle_settings_probe_post),
+        )
+        .route(
             "/remember/v1/{resource}/{action}",
             axum::routing::post(handle_remember_http),
         )
@@ -263,7 +267,7 @@ async fn main() {
             .route("/webhooks/bookstack", axum::routing::post(handle_webhook))
             .route("/status", get(handle_status));
         eprintln!("Semantic: webhook endpoint active at POST /webhooks/bookstack");
-        eprintln!("Semantic: status page at GET /status");
+        eprintln!("Semantic: status page at GET /status (auth-gated — Bearer token or settings cookie)");
     }
 
     let app = app
@@ -451,7 +455,20 @@ fn bar_color(status: &str) -> &str {
 
 async fn handle_status(
     State(state): State<sse::AppState>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    // Auth-gate: accept either a Bearer token (programmatic) or a valid
+    // settings session cookie (browser). Reject otherwise so the embedding
+    // status page isn't world-readable.
+    let bearer_ok = sse::resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await.is_ok();
+    let cookie_ok = settings_ui::has_valid_session(&headers, &state.settings_sessions).await;
+    if !bearer_ok && !cookie_ok {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Html(r#"<html><body style="font-family:sans-serif;padding:2rem;background:#0f172a;color:#e2e8f0;"><h1>Unauthorized</h1><p>The status page requires authentication. Send a Bearer token or sign in via <a href="/settings" style="color:#3498db;">/settings</a> first.</p></body></html>"#.to_string()),
+        ).into_response();
+    }
+
     let semantic = match &state.semantic {
         Some(s) => s,
         None => return Html("Semantic search not enabled".to_string()).into_response(),

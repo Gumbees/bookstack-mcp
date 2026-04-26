@@ -2005,6 +2005,34 @@ fn add_remember_tools(tools: &mut Vec<Value>) {
             "limit": { "type": "integer", "default": 10, "description": "Per-scope result cap" },
         }),
     ));
+
+    // Identity discovery + creation
+    tools.push(remember_tool(
+        "identity",
+        "List or create AI identities under the global Hive shelf. action=list enumerates existing identities (book + manifest page + OUID per agent). action=create scaffolds a new Identity book + manifest page from a prompt template, optionally provisioning the standard chapter set (Subagents, Connections, Opportunities).",
+        &["list", "create"],
+        json!({
+            "name": { "type": "string", "description": "Display name for the new agent (e.g., 'Pia')" },
+            "ouid": { "type": "string", "description": "Optional stable OUID; a UUID is generated if omitted" },
+            "prompt_template": { "type": "string", "default": "default", "description": "Template name for the manifest body. Currently 'default' is the only built-in." },
+            "custom_prompt": { "type": "string", "description": "Override the template entirely with this markdown" },
+            "additional_details": {
+                "type": "object",
+                "description": "Free-form details merged into the default template (role, focus_areas, voice, notes, etc.)",
+            },
+            "auto_provision_chapters": { "type": "boolean", "default": true, "description": "Also create Subagents/Connections/Opportunities chapters in the new book" },
+        }),
+    ));
+
+    // Directory (cross-shelf discovery)
+    tools.push(remember_tool(
+        "directory",
+        "Discover globally-shared resources by kind. action=read with kind='identities' lists books on the Hive shelf; kind='user_journals' lists books on the User Journals shelf. The calling user's BookStack permissions filter what is visible.",
+        &["read"],
+        json!({
+            "kind": { "type": "string", "enum": ["identities", "user_journals"], "description": "Which global shelf to enumerate" },
+        }),
+    ));
 }
 
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {

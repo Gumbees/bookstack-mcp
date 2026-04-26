@@ -70,6 +70,11 @@ impl SqliteDb {
                  id INTEGER PRIMARY KEY CHECK (id = 1),
                  hive_shelf_id INTEGER,
                  user_journals_shelf_id INTEGER,
+                 default_ai_identity_page_id INTEGER,
+                 default_ai_identity_name TEXT,
+                 default_ai_identity_ouid TEXT,
+                 org_required_instructions_page_ids TEXT,
+                 org_ai_usage_policy_page_ids TEXT,
                  set_by_token_hash TEXT,
                  updated_at INTEGER NOT NULL DEFAULT 0
              );
@@ -77,6 +82,23 @@ impl SqliteDb {
              DROP TABLE IF EXISTS registrations;",
         )
         .expect("Failed to initialize database schema");
+
+        // Migrations: ALTER existing global_settings rows to gain new columns.
+        // SQLite doesn't support IF NOT EXISTS on ALTER ADD COLUMN; ignore the
+        // duplicate-column error.
+        // Note: org_*_chapter_ids columns were briefly added during this PR's
+        // development and then dropped in favour of page-IDs-only. Existing
+        // rows with values in those columns are simply ignored — the columns
+        // remain on disk but are not read by the application.
+        for sql in [
+            "ALTER TABLE global_settings ADD COLUMN default_ai_identity_page_id INTEGER",
+            "ALTER TABLE global_settings ADD COLUMN default_ai_identity_name TEXT",
+            "ALTER TABLE global_settings ADD COLUMN default_ai_identity_ouid TEXT",
+            "ALTER TABLE global_settings ADD COLUMN org_required_instructions_page_ids TEXT",
+            "ALTER TABLE global_settings ADD COLUMN org_ai_usage_policy_page_ids TEXT",
+        ] {
+            conn.execute_batch(sql).ok();
+        }
 
         let hash = sha2::Sha256::digest(encryption_key.as_bytes());
         let mut key = Zeroizing::new([0u8; 32]);
@@ -395,13 +417,23 @@ impl DbBackend for SqliteDb {
         tokio::task::spawn_blocking(move || -> Result<GlobalSettings, String> {
             let conn = conn.lock().unwrap();
             let row = conn.query_row(
-                "SELECT hive_shelf_id, user_journals_shelf_id, set_by_token_hash, updated_at FROM global_settings WHERE id = 1",
+                "SELECT hive_shelf_id, user_journals_shelf_id,
+                        default_ai_identity_page_id, default_ai_identity_name, default_ai_identity_ouid,
+                        org_required_instructions_page_ids,
+                        org_ai_usage_policy_page_ids,
+                        set_by_token_hash, updated_at
+                 FROM global_settings WHERE id = 1",
                 [],
                 |row| Ok(GlobalSettings {
                     hive_shelf_id: row.get::<_, Option<i64>>(0)?,
                     user_journals_shelf_id: row.get::<_, Option<i64>>(1)?,
-                    set_by_token_hash: row.get::<_, Option<String>>(2)?,
-                    updated_at: row.get::<_, i64>(3)?,
+                    default_ai_identity_page_id: row.get::<_, Option<i64>>(2)?,
+                    default_ai_identity_name: row.get::<_, Option<String>>(3)?,
+                    default_ai_identity_ouid: row.get::<_, Option<String>>(4)?,
+                    org_required_instructions_page_ids: decode_id_list(row.get::<_, Option<String>>(5)?),
+                    org_ai_usage_policy_page_ids: decode_id_list(row.get::<_, Option<String>>(6)?),
+                    set_by_token_hash: row.get::<_, Option<String>>(7)?,
+                    updated_at: row.get::<_, i64>(8)?,
                 }),
             ).unwrap_or_default();
             Ok(row)
@@ -420,8 +452,6 @@ impl DbBackend for SqliteDb {
         let setter = set_by_token_hash.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            // If the row was never set (updated_at == 0), record this writer as the original setter.
-            // Otherwise preserve the existing set_by_token_hash.
             let existing_setter: Option<String> = conn.query_row(
                 "SELECT set_by_token_hash FROM global_settings WHERE id = 1 AND updated_at > 0",
                 [],
@@ -432,10 +462,25 @@ impl DbBackend for SqliteDb {
                 "UPDATE global_settings
                  SET hive_shelf_id = ?1,
                      user_journals_shelf_id = ?2,
-                     set_by_token_hash = ?3,
-                     updated_at = ?4
+                     default_ai_identity_page_id = ?3,
+                     default_ai_identity_name = ?4,
+                     default_ai_identity_ouid = ?5,
+                     org_required_instructions_page_ids = ?6,
+                     org_ai_usage_policy_page_ids = ?7,
+                     set_by_token_hash = ?8,
+                     updated_at = ?9
                  WHERE id = 1",
-                params![s.hive_shelf_id, s.user_journals_shelf_id, final_setter, SqliteDb::now_secs()],
+                params![
+                    s.hive_shelf_id,
+                    s.user_journals_shelf_id,
+                    s.default_ai_identity_page_id,
+                    s.default_ai_identity_name,
+                    s.default_ai_identity_ouid,
+                    encode_id_list(&s.org_required_instructions_page_ids),
+                    encode_id_list(&s.org_ai_usage_policy_page_ids),
+                    final_setter,
+                    SqliteDb::now_secs(),
+                ],
             ).map_err(|e| format!("save_global_settings: {e}"))?;
             Ok(())
         })
@@ -1272,6 +1317,19 @@ impl SemanticDb for SqliteDb {
         })
         .await
         .map_err(|e| format!("Task failed: {e}"))?
+    }
+}
+
+/// Encode a Vec<i64> as a JSON array string (or NULL when empty so the column
+/// reads back as Option::None and round-trips cleanly).
+fn encode_id_list(ids: &[i64]) -> Option<String> {
+    if ids.is_empty() { None } else { serde_json::to_string(ids).ok() }
+}
+
+fn decode_id_list(value: Option<String>) -> Vec<i64> {
+    match value {
+        Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_default(),
+        _ => Vec::new(),
     }
 }
 

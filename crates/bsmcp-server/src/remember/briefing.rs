@@ -27,8 +27,13 @@ pub async fn read(ctx: &Context) -> Outcome {
         .map(|n| n as usize)
         .unwrap_or(ctx.settings.active_collage_count.max(1));
 
+    // Resolve identity with org-default fallback. If the user hasn't set
+    // their own ai_identity_page_id but the org has a default, use it.
+    let globals = ctx.db.get_global_settings().await.unwrap_or_default();
+    let resolved = globals.resolve_identity(&ctx.settings);
+
     // Identity manifest (page) + user manifest (page) — fetch in parallel.
-    let identity_fut = fetch_optional_page(&ctx.client, ctx.settings.ai_identity_page_id);
+    let identity_fut = fetch_optional_page(&ctx.client, resolved.page_id);
     let user_fut = fetch_optional_page(&ctx.client, ctx.settings.user_identity_page_id);
 
     // Subagents (chapter listing).
@@ -100,13 +105,27 @@ pub async fn read(ctx: &Context) -> Outcome {
         slice
     };
 
-    // Always-on context pages (writing style, communication prefs, etc).
-    let system_prompt_fut = fetch_system_prompt_pages(
+    // Always-on context pages — three sources, all run in parallel:
+    //   - user-configured (system_prompt_page_ids)
+    //   - org-required instructions (admin-mandated page IDs)
+    //   - org-required AI usage policy (admin-mandated page IDs)
+    let user_pages_fut = fetch_pages_with_source(
         &ctx.client,
         &ctx.settings.system_prompt_page_ids,
+        "user",
+    );
+    let org_instructions_fut = fetch_pages_with_source(
+        &ctx.client,
+        &globals.org_required_instructions_page_ids,
+        "org_instructions",
+    );
+    let org_policy_fut = fetch_pages_with_source(
+        &ctx.client,
+        &globals.org_ai_usage_policy_page_ids,
+        "org_policy",
     );
 
-    let (identity, user_page, subagents, recent_journals, active_collage, shared_collage, semantic, system_prompt) = tokio::join!(
+    let (identity, user_page, subagents, recent_journals, active_collage, shared_collage, semantic, user_pages, org_instructions, org_policy) = tokio::join!(
         identity_fut,
         user_fut,
         subagents_fut,
@@ -114,17 +133,75 @@ pub async fn read(ctx: &Context) -> Outcome {
         active_collage_fut,
         shared_collage_fut,
         semantic_fut,
-        system_prompt_fut,
+        user_pages_fut,
+        org_instructions_fut,
+        org_policy_fut,
     );
 
+    // Merge the three sources into one flat array. Each entry carries its
+    // `source` field so callers can group/filter as needed.
+    let mut system_prompt: Vec<Value> = Vec::with_capacity(
+        user_pages.len() + org_instructions.len() + org_policy.len(),
+    );
+    system_prompt.extend(user_pages);
+    system_prompt.extend(org_instructions);
+    system_prompt.extend(org_policy);
+
+    // Setup nudge — show when the user hasn't configured anything AND hasn't
+    // snoozed the reminder. Suppressed once they save anything to /settings or
+    // explicitly dismiss via remember_config.
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let snoozed = ctx.settings.settings_nudge_dismissed_until.map(|t| now_unix < t).unwrap_or(false);
+    let setup_nudge = if !ctx.settings.is_configured() && !snoozed {
+        Some(json!({
+            "show": true,
+            "summary": "Your Hive memory settings aren't configured yet. Briefing is running on org defaults (where set) or empty sections.",
+            "two_paths": {
+                "ui": "Visit the MCP server's /settings page in a browser — fill in dropdowns or use 'Probe existing Hive' to auto-detect.",
+                "mcp_guided": "Have the AI walk you through it via tool calls (recommended for chat-driven setups). See `suggested_workflow` below."
+            },
+            "suggested_workflow": [
+                "1. Ask the user what they want: a fresh identity, or to adopt an existing agent/structure that's already in this BookStack.",
+                "2. If existing: call `remember_directory action=read kind=identities` to see what's already on the global Hive shelf, and `remember_directory action=read kind=user_journals` for journals. If those return settings_not_configured, the global shelves themselves aren't set — surface that to the user (only an admin can fix).",
+                "3. Use `search_content` with queries like '{type:book} Identity', '{type:book} Journal', '{type:book} Topics' to find candidate content that may be elsewhere in BookStack and should belong on the Hive shelf.",
+                "4. For each match, propose to the user whether to (a) adopt it as-is by writing the ID into config, or (b) move it onto the Hive shelf first using `move_book_to_shelf` / `move_chapter` / `move_page`, then write the ID.",
+                "5. For brand-new structure, use `remember_identity action=create name=...` to scaffold a full Identity book + manifest + standard chapters in one call.",
+                "6. Save the resolved IDs with `remember_config action=write` and a `settings` object. The next briefing will reflect the new config and the nudge will stop showing."
+            ],
+            "key_tools": [
+                "remember_directory  — discover what's on the global shelves",
+                "search_content      — find existing candidates anywhere",
+                "list_books / list_chapters / list_shelves — browse",
+                "move_book_to_shelf / move_chapter / move_page — relocate",
+                "remember_identity action=create — scaffold a new identity",
+                "remember_config    action=write — persist the chosen IDs",
+                "remember_config    action=dismiss_setup_nudge days=N — snooze this reminder"
+            ],
+            "settings_path": "/settings",
+            "dismiss": {
+                "tool": "remember_config",
+                "action": "dismiss_setup_nudge",
+                "default_days": 7,
+                "example": "remember_config action=dismiss_setup_nudge days=14"
+            }
+        }))
+    } else {
+        None
+    };
+
     Outcome::ok(json!({
+        "setup_nudge": setup_nudge,
         "identity": match identity {
             Some(p) => json!({
-                "ouid": ctx.settings.ai_identity_ouid,
-                "name": ctx.settings.ai_identity_name.clone()
+                "ouid": resolved.ouid,
+                "name": resolved.name.clone()
                     .or_else(|| p.get("name").and_then(|v| v.as_str()).map(|s| s.to_string())),
+                "using_org_default": resolved.using_default,
                 "manifest": {
-                    "page_id": ctx.settings.ai_identity_page_id,
+                    "page_id": resolved.page_id,
                     "markdown": frontmatter::strip(p.get("markdown").and_then(|v| v.as_str()).unwrap_or("")),
                     "url": p.get("url").cloned().unwrap_or(Value::Null),
                 }
@@ -164,18 +241,25 @@ pub async fn read(ctx: &Context) -> Outcome {
     }))
 }
 
-async fn fetch_system_prompt_pages(client: &BookStackClient, ids: &[i64]) -> Vec<Value> {
-    if ids.is_empty() {
+/// Fetch the markdown for every page in `page_ids` concurrently. Each result
+/// is tagged with the given `source` so the AI knows where the content came
+/// from (`user`, `org_instructions`, or `org_policy`).
+async fn fetch_pages_with_source(
+    client: &BookStackClient,
+    page_ids: &[i64],
+    source: &'static str,
+) -> Vec<Value> {
+    if page_ids.is_empty() {
         return Vec::new();
     }
-    let mut handles = Vec::with_capacity(ids.len());
-    for &id in ids {
+    let mut handles = Vec::with_capacity(page_ids.len());
+    for &id in page_ids {
         let client = client.clone();
         handles.push(tokio::spawn(async move {
             (id, client.get_page(id).await)
         }));
     }
-    let mut out = Vec::with_capacity(ids.len());
+    let mut out = Vec::new();
     for h in handles {
         let Ok((id, result)) = h.await else { continue; };
         match result {
@@ -186,10 +270,11 @@ async fn fetch_system_prompt_pages(client: &BookStackClient, ids: &[i64]) -> Vec
                     "name": page.get("name").cloned().unwrap_or(Value::Null),
                     "markdown": frontmatter::strip(raw),
                     "url": page.get("url").cloned().unwrap_or(Value::Null),
+                    "source": source,
                 }));
             }
             Err(e) => {
-                eprintln!("Briefing: system_prompt_page_ids[{id}] fetch failed: {e}");
+                eprintln!("Briefing: {source} page {id} fetch failed: {e}");
             }
         }
     }

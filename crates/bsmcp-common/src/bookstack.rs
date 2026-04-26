@@ -394,6 +394,43 @@ impl BookStackClient {
         self.get("books", &[("count", "1")]).await
     }
 
+    /// Heuristic admin check: BookStack returns 403 from `/api/users` for
+    /// non-admins. We don't need the user list, just the success/failure.
+    /// Returns Ok(true) on success, Ok(false) on a 403, Err on other failures
+    /// (so callers can distinguish "not admin" from "couldn't reach BookStack").
+    pub async fn is_admin(&self) -> Result<bool, String> {
+        match self.list_users(1, 0).await {
+            Ok(_) => Ok(true),
+            Err(e) if e.contains("403") || e.to_lowercase().contains("forbidden") => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Look up BookStack's "Admin" role ID. Used to lock auto-created Hive
+    /// content to admin-only edit. Matches `display_name` case-insensitively
+    /// against "admin"; returns the first match. Errors if no matching role
+    /// is found (caller should treat as a non-fatal warning).
+    pub async fn find_admin_role_id(&self) -> Result<i64, String> {
+        let resp = self.list_roles(50, 0).await?;
+        let data = resp
+            .get("data")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for role in data {
+            let name = role
+                .get("display_name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            if name.eq_ignore_ascii_case("admin") {
+                if let Some(id) = role.get("id").and_then(|i| i.as_i64()) {
+                    return Ok(id);
+                }
+            }
+        }
+        Err("No role named \"Admin\" found in BookStack — cannot apply admin-only permission lock".to_string())
+    }
+
     // --- Permission check ---
 
     /// Check if the user can access a specific page.

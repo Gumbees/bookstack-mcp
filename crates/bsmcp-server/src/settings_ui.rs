@@ -164,17 +164,19 @@ pub async fn handle_settings_get(
         state.http_client.clone(),
     );
 
-    let (shelves_res, books_res, chapters_res) = tokio::join!(
+    let (shelves_res, books_res, chapters_res, admin_res) = tokio::join!(
         client.list_shelves(500, 0),
         client.list_books(500, 0),
         client.list_chapters(500, 0),
+        client.is_admin(),
     );
 
     let shelves = extract_named_list(shelves_res.ok().as_ref());
     let books = extract_named_list(books_res.ok().as_ref());
     let chapters = extract_named_list(chapters_res.ok().as_ref());
+    let is_admin = admin_res.unwrap_or(false);
 
-    Html(render_settings_page(&settings, &globals, &shelves, &books, &chapters)).into_response()
+    Html(render_settings_page(&settings, &globals, &shelves, &books, &chapters, is_admin)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -222,6 +224,11 @@ pub struct SettingsForm {
     pub create_ai_connections_chapter: Option<String>,
     pub create_ai_opportunities_chapter: Option<String>,
     pub create_ai_activity_chapter: Option<String>,
+
+    // Org-default AI identity (admins only).
+    pub default_ai_identity_page_id: Option<String>,
+    pub default_ai_identity_name: Option<String>,
+    pub default_ai_identity_ouid: Option<String>,
 }
 
 fn empty_to_none(s: Option<String>) -> Option<String> {
@@ -298,30 +305,129 @@ pub async fn handle_settings_post(
         recent_journal_count: parse_count(form.recent_journal_count, 3),
         active_collage_count: parse_count(form.active_collage_count, 10),
         system_prompt_page_ids: parse_id_list(form.system_prompt_page_ids),
+        // Carry over the existing dismiss timestamp — saving via /settings
+        // doesn't change the snooze. (The nudge auto-stops showing once
+        // is_configured() is true.)
+        settings_nudge_dismissed_until: state
+            .db
+            .get_user_settings(&token_id_hash)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| s.settings_nudge_dismissed_until),
     };
 
-    // Globals: respect existing values (first-write-wins for the UI; DB allows overwrites).
+    // Globals: server-side first-write-wins, gated to BookStack admins.
+    // Once a global field is set, it cannot be changed via this UI; once set
+    // by a non-admin (shouldn't happen — UI hides the controls), subsequent
+    // form submissions cannot rewrite them either.
     let existing_globals = state.db.get_global_settings().await.unwrap_or_default();
-    let mut globals = GlobalSettings {
-        hive_shelf_id: existing_globals.hive_shelf_id.or(parse_id(form.hive_shelf_id)),
-        user_journals_shelf_id: existing_globals.user_journals_shelf_id.or(parse_id(form.user_journals_shelf_id)),
-        set_by_token_hash: existing_globals.set_by_token_hash.clone(),
-        updated_at: existing_globals.updated_at,
-    };
+    let is_admin = client.is_admin().await.unwrap_or(false);
+
+    let mut globals = existing_globals.clone();
+    let mut global_warnings: Vec<String> = Vec::new();
+    let proposed_hive = parse_id(form.hive_shelf_id);
+    let proposed_user_journals = parse_id(form.user_journals_shelf_id);
+    let proposed_default_id = parse_id(form.default_ai_identity_page_id);
+    let proposed_default_name = empty_to_none(form.default_ai_identity_name);
+    let proposed_default_ouid = empty_to_none(form.default_ai_identity_ouid);
+
+    if existing_globals.hive_shelf_id.is_none() {
+        if let Some(new_id) = proposed_hive {
+            if is_admin {
+                globals.hive_shelf_id = Some(new_id);
+            } else {
+                global_warnings.push(
+                    "Ignoring hive_shelf_id submission — only BookStack admins can set global shelves.".into()
+                );
+            }
+        }
+    } else if proposed_hive.is_some() && proposed_hive != existing_globals.hive_shelf_id {
+        global_warnings.push(
+            "Ignoring hive_shelf_id change — global shelves are first-write-wins; current value preserved.".into()
+        );
+    }
+
+    if existing_globals.user_journals_shelf_id.is_none() {
+        if let Some(new_id) = proposed_user_journals {
+            if is_admin {
+                globals.user_journals_shelf_id = Some(new_id);
+            } else {
+                global_warnings.push(
+                    "Ignoring user_journals_shelf_id submission — only BookStack admins can set global shelves.".into()
+                );
+            }
+        }
+    } else if proposed_user_journals.is_some() && proposed_user_journals != existing_globals.user_journals_shelf_id {
+        global_warnings.push(
+            "Ignoring user_journals_shelf_id change — global shelves are first-write-wins; current value preserved.".into()
+        );
+    }
+
+    // Org-default identity fields — admin-only writes, but they're updatable
+    // (not first-write-wins) so admins can swap the house agent later.
+    if is_admin {
+        globals.default_ai_identity_page_id = proposed_default_id;
+        globals.default_ai_identity_name = proposed_default_name;
+        globals.default_ai_identity_ouid = proposed_default_ouid;
+    } else if proposed_default_id.is_some() || proposed_default_name.is_some() || proposed_default_ouid.is_some() {
+        global_warnings.push(
+            "Ignoring org-default identity submission — only BookStack admins can set the org default.".into()
+        );
+    }
+
+    // Same admin gate for create-if-missing on the global shelves themselves.
+    if !is_admin {
+        if checkbox_on(form.create_hive_shelf.clone()) || checkbox_on(form.create_user_journals_shelf.clone()) {
+            global_warnings.push(
+                "Ignoring create-if-missing for global shelves — only BookStack admins can provision them.".into()
+            );
+        }
+    }
 
     // Auto-provisioning in dependency order. Each step writes back into
     // `settings` / `globals` so later steps can use the just-created IDs.
+    // After each successful create we lock the new content to admin-only edit
+    // (everyone else read-only; owner keeps default edit). admin_role_id is
+    // looked up lazily so we only pay the cost when something is being created.
     let mut provision_log: Vec<String> = Vec::new();
+    let mut admin_role_id: Option<i64> = None;
+    async fn ensure_admin_role(
+        cached: &mut Option<i64>,
+        client: &BookStackClient,
+    ) -> Option<i64> {
+        if cached.is_some() {
+            return *cached;
+        }
+        match client.find_admin_role_id().await {
+            Ok(id) => { *cached = Some(id); Some(id) }
+            Err(e) => {
+                eprintln!("Settings: admin role lookup failed (locking will be skipped): {e}");
+                None
+            }
+        }
+    }
+    use bsmcp_common::bookstack::ContentType;
 
-    if globals.hive_shelf_id.is_none() && checkbox_on(form.create_hive_shelf) {
+    if is_admin && globals.hive_shelf_id.is_none() && checkbox_on(form.create_hive_shelf) {
         let r = provision::create_shelf(&client, NamedResource::HiveShelf).await;
         provision_log.push(r.human(NamedResource::HiveShelf));
-        if let Some(id) = r.id() { globals.hive_shelf_id = Some(id); }
+        if let Some(id) = r.id() {
+            globals.hive_shelf_id = Some(id);
+            if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
+                provision::lock_to_admin_only(&client, ContentType::Shelf, id, role).await;
+            }
+        }
     }
-    if globals.user_journals_shelf_id.is_none() && checkbox_on(form.create_user_journals_shelf) {
+    if is_admin && globals.user_journals_shelf_id.is_none() && checkbox_on(form.create_user_journals_shelf) {
         let r = provision::create_shelf(&client, NamedResource::UserJournalsShelf).await;
         provision_log.push(r.human(NamedResource::UserJournalsShelf));
-        if let Some(id) = r.id() { globals.user_journals_shelf_id = Some(id); }
+        if let Some(id) = r.id() {
+            globals.user_journals_shelf_id = Some(id);
+            if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
+                provision::lock_to_admin_only(&client, ContentType::Shelf, id, role).await;
+            }
+        }
     }
 
     // Books that live on the Hive shelf.
@@ -329,22 +435,42 @@ pub async fn handle_settings_post(
     if settings.ai_identity_book_id.is_none() && checkbox_on(form.create_ai_identity_book) {
         let r = provision::create_book(&client, NamedResource::IdentityBook, hive_shelf).await;
         provision_log.push(r.human(NamedResource::IdentityBook));
-        if let Some(id) = r.id() { settings.ai_identity_book_id = Some(id); }
+        if let Some(id) = r.id() {
+            settings.ai_identity_book_id = Some(id);
+            if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
+                provision::lock_to_admin_only(&client, ContentType::Book, id, role).await;
+            }
+        }
     }
     if settings.ai_hive_journal_book_id.is_none() && checkbox_on(form.create_ai_hive_journal_book) {
         let r = provision::create_book(&client, NamedResource::JournalBook, hive_shelf).await;
         provision_log.push(r.human(NamedResource::JournalBook));
-        if let Some(id) = r.id() { settings.ai_hive_journal_book_id = Some(id); }
+        if let Some(id) = r.id() {
+            settings.ai_hive_journal_book_id = Some(id);
+            if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
+                provision::lock_to_admin_only(&client, ContentType::Book, id, role).await;
+            }
+        }
     }
     if settings.ai_collage_book_id.is_none() && checkbox_on(form.create_ai_collage_book) {
         let r = provision::create_book(&client, NamedResource::CollageBook, hive_shelf).await;
         provision_log.push(r.human(NamedResource::CollageBook));
-        if let Some(id) = r.id() { settings.ai_collage_book_id = Some(id); }
+        if let Some(id) = r.id() {
+            settings.ai_collage_book_id = Some(id);
+            if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
+                provision::lock_to_admin_only(&client, ContentType::Book, id, role).await;
+            }
+        }
     }
     if settings.ai_shared_collage_book_id.is_none() && checkbox_on(form.create_ai_shared_collage_book) {
         let r = provision::create_book(&client, NamedResource::SharedCollageBook, hive_shelf).await;
         provision_log.push(r.human(NamedResource::SharedCollageBook));
-        if let Some(id) = r.id() { settings.ai_shared_collage_book_id = Some(id); }
+        if let Some(id) = r.id() {
+            settings.ai_shared_collage_book_id = Some(id);
+            if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
+                provision::lock_to_admin_only(&client, ContentType::Book, id, role).await;
+            }
+        }
     }
 
     // User journal book on the User Journals shelf — name personalized by user_id.
@@ -379,17 +505,32 @@ pub async fn handle_settings_post(
         if settings.ai_subagents_chapter_id.is_none() && checkbox_on(form.create_ai_subagents_chapter) {
             let r = provision::create_chapter(&client, NamedResource::SubagentsChapter, book_id).await;
             provision_log.push(r.human(NamedResource::SubagentsChapter));
-            if let Some(id) = r.id() { settings.ai_subagents_chapter_id = Some(id); }
+            if let Some(id) = r.id() {
+                settings.ai_subagents_chapter_id = Some(id);
+                if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
+                    provision::lock_to_admin_only(&client, ContentType::Chapter, id, role).await;
+                }
+            }
         }
         if settings.ai_connections_chapter_id.is_none() && checkbox_on(form.create_ai_connections_chapter) {
             let r = provision::create_chapter(&client, NamedResource::ConnectionsChapter, book_id).await;
             provision_log.push(r.human(NamedResource::ConnectionsChapter));
-            if let Some(id) = r.id() { settings.ai_connections_chapter_id = Some(id); }
+            if let Some(id) = r.id() {
+                settings.ai_connections_chapter_id = Some(id);
+                if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
+                    provision::lock_to_admin_only(&client, ContentType::Chapter, id, role).await;
+                }
+            }
         }
         if settings.ai_opportunities_chapter_id.is_none() && checkbox_on(form.create_ai_opportunities_chapter) {
             let r = provision::create_chapter(&client, NamedResource::OpportunitiesChapter, book_id).await;
             provision_log.push(r.human(NamedResource::OpportunitiesChapter));
-            if let Some(id) = r.id() { settings.ai_opportunities_chapter_id = Some(id); }
+            if let Some(id) = r.id() {
+                settings.ai_opportunities_chapter_id = Some(id);
+                if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
+                    provision::lock_to_admin_only(&client, ContentType::Chapter, id, role).await;
+                }
+            }
         }
     }
     // Activity chapter inside the Journal book.
@@ -397,7 +538,12 @@ pub async fn handle_settings_post(
         if settings.ai_activity_chapter_id.is_none() && checkbox_on(form.create_ai_activity_chapter) {
             let r = provision::create_chapter(&client, NamedResource::ActivityChapter, journal_book_id).await;
             provision_log.push(r.human(NamedResource::ActivityChapter));
-            if let Some(id) = r.id() { settings.ai_activity_chapter_id = Some(id); }
+            if let Some(id) = r.id() {
+                settings.ai_activity_chapter_id = Some(id);
+                if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
+                    provision::lock_to_admin_only(&client, ContentType::Chapter, id, role).await;
+                }
+            }
         }
     }
 
@@ -420,7 +566,11 @@ pub async fn handle_settings_post(
         eprintln!("Settings: auto-provisioned items:");
         for line in &provision_log { eprintln!("  - {line}"); }
     }
-    eprintln!("Settings: saved for user (token_id_hash={}…)", &token_id_hash[..16.min(token_id_hash.len())]);
+    if !global_warnings.is_empty() {
+        eprintln!("Settings: global-write warnings:");
+        for line in &global_warnings { eprintln!("  - {line}"); }
+    }
+    eprintln!("Settings: saved for user (token_id_hash={}…, admin={is_admin})", &token_id_hash[..16.min(token_id_hash.len())]);
     Redirect::to("/settings?saved=1").into_response()
 }
 
@@ -726,6 +876,7 @@ fn render_settings_page(
     shelves: &[NamedItem],
     books: &[NamedItem],
     chapters: &[NamedItem],
+    is_admin: bool,
 ) -> String {
     let css = r#"
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -784,6 +935,26 @@ a.reauth:hover { color: #cbd5e1; text-decoration: underline; }
   {user_journals_shelf_select}
   <div class="hint">Contains every human user's journal book.</div>
   {user_journals_shelf_create}
+</div>
+</div>
+</div>
+
+<div class="card">
+<h2>Org-default AI identity <span style="font-weight:400;font-size:.78rem;color:#94a3b8;">{org_default_note}</span></h2>
+<p class="subtitle" style="margin-bottom:.75rem;">When a user hasn't set their own AI identity, the briefing falls back to this. The "house agent". Admin-editable; can be changed later.</p>
+<div class="field">
+  <label for="default_ai_identity_page_id">Default identity manifest page ID</label>
+  {default_id_input}
+  <div class="hint">The page that defines the fallback agent. Find the ID in BookStack's URL.</div>
+</div>
+<div class="row2">
+<div class="field">
+  <label for="default_ai_identity_name">Default name</label>
+  {default_name_input}
+</div>
+<div class="field">
+  <label for="default_ai_identity_ouid">Default OUID</label>
+  {default_ouid_input}
 </div>
 </div>
 </div>
@@ -982,11 +1153,34 @@ a.reauth:hover { color: #cbd5e1; text-decoration: underline; }
         collage_count = s.active_collage_count,
         system_prompt_ids = html_escape(&format_id_list(&s.system_prompt_page_ids)),
 
-        global_lock_note = if g.updated_at > 0 { "(set globally — locked here)" } else { "" },
-        hive_shelf_select = render_select_locked("hive_shelf_id", shelves, g.hive_shelf_id, g.hive_shelf_id.is_some()),
-        user_journals_shelf_select = render_select_locked("user_journals_shelf_id", shelves, g.user_journals_shelf_id, g.user_journals_shelf_id.is_some()),
-        hive_shelf_create = if g.hive_shelf_id.is_some() { String::new() } else { create_inline("create_hive_shelf", "Create \"Hive\" shelf if missing") },
-        user_journals_shelf_create = if g.user_journals_shelf_id.is_some() { String::new() } else { create_inline("create_user_journals_shelf", "Create \"User Journals\" shelf if missing") },
+        global_lock_note = match (g.updated_at > 0, is_admin) {
+            (true, _) => "(set globally — locked)",
+            (false, true) => "(unset — you are an admin and may set this once)",
+            (false, false) => "(unset — only a BookStack admin can configure this)",
+        },
+        // Lock the field if globals are already set OR the user isn't an admin.
+        hive_shelf_select = render_select_locked("hive_shelf_id", shelves, g.hive_shelf_id, g.hive_shelf_id.is_some() || !is_admin),
+        user_journals_shelf_select = render_select_locked("user_journals_shelf_id", shelves, g.user_journals_shelf_id, g.user_journals_shelf_id.is_some() || !is_admin),
+        // Only show the create checkboxes for admins setting unset globals.
+        hive_shelf_create = if g.hive_shelf_id.is_none() && is_admin { create_inline("create_hive_shelf", "Create \"Hive\" shelf if missing") } else { String::new() },
+        user_journals_shelf_create = if g.user_journals_shelf_id.is_none() && is_admin { create_inline("create_user_journals_shelf", "Create \"User Journals\" shelf if missing") } else { String::new() },
+
+        org_default_note = if is_admin { "(admin-editable)" } else { "(read-only — admin only)" },
+        default_id_input = if is_admin {
+            render_id_input("default_ai_identity_page_id", g.default_ai_identity_page_id)
+        } else {
+            render_locked_value(g.default_ai_identity_page_id.map(|v| v.to_string()))
+        },
+        default_name_input = if is_admin {
+            render_text("default_ai_identity_name", g.default_ai_identity_name.as_deref(), "Pia")
+        } else {
+            render_locked_value(g.default_ai_identity_name.clone())
+        },
+        default_ouid_input = if is_admin {
+            render_text("default_ai_identity_ouid", g.default_ai_identity_ouid.as_deref(), "019dc66e4dd87ea080ebf5d5e2985d91")
+        } else {
+            render_locked_value(g.default_ai_identity_ouid.clone())
+        },
 
         create_ai_identity_book_cb = create_row("create_ai_identity_book", "Create Identity book under the Hive shelf if blank above", s.ai_identity_book_id.is_some()),
         create_ai_hive_journal_book_cb = create_row("create_ai_hive_journal_book", "Create Journal book under the Hive shelf if blank above", s.ai_hive_journal_book_id.is_some()),
@@ -1017,6 +1211,14 @@ fn create_inline(field_name: &str, label: &str) -> String {
         r#"<label class="cb" style="margin-top:.3rem;"><input type="checkbox" name="{name}" value="on"> {label}</label>"#,
         name = html_escape(field_name),
         label = html_escape(label),
+    )
+}
+
+fn render_locked_value(value: Option<String>) -> String {
+    let display = value.unwrap_or_else(|| "(unset)".into());
+    format!(
+        r#"<div style="padding:.55rem .7rem;border:1px solid #2a3a5c;border-radius:6px;background:#0a0f1f;color:#94a3b8;font-size:.9rem;">{}</div>"#,
+        html_escape(&display),
     )
 }
 

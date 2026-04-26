@@ -105,13 +105,27 @@ pub async fn read(ctx: &Context) -> Outcome {
         slice
     };
 
-    // Always-on context pages (writing style, communication prefs, etc).
-    let system_prompt_fut = fetch_system_prompt_pages(
+    // Always-on context pages — three sources, all run in parallel:
+    //   - user-configured (system_prompt_page_ids)
+    //   - org-required instructions (admin-mandated page IDs)
+    //   - org-required AI usage policy (admin-mandated page IDs)
+    let user_pages_fut = fetch_pages_with_source(
         &ctx.client,
         &ctx.settings.system_prompt_page_ids,
+        "user",
+    );
+    let org_instructions_fut = fetch_pages_with_source(
+        &ctx.client,
+        &globals.org_required_instructions_page_ids,
+        "org_instructions",
+    );
+    let org_policy_fut = fetch_pages_with_source(
+        &ctx.client,
+        &globals.org_ai_usage_policy_page_ids,
+        "org_policy",
     );
 
-    let (identity, user_page, subagents, recent_journals, active_collage, shared_collage, semantic, system_prompt) = tokio::join!(
+    let (identity, user_page, subagents, recent_journals, active_collage, shared_collage, semantic, user_pages, org_instructions, org_policy) = tokio::join!(
         identity_fut,
         user_fut,
         subagents_fut,
@@ -119,10 +133,46 @@ pub async fn read(ctx: &Context) -> Outcome {
         active_collage_fut,
         shared_collage_fut,
         semantic_fut,
-        system_prompt_fut,
+        user_pages_fut,
+        org_instructions_fut,
+        org_policy_fut,
     );
 
+    // Merge the three sources into one flat array. Each entry carries its
+    // `source` field so callers can group/filter as needed.
+    let mut system_prompt: Vec<Value> = Vec::with_capacity(
+        user_pages.len() + org_instructions.len() + org_policy.len(),
+    );
+    system_prompt.extend(user_pages);
+    system_prompt.extend(org_instructions);
+    system_prompt.extend(org_policy);
+
+    // Setup nudge — show when the user hasn't configured anything AND hasn't
+    // snoozed the reminder. Suppressed once they save anything to /settings or
+    // explicitly dismiss via remember_config.
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let snoozed = ctx.settings.settings_nudge_dismissed_until.map(|t| now_unix < t).unwrap_or(false);
+    let setup_nudge = if !ctx.settings.is_configured() && !snoozed {
+        Some(json!({
+            "show": true,
+            "message": "Your Hive memory settings aren't configured yet — the briefing is running on org defaults (or empty sections). Visit the MCP server's /settings page to set your AI identity, journal, topics, and more, or call `remember_config` with action=write to do it via tool.",
+            "settings_path": "/settings",
+            "dismiss": {
+                "tool": "remember_config",
+                "action": "dismiss_setup_nudge",
+                "default_days": 7,
+                "example": "remember_config action=dismiss_setup_nudge days=14"
+            }
+        }))
+    } else {
+        None
+    };
+
     Outcome::ok(json!({
+        "setup_nudge": setup_nudge,
         "identity": match identity {
             Some(p) => json!({
                 "ouid": resolved.ouid,
@@ -170,18 +220,25 @@ pub async fn read(ctx: &Context) -> Outcome {
     }))
 }
 
-async fn fetch_system_prompt_pages(client: &BookStackClient, ids: &[i64]) -> Vec<Value> {
-    if ids.is_empty() {
+/// Fetch the markdown for every page in `page_ids` concurrently. Each result
+/// is tagged with the given `source` so the AI knows where the content came
+/// from (`user`, `org_instructions`, or `org_policy`).
+async fn fetch_pages_with_source(
+    client: &BookStackClient,
+    page_ids: &[i64],
+    source: &'static str,
+) -> Vec<Value> {
+    if page_ids.is_empty() {
         return Vec::new();
     }
-    let mut handles = Vec::with_capacity(ids.len());
-    for &id in ids {
+    let mut handles = Vec::with_capacity(page_ids.len());
+    for &id in page_ids {
         let client = client.clone();
         handles.push(tokio::spawn(async move {
             (id, client.get_page(id).await)
         }));
     }
-    let mut out = Vec::with_capacity(ids.len());
+    let mut out = Vec::new();
     for h in handles {
         let Ok((id, result)) = h.await else { continue; };
         match result {
@@ -192,10 +249,11 @@ async fn fetch_system_prompt_pages(client: &BookStackClient, ids: &[i64]) -> Vec
                     "name": page.get("name").cloned().unwrap_or(Value::Null),
                     "markdown": frontmatter::strip(raw),
                     "url": page.get("url").cloned().unwrap_or(Value::Null),
+                    "source": source,
                 }));
             }
             Err(e) => {
-                eprintln!("Briefing: system_prompt_page_ids[{id}] fetch failed: {e}");
+                eprintln!("Briefing: {source} page {id} fetch failed: {e}");
             }
         }
     }

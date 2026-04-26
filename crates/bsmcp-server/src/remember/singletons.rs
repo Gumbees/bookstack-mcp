@@ -334,6 +334,35 @@ pub async fn write_config(ctx: &Context) -> Outcome {
     outcome
 }
 
+/// `remember_config action=dismiss_setup_nudge days=N` — snooze the briefing's
+/// "configure your settings" reminder for N days (default 7, max 365).
+pub async fn dismiss_setup_nudge(ctx: &Context) -> Outcome {
+    let days = ctx
+        .body
+        .get("days")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(7)
+        .clamp(1, 365);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let dismiss_until = now + days * 86400;
+
+    let mut new_settings = ctx.settings.clone();
+    new_settings.settings_nudge_dismissed_until = Some(dismiss_until);
+    if let Err(e) = ctx.db.save_user_settings(&ctx.token_id_hash, &new_settings).await {
+        return Outcome::error(ErrorCode::InternalError, e, None);
+    }
+    Outcome::ok(json!({
+        "action": "dismissed",
+        "days": days,
+        "snoozed_until_unix": dismiss_until,
+        "message": format!("Setup nudge snoozed for {days} days. The briefing will surface it again after that, or sooner if any setting is configured.")
+    }))
+}
+
 // --- helpers ---
 
 pub(super) async fn list_pages_in_chapter(

@@ -5,7 +5,7 @@
 //! module and gracefully surface permission errors as `ProvisionResult::Denied`
 //! rather than crashing the settings save.
 
-use bsmcp_common::bookstack::BookStackClient;
+use bsmcp_common::bookstack::{BookStackClient, ContentType};
 use serde_json::json;
 
 use super::naming::NamedResource;
@@ -119,6 +119,58 @@ pub async fn create_chapter(
             None => ProvisionResult::Failed { reason: "create_chapter returned no id".to_string() },
         },
         Err(e) => classify_error(&e),
+    }
+}
+
+/// Lock a piece of Hive content (shelf/book/chapter/page) so only the Admin
+/// role plus the page owner can edit it; everyone else gets read-only.
+///
+/// BookStack default for newly-created content is to inherit permissions from
+/// its parent. This helper opts the content out of inheritance and writes an
+/// explicit role-permission entry for Admin (full access) plus a fallback that
+/// permits view-only for everyone else. Page owners always retain edit access
+/// regardless of role permissions — that's BookStack's built-in behaviour.
+///
+/// Best-effort: BookStack returns 403 if the calling user can't manage
+/// permissions on the item. Logged + swallowed so it never blocks the parent
+/// save flow.
+pub async fn lock_to_admin_only(
+    client: &BookStackClient,
+    content_type: ContentType,
+    content_id: i64,
+    admin_role_id: i64,
+) {
+    let payload = json!({
+        "role_permissions": [
+            {
+                "role_id": admin_role_id,
+                "view": true,
+                "create": true,
+                "update": true,
+                "delete": true,
+            }
+        ],
+        "fallback_permissions": {
+            "inheriting": false,
+            "view": true,
+            "create": false,
+            "update": false,
+            "delete": false,
+        }
+    });
+    let label = match content_type {
+        ContentType::Page => "page",
+        ContentType::Chapter => "chapter",
+        ContentType::Book => "book",
+        ContentType::Shelf => "shelf",
+    };
+    if let Err(e) = client
+        .update_content_permissions(content_type, content_id, &payload)
+        .await
+    {
+        eprintln!(
+            "Provision: failed to lock {label} {content_id} to admin-only (non-fatal): {e}"
+        );
     }
 }
 

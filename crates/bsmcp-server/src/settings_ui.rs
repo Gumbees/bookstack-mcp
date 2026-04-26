@@ -305,6 +305,16 @@ pub async fn handle_settings_post(
         recent_journal_count: parse_count(form.recent_journal_count, 3),
         active_collage_count: parse_count(form.active_collage_count, 10),
         system_prompt_page_ids: parse_id_list(form.system_prompt_page_ids),
+        // Carry over the existing dismiss timestamp — saving via /settings
+        // doesn't change the snooze. (The nudge auto-stops showing once
+        // is_configured() is true.)
+        settings_nudge_dismissed_until: state
+            .db
+            .get_user_settings(&token_id_hash)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| s.settings_nudge_dismissed_until),
     };
 
     // Globals: server-side first-write-wins, gated to BookStack admins.
@@ -377,17 +387,47 @@ pub async fn handle_settings_post(
 
     // Auto-provisioning in dependency order. Each step writes back into
     // `settings` / `globals` so later steps can use the just-created IDs.
+    // After each successful create we lock the new content to admin-only edit
+    // (everyone else read-only; owner keeps default edit). admin_role_id is
+    // looked up lazily so we only pay the cost when something is being created.
     let mut provision_log: Vec<String> = Vec::new();
+    let mut admin_role_id: Option<i64> = None;
+    async fn ensure_admin_role(
+        cached: &mut Option<i64>,
+        client: &BookStackClient,
+    ) -> Option<i64> {
+        if cached.is_some() {
+            return *cached;
+        }
+        match client.find_admin_role_id().await {
+            Ok(id) => { *cached = Some(id); Some(id) }
+            Err(e) => {
+                eprintln!("Settings: admin role lookup failed (locking will be skipped): {e}");
+                None
+            }
+        }
+    }
+    use bsmcp_common::bookstack::ContentType;
 
     if is_admin && globals.hive_shelf_id.is_none() && checkbox_on(form.create_hive_shelf) {
         let r = provision::create_shelf(&client, NamedResource::HiveShelf).await;
         provision_log.push(r.human(NamedResource::HiveShelf));
-        if let Some(id) = r.id() { globals.hive_shelf_id = Some(id); }
+        if let Some(id) = r.id() {
+            globals.hive_shelf_id = Some(id);
+            if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
+                provision::lock_to_admin_only(&client, ContentType::Shelf, id, role).await;
+            }
+        }
     }
     if is_admin && globals.user_journals_shelf_id.is_none() && checkbox_on(form.create_user_journals_shelf) {
         let r = provision::create_shelf(&client, NamedResource::UserJournalsShelf).await;
         provision_log.push(r.human(NamedResource::UserJournalsShelf));
-        if let Some(id) = r.id() { globals.user_journals_shelf_id = Some(id); }
+        if let Some(id) = r.id() {
+            globals.user_journals_shelf_id = Some(id);
+            if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
+                provision::lock_to_admin_only(&client, ContentType::Shelf, id, role).await;
+            }
+        }
     }
 
     // Books that live on the Hive shelf.
@@ -395,22 +435,42 @@ pub async fn handle_settings_post(
     if settings.ai_identity_book_id.is_none() && checkbox_on(form.create_ai_identity_book) {
         let r = provision::create_book(&client, NamedResource::IdentityBook, hive_shelf).await;
         provision_log.push(r.human(NamedResource::IdentityBook));
-        if let Some(id) = r.id() { settings.ai_identity_book_id = Some(id); }
+        if let Some(id) = r.id() {
+            settings.ai_identity_book_id = Some(id);
+            if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
+                provision::lock_to_admin_only(&client, ContentType::Book, id, role).await;
+            }
+        }
     }
     if settings.ai_hive_journal_book_id.is_none() && checkbox_on(form.create_ai_hive_journal_book) {
         let r = provision::create_book(&client, NamedResource::JournalBook, hive_shelf).await;
         provision_log.push(r.human(NamedResource::JournalBook));
-        if let Some(id) = r.id() { settings.ai_hive_journal_book_id = Some(id); }
+        if let Some(id) = r.id() {
+            settings.ai_hive_journal_book_id = Some(id);
+            if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
+                provision::lock_to_admin_only(&client, ContentType::Book, id, role).await;
+            }
+        }
     }
     if settings.ai_collage_book_id.is_none() && checkbox_on(form.create_ai_collage_book) {
         let r = provision::create_book(&client, NamedResource::CollageBook, hive_shelf).await;
         provision_log.push(r.human(NamedResource::CollageBook));
-        if let Some(id) = r.id() { settings.ai_collage_book_id = Some(id); }
+        if let Some(id) = r.id() {
+            settings.ai_collage_book_id = Some(id);
+            if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
+                provision::lock_to_admin_only(&client, ContentType::Book, id, role).await;
+            }
+        }
     }
     if settings.ai_shared_collage_book_id.is_none() && checkbox_on(form.create_ai_shared_collage_book) {
         let r = provision::create_book(&client, NamedResource::SharedCollageBook, hive_shelf).await;
         provision_log.push(r.human(NamedResource::SharedCollageBook));
-        if let Some(id) = r.id() { settings.ai_shared_collage_book_id = Some(id); }
+        if let Some(id) = r.id() {
+            settings.ai_shared_collage_book_id = Some(id);
+            if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
+                provision::lock_to_admin_only(&client, ContentType::Book, id, role).await;
+            }
+        }
     }
 
     // User journal book on the User Journals shelf — name personalized by user_id.
@@ -445,17 +505,32 @@ pub async fn handle_settings_post(
         if settings.ai_subagents_chapter_id.is_none() && checkbox_on(form.create_ai_subagents_chapter) {
             let r = provision::create_chapter(&client, NamedResource::SubagentsChapter, book_id).await;
             provision_log.push(r.human(NamedResource::SubagentsChapter));
-            if let Some(id) = r.id() { settings.ai_subagents_chapter_id = Some(id); }
+            if let Some(id) = r.id() {
+                settings.ai_subagents_chapter_id = Some(id);
+                if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
+                    provision::lock_to_admin_only(&client, ContentType::Chapter, id, role).await;
+                }
+            }
         }
         if settings.ai_connections_chapter_id.is_none() && checkbox_on(form.create_ai_connections_chapter) {
             let r = provision::create_chapter(&client, NamedResource::ConnectionsChapter, book_id).await;
             provision_log.push(r.human(NamedResource::ConnectionsChapter));
-            if let Some(id) = r.id() { settings.ai_connections_chapter_id = Some(id); }
+            if let Some(id) = r.id() {
+                settings.ai_connections_chapter_id = Some(id);
+                if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
+                    provision::lock_to_admin_only(&client, ContentType::Chapter, id, role).await;
+                }
+            }
         }
         if settings.ai_opportunities_chapter_id.is_none() && checkbox_on(form.create_ai_opportunities_chapter) {
             let r = provision::create_chapter(&client, NamedResource::OpportunitiesChapter, book_id).await;
             provision_log.push(r.human(NamedResource::OpportunitiesChapter));
-            if let Some(id) = r.id() { settings.ai_opportunities_chapter_id = Some(id); }
+            if let Some(id) = r.id() {
+                settings.ai_opportunities_chapter_id = Some(id);
+                if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
+                    provision::lock_to_admin_only(&client, ContentType::Chapter, id, role).await;
+                }
+            }
         }
     }
     // Activity chapter inside the Journal book.
@@ -463,7 +538,12 @@ pub async fn handle_settings_post(
         if settings.ai_activity_chapter_id.is_none() && checkbox_on(form.create_ai_activity_chapter) {
             let r = provision::create_chapter(&client, NamedResource::ActivityChapter, journal_book_id).await;
             provision_log.push(r.human(NamedResource::ActivityChapter));
-            if let Some(id) = r.id() { settings.ai_activity_chapter_id = Some(id); }
+            if let Some(id) = r.id() {
+                settings.ai_activity_chapter_id = Some(id);
+                if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
+                    provision::lock_to_admin_only(&client, ContentType::Chapter, id, role).await;
+                }
+            }
         }
     }
 

@@ -73,6 +73,8 @@ impl SqliteDb {
                  default_ai_identity_page_id INTEGER,
                  default_ai_identity_name TEXT,
                  default_ai_identity_ouid TEXT,
+                 org_required_instructions_page_ids TEXT,
+                 org_ai_usage_policy_page_ids TEXT,
                  set_by_token_hash TEXT,
                  updated_at INTEGER NOT NULL DEFAULT 0
              );
@@ -84,10 +86,16 @@ impl SqliteDb {
         // Migrations: ALTER existing global_settings rows to gain new columns.
         // SQLite doesn't support IF NOT EXISTS on ALTER ADD COLUMN; ignore the
         // duplicate-column error.
+        // Note: org_*_chapter_ids columns were briefly added during this PR's
+        // development and then dropped in favour of page-IDs-only. Existing
+        // rows with values in those columns are simply ignored — the columns
+        // remain on disk but are not read by the application.
         for sql in [
             "ALTER TABLE global_settings ADD COLUMN default_ai_identity_page_id INTEGER",
             "ALTER TABLE global_settings ADD COLUMN default_ai_identity_name TEXT",
             "ALTER TABLE global_settings ADD COLUMN default_ai_identity_ouid TEXT",
+            "ALTER TABLE global_settings ADD COLUMN org_required_instructions_page_ids TEXT",
+            "ALTER TABLE global_settings ADD COLUMN org_ai_usage_policy_page_ids TEXT",
         ] {
             conn.execute_batch(sql).ok();
         }
@@ -411,6 +419,8 @@ impl DbBackend for SqliteDb {
             let row = conn.query_row(
                 "SELECT hive_shelf_id, user_journals_shelf_id,
                         default_ai_identity_page_id, default_ai_identity_name, default_ai_identity_ouid,
+                        org_required_instructions_page_ids,
+                        org_ai_usage_policy_page_ids,
                         set_by_token_hash, updated_at
                  FROM global_settings WHERE id = 1",
                 [],
@@ -420,8 +430,10 @@ impl DbBackend for SqliteDb {
                     default_ai_identity_page_id: row.get::<_, Option<i64>>(2)?,
                     default_ai_identity_name: row.get::<_, Option<String>>(3)?,
                     default_ai_identity_ouid: row.get::<_, Option<String>>(4)?,
-                    set_by_token_hash: row.get::<_, Option<String>>(5)?,
-                    updated_at: row.get::<_, i64>(6)?,
+                    org_required_instructions_page_ids: decode_id_list(row.get::<_, Option<String>>(5)?),
+                    org_ai_usage_policy_page_ids: decode_id_list(row.get::<_, Option<String>>(6)?),
+                    set_by_token_hash: row.get::<_, Option<String>>(7)?,
+                    updated_at: row.get::<_, i64>(8)?,
                 }),
             ).unwrap_or_default();
             Ok(row)
@@ -453,8 +465,10 @@ impl DbBackend for SqliteDb {
                      default_ai_identity_page_id = ?3,
                      default_ai_identity_name = ?4,
                      default_ai_identity_ouid = ?5,
-                     set_by_token_hash = ?6,
-                     updated_at = ?7
+                     org_required_instructions_page_ids = ?6,
+                     org_ai_usage_policy_page_ids = ?7,
+                     set_by_token_hash = ?8,
+                     updated_at = ?9
                  WHERE id = 1",
                 params![
                     s.hive_shelf_id,
@@ -462,6 +476,8 @@ impl DbBackend for SqliteDb {
                     s.default_ai_identity_page_id,
                     s.default_ai_identity_name,
                     s.default_ai_identity_ouid,
+                    encode_id_list(&s.org_required_instructions_page_ids),
+                    encode_id_list(&s.org_ai_usage_policy_page_ids),
                     final_setter,
                     SqliteDb::now_secs(),
                 ],
@@ -1301,6 +1317,19 @@ impl SemanticDb for SqliteDb {
         })
         .await
         .map_err(|e| format!("Task failed: {e}"))?
+    }
+}
+
+/// Encode a Vec<i64> as a JSON array string (or NULL when empty so the column
+/// reads back as Option::None and round-trips cleanly).
+fn encode_id_list(ids: &[i64]) -> Option<String> {
+    if ids.is_empty() { None } else { serde_json::to_string(ids).ok() }
+}
+
+fn decode_id_list(value: Option<String>) -> Vec<i64> {
+    match value {
+        Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_default(),
+        _ => Vec::new(),
     }
 }
 

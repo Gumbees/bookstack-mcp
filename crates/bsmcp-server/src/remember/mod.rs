@@ -133,6 +133,7 @@ async fn route(resource: &str, action: &str, ctx: &Context) -> Outcome {
         ("user", "write") => singletons::write_user(ctx).await,
         ("config", "read") => singletons::read_config(ctx).await,
         ("config", "write") => singletons::write_config(ctx).await,
+        ("config", "dismiss_setup_nudge") => singletons::dismiss_setup_nudge(ctx).await,
 
         // Collections (book parent)
         ("journal", a) => collection::handle(&collection::resources::Journal, a, ctx).await,

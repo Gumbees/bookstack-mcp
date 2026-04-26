@@ -1251,6 +1251,17 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool, su
     let instance_desc = env::var("BSMCP_INSTANCE_DESC").unwrap_or_default();
 
     let mut instructions = String::new();
+
+    // Hive memory flow — surface this FIRST so it lands before any other guidance.
+    instructions.push_str(
+        "It's a best practice to always use remember/briefing at the beginning of any session. \
+         The briefing returns the agent's identity manifest, recent journal entries, active topics, \
+         org-required instructions and AI usage policy, and semantic matches against the user's \
+         first message — one structured pull instead of many tool calls. \
+         Call the `remember_briefing` MCP tool (or POST /remember/v1/briefing/read) with the user's \
+         opening message as `user_prompt`.\n\n"
+    );
+
     if !instance_name.is_empty() {
         instructions.push_str(&instance_name);
         if !instance_desc.is_empty() {
@@ -1909,11 +1920,12 @@ fn add_remember_tools(tools: &mut Vec<Value>) {
 
     tools.push(remember_tool(
         "config",
-        "Per-user settings AND (admin-only) global shelves. read returns both `{settings, global_settings}`. write accepts `settings` (per-user — any user) and/or `global_settings` (admin-only, server-side first-write-wins; pre-set fields cannot be changed and trigger a `global_locked` warning).",
-        &["read", "write"],
+        "Per-user settings AND (admin-only) global shelves. read returns both `{settings, global_settings}`. write accepts `settings` (per-user — any user) and/or `global_settings` (admin-only, server-side first-write-wins; pre-set fields cannot be changed and trigger a `global_locked` warning). dismiss_setup_nudge snoozes the briefing's setup reminder for `days` days (default 7, max 365).",
+        &["read", "write", "dismiss_setup_nudge"],
         json!({
             "settings": { "type": "object", "description": "Full UserSettings object for per-user write" },
             "global_settings": { "type": "object", "description": "GlobalSettings object (admin-only). Only null fields are written; set fields are preserved." },
+            "days": { "type": "integer", "description": "For dismiss_setup_nudge: how many days to snooze (default 7, max 365)" },
         }),
     ));
 

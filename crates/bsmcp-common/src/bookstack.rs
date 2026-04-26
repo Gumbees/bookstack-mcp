@@ -406,6 +406,31 @@ impl BookStackClient {
         }
     }
 
+    /// Look up BookStack's "Admin" role ID. Used to lock auto-created Hive
+    /// content to admin-only edit. Matches `display_name` case-insensitively
+    /// against "admin"; returns the first match. Errors if no matching role
+    /// is found (caller should treat as a non-fatal warning).
+    pub async fn find_admin_role_id(&self) -> Result<i64, String> {
+        let resp = self.list_roles(50, 0).await?;
+        let data = resp
+            .get("data")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for role in data {
+            let name = role
+                .get("display_name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            if name.eq_ignore_ascii_case("admin") {
+                if let Some(id) = role.get("id").and_then(|i| i.as_i64()) {
+                    return Ok(id);
+                }
+            }
+        }
+        Err("No role named \"Admin\" found in BookStack — cannot apply admin-only permission lock".to_string())
+    }
+
     // --- Permission check ---
 
     /// Check if the user can access a specific page.

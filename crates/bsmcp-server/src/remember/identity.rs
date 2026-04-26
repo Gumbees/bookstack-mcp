@@ -208,6 +208,16 @@ async fn create(ctx: &Context) -> Outcome {
 
     // 3. Optional chapter scaffold.
     let mut scaffolded = json!({});
+    let admin_role = ctx.client.find_admin_role_id().await.ok();
+
+    // Lock the newly-created Identity book + manifest page to admin-only edit.
+    if let Some(role) = admin_role {
+        provision::lock_to_admin_only(&ctx.client, bsmcp_common::bookstack::ContentType::Book, book_id, role).await;
+        if let Some(pid) = page_id {
+            provision::lock_to_admin_only(&ctx.client, bsmcp_common::bookstack::ContentType::Page, pid, role).await;
+        }
+    }
+
     if auto_provision_chapters {
         for resource in [
             NamedResource::SubagentsChapter,
@@ -215,6 +225,9 @@ async fn create(ctx: &Context) -> Outcome {
             NamedResource::OpportunitiesChapter,
         ] {
             let result = provision::create_chapter(&ctx.client, resource, book_id).await;
+            if let (Some(id), Some(role)) = (result.id(), admin_role) {
+                provision::lock_to_admin_only(&ctx.client, bsmcp_common::bookstack::ContentType::Chapter, id, role).await;
+            }
             scaffolded[resource_key(resource)] = json!({
                 "id": result.id(),
                 "human": result.human(resource),

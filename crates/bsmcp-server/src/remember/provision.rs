@@ -104,6 +104,64 @@ pub async fn create_book(
     }
 }
 
+/// Lock both journal books to owner-only access. No-op for unset IDs.
+///
+/// Called on every settings save (UI, probe-accept, MCP) so journals are
+/// always private — whether auto-created or selected from existing books.
+pub async fn lock_journal_books_to_owner(
+    client: &BookStackClient,
+    ai_journal_book_id: Option<i64>,
+    user_journal_book_id: Option<i64>,
+) {
+    if let Some(id) = ai_journal_book_id {
+        lock_to_owner_only(client, ContentType::Book, id).await;
+    }
+    if let Some(id) = user_journal_book_id {
+        lock_to_owner_only(client, ContentType::Book, id).await;
+    }
+}
+
+/// Lock a piece of Hive content so only its owner (and admins via system
+/// permission) can access it. Used for journals — content nobody else should
+/// see, including other Hive users on the same instance.
+///
+/// Disables inheritance, clears all role permissions, and zeroes the fallback
+/// (so non-owner non-admin users get no view/create/update/delete). Owners and
+/// admins keep access via BookStack's built-in semantics.
+///
+/// Best-effort: BookStack returns 403 if the calling user can't manage
+/// permissions on the item. Logged + swallowed so it never blocks the save.
+pub async fn lock_to_owner_only(
+    client: &BookStackClient,
+    content_type: ContentType,
+    content_id: i64,
+) {
+    let payload = json!({
+        "role_permissions": [],
+        "fallback_permissions": {
+            "inheriting": false,
+            "view": false,
+            "create": false,
+            "update": false,
+            "delete": false,
+        }
+    });
+    let label = match content_type {
+        ContentType::Page => "page",
+        ContentType::Chapter => "chapter",
+        ContentType::Book => "book",
+        ContentType::Shelf => "shelf",
+    };
+    if let Err(e) = client
+        .update_content_permissions(content_type, content_id, &payload)
+        .await
+    {
+        eprintln!(
+            "Provision: failed to lock {label} {content_id} to owner-only (non-fatal): {e}"
+        );
+    }
+}
+
 /// Lock a piece of Hive content (shelf/book/chapter/page) so only the Admin
 /// role plus the page owner can edit it; everyone else gets read-only.
 ///

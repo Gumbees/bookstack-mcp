@@ -10,6 +10,7 @@ use bsmcp_common::settings::{GlobalSettings, UserSettings};
 
 use super::envelope::ErrorCode;
 use super::frontmatter;
+use super::provision;
 use super::{Context, Outcome};
 
 // --- whoami ---
@@ -242,6 +243,14 @@ pub async fn write_config(ctx: &Context) -> Outcome {
         if let Err(e) = ctx.db.save_user_settings(&ctx.token_id_hash, &new_settings).await {
             return Outcome::error(ErrorCode::InternalError, e, None);
         }
+        // Lock journal books to owner-only on every config write — covers both
+        // freshly-set IDs and re-saves of existing IDs. Idempotent.
+        provision::lock_journal_books_to_owner(
+            &ctx.client,
+            new_settings.ai_hive_journal_book_id,
+            new_settings.user_journal_book_id,
+        )
+        .await;
         saved_user = Some(new_settings);
     }
 

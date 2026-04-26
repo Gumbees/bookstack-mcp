@@ -221,6 +221,12 @@ pub async fn read(ctx: &Context) -> Outcome {
         "user_journal_semantic_matches": semantic.user_journal_matches,
         "kb_semantic_matches": if ctx.settings.semantic_against_full_kb { json!(semantic.kb_matches) } else { Value::Null },
         "system_prompt_additions": system_prompt,
+        "time": {
+            "now_unix": frontmatter::now_unix(),
+            "now_utc": frontmatter::now_iso_utc(),
+            "timezone": ctx.settings.timezone.clone().unwrap_or_else(|| "UTC".to_string()),
+            "timezone_source": if ctx.settings.timezone.is_some() { "user_settings" } else { "default_utc" },
+        },
         "config": {
             "label": ctx.settings.label,
             "role": ctx.settings.role,
@@ -290,24 +296,55 @@ async fn fetch_optional_page(client: &BookStackClient, page_id: Option<i64>) -> 
     }
 }
 
+/// Lists the most-recently-updated pages within a book.
+///
+/// Uses `get_book` rather than `search` because BookStack's search API silently
+/// returns unfiltered results when no positive keyword term is present —
+/// `{type:page} {in_book:N}` alone produces system-wide matches, not book-scoped
+/// ones. `get_book` returns the book's full contents (top-level pages + chapter-
+/// nested pages) in one call, which we flatten and sort by `updated_at` desc.
 async fn list_recent_pages(book_id: Option<i64>, limit: usize, client: &BookStackClient) -> Vec<Value> {
     let Some(book_id) = book_id else { return Vec::new(); };
-    let query = format!("{{type:page}} {{in_book:{book_id}}} {{updated_after:1970-01-01}}");
-    let resp = match client.search(&query, 1, limit as i64).await {
-        Ok(v) => v,
+    let book = match client.get_book(book_id).await {
+        Ok(b) => b,
         Err(e) => {
-            eprintln!("Briefing: list_recent_pages({book_id}) failed: {e}");
+            eprintln!("Briefing: get_book({book_id}) failed: {e}");
             return Vec::new();
         }
     };
-    let data = resp.get("data").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    data.into_iter()
-        .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("page"))
+
+    // Flatten contents — top-level pages + every chapter's nested pages.
+    let mut pages: Vec<Value> = Vec::new();
+    if let Some(contents) = book.get("contents").and_then(|v| v.as_array()) {
+        for item in contents {
+            let kind = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            match kind {
+                "page" => pages.push(item.clone()),
+                "chapter" => {
+                    if let Some(ch_pages) = item.get("pages").and_then(|p| p.as_array()) {
+                        for p in ch_pages {
+                            pages.push(p.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Sort by updated_at descending (ISO-8601 strings sort lexicographically).
+    pages.sort_by(|a, b| {
+        let a_t = a.get("updated_at").and_then(|t| t.as_str()).unwrap_or("");
+        let b_t = b.get("updated_at").and_then(|t| t.as_str()).unwrap_or("");
+        b_t.cmp(a_t)
+    });
+
+    pages
+        .into_iter()
         .take(limit)
         .map(|p| json!({
             "page_id": p.get("id").cloned().unwrap_or(Value::Null),
             "name": p.get("name").cloned().unwrap_or(Value::Null),
-            "preview": p.get("preview_html").cloned().unwrap_or(Value::Null),
             "url": p.get("url").cloned().unwrap_or(Value::Null),
             "updated_at": p.get("updated_at").cloned().unwrap_or(Value::Null),
         }))

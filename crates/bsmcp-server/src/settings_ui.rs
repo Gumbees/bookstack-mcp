@@ -201,6 +201,7 @@ pub struct SettingsForm {
     pub recent_journal_count: Option<String>,
     pub active_collage_count: Option<String>,
     pub system_prompt_page_ids: Option<String>,
+    pub timezone: Option<String>,
 
     // Global shelves
     pub hive_shelf_id: Option<String>,
@@ -291,6 +292,7 @@ pub async fn handle_settings_post(
         recent_journal_count: parse_count(form.recent_journal_count, 3),
         active_collage_count: parse_count(form.active_collage_count, 10),
         system_prompt_page_ids: parse_id_list(form.system_prompt_page_ids),
+        timezone: empty_to_none(form.timezone),
         // Carry over the existing dismiss timestamp — saving via /settings
         // doesn't change the snooze. (The nudge auto-stops showing once
         // is_configured() is true.)
@@ -978,6 +980,11 @@ a.reauth:hover { color: #cbd5e1; text-decoration: underline; }
   <input type="text" name="system_prompt_page_ids" id="system_prompt_page_ids" value="{system_prompt_ids}" placeholder="e.g. 3281, 3299, 3402">
   <div class="hint">Page IDs whose full markdown is included in every briefing response. Best for SHORT durable context — writing style, communication preferences, formatting rules, ethical constraints. Long pages bloat every response. Comma- or space-separated.</div>
 </div>
+<div class="field" style="margin-top: 1rem;">
+  <label for="timezone">Timezone</label>
+  <input type="text" name="timezone" id="timezone" value="{timezone_input}" placeholder="America/New_York">
+  <div class="hint">IANA timezone name. Surfaced in the briefing's <code>time</code> block so the AI can format timestamps in your local time. Leave blank for UTC. <a href="https://en.wikipedia.org/wiki/List_of_tz_database_time_zones" target="_blank">List of tz names</a>.</div>
+</div>
 </div>
 
 <div class="card">
@@ -1023,6 +1030,7 @@ a.reauth:hover { color: #cbd5e1; text-decoration: underline; }
         recent_count = s.recent_journal_count,
         collage_count = s.active_collage_count,
         system_prompt_ids = html_escape(&format_id_list(&s.system_prompt_page_ids)),
+        timezone_input = html_escape(s.timezone.as_deref().unwrap_or("")),
 
         global_lock_note = match (g.updated_at > 0, is_admin) {
             (true, _) => "(set globally — locked)",

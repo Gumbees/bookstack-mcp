@@ -61,7 +61,7 @@ pub async fn read(ctx: &Context) -> Outcome {
         &ctx.client,
     );
 
-    // Semantic search fan-out — one per configured target.
+    // Semantic search fan-out.
     //
     // The query string we send to `sem.search` is the user's prompt prefixed
     // with a `[Context: ...]` block carrying current time, timezone, user
@@ -72,7 +72,23 @@ pub async fn read(ctx: &Context) -> Outcome {
     //     embedding model was trained.
     //   - Keyword side: the user_id and identity name appear in pages that
     //     mention the same person, biasing relevance toward their content.
+    //
+    // Scope:
+    //   - When `semantic_against_full_kb` is true, run one unfiltered query
+    //     across the entire embedded corpus and partition results by book.
+    //     `kb_semantic_matches` then surfaces the top hits NOT in any
+    //     configured book (so it complements the per-book sections instead
+    //     of duplicating them).
+    //   - When false (default), restrict the vector pass to the union of the
+    //     user's configured books whose individual toggles are on. The
+    //     candidate pool is naturally smaller, which proportionally shrinks
+    //     the permission filter and per-result fan-out. `kb_semantic_matches`
+    //     is returned as `{enabled: false, reason: ...}` so consumers know
+    //     the user opted out rather than getting a misleading empty slot.
     let prompt_for_semantic = build_semantic_query(&user_prompt, ctx);
+    let configured_book_ids = configured_semantic_book_ids(&ctx.settings);
+    let full_kb = ctx.settings.semantic_against_full_kb;
+    let configured_books_for_kb_exclusion = configured_book_ids.clone();
     let semantic_fut = async {
         if user_prompt.is_empty() {
             return SemanticSlice::default();
@@ -82,9 +98,24 @@ pub async fn read(ctx: &Context) -> Outcome {
         };
         let mut slice = SemanticSlice::default();
 
-        // Use a single semantic search and partition results by book/chapter.
+        // Pass `None` when full_kb is on (search everything), or `Some(&ids)`
+        // to scope the vector pass to the configured books. An empty Some(&[])
+        // would mean "no books to search" — handled by sem.search treating
+        // empty as full corpus, but we never get here without ids when full_kb
+        // is off because of the early-return guard below.
+        let book_filter: Option<&[i64]> = if full_kb {
+            None
+        } else {
+            if configured_book_ids.is_empty() {
+                // No books configured AND user disabled full_kb — nothing to
+                // search. Return empty slice without burning an embedder call.
+                return slice;
+            }
+            Some(configured_book_ids.as_slice())
+        };
+
         let raw = match sem
-            .search(&prompt_for_semantic, 40, 0.40, true, false, &ctx.client)
+            .search(&prompt_for_semantic, 40, 0.40, true, false, &ctx.client, book_filter)
             .await
         {
             Ok(v) => v.get("results").and_then(|r| r.as_array()).cloned().unwrap_or_default(),
@@ -106,8 +137,20 @@ pub async fn read(ctx: &Context) -> Outcome {
         if ctx.settings.semantic_against_user_journal {
             slice.user_journal_matches = filter_by_book(&raw, ctx.settings.user_journal_book_id, 5);
         }
-        if ctx.settings.semantic_against_full_kb {
-            slice.kb_matches = raw.iter().take(10).cloned().collect();
+        if full_kb {
+            // KB matches = top hits NOT in any configured book, so they
+            // genuinely complement the per-book sections instead of just
+            // duplicating their first few entries.
+            let exclude: std::collections::HashSet<i64> =
+                configured_books_for_kb_exclusion.iter().copied().collect();
+            slice.kb_matches = raw.iter()
+                .filter(|h| {
+                    let bid = h.get("book_id").and_then(|v| v.as_i64()).unwrap_or(0);
+                    !exclude.contains(&bid)
+                })
+                .take(10)
+                .cloned()
+                .collect();
         }
         slice
     };
@@ -237,7 +280,7 @@ pub async fn read(ctx: &Context) -> Outcome {
         "collage_semantic_matches": semantic.collage_matches,
         "shared_collage_active": shared_collage,
         "shared_collage_semantic_matches": semantic.shared_collage_matches,
-        "kb_semantic_matches": if ctx.settings.semantic_against_full_kb { json!(semantic.kb_matches) } else { Value::Null },
+        "kb_semantic_matches": kb_matches_envelope(ctx, &semantic.kb_matches),
         "system_prompt_additions": system_prompt,
         "time": {
             "now_unix": frontmatter::now_unix(),
@@ -374,6 +417,61 @@ fn filter_by_book(hits: &[Value], book_id: Option<i64>, limit: usize) -> Vec<Val
         .take(limit)
         .cloned()
         .collect()
+}
+
+/// Collect the book IDs that the user has configured AND has the matching
+/// semantic toggle on for. Used as the vector-search scope when
+/// `semantic_against_full_kb` is off — we only embed against books the user
+/// actually wants surfaced. Order is intentional but irrelevant; duplicates
+/// are deduped by sort+dedup.
+fn configured_semantic_book_ids(s: &bsmcp_common::settings::UserSettings) -> Vec<i64> {
+    let mut ids: Vec<i64> = Vec::with_capacity(4);
+    if s.semantic_against_journal {
+        if let Some(id) = s.ai_hive_journal_book_id { ids.push(id); }
+    }
+    if s.semantic_against_collage {
+        if let Some(id) = s.ai_collage_book_id { ids.push(id); }
+    }
+    if s.semantic_against_shared_collage {
+        if let Some(id) = s.ai_shared_collage_book_id { ids.push(id); }
+    }
+    if s.semantic_against_user_journal {
+        if let Some(id) = s.user_journal_book_id { ids.push(id); }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// Build the `kb_semantic_matches` response envelope. Always returns an
+/// object so consumers can branch on `enabled` rather than checking for a
+/// null payload — a null was ambiguous between "user opted out", "no
+/// semantic backend", and "search ran but returned no out-of-scope hits".
+fn kb_matches_envelope(ctx: &Context, results: &[Value]) -> Value {
+    if !ctx.settings.semantic_against_full_kb {
+        return json!({
+            "enabled": false,
+            "reason": "user_disabled",
+            "detail": "User setting `semantic_against_full_kb` is false. \
+                Vector search was scoped to the configured journal/collage/user_journal \
+                books only. Enable in /settings to search across the entire knowledge base.",
+            "results": [],
+        });
+    }
+    if ctx.semantic.is_none() {
+        return json!({
+            "enabled": false,
+            "reason": "semantic_backend_unavailable",
+            "detail": "Semantic search is not configured on this server.",
+            "results": [],
+        });
+    }
+    json!({
+        "enabled": true,
+        "reason": null,
+        "detail": "Top hits from the entire knowledge base, excluding pages already surfaced in per-book sections.",
+        "results": results,
+    })
 }
 
 // Suppress unused-import warning when this module is built with other features.

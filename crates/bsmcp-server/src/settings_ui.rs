@@ -1026,7 +1026,7 @@ a.reauth:hover { color: #cbd5e1; text-decoration: underline; }
         cb_collage = render_checkbox("semantic_against_collage", s.semantic_against_collage, "Topics / collage"),
         cb_shared_collage = render_checkbox("semantic_against_shared_collage", s.semantic_against_shared_collage, "Shared collage"),
         cb_user_journal = render_checkbox("semantic_against_user_journal", s.semantic_against_user_journal, "User journal"),
-        cb_full_kb = render_checkbox("semantic_against_full_kb", s.semantic_against_full_kb, "Full KB (expensive — opt in only)"),
+        cb_full_kb = render_checkbox("semantic_against_full_kb", s.semantic_against_full_kb, "Full KB (off: scope vector search to the configured books above; on: search the entire KB and surface out-of-scope hits in kb_semantic_matches)"),
         cb_followup = render_checkbox("use_follow_up_remember_agent", s.use_follow_up_remember_agent, "Run a follow-up reconstitution agent after the structured pull"),
         recent_count = s.recent_journal_count,
         collage_count = s.active_collage_count,

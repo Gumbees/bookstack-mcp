@@ -6,11 +6,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::stream::{self, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
 use bsmcp_common::bookstack::BookStackClient;
 use bsmcp_common::db::SemanticDb;
+use bsmcp_common::types::MarkovBlanket;
 
 const PERMISSION_CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
 
@@ -146,8 +148,10 @@ impl SemanticState {
         }
 
         if !uncached_ids.is_empty() {
-            // Check each page individually with concurrency limit
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
+            // Check each page individually with concurrency limit. Bumped from
+            // 10 → 25 because the cold-cache permission filter is the dominant
+            // cost in semantic search; BookStack handles the burst comfortably.
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(25));
             let mut handles = Vec::new();
 
             for pid in uncached_ids.clone() {
@@ -189,6 +193,13 @@ impl SemanticState {
     }
 
     /// Hybrid search: vector + keyword + blanket re-ranking.
+    ///
+    /// `book_filter`: when `Some(&[..])`, restricts the vector pass to chunks
+    /// whose page lives in one of the supplied books. The keyword pass and
+    /// permission/blanket steps are unaffected; the vector candidate pool is
+    /// just smaller from the outset, which proportionally shrinks the
+    /// permission filter and per-result fan-out. `None` keeps the old
+    /// whole-corpus behavior.
     pub async fn search(
         &self,
         query: &str,
@@ -197,13 +208,27 @@ impl SemanticState {
         hybrid: bool,
         verbose: bool,
         client: &BookStackClient,
+        book_filter: Option<&[i64]>,
     ) -> Result<Value, String> {
         let start = Instant::now();
 
-        // Run vector search and optional keyword search in parallel
+        // Run vector search and optional keyword search in parallel.
+        // Candidate over-fetch dropped from limit*5 → limit*2 — empirically
+        // sufficient headroom after permission filtering, and halves both the
+        // permission HTTP fan-out and the blanket DB fan-out.
+        let book_filter_owned: Option<Vec<i64>> = book_filter
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_vec());
         let vector_future = async {
             let query_vec = self.embed_query(query).await?;
-            self.db.vector_search(&query_vec, limit * 5, threshold).await
+            self.db
+                .vector_search(
+                    &query_vec,
+                    limit * 2,
+                    threshold,
+                    book_filter_owned.as_deref(),
+                )
+                .await
         };
 
         let keyword_future = async {
@@ -227,7 +252,37 @@ impl SemanticState {
 
         let (vector_result, keyword_result) = tokio::join!(vector_future, keyword_future);
         let hits = vector_result?;
-        let keyword_results: Vec<Value> = keyword_result;
+        let mut keyword_results: Vec<Value> = keyword_result;
+
+        // If a book filter was applied to the vector pass, apply the same
+        // filter to keyword results so we don't re-introduce out-of-scope
+        // pages via the hybrid merge path.
+        if let Some(allowed) = book_filter_owned.as_deref() {
+            let allowed_set: HashSet<i64> = allowed.iter().copied().collect();
+            // Keyword results don't carry book_id; fetch the book_id for each
+            // candidate page in one batched DB call and drop anything outside
+            // the allowed set.
+            let candidate_ids: Vec<i64> = keyword_results.iter()
+                .filter(|r| r.get("type").and_then(|v| v.as_str()) == Some("page"))
+                .filter_map(|r| r.get("id").and_then(|v| v.as_i64()))
+                .collect();
+            if !candidate_ids.is_empty() {
+                let book_lookup: HashMap<i64, i64> = self.db
+                    .get_page_book_ids(&candidate_ids)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+                keyword_results.retain(|r| {
+                    let pid = r.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+                    match book_lookup.get(&pid) {
+                        Some(bid) => allowed_set.contains(bid),
+                        // Page not in embedding store — drop it (out-of-scope by definition).
+                        None => false,
+                    }
+                });
+            }
+        }
 
         // Build page scores from vector hits
         let mut page_scores: HashMap<i64, PageScore> = HashMap::new();
@@ -277,30 +332,44 @@ impl SemanticState {
         // Blanket re-ranking: boost pages whose neighbors also appear in vector results.
         // Use the full set of pages from raw vector hits (not just final candidates),
         // so neighbors that scored below the per-page threshold still contribute.
+        //
+        // Each `get_markov_blanket` is 4 small indexed queries; previously this
+        // ran serially over ~40 scored pages, costing ~1s on Postgres latency
+        // alone. Parallelize at concurrency 20 — same compute, ~10x wall-clock.
+        // Cache the fetched blankets so verbose mode below can reuse them.
         let all_hit_page_ids: HashSet<i64> = hits.iter().map(|h| h.page_id).collect();
-        let scored_page_ids: HashSet<i64> = page_scores.keys().copied().collect();
-        for page_id in scored_page_ids.iter().copied() {
-            let blanket = match self.db.get_markov_blanket(page_id).await {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("Blanket: error for page {page_id}: {e}");
-                    continue;
+        let scored_page_ids: Vec<i64> = page_scores.keys().copied().collect();
+        let scored_set: HashSet<i64> = scored_page_ids.iter().copied().collect();
+
+        let blanket_fetches: Vec<(i64, MarkovBlanket)> = stream::iter(scored_page_ids.iter().copied())
+            .map(|pid| async move {
+                match self.db.get_markov_blanket(pid).await {
+                    Ok(b) => Some((pid, b)),
+                    Err(e) => {
+                        eprintln!("Blanket: error for page {pid}: {e}");
+                        None
+                    }
                 }
-            };
-            let neighbor_ids: Vec<i64> = blanket.linked_from.iter()
+            })
+            .buffer_unordered(20)
+            .filter_map(|x| async move { x })
+            .collect()
+            .await;
+
+        let blanket_cache: HashMap<i64, MarkovBlanket> = blanket_fetches.into_iter().collect();
+
+        for (&page_id, blanket) in blanket_cache.iter() {
+            let mut strong = 0usize;
+            let mut weak = 0usize;
+            for related in blanket.linked_from.iter()
                 .chain(blanket.links_to.iter())
                 .chain(blanket.co_linked.iter())
                 .chain(blanket.siblings.iter())
-                .map(|p| p.page_id)
-                .collect();
-
-            // Count neighbors in final results (strong signal) and raw vector hits (weak signal)
-            let mut strong = 0usize;
-            let mut weak = 0usize;
-            for nid in &neighbor_ids {
-                if scored_page_ids.contains(nid) {
+            {
+                let nid = related.page_id;
+                if scored_set.contains(&nid) {
                     strong += 1;
-                } else if all_hit_page_ids.contains(nid) {
+                } else if all_hit_page_ids.contains(&nid) {
                     weak += 1;
                 }
             }
@@ -363,27 +432,72 @@ impl SemanticState {
             page_results.truncate(limit);
         }
 
+        // Batch the per-result lookups. Previously this loop did one
+        // get_page_meta and one get_chunk_details per result (~80 sequential
+        // DB roundtrips for limit=40). Collect all IDs once, fetch in two
+        // queries, then assemble.
+        let final_page_ids: Vec<i64> = page_results.iter().map(|(pid, _, _)| *pid).collect();
+        let all_chunk_ids: Vec<i64> = page_results.iter()
+            .flat_map(|(_, _, score)| score.chunks.iter().map(|c| c.0))
+            .collect();
+
+        let (metas, chunk_details) = tokio::try_join!(
+            self.db.get_page_metas(&final_page_ids),
+            self.db.get_chunk_details(&all_chunk_ids),
+        )?;
+
+        let meta_by_page: HashMap<i64, &bsmcp_common::types::PageMeta> =
+            metas.iter().map(|m| (m.page_id, m)).collect();
+
+        // Group chunk details by their page_id so each result picks up only its chunks.
+        let mut chunks_by_page: HashMap<i64, Vec<&bsmcp_common::types::ChunkDetail>> = HashMap::new();
+        for detail in &chunk_details {
+            chunks_by_page.entry(detail.page_id).or_default().push(detail);
+        }
+
+        // For verbose mode, fetch any blankets we haven't already cached during
+        // re-ranking. Most final results will hit the cache for free.
+        let mut blanket_cache = blanket_cache;
+        if verbose {
+            let missing: Vec<i64> = final_page_ids.iter()
+                .copied()
+                .filter(|pid| !blanket_cache.contains_key(pid))
+                .collect();
+            if !missing.is_empty() {
+                let extras: Vec<(i64, MarkovBlanket)> = stream::iter(missing.into_iter())
+                    .map(|pid| async move {
+                        self.db.get_markov_blanket(pid).await.ok().map(|b| (pid, b))
+                    })
+                    .buffer_unordered(20)
+                    .filter_map(|x| async move { x })
+                    .collect()
+                    .await;
+                for (pid, b) in extras {
+                    blanket_cache.insert(pid, b);
+                }
+            }
+        }
+
         // Build result JSON
         let mut results = Vec::new();
         for (page_id, final_score, score) in &page_results {
-            let page_meta = self.db.get_page_meta(*page_id).await?;
-            let (page_name, book_id, updated_at) = match &page_meta {
+            let (page_name, book_id, updated_at) = match meta_by_page.get(page_id) {
                 Some(m) => (m.name.clone(), m.book_id, m.updated_at.clone()),
                 None => ("Unknown".to_string(), 0, None),
             };
 
-            // Get chunk details if we have vector hits
+            // Get chunk details if we have vector hits — pulled from the batched fetch.
             let mut chunks_json = Vec::new();
             if !score.chunks.is_empty() {
-                let chunk_ids: Vec<i64> = score.chunks.iter().map(|c| c.0).collect();
-                let chunk_details = self.db.get_chunk_details(&chunk_ids).await?;
-                for detail in &chunk_details {
-                    let chunk_score = score.chunks.iter().find(|c| c.0 == detail.chunk_id).map(|c| c.1).unwrap_or(0.0);
-                    chunks_json.push(json!({
-                        "heading_path": detail.heading_path,
-                        "content": detail.content,
-                        "score": (chunk_score * 1000.0).round() / 1000.0,
-                    }));
+                if let Some(details) = chunks_by_page.get(page_id) {
+                    for detail in details {
+                        let chunk_score = score.chunks.iter().find(|c| c.0 == detail.chunk_id).map(|c| c.1).unwrap_or(0.0);
+                        chunks_json.push(json!({
+                            "heading_path": detail.heading_path,
+                            "content": detail.content,
+                            "score": (chunk_score * 1000.0).round() / 1000.0,
+                        }));
+                    }
                 }
             }
 
@@ -404,15 +518,17 @@ impl SemanticState {
                 result["updated_at"] = json!(ts);
             }
 
-            // Only include full blanket data in verbose mode
+            // Only include full blanket data in verbose mode — reuse the
+            // re-ranking cache so we don't re-fetch what we already pulled.
             if verbose {
-                let blanket = self.db.get_markov_blanket(*page_id).await?;
-                result["blanket"] = json!({
-                    "linked_from": blanket.linked_from.iter().map(|p| json!({"page_id": p.page_id, "name": p.name})).collect::<Vec<_>>(),
-                    "links_to": blanket.links_to.iter().map(|p| json!({"page_id": p.page_id, "name": p.name})).collect::<Vec<_>>(),
-                    "co_linked": blanket.co_linked.iter().map(|p| json!({"page_id": p.page_id, "name": p.name})).collect::<Vec<_>>(),
-                    "siblings": blanket.siblings.iter().map(|p| json!({"page_id": p.page_id, "name": p.name})).collect::<Vec<_>>(),
-                });
+                if let Some(blanket) = blanket_cache.get(page_id) {
+                    result["blanket"] = json!({
+                        "linked_from": blanket.linked_from.iter().map(|p| json!({"page_id": p.page_id, "name": p.name})).collect::<Vec<_>>(),
+                        "links_to": blanket.links_to.iter().map(|p| json!({"page_id": p.page_id, "name": p.name})).collect::<Vec<_>>(),
+                        "co_linked": blanket.co_linked.iter().map(|p| json!({"page_id": p.page_id, "name": p.name})).collect::<Vec<_>>(),
+                        "siblings": blanket.siblings.iter().map(|p| json!({"page_id": p.page_id, "name": p.name})).collect::<Vec<_>>(),
+                    });
+                }
             }
 
             results.push(result);

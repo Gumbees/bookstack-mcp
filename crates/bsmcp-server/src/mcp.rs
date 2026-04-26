@@ -131,7 +131,7 @@ async fn execute_tool(
             let default_threshold = if hybrid { 0.45 } else { 0.50 };
             let threshold = args.get("threshold").and_then(|v| v.as_f64()).unwrap_or(default_threshold) as f32;
             let verbose = args.get("verbose").and_then(|v| v.as_bool()).unwrap_or(false);
-            let result = sem.search(&query, limit, threshold, hybrid, verbose, client).await?;
+            let result = sem.search(&query, limit, threshold, hybrid, verbose, client, None).await?;
             format_json(&result)
         }
         "reembed" => {

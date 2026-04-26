@@ -43,7 +43,7 @@ pub async fn read(ctx: &Context) -> Outcome {
     // One big semantic search, then partition results by scope.
     let mut warnings = Vec::new();
     let raw_hits: Vec<Value> = if let Some(sem) = &ctx.semantic {
-        match sem.search(&query, limit * (scope_targets.len().max(1)) * 2, 0.40, true, false, &ctx.client).await {
+        match sem.search(&query, limit * (scope_targets.len().max(1)) * 2, 0.40, true, false, &ctx.client, None).await {
             Ok(v) => v.get("results").and_then(|r| r.as_array()).cloned().unwrap_or_default(),
             Err(e) => {
                 warnings.push(RememberWarning::new(

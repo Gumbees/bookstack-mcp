@@ -119,6 +119,20 @@ fn yaml_scalar(s: &str) -> String {
     }
 }
 
+/// Current Unix timestamp in seconds.
+pub fn now_unix() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+/// Current UTC time as ISO 8601 (e.g., "2026-04-26T05:51:23Z").
+pub fn now_iso_utc() -> String {
+    iso_now()
+}
+
 /// Build today's date in YYYY-MM-DD format. Used as the natural key for journals.
 pub fn today_iso_date() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};

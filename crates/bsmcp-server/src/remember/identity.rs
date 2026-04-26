@@ -57,23 +57,22 @@ async fn list(ctx: &Context) -> Outcome {
         .unwrap_or_default();
 
     // For each book, find the Identity manifest page (matches the naming convention).
-    // Run lookups in parallel.
+    // Run lookups in parallel. Goes through `list_book_pages_by_updated`
+    // (which uses `get_book`) so the book scope is honored — search would
+    // silently fall through to system-wide results without a positive
+    // keyword term.
     let mut handles = Vec::with_capacity(books.len());
     for (book_id, book_name) in books {
         let client = ctx.client.clone();
         handles.push(tokio::spawn(async move {
-            // Search for the manifest page within this book.
-            let q = format!("{{type:page}} {{in_book:{book_id}}}");
-            let resp = client.search(&q, 1, 50).await.ok();
-            let manifest = resp
-                .and_then(|r| r.get("data").and_then(|d| d.as_array()).cloned())
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("page"))
-                .find(|p| {
-                    let n = p.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                    NamedResource::IdentityPage.matches(n)
-                });
+            let pages = client
+                .list_book_pages_by_updated(book_id, usize::MAX)
+                .await
+                .unwrap_or_default();
+            let manifest = pages.into_iter().find(|p| {
+                let n = p.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                NamedResource::IdentityPage.matches(n)
+            });
 
             (book_id, book_name, manifest)
         }));

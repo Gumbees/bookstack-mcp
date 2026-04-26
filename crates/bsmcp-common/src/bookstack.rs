@@ -554,6 +554,74 @@ impl BookStackClient {
         self.delete(&format!("pages/{id}")).await
     }
 
+    // --- Book traversal helpers ---
+    //
+    // These exist because BookStack's search API silently ignores
+    // `{in_book:N}` / `{name:foo}` filters when the query has no positive
+    // keyword term — `{type:page} {in_book:986}` parses fine but returns
+    // system-wide matches, not book-scoped ones. Filter-only listings must
+    // go through `get_book` (page row metadata) instead. Callers get
+    // `updated_at` from the database row, never parsed from page content.
+
+    /// Returns the most-recently-updated pages within a book, sorted by
+    /// `updated_at` descending, capped at `limit`. Page rows include
+    /// `id`, `name`, `slug`, `book_id`, `chapter_id`, `updated_at`, `url`.
+    pub async fn list_book_pages_by_updated(
+        &self,
+        book_id: i64,
+        limit: usize,
+    ) -> Result<Vec<Value>, String> {
+        let book = self.get_book(book_id).await?;
+        let mut pages = flatten_book_pages(&book);
+        pages.sort_by(|a, b| {
+            let a_t = a.get("updated_at").and_then(|t| t.as_str()).unwrap_or("");
+            let b_t = b.get("updated_at").and_then(|t| t.as_str()).unwrap_or("");
+            b_t.cmp(a_t)
+        });
+        pages.truncate(limit);
+        Ok(pages)
+    }
+
+    /// Find a page in a book by exact (case-insensitive) name. Returns the
+    /// page row if found, or `None`. One `get_book` call.
+    pub async fn find_page_in_book(
+        &self,
+        book_id: i64,
+        name: &str,
+    ) -> Result<Option<Value>, String> {
+        let book = self.get_book(book_id).await?;
+        let pages = flatten_book_pages(&book);
+        Ok(pages.into_iter().find(|p| {
+            p.get("name")
+                .and_then(|n| n.as_str())
+                .map(|n| n.eq_ignore_ascii_case(name))
+                .unwrap_or(false)
+        }))
+    }
+
+    /// Find a chapter in a book by exact (case-insensitive) name. Returns
+    /// the chapter row if found, or `None`. One `get_book` call.
+    pub async fn find_chapter_in_book(
+        &self,
+        book_id: i64,
+        name: &str,
+    ) -> Result<Option<Value>, String> {
+        let book = self.get_book(book_id).await?;
+        let contents = book
+            .get("contents")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(contents.into_iter().find(|item| {
+            item.get("type").and_then(|t| t.as_str()) == Some("chapter")
+                && item
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|n| n.eq_ignore_ascii_case(name))
+                    .unwrap_or(false)
+        }))
+    }
+
     // --- Search ---
 
     pub async fn search(&self, query: &str, page: i64, count: i64) -> Result<Value, String> {
@@ -744,5 +812,100 @@ impl BookStackClient {
 
     pub async fn get_role(&self, id: i64) -> Result<Value, String> {
         self.get(&format!("roles/{id}"), &[]).await
+    }
+}
+
+/// Flatten a `get_book` response into a single list of page rows —
+/// top-level pages plus every chapter's nested pages. Returns an empty
+/// vec if `contents` is missing or malformed.
+fn flatten_book_pages(book: &Value) -> Vec<Value> {
+    let Some(contents) = book.get("contents").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut pages = Vec::new();
+    for item in contents {
+        match item.get("type").and_then(|t| t.as_str()) {
+            Some("page") => pages.push(item.clone()),
+            Some("chapter") => {
+                if let Some(ch_pages) = item.get("pages").and_then(|p| p.as_array()) {
+                    for p in ch_pages {
+                        pages.push(p.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    pages
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fixture_book() -> Value {
+        // Mimics the shape of `GET /api/books/{id}` — top-level pages
+        // mixed with chapters that have their own nested pages.
+        json!({
+            "id": 986,
+            "name": "Pia's Journal",
+            "contents": [
+                {
+                    "type": "page",
+                    "id": 1003,
+                    "name": "Archive Daily Log",
+                    "updated_at": "2026-03-02T20:07:50Z"
+                },
+                {
+                    "type": "chapter",
+                    "id": 989,
+                    "name": "2026-02",
+                    "pages": [
+                        { "id": 990, "name": "2026-02-22", "updated_at": "2026-03-03T20:32:51Z" },
+                        { "id": 991, "name": "2026-02-19", "updated_at": "2026-03-03T20:32:53Z" },
+                    ]
+                },
+                {
+                    "type": "chapter",
+                    "id": 1869,
+                    "name": "2026-04",
+                    "pages": [
+                        { "id": 2025, "name": "2026-04-26", "updated_at": "2026-04-26T06:10:24Z" },
+                        { "id": 2006, "name": "2026-04-25", "updated_at": "2026-04-25T22:29:51Z" },
+                    ]
+                },
+            ]
+        })
+    }
+
+    #[test]
+    fn flatten_collects_top_level_and_chapter_pages() {
+        let pages = flatten_book_pages(&fixture_book());
+        let ids: Vec<i64> = pages
+            .iter()
+            .map(|p| p.get("id").and_then(|v| v.as_i64()).unwrap_or(0))
+            .collect();
+        // 5 pages total: 1 top-level + 2 in 2026-02 + 2 in 2026-04
+        assert_eq!(ids.len(), 5);
+        assert!(ids.contains(&1003));
+        assert!(ids.contains(&2025));
+        assert!(ids.contains(&990));
+    }
+
+    #[test]
+    fn flatten_handles_missing_contents() {
+        let book = json!({ "id": 1, "name": "Empty" });
+        assert!(flatten_book_pages(&book).is_empty());
+    }
+
+    #[test]
+    fn flatten_handles_malformed_chapter() {
+        let book = json!({
+            "contents": [
+                { "type": "chapter", "id": 1, "name": "no pages array" }
+            ]
+        });
+        assert!(flatten_book_pages(&book).is_empty());
     }
 }

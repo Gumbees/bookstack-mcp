@@ -36,9 +36,15 @@ pub async fn read(ctx: &Context) -> Outcome {
     let identity_fut = fetch_optional_page(&ctx.client, resolved.page_id);
     let user_fut = fetch_optional_page(&ctx.client, ctx.settings.user_identity_page_id);
 
-    // Recent journals (newest pages in the journal book).
+    // Recent journals (newest pages in each journal book — both the AI's
+    // reflection journal and the user's personal journal).
     let recent_journals_fut = list_recent_pages(
         ctx.settings.ai_hive_journal_book_id,
+        recent_count,
+        &ctx.client,
+    );
+    let recent_user_journal_fut = list_recent_pages(
+        ctx.settings.user_journal_book_id,
         recent_count,
         &ctx.client,
     );
@@ -56,9 +62,19 @@ pub async fn read(ctx: &Context) -> Outcome {
     );
 
     // Semantic search fan-out — one per configured target.
-    let prompt_for_semantic = user_prompt.clone();
+    //
+    // The query string we send to `sem.search` is the user's prompt prefixed
+    // with a `[Context: ...]` block carrying current time, timezone, user
+    // identity, and AI identity. Both halves of hybrid search benefit:
+    //   - Embedding side: the query vector is enriched with date / user
+    //     signal so prompts like "what was I working on yesterday" can match
+    //     pages dated relative to *today*, not relative to whenever the
+    //     embedding model was trained.
+    //   - Keyword side: the user_id and identity name appear in pages that
+    //     mention the same person, biasing relevance toward their content.
+    let prompt_for_semantic = build_semantic_query(&user_prompt, ctx);
     let semantic_fut = async {
-        if prompt_for_semantic.is_empty() {
+        if user_prompt.is_empty() {
             return SemanticSlice::default();
         }
         let Some(sem) = &ctx.semantic else {
@@ -116,10 +132,11 @@ pub async fn read(ctx: &Context) -> Outcome {
         "org_policy",
     );
 
-    let (identity, user_page, recent_journals, active_collage, shared_collage, semantic, user_pages, org_instructions, org_policy) = tokio::join!(
+    let (identity, user_page, recent_journals, recent_user_journal, active_collage, shared_collage, semantic, user_pages, org_instructions, org_policy) = tokio::join!(
         identity_fut,
         user_fut,
         recent_journals_fut,
+        recent_user_journal_fut,
         active_collage_fut,
         shared_collage_fut,
         semantic_fut,
@@ -214,13 +231,20 @@ pub async fn read(ctx: &Context) -> Outcome {
         },
         "journal_recent": recent_journals,
         "journal_semantic_matches": semantic.journal_matches,
+        "user_journal_recent": recent_user_journal,
+        "user_journal_semantic_matches": semantic.user_journal_matches,
         "collage_active": active_collage,
         "collage_semantic_matches": semantic.collage_matches,
         "shared_collage_active": shared_collage,
         "shared_collage_semantic_matches": semantic.shared_collage_matches,
-        "user_journal_semantic_matches": semantic.user_journal_matches,
         "kb_semantic_matches": if ctx.settings.semantic_against_full_kb { json!(semantic.kb_matches) } else { Value::Null },
         "system_prompt_additions": system_prompt,
+        "time": {
+            "now_unix": frontmatter::now_unix(),
+            "now_utc": frontmatter::now_iso_utc(),
+            "timezone": ctx.settings.timezone.clone().unwrap_or_else(|| "UTC".to_string()),
+            "timezone_source": if ctx.settings.timezone.is_some() { "user_settings" } else { "default_utc" },
+        },
         "config": {
             "label": ctx.settings.label,
             "role": ctx.settings.role,
@@ -230,9 +254,38 @@ pub async fn read(ctx: &Context) -> Outcome {
     }))
 }
 
+/// Build the semantic-search query string by prefixing the user's prompt
+/// with a `[Context: ...]` block carrying current time, timezone, user
+/// identity, and AI identity. The whole string is used for both vector
+/// embedding and the hybrid keyword pass.
+fn build_semantic_query(user_prompt: &str, ctx: &Context) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(format!("time={}", frontmatter::now_iso_utc()));
+    if let Some(tz) = &ctx.settings.timezone {
+        parts.push(format!("tz={tz}"));
+    }
+    if let Some(uid) = &ctx.settings.user_id {
+        parts.push(format!("user={uid}"));
+    }
+    if let Some(name) = &ctx.settings.ai_identity_name {
+        parts.push(format!("ai={name}"));
+    }
+    if parts.is_empty() {
+        user_prompt.to_string()
+    } else {
+        format!("[Context: {}]\n{}", parts.join(", "), user_prompt)
+    }
+}
+
 /// Fetch the markdown for every page in `page_ids` concurrently. Each result
 /// is tagged with the given `source` so the AI knows where the content came
 /// from (`user`, `org_instructions`, or `org_policy`).
+///
+/// **Invariant: no truncation.** System prompts and org policies are
+/// load-bearing — every word matters. The body returned here is the full
+/// page markdown with only the leading YAML frontmatter (provenance metadata)
+/// stripped. Do not add length caps, summarization, or chunking. If the body
+/// is too large for some downstream consumer, fix the consumer.
 async fn fetch_pages_with_source(
     client: &BookStackClient,
     page_ids: &[i64],
@@ -290,28 +343,28 @@ async fn fetch_optional_page(client: &BookStackClient, page_id: Option<i64>) -> 
     }
 }
 
+/// Lists the most-recently-updated pages within a book, using the
+/// `BookStackClient::list_book_pages_by_updated` helper. The helper sorts
+/// by the page row's `updated_at` from BookStack's database — never from
+/// markdown content. We just narrow the page row down to the four fields
+/// the briefing surfaces.
 async fn list_recent_pages(book_id: Option<i64>, limit: usize, client: &BookStackClient) -> Vec<Value> {
     let Some(book_id) = book_id else { return Vec::new(); };
-    let query = format!("{{type:page}} {{in_book:{book_id}}} {{updated_after:1970-01-01}}");
-    let resp = match client.search(&query, 1, limit as i64).await {
-        Ok(v) => v,
+    match client.list_book_pages_by_updated(book_id, limit).await {
+        Ok(pages) => pages
+            .into_iter()
+            .map(|p| json!({
+                "page_id": p.get("id").cloned().unwrap_or(Value::Null),
+                "name": p.get("name").cloned().unwrap_or(Value::Null),
+                "url": p.get("url").cloned().unwrap_or(Value::Null),
+                "updated_at": p.get("updated_at").cloned().unwrap_or(Value::Null),
+            }))
+            .collect(),
         Err(e) => {
-            eprintln!("Briefing: list_recent_pages({book_id}) failed: {e}");
-            return Vec::new();
+            eprintln!("Briefing: list_book_pages_by_updated({book_id}) failed: {e}");
+            Vec::new()
         }
-    };
-    let data = resp.get("data").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    data.into_iter()
-        .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("page"))
-        .take(limit)
-        .map(|p| json!({
-            "page_id": p.get("id").cloned().unwrap_or(Value::Null),
-            "name": p.get("name").cloned().unwrap_or(Value::Null),
-            "preview": p.get("preview_html").cloned().unwrap_or(Value::Null),
-            "url": p.get("url").cloned().unwrap_or(Value::Null),
-            "updated_at": p.get("updated_at").cloned().unwrap_or(Value::Null),
-        }))
-        .collect()
+    }
 }
 
 fn filter_by_book(hits: &[Value], book_id: Option<i64>, limit: usize) -> Vec<Value> {

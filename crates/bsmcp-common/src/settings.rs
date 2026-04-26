@@ -117,6 +117,12 @@ pub struct UserSettings {
     #[serde(default = "default_collage_count")]
     pub active_collage_count: usize,
 
+    /// User's IANA timezone name (e.g., "America/New_York"). Surfaced in the
+    /// briefing's `time` block so the AI can format timestamps in the user's
+    /// local time. If unset, the briefing reports UTC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+
     /// Unix epoch seconds until which the briefing's "configure your settings"
     /// nudge is snoozed. When `now < this`, the nudge is suppressed. Set via
     /// `remember_config action=dismiss_setup_nudge days=N`. Auto-becomes

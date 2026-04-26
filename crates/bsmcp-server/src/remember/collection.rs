@@ -160,26 +160,24 @@ async fn list_pages(
     parent: CollectionParent,
     ctx: &Context,
 ) -> Outcome {
-    let limit = ctx.body_count("limit", 25, 200) as i64;
-    let offset = ctx.body.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
-    let filter = parent_filter(parent);
-    let query = format!("{{type:page}} {filter}");
-    match ctx.client.search(&query, 1, limit + offset).await {
-        Ok(resp) => {
-            let data = resp
-                .get("data")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let pages: Vec<Value> = data
+    let limit = ctx.body_count("limit", 25, 200);
+    let offset = ctx.body.get("offset").and_then(|v| v.as_i64()).unwrap_or(0).max(0) as usize;
+    // Pull (limit + offset) most-recently-updated pages from the book and
+    // skip to the requested offset. Goes through the BookStackClient helper
+    // so we get database `updated_at` ordering, not search-relevance.
+    match ctx
+        .client
+        .list_book_pages_by_updated(parent, limit + offset)
+        .await
+    {
+        Ok(rows) => {
+            let pages: Vec<Value> = rows
                 .into_iter()
-                .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("page"))
-                .skip(offset as usize)
-                .take(limit as usize)
+                .skip(offset)
+                .take(limit)
                 .map(|p| json!({
                     "id": p.get("id").cloned().unwrap_or(Value::Null),
                     "name": p.get("name").cloned().unwrap_or(Value::Null),
-                    "preview": p.get("preview_html").cloned().unwrap_or(Value::Null),
                     "url": p.get("url").cloned().unwrap_or(Value::Null),
                     "updated_at": p.get("updated_at").cloned().unwrap_or(Value::Null),
                 }))
@@ -194,32 +192,24 @@ async fn list_pages(
     }
 }
 
-fn parent_filter(book_id: CollectionParent) -> String {
-    format!("{{in_book:{book_id}}}")
-}
-
 async fn find_page_by_name(
     parent: CollectionParent,
     name: &str,
     ctx: &Context,
 ) -> Result<Option<i64>, String> {
-    let filter = parent_filter(parent);
-    // BookStack's name filter does substring match; we verify exact name client-side.
-    let query = format!("{{type:page}} {{name:{name}}} {filter}");
-    let resp = ctx.client.search(&query, 1, 25).await?;
-    let data = resp.get("data").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    for item in data {
-        if item.get("type").and_then(|t| t.as_str()) != Some("page") {
-            continue;
-        }
-        let item_name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
-        if item_name.eq_ignore_ascii_case(name) {
-            if let Some(id) = item.get("id").and_then(|i| i.as_i64()) {
-                return Ok(Some(id));
-            }
-        }
+    // Goes through `get_book` + flatten — never `search` — so the book scope
+    // is honored. Exact-name match (case-insensitive) is done client-side.
+    match ctx.client.find_page_in_book(parent, name).await? {
+        Some(page) => Ok(page.get("id").and_then(|v| v.as_i64())),
+        None => Ok(None),
     }
-    Ok(None)
+}
+
+/// Used only by `handle_search`, which prepends a positive keyword term —
+/// so the filter is honored. Listing/lookup paths must NOT use this; go
+/// through `list_book_pages_by_updated` / `find_page_in_book` instead.
+fn parent_filter(book_id: CollectionParent) -> String {
+    format!("{{in_book:{book_id}}}")
 }
 
 // --- WRITE ---
@@ -355,18 +345,11 @@ async fn find_or_create_chapter(
     name: &str,
     ctx: &Context,
 ) -> Result<i64, String> {
-    let query = format!("{{type:chapter}} {{in_book:{book_id}}} {{name:{name}}}");
-    let resp = ctx.client.search(&query, 1, 25).await?;
-    let data = resp.get("data").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    for item in data {
-        if item.get("type").and_then(|t| t.as_str()) != Some("chapter") {
-            continue;
-        }
-        let item_name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
-        if item_name.eq_ignore_ascii_case(name) {
-            if let Some(id) = item.get("id").and_then(|i| i.as_i64()) {
-                return Ok(id);
-            }
+    // Look up via `get_book` + chapter list — never `search` — so we always
+    // see existing chapters and never create duplicates.
+    if let Some(existing) = ctx.client.find_chapter_in_book(book_id, name).await? {
+        if let Some(id) = existing.get("id").and_then(|v| v.as_i64()) {
+            return Ok(id);
         }
     }
     // Create with a generated description (server requires non-empty).

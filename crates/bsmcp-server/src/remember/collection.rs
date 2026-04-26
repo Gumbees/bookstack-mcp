@@ -403,7 +403,7 @@ async fn handle_search(
     // semantic backend doesn't accept book/chapter filters yet.
     let mut warnings = Vec::new();
     let semantic_hits: Vec<Value> = if let Some(sem) = &ctx.semantic {
-        match sem.search(&query, limit * 4, 0.45, true, false, &ctx.client).await {
+        match sem.search(&query, limit * 4, 0.45, true, false, &ctx.client, None).await {
             Ok(v) => {
                 let results = v.get("results").and_then(|r| r.as_array()).cloned().unwrap_or_default();
                 results.into_iter().filter(|hit| matches_parent(hit, parent)).take(limit).collect()

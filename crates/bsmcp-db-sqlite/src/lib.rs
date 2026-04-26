@@ -727,6 +727,67 @@ impl SemanticDb for SqliteDb {
         .map_err(|e| format!("Task failed: {e}"))?
     }
 
+    async fn get_page_book_ids(&self, page_ids: &[i64]) -> Result<Vec<(i64, i64)>, String> {
+        if page_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.clone();
+        let ids = page_ids.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+            let sql = format!("SELECT page_id, book_id FROM pages WHERE page_id IN ({placeholders})");
+            let mut stmt = conn.prepare(&sql).map_err(|e| format!("Prepare failed: {e}"))?;
+            let params_vec: Vec<&dyn rusqlite::ToSql> =
+                ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+            let rows: Vec<(i64, i64)> = stmt.query_map(params_vec.as_slice(), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .map_err(|e| format!("Query failed: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+            Ok(rows)
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn get_page_metas(&self, page_ids: &[i64]) -> Result<Vec<PageMeta>, String> {
+        if page_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.clone();
+        let ids = page_ids.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT page_id, book_id, chapter_id, name, slug, content_hash, updated_at
+                 FROM pages WHERE page_id IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(|e| format!("Prepare failed: {e}"))?;
+            let params_vec: Vec<&dyn rusqlite::ToSql> =
+                ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+            let rows: Vec<PageMeta> = stmt.query_map(params_vec.as_slice(), |row| {
+                Ok(PageMeta {
+                    page_id: row.get(0)?,
+                    book_id: row.get(1)?,
+                    chapter_id: row.get(2)?,
+                    name: row.get(3)?,
+                    slug: row.get(4)?,
+                    content_hash: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            })
+            .map_err(|e| format!("Query failed: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+            Ok(rows)
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
     async fn insert_chunks(&self, page_id: i64, chunks: &[ChunkInsert]) -> Result<(), String> {
         let conn = self.conn.clone();
         let chunks: Vec<ChunkInsert> = chunks.to_vec();
@@ -1173,20 +1234,63 @@ impl SemanticDb for SqliteDb {
         .map_err(|e| format!("Task failed: {e}"))?
     }
 
-    async fn vector_search(&self, query_embedding: &[f32], limit: usize, threshold: f32) -> Result<Vec<SearchHit>, String> {
+    async fn vector_search(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        threshold: f32,
+        book_ids: Option<&[i64]>,
+    ) -> Result<Vec<SearchHit>, String> {
         let conn = self.conn.clone();
         let query_embedding = query_embedding.to_vec();
+        // Materialize the optional filter into a Vec the closure can own. Empty
+        // slice means "no filter", same as None.
+        let book_filter: Option<Vec<i64>> = match book_ids {
+            Some(ids) if !ids.is_empty() => Some(ids.to_vec()),
+            _ => None,
+        };
+
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            let mut stmt = conn
-                .prepare("SELECT id, page_id, embedding FROM chunks")
-                .map_err(|e| format!("Prepare failed: {e}"))?;
-            let all_chunks: Vec<(i64, i64, Vec<u8>)> = stmt.query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
-            .map_err(|e| format!("Query failed: {e}"))?
-            .filter_map(|r| r.ok())
-            .collect();
+
+            // Note: each branch binds `out` to a Vec before yielding it from
+            // the block. The borrow checker rejects returning the .collect()
+            // expression directly because the temporary MappedRows borrows
+            // `stmt`, and `stmt` is dropped at the end of the block.
+            let all_chunks: Vec<(i64, i64, Vec<u8>)> = if let Some(ids) = book_filter {
+                // Build a parameterized IN list — rusqlite doesn't expand &[i64]
+                // automatically, so we generate "?, ?, ?" placeholders and bind
+                // each id individually.
+                let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+                let sql = format!(
+                    "SELECT c.id, c.page_id, c.embedding
+                     FROM chunks c JOIN pages p ON c.page_id = p.page_id
+                     WHERE p.book_id IN ({placeholders})"
+                );
+                let mut stmt = conn.prepare(&sql).map_err(|e| format!("Prepare failed: {e}"))?;
+                let params_vec: Vec<&dyn rusqlite::ToSql> =
+                    ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+                let out: Vec<(i64, i64, Vec<u8>)> = stmt
+                    .query_map(params_vec.as_slice(), |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .map_err(|e| format!("Query failed: {e}"))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                out
+            } else {
+                let mut stmt = conn
+                    .prepare("SELECT id, page_id, embedding FROM chunks")
+                    .map_err(|e| format!("Prepare failed: {e}"))?;
+                let out: Vec<(i64, i64, Vec<u8>)> = stmt
+                    .query_map([], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .map_err(|e| format!("Query failed: {e}"))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                out
+            };
 
             let hits = vector::search_embeddings(&query_embedding, &all_chunks, limit, threshold);
             Ok(hits.into_iter().map(|(chunk_id, page_id, score)| SearchHit { chunk_id, page_id, score }).collect())

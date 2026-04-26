@@ -124,7 +124,26 @@ pub trait SemanticDb: Send + Sync + 'static {
     // --- Vector search ---
 
     /// Backend-specific vector search. SQLite: brute-force cosine scan. Postgres: pgvector HNSW.
-    async fn vector_search(&self, query_embedding: &[f32], limit: usize, threshold: f32) -> Result<Vec<SearchHit>, String>;
+    ///
+    /// `book_ids`: when `Some(&[..])`, restrict candidates to chunks whose
+    /// parent page lives in one of those books. When `None` or an empty slice,
+    /// search across the entire embedded corpus.
+    async fn vector_search(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        threshold: f32,
+        book_ids: Option<&[i64]>,
+    ) -> Result<Vec<SearchHit>, String>;
+
+    /// Look up the `book_id` for each requested page in one roundtrip.
+    /// Returns the rows that matched, in unspecified order. Pages missing
+    /// from the embedding store are simply omitted.
+    async fn get_page_book_ids(&self, page_ids: &[i64]) -> Result<Vec<(i64, i64)>, String>;
+
+    /// Batched variant of `get_page_meta`. Returns one entry per requested
+    /// page that exists in the embedding store; missing pages are omitted.
+    async fn get_page_metas(&self, page_ids: &[i64]) -> Result<Vec<PageMeta>, String>;
 
     /// Delete all pages, chunks, and relationships. Used for full re-index.
     async fn clear_all_embeddings(&self) -> Result<(), String>;

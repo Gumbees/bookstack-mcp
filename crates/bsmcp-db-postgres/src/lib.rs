@@ -677,6 +677,44 @@ impl SemanticDb for PostgresDb {
         Ok(row.map(|r| r.get("page_id")))
     }
 
+    async fn get_page_book_ids(&self, page_ids: &[i64]) -> Result<Vec<(i64, i64)>, String> {
+        if page_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<i64> = page_ids.to_vec();
+        let rows = sqlx::query("SELECT page_id, book_id FROM pages WHERE page_id = ANY($1)")
+            .bind(&ids)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("get_page_book_ids failed: {e}"))?;
+        Ok(rows.iter().map(|r| (r.get("page_id"), r.get("book_id"))).collect())
+    }
+
+    async fn get_page_metas(&self, page_ids: &[i64]) -> Result<Vec<PageMeta>, String> {
+        if page_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<i64> = page_ids.to_vec();
+        let rows = sqlx::query(
+            "SELECT page_id, book_id, chapter_id, name, slug, content_hash, updated_at
+             FROM pages WHERE page_id = ANY($1)"
+        )
+        .bind(&ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("get_page_metas failed: {e}"))?;
+
+        Ok(rows.iter().map(|r| PageMeta {
+            page_id: r.get("page_id"),
+            book_id: r.get("book_id"),
+            chapter_id: r.get("chapter_id"),
+            name: r.get("name"),
+            slug: r.get("slug"),
+            content_hash: r.get("content_hash"),
+            updated_at: r.get("updated_at"),
+        }).collect())
+    }
+
     async fn insert_chunks(&self, page_id: i64, chunks: &[ChunkInsert]) -> Result<(), String> {
         // Wrap DELETE + INSERTs in a transaction to prevent partial state
         // (without this, queries hitting the table between DELETE and INSERT see zero chunks)
@@ -1053,7 +1091,13 @@ impl SemanticDb for PostgresDb {
         }).collect())
     }
 
-    async fn vector_search(&self, query_embedding: &[f32], limit: usize, threshold: f32) -> Result<Vec<SearchHit>, String> {
+    async fn vector_search(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        threshold: f32,
+        book_ids: Option<&[i64]>,
+    ) -> Result<Vec<SearchHit>, String> {
         // Sanity check: detect garbage embeddings (all zeros, NaN, etc.)
         let magnitude: f32 = query_embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
         if magnitude < 0.01 || magnitude.is_nan() {
@@ -1070,19 +1114,45 @@ impl SemanticDb for PostgresDb {
         sqlx::query("SET LOCAL hnsw.ef_search = 100")
             .execute(&mut *tx).await.ok();
 
-        let rows = sqlx::query(
-            "SELECT id, page_id, (1 - (embedding <=> $1::vector))::FLOAT4 AS score
-             FROM chunks
-             WHERE 1 - (embedding <=> $1::vector) > $2::FLOAT8
-             ORDER BY embedding <=> $1::vector
-             LIMIT $3"
-        )
-        .bind(&vec)
-        .bind(threshold)
-        .bind(limit as i64)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| format!("vector_search failed: {e}"))?;
+        // Optional book scope. When set, restrict candidates to chunks whose
+        // page lives in one of the requested books. Empty slice = full corpus.
+        let book_filter: Option<Vec<i64>> = match book_ids {
+            Some(ids) if !ids.is_empty() => Some(ids.to_vec()),
+            _ => None,
+        };
+
+        let rows = if let Some(ids) = book_filter {
+            sqlx::query(
+                "SELECT c.id, c.page_id, (1 - (c.embedding <=> $1::vector))::FLOAT4 AS score
+                 FROM chunks c
+                 JOIN pages p ON c.page_id = p.page_id
+                 WHERE 1 - (c.embedding <=> $1::vector) > $2::FLOAT8
+                   AND p.book_id = ANY($4)
+                 ORDER BY c.embedding <=> $1::vector
+                 LIMIT $3"
+            )
+            .bind(&vec)
+            .bind(threshold)
+            .bind(limit as i64)
+            .bind(&ids)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| format!("vector_search (scoped) failed: {e}"))?
+        } else {
+            sqlx::query(
+                "SELECT id, page_id, (1 - (embedding <=> $1::vector))::FLOAT4 AS score
+                 FROM chunks
+                 WHERE 1 - (embedding <=> $1::vector) > $2::FLOAT8
+                 ORDER BY embedding <=> $1::vector
+                 LIMIT $3"
+            )
+            .bind(&vec)
+            .bind(threshold)
+            .bind(limit as i64)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| format!("vector_search failed: {e}"))?
+        };
 
         tx.commit().await.ok();
 

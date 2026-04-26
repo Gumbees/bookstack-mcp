@@ -148,8 +148,10 @@ The page lets users pick their book/chapter IDs from dropdowns (populated from B
 
 | Config | UI (`/settings`) | MCP (`remember_config`) |
 |---|---|---|
-| Per-user settings (book/chapter IDs, semantic toggles, etc.) | yes | yes — `action=read` / `action=write` with full `settings` object |
-| Global shelf IDs | yes (admins only, first-write-wins) | **no** — UI is the only path |
+| Per-user settings | any user | `action=write` with `settings` object |
+| Global shelves | admins only, first-write-wins | `action=write` with `global_settings` object — admin-checked server-side, first-write-wins enforced (already-set fields trigger a `global_locked` warning rather than overwriting) |
+
+`remember_config action=read` returns both `{settings, global_settings}` in one envelope.
 
 **Auto-create:** every book/chapter setting has a "Create if missing" checkbox. On save, the server creates absent structure in dependency order (shelves → books → chapters) using sensible default names from the naming module. Permission denials surface as warnings rather than blocking the save.
 

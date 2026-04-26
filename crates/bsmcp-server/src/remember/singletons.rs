@@ -6,7 +6,7 @@
 
 use serde_json::{json, Value};
 
-use bsmcp_common::settings::UserSettings;
+use bsmcp_common::settings::{GlobalSettings, UserSettings};
 
 use super::envelope::ErrorCode;
 use super::frontmatter;
@@ -208,45 +208,127 @@ pub async fn write_user(ctx: &Context) -> Outcome {
     }
 }
 
-// --- config (UserSettings) ---
+// --- config (UserSettings + GlobalSettings) ---
 
 pub async fn read_config(ctx: &Context) -> Outcome {
-    let json_value = match serde_json::to_value(&ctx.settings) {
+    let user_json = match serde_json::to_value(&ctx.settings) {
         Ok(v) => v,
         Err(e) => return Outcome::error(ErrorCode::InternalError, e.to_string(), None),
     };
-    Outcome::ok(json_value)
+    let globals = ctx.db.get_global_settings().await.unwrap_or_default();
+    let global_json = match serde_json::to_value(&globals) {
+        Ok(v) => v,
+        Err(e) => return Outcome::error(ErrorCode::InternalError, e.to_string(), None),
+    };
+    Outcome::ok(json!({
+        "settings": user_json,
+        "global_settings": global_json,
+    }))
 }
 
 pub async fn write_config(ctx: &Context) -> Outcome {
-    // Body must be a UserSettings JSON object (partial = full replace).
-    let raw = match ctx.body.get("settings") {
-        Some(v) => v.clone(),
-        None => {
-            return Outcome::error(
-                ErrorCode::InvalidArgument,
-                "settings field (object) is required",
-                Some("settings"),
-            );
-        }
-    };
-    let new_settings: UserSettings = match serde_json::from_value(raw) {
-        Ok(s) => s,
-        Err(e) => {
-            return Outcome::error(
-                ErrorCode::InvalidArgument,
-                format!("settings parse error: {e}"),
-                Some("settings"),
-            );
-        }
-    };
-    if let Err(e) = ctx.db.save_user_settings(&ctx.token_id_hash, &new_settings).await {
-        return Outcome::error(ErrorCode::InternalError, e, None);
+    // Two optional sub-objects:
+    //   - "settings"        : per-user UserSettings (anyone can write their own)
+    //   - "global_settings" : instance-wide GlobalSettings (admins only,
+    //                         server-side first-write-wins for set fields)
+    let user_settings_arg = ctx.body.get("settings").cloned();
+    let global_settings_arg = ctx.body.get("global_settings").cloned();
+
+    if user_settings_arg.is_none() && global_settings_arg.is_none() {
+        return Outcome::error(
+            ErrorCode::InvalidArgument,
+            "at least one of `settings` or `global_settings` is required",
+            None,
+        );
     }
-    Outcome::ok(json!({
+
+    let mut warnings: Vec<super::envelope::RememberWarning> = Vec::new();
+    let mut saved_user: Option<UserSettings> = None;
+    let mut saved_globals: Option<GlobalSettings> = None;
+
+    // --- per-user settings ---
+    if let Some(raw) = user_settings_arg {
+        let new_settings: UserSettings = match serde_json::from_value(raw) {
+            Ok(s) => s,
+            Err(e) => {
+                return Outcome::error(
+                    ErrorCode::InvalidArgument,
+                    format!("settings parse error: {e}"),
+                    Some("settings"),
+                );
+            }
+        };
+        if let Err(e) = ctx.db.save_user_settings(&ctx.token_id_hash, &new_settings).await {
+            return Outcome::error(ErrorCode::InternalError, e, None);
+        }
+        saved_user = Some(new_settings);
+    }
+
+    // --- global settings (admin-only, first-write-wins) ---
+    if let Some(raw) = global_settings_arg {
+        let proposed: GlobalSettings = match serde_json::from_value(raw) {
+            Ok(g) => g,
+            Err(e) => {
+                return Outcome::error(
+                    ErrorCode::InvalidArgument,
+                    format!("global_settings parse error: {e}"),
+                    Some("global_settings"),
+                );
+            }
+        };
+        let is_admin = ctx.client.is_admin().await.unwrap_or(false);
+        if !is_admin {
+            return Outcome::error(
+                ErrorCode::InvalidArgument,
+                "global_settings can only be written by BookStack admins",
+                Some("global_settings"),
+            );
+        }
+
+        // Enforce first-write-wins server-side: only fields that are currently
+        // null may be set; pre-existing values are preserved silently.
+        let existing = ctx.db.get_global_settings().await.unwrap_or_default();
+        let mut merged = existing.clone();
+        if existing.hive_shelf_id.is_none() {
+            if let Some(v) = proposed.hive_shelf_id {
+                merged.hive_shelf_id = Some(v);
+            }
+        } else if proposed.hive_shelf_id.is_some()
+            && proposed.hive_shelf_id != existing.hive_shelf_id
+        {
+            warnings.push(super::envelope::RememberWarning::new(
+                "global_locked",
+                "hive_shelf_id is already set; ignoring requested change (first-write-wins).",
+            ));
+        }
+        if existing.user_journals_shelf_id.is_none() {
+            if let Some(v) = proposed.user_journals_shelf_id {
+                merged.user_journals_shelf_id = Some(v);
+            }
+        } else if proposed.user_journals_shelf_id.is_some()
+            && proposed.user_journals_shelf_id != existing.user_journals_shelf_id
+        {
+            warnings.push(super::envelope::RememberWarning::new(
+                "global_locked",
+                "user_journals_shelf_id is already set; ignoring requested change (first-write-wins).",
+            ));
+        }
+
+        if let Err(e) = ctx.db.save_global_settings(&merged, &ctx.token_id_hash).await {
+            return Outcome::error(ErrorCode::InternalError, e, None);
+        }
+        saved_globals = Some(merged);
+    }
+
+    let mut outcome = Outcome::ok(json!({
         "action": "saved",
-        "settings": new_settings,
-    }))
+        "settings": saved_user,
+        "global_settings": saved_globals,
+    }));
+    for w in warnings {
+        outcome = outcome.with_warning(w);
+    }
+    outcome
 }
 
 // --- helpers ---

@@ -1909,10 +1909,11 @@ fn add_remember_tools(tools: &mut Vec<Value>) {
 
     tools.push(remember_tool(
         "config",
-        "Per-user settings (the same object the /settings UI manages). read returns the current settings. write replaces them — pass the full UserSettings object as `settings`.",
+        "Per-user settings AND (admin-only) global shelves. read returns both `{settings, global_settings}`. write accepts `settings` (per-user — any user) and/or `global_settings` (admin-only, server-side first-write-wins; pre-set fields cannot be changed and trigger a `global_locked` warning).",
         &["read", "write"],
         json!({
-            "settings": { "type": "object", "description": "Full UserSettings object for write" },
+            "settings": { "type": "object", "description": "Full UserSettings object for per-user write" },
+            "global_settings": { "type": "object", "description": "GlobalSettings object (admin-only). Only null fields are written; set fields are preserved." },
         }),
     ));
 

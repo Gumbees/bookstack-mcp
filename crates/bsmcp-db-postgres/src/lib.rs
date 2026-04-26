@@ -113,6 +113,9 @@ impl PostgresDb {
                 id INT PRIMARY KEY CHECK (id = 1),
                 hive_shelf_id BIGINT,
                 user_journals_shelf_id BIGINT,
+                default_ai_identity_page_id BIGINT,
+                default_ai_identity_name TEXT,
+                default_ai_identity_ouid TEXT,
                 set_by_token_hash TEXT,
                 updated_at BIGINT NOT NULL DEFAULT 0
             )"
@@ -120,6 +123,15 @@ impl PostgresDb {
         .execute(&pool)
         .await
         .map_err(|e| format!("Failed to create global_settings table: {e}"))?;
+
+        // Migrations for older deployments — ADD COLUMN IF NOT EXISTS is supported in PG 9.6+.
+        for sql in [
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS default_ai_identity_page_id BIGINT",
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS default_ai_identity_name TEXT",
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS default_ai_identity_ouid TEXT",
+        ] {
+            sqlx::query(sql).execute(&pool).await.ok();
+        }
 
         sqlx::query("INSERT INTO global_settings (id, updated_at) VALUES (1, 0) ON CONFLICT (id) DO NOTHING")
             .execute(&pool).await.ok();
@@ -393,7 +405,9 @@ impl DbBackend for PostgresDb {
 
     async fn get_global_settings(&self) -> Result<GlobalSettings, String> {
         let row = sqlx::query(
-            "SELECT hive_shelf_id, user_journals_shelf_id, set_by_token_hash, updated_at
+            "SELECT hive_shelf_id, user_journals_shelf_id,
+                    default_ai_identity_page_id, default_ai_identity_name, default_ai_identity_ouid,
+                    set_by_token_hash, updated_at
              FROM global_settings WHERE id = 1"
         )
         .fetch_optional(&self.pool)
@@ -403,6 +417,9 @@ impl DbBackend for PostgresDb {
         Ok(row.map(|r| GlobalSettings {
             hive_shelf_id: r.get("hive_shelf_id"),
             user_journals_shelf_id: r.get("user_journals_shelf_id"),
+            default_ai_identity_page_id: r.get("default_ai_identity_page_id"),
+            default_ai_identity_name: r.get("default_ai_identity_name"),
+            default_ai_identity_ouid: r.get("default_ai_identity_ouid"),
             set_by_token_hash: r.get("set_by_token_hash"),
             updated_at: r.get("updated_at"),
         }).unwrap_or_default())
@@ -426,12 +443,18 @@ impl DbBackend for PostgresDb {
             "UPDATE global_settings
              SET hive_shelf_id = $1,
                  user_journals_shelf_id = $2,
-                 set_by_token_hash = $3,
-                 updated_at = $4
+                 default_ai_identity_page_id = $3,
+                 default_ai_identity_name = $4,
+                 default_ai_identity_ouid = $5,
+                 set_by_token_hash = $6,
+                 updated_at = $7
              WHERE id = 1"
         )
         .bind(settings.hive_shelf_id)
         .bind(settings.user_journals_shelf_id)
+        .bind(settings.default_ai_identity_page_id)
+        .bind(&settings.default_ai_identity_name)
+        .bind(&settings.default_ai_identity_ouid)
         .bind(&final_setter)
         .bind(Self::now_secs())
         .execute(&self.pool)

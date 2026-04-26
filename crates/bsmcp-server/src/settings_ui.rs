@@ -224,6 +224,11 @@ pub struct SettingsForm {
     pub create_ai_connections_chapter: Option<String>,
     pub create_ai_opportunities_chapter: Option<String>,
     pub create_ai_activity_chapter: Option<String>,
+
+    // Org-default AI identity (admins only).
+    pub default_ai_identity_page_id: Option<String>,
+    pub default_ai_identity_name: Option<String>,
+    pub default_ai_identity_ouid: Option<String>,
 }
 
 fn empty_to_none(s: Option<String>) -> Option<String> {
@@ -313,6 +318,9 @@ pub async fn handle_settings_post(
     let mut global_warnings: Vec<String> = Vec::new();
     let proposed_hive = parse_id(form.hive_shelf_id);
     let proposed_user_journals = parse_id(form.user_journals_shelf_id);
+    let proposed_default_id = parse_id(form.default_ai_identity_page_id);
+    let proposed_default_name = empty_to_none(form.default_ai_identity_name);
+    let proposed_default_ouid = empty_to_none(form.default_ai_identity_ouid);
 
     if existing_globals.hive_shelf_id.is_none() {
         if let Some(new_id) = proposed_hive {
@@ -343,6 +351,18 @@ pub async fn handle_settings_post(
     } else if proposed_user_journals.is_some() && proposed_user_journals != existing_globals.user_journals_shelf_id {
         global_warnings.push(
             "Ignoring user_journals_shelf_id change — global shelves are first-write-wins; current value preserved.".into()
+        );
+    }
+
+    // Org-default identity fields — admin-only writes, but they're updatable
+    // (not first-write-wins) so admins can swap the house agent later.
+    if is_admin {
+        globals.default_ai_identity_page_id = proposed_default_id;
+        globals.default_ai_identity_name = proposed_default_name;
+        globals.default_ai_identity_ouid = proposed_default_ouid;
+    } else if proposed_default_id.is_some() || proposed_default_name.is_some() || proposed_default_ouid.is_some() {
+        global_warnings.push(
+            "Ignoring org-default identity submission — only BookStack admins can set the org default.".into()
         );
     }
 
@@ -840,6 +860,26 @@ a.reauth:hover { color: #cbd5e1; text-decoration: underline; }
 </div>
 
 <div class="card">
+<h2>Org-default AI identity <span style="font-weight:400;font-size:.78rem;color:#94a3b8;">{org_default_note}</span></h2>
+<p class="subtitle" style="margin-bottom:.75rem;">When a user hasn't set their own AI identity, the briefing falls back to this. The "house agent". Admin-editable; can be changed later.</p>
+<div class="field">
+  <label for="default_ai_identity_page_id">Default identity manifest page ID</label>
+  {default_id_input}
+  <div class="hint">The page that defines the fallback agent. Find the ID in BookStack's URL.</div>
+</div>
+<div class="row2">
+<div class="field">
+  <label for="default_ai_identity_name">Default name</label>
+  {default_name_input}
+</div>
+<div class="field">
+  <label for="default_ai_identity_ouid">Default OUID</label>
+  {default_ouid_input}
+</div>
+</div>
+</div>
+
+<div class="card">
 <h2>Instance</h2>
 <div class="row2">
 <div class="field">
@@ -1045,6 +1085,23 @@ a.reauth:hover { color: #cbd5e1; text-decoration: underline; }
         hive_shelf_create = if g.hive_shelf_id.is_none() && is_admin { create_inline("create_hive_shelf", "Create \"Hive\" shelf if missing") } else { String::new() },
         user_journals_shelf_create = if g.user_journals_shelf_id.is_none() && is_admin { create_inline("create_user_journals_shelf", "Create \"User Journals\" shelf if missing") } else { String::new() },
 
+        org_default_note = if is_admin { "(admin-editable)" } else { "(read-only — admin only)" },
+        default_id_input = if is_admin {
+            render_id_input("default_ai_identity_page_id", g.default_ai_identity_page_id)
+        } else {
+            render_locked_value(g.default_ai_identity_page_id.map(|v| v.to_string()))
+        },
+        default_name_input = if is_admin {
+            render_text("default_ai_identity_name", g.default_ai_identity_name.as_deref(), "Pia")
+        } else {
+            render_locked_value(g.default_ai_identity_name.clone())
+        },
+        default_ouid_input = if is_admin {
+            render_text("default_ai_identity_ouid", g.default_ai_identity_ouid.as_deref(), "019dc66e4dd87ea080ebf5d5e2985d91")
+        } else {
+            render_locked_value(g.default_ai_identity_ouid.clone())
+        },
+
         create_ai_identity_book_cb = create_row("create_ai_identity_book", "Create Identity book under the Hive shelf if blank above", s.ai_identity_book_id.is_some()),
         create_ai_hive_journal_book_cb = create_row("create_ai_hive_journal_book", "Create Journal book under the Hive shelf if blank above", s.ai_hive_journal_book_id.is_some()),
         create_ai_collage_book_cb = create_row("create_ai_collage_book", "Create Topics / Collage book under the Hive shelf if blank above", s.ai_collage_book_id.is_some()),
@@ -1074,6 +1131,14 @@ fn create_inline(field_name: &str, label: &str) -> String {
         r#"<label class="cb" style="margin-top:.3rem;"><input type="checkbox" name="{name}" value="on"> {label}</label>"#,
         name = html_escape(field_name),
         label = html_escape(label),
+    )
+}
+
+fn render_locked_value(value: Option<String>) -> String {
+    let display = value.unwrap_or_else(|| "(unset)".into());
+    format!(
+        r#"<div style="padding:.55rem .7rem;border:1px solid #2a3a5c;border-radius:6px;background:#0a0f1f;color:#94a3b8;font-size:.9rem;">{}</div>"#,
+        html_escape(&display),
     )
 }
 

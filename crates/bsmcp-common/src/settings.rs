@@ -184,6 +184,21 @@ pub struct GlobalSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_journals_shelf_id: Option<i64>,
 
+    /// Org-wide default AI identity manifest page ID. When a user has not set
+    /// their own `ai_identity_page_id`, the briefing / whoami response falls
+    /// back to this. Lets an admin stand up a "house" agent that any new user
+    /// gets automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_ai_identity_page_id: Option<i64>,
+
+    /// Default AI identity display name (paired with the page above).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_ai_identity_name: Option<String>,
+
+    /// Default AI identity OUID (paired with the page above).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_ai_identity_ouid: Option<String>,
+
     /// Hash of the first token_id that set these values (informational; does
     /// not gate writes — UI handles the lock-after-set semantics).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -192,4 +207,31 @@ pub struct GlobalSettings {
     /// Unix epoch seconds of last update. 0 = never set.
     #[serde(default)]
     pub updated_at: i64,
+}
+
+impl GlobalSettings {
+    /// Resolve the AI identity for a user — user's own settings take precedence,
+    /// org defaults fill in any nulls. Returns the page_id, name, ouid triple.
+    pub fn resolve_identity(&self, user: &UserSettings) -> ResolvedIdentity {
+        ResolvedIdentity {
+            page_id: user.ai_identity_page_id.or(self.default_ai_identity_page_id),
+            name: user.ai_identity_name.clone().or_else(|| self.default_ai_identity_name.clone()),
+            ouid: user.ai_identity_ouid.clone().or_else(|| self.default_ai_identity_ouid.clone()),
+            using_default: user.ai_identity_page_id.is_none()
+                && self.default_ai_identity_page_id.is_some(),
+        }
+    }
+}
+
+/// Output of [`GlobalSettings::resolve_identity`] — the AI identity to use for
+/// a request after applying the user → org-default fallback chain.
+#[derive(Clone, Debug)]
+pub struct ResolvedIdentity {
+    pub page_id: Option<i64>,
+    pub name: Option<String>,
+    pub ouid: Option<String>,
+    /// True when the resolved page_id came from the org default (not the user).
+    /// Surfaced in the briefing response so the AI knows it's running on the
+    /// house identity rather than its own configured one.
+    pub using_default: bool,
 }

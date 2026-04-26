@@ -15,12 +15,14 @@ use super::{Context, Outcome};
 // --- whoami ---
 
 pub async fn read_whoami(ctx: &Context) -> Outcome {
-    let page_id = match ctx.settings.ai_identity_page_id {
+    let globals = ctx.db.get_global_settings().await.unwrap_or_default();
+    let resolved = globals.resolve_identity(&ctx.settings);
+    let page_id = match resolved.page_id {
         Some(id) => id,
         None => {
             return Outcome::error(
                 ErrorCode::SettingsNotConfigured,
-                "ai_identity_page_id not configured",
+                "ai_identity_page_id not configured (no user setting and no org default)",
                 Some("ai_identity_page_id"),
             );
         }
@@ -49,9 +51,10 @@ pub async fn read_whoami(ctx: &Context) -> Outcome {
     let body = frontmatter::strip(raw_md).to_string();
 
     Outcome::ok(json!({
-        "ouid": ctx.settings.ai_identity_ouid,
-        "name": ctx.settings.ai_identity_name.clone()
+        "ouid": resolved.ouid,
+        "name": resolved.name.clone()
             .or_else(|| page.get("name").and_then(|v| v.as_str()).map(|s| s.to_string())),
+        "using_org_default": resolved.using_default,
         "manifest": {
             "page_id": page_id,
             "name": page.get("name").cloned().unwrap_or(Value::Null),

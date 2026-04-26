@@ -27,8 +27,13 @@ pub async fn read(ctx: &Context) -> Outcome {
         .map(|n| n as usize)
         .unwrap_or(ctx.settings.active_collage_count.max(1));
 
+    // Resolve identity with org-default fallback. If the user hasn't set
+    // their own ai_identity_page_id but the org has a default, use it.
+    let globals = ctx.db.get_global_settings().await.unwrap_or_default();
+    let resolved = globals.resolve_identity(&ctx.settings);
+
     // Identity manifest (page) + user manifest (page) — fetch in parallel.
-    let identity_fut = fetch_optional_page(&ctx.client, ctx.settings.ai_identity_page_id);
+    let identity_fut = fetch_optional_page(&ctx.client, resolved.page_id);
     let user_fut = fetch_optional_page(&ctx.client, ctx.settings.user_identity_page_id);
 
     // Subagents (chapter listing).
@@ -120,11 +125,12 @@ pub async fn read(ctx: &Context) -> Outcome {
     Outcome::ok(json!({
         "identity": match identity {
             Some(p) => json!({
-                "ouid": ctx.settings.ai_identity_ouid,
-                "name": ctx.settings.ai_identity_name.clone()
+                "ouid": resolved.ouid,
+                "name": resolved.name.clone()
                     .or_else(|| p.get("name").and_then(|v| v.as_str()).map(|s| s.to_string())),
+                "using_org_default": resolved.using_default,
                 "manifest": {
-                    "page_id": ctx.settings.ai_identity_page_id,
+                    "page_id": resolved.page_id,
                     "markdown": frontmatter::strip(p.get("markdown").and_then(|v| v.as_str()).unwrap_or("")),
                     "url": p.get("url").cloned().unwrap_or(Value::Null),
                 }

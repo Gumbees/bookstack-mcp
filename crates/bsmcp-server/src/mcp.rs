@@ -1259,7 +1259,12 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool, su
          org-required instructions and AI usage policy, and semantic matches against the user's \
          first message — one structured pull instead of many tool calls. \
          Call the `remember_briefing` MCP tool (or POST /remember/v1/briefing/read) with the user's \
-         opening message as `user_prompt`.\n\n"
+         opening message as `user_prompt`.\n\n\
+         If the briefing response includes a `setup_nudge` field, the user hasn't configured their \
+         Hive yet. Walk them through the `suggested_workflow` in that nudge — use search_content + \
+         remember_directory to discover existing structure, propose moves with move_book_to_shelf / \
+         move_chapter / move_page, and lock in the IDs with `remember_config action=write`. The \
+         user can snooze the reminder via `remember_config action=dismiss_setup_nudge days=N`.\n\n"
     );
 
     if !instance_name.is_empty() {

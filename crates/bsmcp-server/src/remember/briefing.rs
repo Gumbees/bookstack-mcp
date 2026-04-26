@@ -158,7 +158,28 @@ pub async fn read(ctx: &Context) -> Outcome {
     let setup_nudge = if !ctx.settings.is_configured() && !snoozed {
         Some(json!({
             "show": true,
-            "message": "Your Hive memory settings aren't configured yet — the briefing is running on org defaults (or empty sections). Visit the MCP server's /settings page to set your AI identity, journal, topics, and more, or call `remember_config` with action=write to do it via tool.",
+            "summary": "Your Hive memory settings aren't configured yet. Briefing is running on org defaults (where set) or empty sections.",
+            "two_paths": {
+                "ui": "Visit the MCP server's /settings page in a browser — fill in dropdowns or use 'Probe existing Hive' to auto-detect.",
+                "mcp_guided": "Have the AI walk you through it via tool calls (recommended for chat-driven setups). See `suggested_workflow` below."
+            },
+            "suggested_workflow": [
+                "1. Ask the user what they want: a fresh identity, or to adopt an existing agent/structure that's already in this BookStack.",
+                "2. If existing: call `remember_directory action=read kind=identities` to see what's already on the global Hive shelf, and `remember_directory action=read kind=user_journals` for journals. If those return settings_not_configured, the global shelves themselves aren't set — surface that to the user (only an admin can fix).",
+                "3. Use `search_content` with queries like '{type:book} Identity', '{type:book} Journal', '{type:book} Topics' to find candidate content that may be elsewhere in BookStack and should belong on the Hive shelf.",
+                "4. For each match, propose to the user whether to (a) adopt it as-is by writing the ID into config, or (b) move it onto the Hive shelf first using `move_book_to_shelf` / `move_chapter` / `move_page`, then write the ID.",
+                "5. For brand-new structure, use `remember_identity action=create name=...` to scaffold a full Identity book + manifest + standard chapters in one call.",
+                "6. Save the resolved IDs with `remember_config action=write` and a `settings` object. The next briefing will reflect the new config and the nudge will stop showing."
+            ],
+            "key_tools": [
+                "remember_directory  — discover what's on the global shelves",
+                "search_content      — find existing candidates anywhere",
+                "list_books / list_chapters / list_shelves — browse",
+                "move_book_to_shelf / move_chapter / move_page — relocate",
+                "remember_identity action=create — scaffold a new identity",
+                "remember_config    action=write — persist the chosen IDs",
+                "remember_config    action=dismiss_setup_nudge days=N — snooze this reminder"
+            ],
             "settings_path": "/settings",
             "dismiss": {
                 "tool": "remember_config",

@@ -36,9 +36,15 @@ pub async fn read(ctx: &Context) -> Outcome {
     let identity_fut = fetch_optional_page(&ctx.client, resolved.page_id);
     let user_fut = fetch_optional_page(&ctx.client, ctx.settings.user_identity_page_id);
 
-    // Recent journals (newest pages in the journal book).
+    // Recent journals (newest pages in each journal book — both the AI's
+    // reflection journal and the user's personal journal).
     let recent_journals_fut = list_recent_pages(
         ctx.settings.ai_hive_journal_book_id,
+        recent_count,
+        &ctx.client,
+    );
+    let recent_user_journal_fut = list_recent_pages(
+        ctx.settings.user_journal_book_id,
         recent_count,
         &ctx.client,
     );
@@ -116,10 +122,11 @@ pub async fn read(ctx: &Context) -> Outcome {
         "org_policy",
     );
 
-    let (identity, user_page, recent_journals, active_collage, shared_collage, semantic, user_pages, org_instructions, org_policy) = tokio::join!(
+    let (identity, user_page, recent_journals, recent_user_journal, active_collage, shared_collage, semantic, user_pages, org_instructions, org_policy) = tokio::join!(
         identity_fut,
         user_fut,
         recent_journals_fut,
+        recent_user_journal_fut,
         active_collage_fut,
         shared_collage_fut,
         semantic_fut,
@@ -214,11 +221,12 @@ pub async fn read(ctx: &Context) -> Outcome {
         },
         "journal_recent": recent_journals,
         "journal_semantic_matches": semantic.journal_matches,
+        "user_journal_recent": recent_user_journal,
+        "user_journal_semantic_matches": semantic.user_journal_matches,
         "collage_active": active_collage,
         "collage_semantic_matches": semantic.collage_matches,
         "shared_collage_active": shared_collage,
         "shared_collage_semantic_matches": semantic.shared_collage_matches,
-        "user_journal_semantic_matches": semantic.user_journal_matches,
         "kb_semantic_matches": if ctx.settings.semantic_against_full_kb { json!(semantic.kb_matches) } else { Value::Null },
         "system_prompt_additions": system_prompt,
         "time": {
@@ -296,59 +304,28 @@ async fn fetch_optional_page(client: &BookStackClient, page_id: Option<i64>) -> 
     }
 }
 
-/// Lists the most-recently-updated pages within a book.
-///
-/// Uses `get_book` rather than `search` because BookStack's search API silently
-/// returns unfiltered results when no positive keyword term is present —
-/// `{type:page} {in_book:N}` alone produces system-wide matches, not book-scoped
-/// ones. `get_book` returns the book's full contents (top-level pages + chapter-
-/// nested pages) in one call, which we flatten and sort by `updated_at` desc.
+/// Lists the most-recently-updated pages within a book, using the
+/// `BookStackClient::list_book_pages_by_updated` helper. The helper sorts
+/// by the page row's `updated_at` from BookStack's database — never from
+/// markdown content. We just narrow the page row down to the four fields
+/// the briefing surfaces.
 async fn list_recent_pages(book_id: Option<i64>, limit: usize, client: &BookStackClient) -> Vec<Value> {
     let Some(book_id) = book_id else { return Vec::new(); };
-    let book = match client.get_book(book_id).await {
-        Ok(b) => b,
+    match client.list_book_pages_by_updated(book_id, limit).await {
+        Ok(pages) => pages
+            .into_iter()
+            .map(|p| json!({
+                "page_id": p.get("id").cloned().unwrap_or(Value::Null),
+                "name": p.get("name").cloned().unwrap_or(Value::Null),
+                "url": p.get("url").cloned().unwrap_or(Value::Null),
+                "updated_at": p.get("updated_at").cloned().unwrap_or(Value::Null),
+            }))
+            .collect(),
         Err(e) => {
-            eprintln!("Briefing: get_book({book_id}) failed: {e}");
-            return Vec::new();
-        }
-    };
-
-    // Flatten contents — top-level pages + every chapter's nested pages.
-    let mut pages: Vec<Value> = Vec::new();
-    if let Some(contents) = book.get("contents").and_then(|v| v.as_array()) {
-        for item in contents {
-            let kind = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            match kind {
-                "page" => pages.push(item.clone()),
-                "chapter" => {
-                    if let Some(ch_pages) = item.get("pages").and_then(|p| p.as_array()) {
-                        for p in ch_pages {
-                            pages.push(p.clone());
-                        }
-                    }
-                }
-                _ => {}
-            }
+            eprintln!("Briefing: list_book_pages_by_updated({book_id}) failed: {e}");
+            Vec::new()
         }
     }
-
-    // Sort by updated_at descending (ISO-8601 strings sort lexicographically).
-    pages.sort_by(|a, b| {
-        let a_t = a.get("updated_at").and_then(|t| t.as_str()).unwrap_or("");
-        let b_t = b.get("updated_at").and_then(|t| t.as_str()).unwrap_or("");
-        b_t.cmp(a_t)
-    });
-
-    pages
-        .into_iter()
-        .take(limit)
-        .map(|p| json!({
-            "page_id": p.get("id").cloned().unwrap_or(Value::Null),
-            "name": p.get("name").cloned().unwrap_or(Value::Null),
-            "url": p.get("url").cloned().unwrap_or(Value::Null),
-            "updated_at": p.get("updated_at").cloned().unwrap_or(Value::Null),
-        }))
-        .collect()
 }
 
 fn filter_by_book(hits: &[Value], book_id: Option<i64>, limit: usize) -> Vec<Value> {

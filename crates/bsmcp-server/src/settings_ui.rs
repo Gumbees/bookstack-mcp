@@ -625,13 +625,14 @@ async fn probe_hive(client: &BookStackClient, hive_shelf_id: i64) -> Result<Prob
     out.collage_book = books_on_shelf.iter().find(|b| NamedResource::CollageBook.matches(&b.name)).cloned();
     out.shared_collage_book = books_on_shelf.iter().find(|b| NamedResource::SharedCollageBook.matches(&b.name)).cloned();
 
-    // Identity manifest page inside the Identity book
+    // Identity manifest page inside the Identity book.
+    // Goes through `list_book_pages_by_updated` (which uses `get_book`)
+    // rather than `search` — search silently returns system-wide results
+    // when the query has no positive keyword term, which would surface
+    // pages from outside the identity book.
     if let Some(ref ib) = out.identity_book {
-        let q = format!("{{type:page}} {{in_book:{}}}", ib.id);
-        if let Ok(resp) = client.search(&q, 1, 100).await {
-            let pages = resp.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+        if let Ok(pages) = client.list_book_pages_by_updated(ib.id, usize::MAX).await {
             out.identity_page = pages.iter().find_map(|p| {
-                if p.get("type").and_then(|t| t.as_str()) != Some("page") { return None; }
                 let name = p.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 if NamedResource::IdentityPage.matches(name) {
                     let id = p.get("id").and_then(|i| i.as_i64())?;

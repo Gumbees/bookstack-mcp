@@ -105,7 +105,7 @@ Server-side reconstitution + memory CRUD. Replaces the multi-call AI bootstrap w
 
 **HTTP:** `POST /remember/v1/{resource}/{action}` — JSON body in, JSON envelope out (`{ok, data, meta, error}`). Auth via the same Bearer token as `/mcp/sse`.
 
-**MCP:** one tool per resource (`remember_briefing`, `remember_journal`, etc.) with an `action` arg picking the operation. 14 tools total.
+**MCP:** one tool per resource (`remember_briefing`, `remember_journal`, etc.) with an `action` arg picking the operation. 12 tools total.
 
 **Resources:**
 
@@ -121,10 +121,6 @@ Server-side reconstitution + memory CRUD. Replaces the multi-call AI bootstrap w
 | `collage` | collection (book) | read, write, search, delete | `ai_collage_book_id` |
 | `shared_collage` | collection (book) | read, write, search, delete | `ai_shared_collage_book_id` |
 | `user_journal` | collection (book) | read, write, search, delete | `user_journal_book_id` (auto-creates YYYY-MM chapters) |
-| `connections` | collection (chapter in Identity book) | read, write, search, delete | `ai_connections_chapter_id` |
-| `opportunities` | collection (chapter in Identity book) | read, write, search, delete | `ai_opportunities_chapter_id` |
-| `subagent` | collection (chapter in Identity book) | read, write, delete | `ai_subagents_chapter_id` |
-| `activity` | append-only chapter (in Journal book) | read, write, search | `ai_activity_chapter_id` |
 | `audit` | server-side log | read | `remember_audit` table (per-user) |
 | `search` | cross-resource | read | semantic + keyword across configured scopes |
 
@@ -153,9 +149,9 @@ The page lets users pick their book/chapter IDs from dropdowns (populated from B
 
 `remember_config action=read` returns both `{settings, global_settings}` in one envelope.
 
-**Auto-create:** every book/chapter setting has a "Create if missing" checkbox. On save, the server creates absent structure in dependency order (shelves → books → chapters) using sensible default names from the naming module. Permission denials surface as warnings rather than blocking the save.
+**Auto-create:** every book setting has a "Create if missing" checkbox. On save, the server creates absent structure in dependency order (shelves → books) using sensible default names from the naming module. Permission denials surface as warnings rather than blocking the save.
 
-**Probe (`/settings/probe`):** scans the configured Hive shelf for known structure by name (Identity, Journal, Topics, Subagents, Connections, Opportunities, Activity), shows matches with checkboxes, lets the user accept some/all into their settings without typing IDs.
+**Probe (`/settings/probe`):** scans the configured Hive shelf for known structure by name (Identity, Journal, Topics), shows matches with checkboxes, lets the user accept some/all into their settings without typing IDs.
 
 ## Auth-gated `/status`
 
@@ -170,7 +166,7 @@ Single-row table holding instance-wide pointers:
 
 Used by `remember_identity action=list`, `remember_directory`, and the settings UI lock-after-set behaviour.
 
-## Implemented Tools (61 + 14 remember)
+## Implemented Tools (61 + 12 remember)
 
 - **search_content** - Full-text search with BookStack query operators
 - **semantic_search** - Natural language vector search (when semantic enabled)

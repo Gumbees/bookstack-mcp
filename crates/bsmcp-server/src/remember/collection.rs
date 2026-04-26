@@ -1,5 +1,5 @@
 //! Generic handler shared by all collection resources (journal, collage,
-//! connections, etc). Each resource is a small struct implementing
+//! opportunities, etc). Each resource is a small struct implementing
 //! [`CollectionResource`]; the handler does the heavy lifting once.
 
 use serde_json::{json, Value};
@@ -10,25 +10,17 @@ use super::envelope::{ErrorCode, RememberWarning};
 use super::frontmatter;
 use super::{Context, Outcome};
 
-/// Where a resource's pages live.
-#[derive(Clone, Copy)]
-pub enum CollectionParent {
-    /// Pages live directly in a book (possibly distributed across sub-chapters
-    /// per `sub_chapter_for_key`).
-    Book(i64),
-    /// Pages live directly under a chapter. Sub-chapter splitting is unavailable
-    /// (BookStack chapters can't contain chapters).
-    Chapter(i64),
-}
+/// Book ID where a resource's pages live. Pages may be distributed across
+/// sub-chapters per `sub_chapter_for_key` (e.g., journals split into YYYY-MM
+/// monthly chapters).
+pub type CollectionParent = i64;
 
 #[derive(Clone, Copy, Debug)]
 pub enum KeyKind {
     /// YYYY-MM-DD — used by journals.
     Date,
-    /// Slugified topic/name — used by collage, connections, opportunities.
+    /// Slugified topic/name — used by collage.
     Slug,
-    /// Raw lowercase identifier — used by subagent (matches the agent's filename).
-    Name,
 }
 
 /// Trait implemented by each collection resource.
@@ -202,11 +194,8 @@ async fn list_pages(
     }
 }
 
-fn parent_filter(parent: CollectionParent) -> String {
-    match parent {
-        CollectionParent::Book(id) => format!("{{in_book:{id}}}"),
-        CollectionParent::Chapter(id) => format!("{{in_chapter:{id}}}"),
-    }
+fn parent_filter(book_id: CollectionParent) -> String {
+    format!("{{in_book:{book_id}}}")
 }
 
 async fn find_page_by_name(
@@ -270,7 +259,6 @@ async fn handle_write(
 
     let normalized_key = key_arg.as_deref().map(|k| match resource.key_kind() {
         KeyKind::Slug => frontmatter::slugify(k),
-        KeyKind::Name => k.to_lowercase(),
         KeyKind::Date => k.to_string(),
     });
 
@@ -348,22 +336,17 @@ enum CreateTarget {
 
 async fn resolve_create_target(
     resource: &dyn CollectionResource,
-    parent: CollectionParent,
+    book_id: CollectionParent,
     key: Option<&str>,
     ctx: &Context,
 ) -> Result<CreateTarget, String> {
-    match parent {
-        CollectionParent::Chapter(id) => Ok(CreateTarget::Chapter(id)),
-        CollectionParent::Book(book_id) => {
-            // If the resource splits by sub-chapter, find or create it.
-            let sub_chapter_name = key.and_then(|k| resource.sub_chapter_for_key(k));
-            if let Some(chapter_name) = sub_chapter_name {
-                let chapter_id = find_or_create_chapter(book_id, &chapter_name, ctx).await?;
-                Ok(CreateTarget::Chapter(chapter_id))
-            } else {
-                Ok(CreateTarget::Book(book_id))
-            }
-        }
+    // If the resource splits by sub-chapter, find or create it.
+    let sub_chapter_name = key.and_then(|k| resource.sub_chapter_for_key(k));
+    if let Some(chapter_name) = sub_chapter_name {
+        let chapter_id = find_or_create_chapter(book_id, &chapter_name, ctx).await?;
+        Ok(CreateTarget::Chapter(chapter_id))
+    } else {
+        Ok(CreateTarget::Book(book_id))
     }
 }
 
@@ -470,11 +453,8 @@ async fn handle_search(
     outcome
 }
 
-fn matches_parent(hit: &Value, parent: CollectionParent) -> bool {
-    match parent {
-        CollectionParent::Book(id) => hit.get("book_id").and_then(|v| v.as_i64()) == Some(id),
-        CollectionParent::Chapter(id) => hit.get("chapter_id").and_then(|v| v.as_i64()) == Some(id),
-    }
+fn matches_parent(hit: &Value, book_id: CollectionParent) -> bool {
+    hit.get("book_id").and_then(|v| v.as_i64()) == Some(book_id)
 }
 
 // --- DELETE (soft) ---
@@ -563,7 +543,7 @@ fn yaml_inline(s: &str) -> String {
     }
 }
 
-// --- The 7 collection resource impls ---
+// --- The 4 collection resource impls ---
 
 pub mod resources {
     use super::*;
@@ -572,8 +552,7 @@ pub mod resources {
     impl CollectionResource for Journal {
         fn name(&self) -> &'static str { "journal" }
         fn parent(&self, s: &UserSettings) -> Option<CollectionParent> {
-            s.ai_hive_journal_book_id.map(CollectionParent::Book)
-        }
+            s.ai_hive_journal_book_id        }
         fn key_kind(&self) -> KeyKind { KeyKind::Date }
         fn sub_chapter_for_key(&self, key: &str) -> Option<String> {
             // YYYY-MM-DD → YYYY-MM monthly chapter
@@ -585,8 +564,7 @@ pub mod resources {
     impl CollectionResource for Collage {
         fn name(&self) -> &'static str { "collage" }
         fn parent(&self, s: &UserSettings) -> Option<CollectionParent> {
-            s.ai_collage_book_id.map(CollectionParent::Book)
-        }
+            s.ai_collage_book_id        }
         fn key_kind(&self) -> KeyKind { KeyKind::Slug }
     }
 
@@ -594,8 +572,7 @@ pub mod resources {
     impl CollectionResource for SharedCollage {
         fn name(&self) -> &'static str { "shared_collage" }
         fn parent(&self, s: &UserSettings) -> Option<CollectionParent> {
-            s.ai_shared_collage_book_id.map(CollectionParent::Book)
-        }
+            s.ai_shared_collage_book_id        }
         fn key_kind(&self) -> KeyKind { KeyKind::Slug }
     }
 
@@ -603,38 +580,10 @@ pub mod resources {
     impl CollectionResource for UserJournal {
         fn name(&self) -> &'static str { "user_journal" }
         fn parent(&self, s: &UserSettings) -> Option<CollectionParent> {
-            s.user_journal_book_id.map(CollectionParent::Book)
-        }
+            s.user_journal_book_id        }
         fn key_kind(&self) -> KeyKind { KeyKind::Date }
         fn sub_chapter_for_key(&self, key: &str) -> Option<String> {
             if key.len() >= 7 { Some(key[..7].to_string()) } else { None }
         }
-    }
-
-    pub struct Connections;
-    impl CollectionResource for Connections {
-        fn name(&self) -> &'static str { "connections" }
-        fn parent(&self, s: &UserSettings) -> Option<CollectionParent> {
-            s.ai_connections_chapter_id.map(CollectionParent::Chapter)
-        }
-        fn key_kind(&self) -> KeyKind { KeyKind::Slug }
-    }
-
-    pub struct Opportunities;
-    impl CollectionResource for Opportunities {
-        fn name(&self) -> &'static str { "opportunities" }
-        fn parent(&self, s: &UserSettings) -> Option<CollectionParent> {
-            s.ai_opportunities_chapter_id.map(CollectionParent::Chapter)
-        }
-        fn key_kind(&self) -> KeyKind { KeyKind::Slug }
-    }
-
-    pub struct Subagent;
-    impl CollectionResource for Subagent {
-        fn name(&self) -> &'static str { "subagent" }
-        fn parent(&self, s: &UserSettings) -> Option<CollectionParent> {
-            s.ai_subagents_chapter_id.map(CollectionParent::Chapter)
-        }
-        fn key_kind(&self) -> KeyKind { KeyKind::Name }
     }
 }

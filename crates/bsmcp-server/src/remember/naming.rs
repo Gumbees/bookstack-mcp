@@ -19,10 +19,6 @@ pub enum NamedResource {
     JournalBook,
     CollageBook,
     SharedCollageBook,
-    SubagentsChapter,
-    ConnectionsChapter,
-    OpportunitiesChapter,
-    ActivityChapter,
 }
 
 impl NamedResource {
@@ -36,10 +32,6 @@ impl NamedResource {
             Self::JournalBook => "Journal",
             Self::CollageBook => "Topics",
             Self::SharedCollageBook => "Shared Topics",
-            Self::SubagentsChapter => "Subagents",
-            Self::ConnectionsChapter => "Connections",
-            Self::OpportunitiesChapter => "Opportunities",
-            Self::ActivityChapter => "Activity",
         }
     }
 
@@ -51,7 +43,7 @@ impl NamedResource {
             Self::UserJournalsShelf =>
                 "Shared shelf containing each human user's journal book. Auto-created by /remember.",
             Self::IdentityBook =>
-                "AI agent's identity manifest plus structured chapters about themselves (Connections, Opportunities, Subagents). Auto-created by /remember.",
+                "AI agent's identity manifest. Auto-created by /remember.",
             Self::IdentityPage =>
                 "Manifest page that defines who this AI agent is. Auto-created by /remember.",
             Self::JournalBook =>
@@ -60,14 +52,6 @@ impl NamedResource {
                 "AI agent's active topics / collage entries. Auto-created by /remember.",
             Self::SharedCollageBook =>
                 "Cross-agent shared topics. Auto-created by /remember.",
-            Self::SubagentsChapter =>
-                "Subagent definition pages. Auto-created by /remember.",
-            Self::ConnectionsChapter =>
-                "People and agents the AI has met. Auto-created by /remember.",
-            Self::OpportunitiesChapter =>
-                "Financial / actionable opportunities the AI is tracking. Auto-created by /remember.",
-            Self::ActivityChapter =>
-                "Append-only feed of conversations, social events, etc. Sits before the date chapters. Auto-created by /remember.",
         }
     }
 
@@ -83,10 +67,6 @@ impl NamedResource {
             Self::JournalBook => n == "journal",
             Self::CollageBook => matches!(n.as_str(), "topics" | "collage"),
             Self::SharedCollageBook => matches!(n.as_str(), "shared topics" | "shared collage"),
-            Self::SubagentsChapter => matches!(n.as_str(), "subagent" | "subagents"),
-            Self::ConnectionsChapter => n == "connections",
-            Self::OpportunitiesChapter => n == "opportunities",
-            Self::ActivityChapter => n == "activity",
         }
     }
 }
@@ -121,9 +101,6 @@ mod tests {
         assert!(NamedResource::CollageBook.matches("Topics"));
         assert!(NamedResource::CollageBook.matches("Collage"));
         assert!(!NamedResource::CollageBook.matches("Topic"));
-
-        assert!(NamedResource::SubagentsChapter.matches("Subagents"));
-        assert!(NamedResource::SubagentsChapter.matches("Subagent"));
     }
 
     #[test]

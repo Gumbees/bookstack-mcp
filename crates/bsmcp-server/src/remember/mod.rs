@@ -1,16 +1,14 @@
 //! `/remember/v1/{resource}/{action}` — the memory protocol.
 //!
 //! Resources (singletons): briefing, whoami, user, config
-//! Resources (collections): journal, collage, shared_collage, user_journal,
-//!                          connections, opportunities, subagent
-//! Resources (special):   activity (append-only), audit (read-only),
+//! Resources (collections): journal, collage, shared_collage, user_journal
+//! Resources (special):   audit (read-only),
 //!                        search (cross-resource semantic + keyword)
 //!
 //! Every handler returns the same envelope: `{ok, data, meta, error}`.
 //! Null settings disable the affected section/resource — the request never
 //! crashes when a setting is missing.
 
-pub mod activity;
 pub mod audit;
 pub mod briefing;
 pub mod collection;
@@ -141,13 +139,7 @@ async fn route(resource: &str, action: &str, ctx: &Context) -> Outcome {
         ("shared_collage", a) => collection::handle(&collection::resources::SharedCollage, a, ctx).await,
         ("user_journal", a) => collection::handle(&collection::resources::UserJournal, a, ctx).await,
 
-        // Collections (chapter parent)
-        ("connections", a) => collection::handle(&collection::resources::Connections, a, ctx).await,
-        ("opportunities", a) => collection::handle(&collection::resources::Opportunities, a, ctx).await,
-        ("subagent", a) => collection::handle(&collection::resources::Subagent, a, ctx).await,
-
         // Special
-        ("activity", a) => activity::handle(a, ctx).await,
         ("audit", "read") => audit::read(ctx).await,
         ("search", "read") => search::read(ctx).await,
         ("identity", a) => identity::handle(a, ctx).await,

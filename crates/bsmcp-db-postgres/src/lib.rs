@@ -13,10 +13,22 @@ use zeroize::Zeroizing;
 
 use bsmcp_common::config::{access_token_ttl, refresh_token_ttl};
 use bsmcp_common::db::{DbBackend, SemanticDb};
+use bsmcp_common::settings::{GlobalSettings, UserSettings};
 use bsmcp_common::types::*;
 
 const BASE64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::STANDARD;
+
+fn encode_id_list(ids: &[i64]) -> Option<String> {
+    if ids.is_empty() { None } else { serde_json::to_string(ids).ok() }
+}
+
+fn decode_id_list(value: Option<String>) -> Vec<i64> {
+    match value {
+        Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
 
 pub struct PostgresDb {
     pool: PgPool,
@@ -70,6 +82,77 @@ impl PostgresDb {
             .execute(&pool)
             .await
             .ok();
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS user_settings (
+                token_id_hash TEXT PRIMARY KEY,
+                settings_json TEXT NOT NULL,
+                updated_at BIGINT NOT NULL
+            )"
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("Failed to create user_settings table: {e}"))?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS remember_audit (
+                id BIGSERIAL PRIMARY KEY,
+                token_id_hash TEXT NOT NULL,
+                ai_identity_ouid TEXT,
+                user_id TEXT,
+                resource TEXT NOT NULL,
+                action TEXT NOT NULL,
+                target_page_id BIGINT,
+                target_key TEXT,
+                success BOOLEAN NOT NULL,
+                error TEXT,
+                trace_id TEXT,
+                occurred_at BIGINT NOT NULL
+            )"
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("Failed to create remember_audit table: {e}"))?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_user_time ON remember_audit(token_id_hash, occurred_at DESC)")
+            .execute(&pool).await.ok();
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_resource_time ON remember_audit(resource, occurred_at DESC)")
+            .execute(&pool).await.ok();
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS global_settings (
+                id INT PRIMARY KEY CHECK (id = 1),
+                hive_shelf_id BIGINT,
+                user_journals_shelf_id BIGINT,
+                default_ai_identity_page_id BIGINT,
+                default_ai_identity_name TEXT,
+                default_ai_identity_ouid TEXT,
+                org_required_instructions_page_ids TEXT,
+                org_ai_usage_policy_page_ids TEXT,
+                set_by_token_hash TEXT,
+                updated_at BIGINT NOT NULL DEFAULT 0
+            )"
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("Failed to create global_settings table: {e}"))?;
+
+        // Migrations for older deployments — ADD COLUMN IF NOT EXISTS is supported in PG 9.6+.
+        // org_*_chapter_ids columns were briefly added during this PR's development and
+        // then dropped in favour of page-IDs-only — leaving any existing columns in place
+        // is harmless since we no longer read or write them.
+        for sql in [
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS default_ai_identity_page_id BIGINT",
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS default_ai_identity_name TEXT",
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS default_ai_identity_ouid TEXT",
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS org_required_instructions_page_ids TEXT",
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS org_ai_usage_policy_page_ids TEXT",
+        ] {
+            sqlx::query(sql).execute(&pool).await.ok();
+        }
+
+        sqlx::query("INSERT INTO global_settings (id, updated_at) VALUES (1, 0) ON CONFLICT (id) DO NOTHING")
+            .execute(&pool).await.ok();
 
         let hash = sha2::Sha256::digest(encryption_key.as_bytes());
         let mut key = Zeroizing::new([0u8; 32]);
@@ -276,6 +359,174 @@ impl DbBackend for PostgresDb {
         eprintln!("Backup: PostgreSQL backups should use pg_dump externally");
         Ok(())
     }
+
+    async fn get_user_settings(&self, token_id_hash: &str) -> Result<Option<UserSettings>, String> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT settings_json FROM user_settings WHERE token_id_hash = $1"
+        )
+        .bind(token_id_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("get_user_settings: {e}"))?;
+
+        match row {
+            Some((json,)) => serde_json::from_str(&json)
+                .map(Some)
+                .map_err(|e| format!("user_settings JSON parse: {e}")),
+            None => Ok(None),
+        }
+    }
+
+    async fn save_user_settings(&self, token_id_hash: &str, settings: &UserSettings) -> Result<(), String> {
+        let json = serde_json::to_string(settings)
+            .map_err(|e| format!("user_settings serialize: {e}"))?;
+        sqlx::query(
+            "INSERT INTO user_settings (token_id_hash, settings_json, updated_at)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (token_id_hash) DO UPDATE SET
+                settings_json = EXCLUDED.settings_json,
+                updated_at = EXCLUDED.updated_at"
+        )
+        .bind(token_id_hash)
+        .bind(&json)
+        .bind(Self::now_secs())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("save_user_settings: {e}"))?;
+        Ok(())
+    }
+
+    async fn insert_audit_entry(&self, entry: &AuditEntryInsert) -> Result<i64, String> {
+        let row = sqlx::query(
+            "INSERT INTO remember_audit
+                (token_id_hash, ai_identity_ouid, user_id, resource, action,
+                 target_page_id, target_key, success, error, trace_id, occurred_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             RETURNING id"
+        )
+        .bind(&entry.token_id_hash)
+        .bind(&entry.ai_identity_ouid)
+        .bind(&entry.user_id)
+        .bind(&entry.resource)
+        .bind(&entry.action)
+        .bind(entry.target_page_id)
+        .bind(&entry.target_key)
+        .bind(entry.success)
+        .bind(&entry.error)
+        .bind(&entry.trace_id)
+        .bind(Self::now_secs())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| format!("insert_audit_entry: {e}"))?;
+        Ok(row.get("id"))
+    }
+
+    async fn get_global_settings(&self) -> Result<GlobalSettings, String> {
+        let row = sqlx::query(
+            "SELECT hive_shelf_id, user_journals_shelf_id,
+                    default_ai_identity_page_id, default_ai_identity_name, default_ai_identity_ouid,
+                    org_required_instructions_page_ids,
+                    org_ai_usage_policy_page_ids,
+                    set_by_token_hash, updated_at
+             FROM global_settings WHERE id = 1"
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("get_global_settings: {e}"))?;
+
+        Ok(row.map(|r| GlobalSettings {
+            hive_shelf_id: r.get("hive_shelf_id"),
+            user_journals_shelf_id: r.get("user_journals_shelf_id"),
+            default_ai_identity_page_id: r.get("default_ai_identity_page_id"),
+            default_ai_identity_name: r.get("default_ai_identity_name"),
+            default_ai_identity_ouid: r.get("default_ai_identity_ouid"),
+            org_required_instructions_page_ids: decode_id_list(r.get("org_required_instructions_page_ids")),
+            org_ai_usage_policy_page_ids: decode_id_list(r.get("org_ai_usage_policy_page_ids")),
+            set_by_token_hash: r.get("set_by_token_hash"),
+            updated_at: r.get("updated_at"),
+        }).unwrap_or_default())
+    }
+
+    async fn save_global_settings(
+        &self,
+        settings: &GlobalSettings,
+        set_by_token_hash: &str,
+    ) -> Result<(), String> {
+        let existing_setter: Option<String> = sqlx::query_scalar(
+            "SELECT set_by_token_hash FROM global_settings WHERE id = 1 AND updated_at > 0"
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("save_global_settings preflight: {e}"))?
+        .flatten();
+        let final_setter = existing_setter.unwrap_or_else(|| set_by_token_hash.to_string());
+
+        sqlx::query(
+            "UPDATE global_settings
+             SET hive_shelf_id = $1,
+                 user_journals_shelf_id = $2,
+                 default_ai_identity_page_id = $3,
+                 default_ai_identity_name = $4,
+                 default_ai_identity_ouid = $5,
+                 org_required_instructions_page_ids = $6,
+                 org_ai_usage_policy_page_ids = $7,
+                 set_by_token_hash = $8,
+                 updated_at = $9
+             WHERE id = 1"
+        )
+        .bind(settings.hive_shelf_id)
+        .bind(settings.user_journals_shelf_id)
+        .bind(settings.default_ai_identity_page_id)
+        .bind(&settings.default_ai_identity_name)
+        .bind(&settings.default_ai_identity_ouid)
+        .bind(encode_id_list(&settings.org_required_instructions_page_ids))
+        .bind(encode_id_list(&settings.org_ai_usage_policy_page_ids))
+        .bind(&final_setter)
+        .bind(Self::now_secs())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("save_global_settings: {e}"))?;
+        Ok(())
+    }
+
+    async fn list_audit_entries(
+        &self,
+        token_id_hash: &str,
+        limit: i64,
+        offset: i64,
+        since_unix: Option<i64>,
+    ) -> Result<Vec<AuditEntry>, String> {
+        let rows = sqlx::query(
+            "SELECT id, token_id_hash, ai_identity_ouid, user_id, resource, action,
+                    target_page_id, target_key, success, error, trace_id, occurred_at
+             FROM remember_audit
+             WHERE token_id_hash = $1 AND occurred_at >= $2
+             ORDER BY occurred_at DESC
+             LIMIT $3 OFFSET $4"
+        )
+        .bind(token_id_hash)
+        .bind(since_unix.unwrap_or(0))
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_audit_entries: {e}"))?;
+
+        Ok(rows.iter().map(|r| AuditEntry {
+            id: r.get("id"),
+            token_id_hash: r.get("token_id_hash"),
+            ai_identity_ouid: r.get("ai_identity_ouid"),
+            user_id: r.get("user_id"),
+            resource: r.get("resource"),
+            action: r.get("action"),
+            target_page_id: r.get("target_page_id"),
+            target_key: r.get("target_key"),
+            success: r.get("success"),
+            error: r.get("error"),
+            trace_id: r.get("trace_id"),
+            occurred_at: r.get("occurred_at"),
+        }).collect())
+    }
 }
 
 #[async_trait]
@@ -424,6 +675,44 @@ impl SemanticDb for PostgresDb {
             .await
             .map_err(|e| format!("resolve_page_slug failed: {e}"))?;
         Ok(row.map(|r| r.get("page_id")))
+    }
+
+    async fn get_page_book_ids(&self, page_ids: &[i64]) -> Result<Vec<(i64, i64)>, String> {
+        if page_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<i64> = page_ids.to_vec();
+        let rows = sqlx::query("SELECT page_id, book_id FROM pages WHERE page_id = ANY($1)")
+            .bind(&ids)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("get_page_book_ids failed: {e}"))?;
+        Ok(rows.iter().map(|r| (r.get("page_id"), r.get("book_id"))).collect())
+    }
+
+    async fn get_page_metas(&self, page_ids: &[i64]) -> Result<Vec<PageMeta>, String> {
+        if page_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<i64> = page_ids.to_vec();
+        let rows = sqlx::query(
+            "SELECT page_id, book_id, chapter_id, name, slug, content_hash, updated_at
+             FROM pages WHERE page_id = ANY($1)"
+        )
+        .bind(&ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("get_page_metas failed: {e}"))?;
+
+        Ok(rows.iter().map(|r| PageMeta {
+            page_id: r.get("page_id"),
+            book_id: r.get("book_id"),
+            chapter_id: r.get("chapter_id"),
+            name: r.get("name"),
+            slug: r.get("slug"),
+            content_hash: r.get("content_hash"),
+            updated_at: r.get("updated_at"),
+        }).collect())
     }
 
     async fn insert_chunks(&self, page_id: i64, chunks: &[ChunkInsert]) -> Result<(), String> {
@@ -802,7 +1091,13 @@ impl SemanticDb for PostgresDb {
         }).collect())
     }
 
-    async fn vector_search(&self, query_embedding: &[f32], limit: usize, threshold: f32) -> Result<Vec<SearchHit>, String> {
+    async fn vector_search(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        threshold: f32,
+        book_ids: Option<&[i64]>,
+    ) -> Result<Vec<SearchHit>, String> {
         // Sanity check: detect garbage embeddings (all zeros, NaN, etc.)
         let magnitude: f32 = query_embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
         if magnitude < 0.01 || magnitude.is_nan() {
@@ -819,19 +1114,45 @@ impl SemanticDb for PostgresDb {
         sqlx::query("SET LOCAL hnsw.ef_search = 100")
             .execute(&mut *tx).await.ok();
 
-        let rows = sqlx::query(
-            "SELECT id, page_id, (1 - (embedding <=> $1::vector))::FLOAT4 AS score
-             FROM chunks
-             WHERE 1 - (embedding <=> $1::vector) > $2::FLOAT8
-             ORDER BY embedding <=> $1::vector
-             LIMIT $3"
-        )
-        .bind(&vec)
-        .bind(threshold)
-        .bind(limit as i64)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| format!("vector_search failed: {e}"))?;
+        // Optional book scope. When set, restrict candidates to chunks whose
+        // page lives in one of the requested books. Empty slice = full corpus.
+        let book_filter: Option<Vec<i64>> = match book_ids {
+            Some(ids) if !ids.is_empty() => Some(ids.to_vec()),
+            _ => None,
+        };
+
+        let rows = if let Some(ids) = book_filter {
+            sqlx::query(
+                "SELECT c.id, c.page_id, (1 - (c.embedding <=> $1::vector))::FLOAT4 AS score
+                 FROM chunks c
+                 JOIN pages p ON c.page_id = p.page_id
+                 WHERE 1 - (c.embedding <=> $1::vector) > $2::FLOAT8
+                   AND p.book_id = ANY($4)
+                 ORDER BY c.embedding <=> $1::vector
+                 LIMIT $3"
+            )
+            .bind(&vec)
+            .bind(threshold)
+            .bind(limit as i64)
+            .bind(&ids)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| format!("vector_search (scoped) failed: {e}"))?
+        } else {
+            sqlx::query(
+                "SELECT id, page_id, (1 - (embedding <=> $1::vector))::FLOAT4 AS score
+                 FROM chunks
+                 WHERE 1 - (embedding <=> $1::vector) > $2::FLOAT8
+                 ORDER BY embedding <=> $1::vector
+                 LIMIT $3"
+            )
+            .bind(&vec)
+            .bind(threshold)
+            .bind(limit as i64)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| format!("vector_search failed: {e}"))?
+        };
 
         tx.commit().await.ok();
 

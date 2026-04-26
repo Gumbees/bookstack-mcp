@@ -12,6 +12,7 @@ use zeroize::Zeroizing;
 
 use bsmcp_common::config::{access_token_ttl, refresh_token_ttl};
 use bsmcp_common::db::{DbBackend, SemanticDb};
+use bsmcp_common::settings::{GlobalSettings, UserSettings};
 use bsmcp_common::types::*;
 use bsmcp_common::vector;
 
@@ -44,9 +45,60 @@ impl SqliteDb {
                  created_at INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_refresh_tokens_created ON refresh_tokens(created_at);
+             CREATE TABLE IF NOT EXISTS user_settings (
+                 token_id_hash TEXT PRIMARY KEY,
+                 settings_json TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS remember_audit (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 token_id_hash TEXT NOT NULL,
+                 ai_identity_ouid TEXT,
+                 user_id TEXT,
+                 resource TEXT NOT NULL,
+                 action TEXT NOT NULL,
+                 target_page_id INTEGER,
+                 target_key TEXT,
+                 success INTEGER NOT NULL,
+                 error TEXT,
+                 trace_id TEXT,
+                 occurred_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_audit_user_time ON remember_audit(token_id_hash, occurred_at DESC);
+             CREATE INDEX IF NOT EXISTS idx_audit_resource_time ON remember_audit(resource, occurred_at DESC);
+             CREATE TABLE IF NOT EXISTS global_settings (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 hive_shelf_id INTEGER,
+                 user_journals_shelf_id INTEGER,
+                 default_ai_identity_page_id INTEGER,
+                 default_ai_identity_name TEXT,
+                 default_ai_identity_ouid TEXT,
+                 org_required_instructions_page_ids TEXT,
+                 org_ai_usage_policy_page_ids TEXT,
+                 set_by_token_hash TEXT,
+                 updated_at INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT OR IGNORE INTO global_settings (id, updated_at) VALUES (1, 0);
              DROP TABLE IF EXISTS registrations;",
         )
         .expect("Failed to initialize database schema");
+
+        // Migrations: ALTER existing global_settings rows to gain new columns.
+        // SQLite doesn't support IF NOT EXISTS on ALTER ADD COLUMN; ignore the
+        // duplicate-column error.
+        // Note: org_*_chapter_ids columns were briefly added during this PR's
+        // development and then dropped in favour of page-IDs-only. Existing
+        // rows with values in those columns are simply ignored — the columns
+        // remain on disk but are not read by the application.
+        for sql in [
+            "ALTER TABLE global_settings ADD COLUMN default_ai_identity_page_id INTEGER",
+            "ALTER TABLE global_settings ADD COLUMN default_ai_identity_name TEXT",
+            "ALTER TABLE global_settings ADD COLUMN default_ai_identity_ouid TEXT",
+            "ALTER TABLE global_settings ADD COLUMN org_required_instructions_page_ids TEXT",
+            "ALTER TABLE global_settings ADD COLUMN org_ai_usage_policy_page_ids TEXT",
+        ] {
+            conn.execute_batch(sql).ok();
+        }
 
         let hash = sha2::Sha256::digest(encryption_key.as_bytes());
         let mut key = Zeroizing::new([0u8; 32]);
@@ -288,6 +340,195 @@ impl DbBackend for SqliteDb {
         .map_err(|e| format!("Task failed: {e}"))?
     }
 
+    async fn get_user_settings(&self, token_id_hash: &str) -> Result<Option<UserSettings>, String> {
+        let conn = self.conn.clone();
+        let token_id_hash = token_id_hash.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Option<UserSettings>, String> {
+            let conn = conn.lock().unwrap();
+            let json: Option<String> = conn.query_row(
+                "SELECT settings_json FROM user_settings WHERE token_id_hash = ?1",
+                params![token_id_hash],
+                |row| row.get(0),
+            ).ok();
+            match json {
+                Some(s) => serde_json::from_str(&s)
+                    .map(Some)
+                    .map_err(|e| format!("user_settings JSON parse: {e}")),
+                None => Ok(None),
+            }
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn save_user_settings(&self, token_id_hash: &str, settings: &UserSettings) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let token_id_hash = token_id_hash.to_string();
+        let json = serde_json::to_string(settings)
+            .map_err(|e| format!("user_settings serialize: {e}"))?;
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO user_settings (token_id_hash, settings_json, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(token_id_hash) DO UPDATE SET
+                    settings_json = excluded.settings_json,
+                    updated_at = excluded.updated_at",
+                params![token_id_hash, json, SqliteDb::now_secs()],
+            ).map_err(|e| format!("save_user_settings: {e}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn insert_audit_entry(&self, entry: &AuditEntryInsert) -> Result<i64, String> {
+        let conn = self.conn.clone();
+        let entry = entry.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO remember_audit
+                    (token_id_hash, ai_identity_ouid, user_id, resource, action,
+                     target_page_id, target_key, success, error, trace_id, occurred_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    entry.token_id_hash,
+                    entry.ai_identity_ouid,
+                    entry.user_id,
+                    entry.resource,
+                    entry.action,
+                    entry.target_page_id,
+                    entry.target_key,
+                    if entry.success { 1 } else { 0 },
+                    entry.error,
+                    entry.trace_id,
+                    SqliteDb::now_secs(),
+                ],
+            ).map_err(|e| format!("insert_audit_entry: {e}"))?;
+            Ok(conn.last_insert_rowid())
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn get_global_settings(&self) -> Result<GlobalSettings, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<GlobalSettings, String> {
+            let conn = conn.lock().unwrap();
+            let row = conn.query_row(
+                "SELECT hive_shelf_id, user_journals_shelf_id,
+                        default_ai_identity_page_id, default_ai_identity_name, default_ai_identity_ouid,
+                        org_required_instructions_page_ids,
+                        org_ai_usage_policy_page_ids,
+                        set_by_token_hash, updated_at
+                 FROM global_settings WHERE id = 1",
+                [],
+                |row| Ok(GlobalSettings {
+                    hive_shelf_id: row.get::<_, Option<i64>>(0)?,
+                    user_journals_shelf_id: row.get::<_, Option<i64>>(1)?,
+                    default_ai_identity_page_id: row.get::<_, Option<i64>>(2)?,
+                    default_ai_identity_name: row.get::<_, Option<String>>(3)?,
+                    default_ai_identity_ouid: row.get::<_, Option<String>>(4)?,
+                    org_required_instructions_page_ids: decode_id_list(row.get::<_, Option<String>>(5)?),
+                    org_ai_usage_policy_page_ids: decode_id_list(row.get::<_, Option<String>>(6)?),
+                    set_by_token_hash: row.get::<_, Option<String>>(7)?,
+                    updated_at: row.get::<_, i64>(8)?,
+                }),
+            ).unwrap_or_default();
+            Ok(row)
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn save_global_settings(
+        &self,
+        settings: &GlobalSettings,
+        set_by_token_hash: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let s = settings.clone();
+        let setter = set_by_token_hash.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let existing_setter: Option<String> = conn.query_row(
+                "SELECT set_by_token_hash FROM global_settings WHERE id = 1 AND updated_at > 0",
+                [],
+                |row| row.get(0),
+            ).ok().flatten();
+            let final_setter = existing_setter.unwrap_or(setter);
+            conn.execute(
+                "UPDATE global_settings
+                 SET hive_shelf_id = ?1,
+                     user_journals_shelf_id = ?2,
+                     default_ai_identity_page_id = ?3,
+                     default_ai_identity_name = ?4,
+                     default_ai_identity_ouid = ?5,
+                     org_required_instructions_page_ids = ?6,
+                     org_ai_usage_policy_page_ids = ?7,
+                     set_by_token_hash = ?8,
+                     updated_at = ?9
+                 WHERE id = 1",
+                params![
+                    s.hive_shelf_id,
+                    s.user_journals_shelf_id,
+                    s.default_ai_identity_page_id,
+                    s.default_ai_identity_name,
+                    s.default_ai_identity_ouid,
+                    encode_id_list(&s.org_required_instructions_page_ids),
+                    encode_id_list(&s.org_ai_usage_policy_page_ids),
+                    final_setter,
+                    SqliteDb::now_secs(),
+                ],
+            ).map_err(|e| format!("save_global_settings: {e}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn list_audit_entries(
+        &self,
+        token_id_hash: &str,
+        limit: i64,
+        offset: i64,
+        since_unix: Option<i64>,
+    ) -> Result<Vec<AuditEntry>, String> {
+        let conn = self.conn.clone();
+        let token_id_hash = token_id_hash.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let sql = "SELECT id, token_id_hash, ai_identity_ouid, user_id, resource, action,
+                              target_page_id, target_key, success, error, trace_id, occurred_at
+                       FROM remember_audit
+                       WHERE token_id_hash = ?1 AND occurred_at >= ?2
+                       ORDER BY occurred_at DESC
+                       LIMIT ?3 OFFSET ?4";
+            let mut stmt = conn.prepare(sql).map_err(|e| format!("audit prepare: {e}"))?;
+            let rows = stmt.query_map(
+                params![token_id_hash, since_unix.unwrap_or(0), limit, offset],
+                |row| Ok(AuditEntry {
+                    id: row.get(0)?,
+                    token_id_hash: row.get(1)?,
+                    ai_identity_ouid: row.get(2)?,
+                    user_id: row.get(3)?,
+                    resource: row.get(4)?,
+                    action: row.get(5)?,
+                    target_page_id: row.get(6)?,
+                    target_key: row.get(7)?,
+                    success: { let n: i64 = row.get(8)?; n != 0 },
+                    error: row.get(9)?,
+                    trace_id: row.get(10)?,
+                    occurred_at: row.get(11)?,
+                }),
+            ).map_err(|e| format!("audit query: {e}"))?;
+            Ok(rows.filter_map(|r| r.ok()).collect())
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
     async fn backup(&self, backup_dir: &Path) -> Result<(), String> {
         let conn = self.conn.clone();
         let backup_dir = backup_dir.to_path_buf();
@@ -481,6 +722,67 @@ impl SemanticDb for SqliteDb {
                 params![slug],
                 |row| row.get(0),
             ).ok())
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn get_page_book_ids(&self, page_ids: &[i64]) -> Result<Vec<(i64, i64)>, String> {
+        if page_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.clone();
+        let ids = page_ids.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+            let sql = format!("SELECT page_id, book_id FROM pages WHERE page_id IN ({placeholders})");
+            let mut stmt = conn.prepare(&sql).map_err(|e| format!("Prepare failed: {e}"))?;
+            let params_vec: Vec<&dyn rusqlite::ToSql> =
+                ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+            let rows: Vec<(i64, i64)> = stmt.query_map(params_vec.as_slice(), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .map_err(|e| format!("Query failed: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+            Ok(rows)
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn get_page_metas(&self, page_ids: &[i64]) -> Result<Vec<PageMeta>, String> {
+        if page_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.clone();
+        let ids = page_ids.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT page_id, book_id, chapter_id, name, slug, content_hash, updated_at
+                 FROM pages WHERE page_id IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(|e| format!("Prepare failed: {e}"))?;
+            let params_vec: Vec<&dyn rusqlite::ToSql> =
+                ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+            let rows: Vec<PageMeta> = stmt.query_map(params_vec.as_slice(), |row| {
+                Ok(PageMeta {
+                    page_id: row.get(0)?,
+                    book_id: row.get(1)?,
+                    chapter_id: row.get(2)?,
+                    name: row.get(3)?,
+                    slug: row.get(4)?,
+                    content_hash: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            })
+            .map_err(|e| format!("Query failed: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+            Ok(rows)
         })
         .await
         .map_err(|e| format!("Task failed: {e}"))?
@@ -932,20 +1234,63 @@ impl SemanticDb for SqliteDb {
         .map_err(|e| format!("Task failed: {e}"))?
     }
 
-    async fn vector_search(&self, query_embedding: &[f32], limit: usize, threshold: f32) -> Result<Vec<SearchHit>, String> {
+    async fn vector_search(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        threshold: f32,
+        book_ids: Option<&[i64]>,
+    ) -> Result<Vec<SearchHit>, String> {
         let conn = self.conn.clone();
         let query_embedding = query_embedding.to_vec();
+        // Materialize the optional filter into a Vec the closure can own. Empty
+        // slice means "no filter", same as None.
+        let book_filter: Option<Vec<i64>> = match book_ids {
+            Some(ids) if !ids.is_empty() => Some(ids.to_vec()),
+            _ => None,
+        };
+
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            let mut stmt = conn
-                .prepare("SELECT id, page_id, embedding FROM chunks")
-                .map_err(|e| format!("Prepare failed: {e}"))?;
-            let all_chunks: Vec<(i64, i64, Vec<u8>)> = stmt.query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
-            .map_err(|e| format!("Query failed: {e}"))?
-            .filter_map(|r| r.ok())
-            .collect();
+
+            // Note: each branch binds `out` to a Vec before yielding it from
+            // the block. The borrow checker rejects returning the .collect()
+            // expression directly because the temporary MappedRows borrows
+            // `stmt`, and `stmt` is dropped at the end of the block.
+            let all_chunks: Vec<(i64, i64, Vec<u8>)> = if let Some(ids) = book_filter {
+                // Build a parameterized IN list — rusqlite doesn't expand &[i64]
+                // automatically, so we generate "?, ?, ?" placeholders and bind
+                // each id individually.
+                let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+                let sql = format!(
+                    "SELECT c.id, c.page_id, c.embedding
+                     FROM chunks c JOIN pages p ON c.page_id = p.page_id
+                     WHERE p.book_id IN ({placeholders})"
+                );
+                let mut stmt = conn.prepare(&sql).map_err(|e| format!("Prepare failed: {e}"))?;
+                let params_vec: Vec<&dyn rusqlite::ToSql> =
+                    ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+                let out: Vec<(i64, i64, Vec<u8>)> = stmt
+                    .query_map(params_vec.as_slice(), |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .map_err(|e| format!("Query failed: {e}"))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                out
+            } else {
+                let mut stmt = conn
+                    .prepare("SELECT id, page_id, embedding FROM chunks")
+                    .map_err(|e| format!("Prepare failed: {e}"))?;
+                let out: Vec<(i64, i64, Vec<u8>)> = stmt
+                    .query_map([], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .map_err(|e| format!("Query failed: {e}"))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                out
+            };
 
             let hits = vector::search_embeddings(&query_embedding, &all_chunks, limit, threshold);
             Ok(hits.into_iter().map(|(chunk_id, page_id, score)| SearchHit { chunk_id, page_id, score }).collect())
@@ -1076,6 +1421,19 @@ impl SemanticDb for SqliteDb {
         })
         .await
         .map_err(|e| format!("Task failed: {e}"))?
+    }
+}
+
+/// Encode a Vec<i64> as a JSON array string (or NULL when empty so the column
+/// reads back as Option::None and round-trips cleanly).
+fn encode_id_list(ids: &[i64]) -> Option<String> {
+    if ids.is_empty() { None } else { serde_json::to_string(ids).ok() }
+}
+
+fn decode_id_list(value: Option<String>) -> Vec<i64> {
+    match value {
+        Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_default(),
+        _ => Vec::new(),
     }
 }
 

@@ -2,9 +2,10 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
+use crate::settings::{GlobalSettings, UserSettings};
 use crate::types::*;
 
-/// Core database operations (auth tokens, backups).
+/// Core database operations (auth tokens, backups, user settings).
 #[async_trait]
 pub trait DbBackend: Send + Sync + 'static {
     /// Atomically insert an access token if under the 10k limit.
@@ -29,6 +30,44 @@ pub trait DbBackend: Send + Sync + 'static {
 
     /// Create a database backup. SQLite: VACUUM INTO. Postgres: no-op (use pg_dump).
     async fn backup(&self, path: &Path) -> Result<(), String>;
+
+    // --- User settings (Hive memory flow config) ---
+
+    /// Load user settings keyed by `token_id_hash` (SHA-256 of raw token_id).
+    /// Returns Ok(None) when no row exists for this user. Default settings are
+    /// applied by the caller (UserSettings::default()) so v1 callers and
+    /// pre-existing users behave identically.
+    async fn get_user_settings(&self, token_id_hash: &str) -> Result<Option<UserSettings>, String>;
+
+    /// Upsert user settings for `token_id_hash`. Replaces the entire row.
+    async fn save_user_settings(&self, token_id_hash: &str, settings: &UserSettings) -> Result<(), String>;
+
+    // --- Remember audit log ---
+
+    /// Insert one audit entry. Failures are logged but do not propagate (audit
+    /// logging is best-effort; never blocks the user-facing call).
+    async fn insert_audit_entry(&self, entry: &AuditEntryInsert) -> Result<i64, String>;
+
+    /// List audit entries for one user, newest first, paginated.
+    async fn list_audit_entries(
+        &self,
+        token_id_hash: &str,
+        limit: i64,
+        offset: i64,
+        since_unix: Option<i64>,
+    ) -> Result<Vec<AuditEntry>, String>;
+
+    // --- Global settings (server-instance-wide) ---
+
+    /// Load the singleton global settings row. Returns defaults if never set.
+    async fn get_global_settings(&self) -> Result<GlobalSettings, String>;
+
+    /// Upsert the singleton global settings row. Records the writer's token hash.
+    async fn save_global_settings(
+        &self,
+        settings: &GlobalSettings,
+        set_by_token_hash: &str,
+    ) -> Result<(), String>;
 }
 
 /// Semantic search database operations.
@@ -85,7 +124,26 @@ pub trait SemanticDb: Send + Sync + 'static {
     // --- Vector search ---
 
     /// Backend-specific vector search. SQLite: brute-force cosine scan. Postgres: pgvector HNSW.
-    async fn vector_search(&self, query_embedding: &[f32], limit: usize, threshold: f32) -> Result<Vec<SearchHit>, String>;
+    ///
+    /// `book_ids`: when `Some(&[..])`, restrict candidates to chunks whose
+    /// parent page lives in one of those books. When `None` or an empty slice,
+    /// search across the entire embedded corpus.
+    async fn vector_search(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        threshold: f32,
+        book_ids: Option<&[i64]>,
+    ) -> Result<Vec<SearchHit>, String>;
+
+    /// Look up the `book_id` for each requested page in one roundtrip.
+    /// Returns the rows that matched, in unspecified order. Pages missing
+    /// from the embedding store are simply omitted.
+    async fn get_page_book_ids(&self, page_ids: &[i64]) -> Result<Vec<(i64, i64)>, String>;
+
+    /// Batched variant of `get_page_meta`. Returns one entry per requested
+    /// page that exists in the embedding store; missing pages are omitted.
+    async fn get_page_metas(&self, page_ids: &[i64]) -> Result<Vec<PageMeta>, String>;
 
     /// Delete all pages, chunks, and relationships. Used for full re-index.
     async fn clear_all_embeddings(&self) -> Result<(), String>;

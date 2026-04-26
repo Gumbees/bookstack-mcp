@@ -1,14 +1,26 @@
 use std::collections::HashMap;
 use std::env;
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 
 use pulldown_cmark::{html, Options, Parser};
 
 use bsmcp_common::bookstack::{self, BookStackClient, ContentType, ExportFormat};
+use bsmcp_common::db::DbBackend;
+use crate::remember;
 use crate::semantic::SemanticState;
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
+
+/// Dependencies the `remember_*` tools need beyond the BookStack client.
+/// Bundled into one struct to keep `handle_request` / `execute_tool` signatures
+/// from sprouting more positional args.
+pub struct RememberDeps {
+    pub db: Arc<dyn DbBackend>,
+    pub semantic: Option<Arc<SemanticState>>,
+    pub token_id: String,
+}
 
 pub async fn handle_request(
     request: &Value,
@@ -16,6 +28,7 @@ pub async fn handle_request(
     semantic: Option<&SemanticState>,
     summary_cache: &crate::summary::SummaryCache,
     staging: &crate::staging::StagingStore,
+    remember_deps: &RememberDeps,
 ) -> Option<Value> {
     let id = request.get("id");
 
@@ -48,7 +61,7 @@ pub async fn handle_request(
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let result = execute_tool(name, &args, client, semantic, staging).await;
+            let result = execute_tool(name, &args, client, semantic, staging, remember_deps).await;
             match result {
                 Ok(text) => Some(json_rpc_result(id, json!({
                     "content": [{ "type": "text", "text": text }],
@@ -79,7 +92,35 @@ fn json_rpc_error(id: Option<&Value>, code: i64, message: &str) -> Value {
     })
 }
 
-async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semantic: Option<&SemanticState>, staging: &crate::staging::StagingStore) -> Result<String, String> {
+async fn execute_tool(
+    name: &str,
+    args: &Value,
+    client: &BookStackClient,
+    semantic: Option<&SemanticState>,
+    staging: &crate::staging::StagingStore,
+    remember_deps: &RememberDeps,
+) -> Result<String, String> {
+    // Remember tools share one dispatch path: tool name = "remember_{resource}",
+    // action carried as an arg. Keeps the MCP tool count manageable.
+    if let Some(resource) = name.strip_prefix("remember_") {
+        let action = arg_str_default(args, "action", "read");
+        let mut body = args.clone();
+        if let Value::Object(ref mut map) = body {
+            map.remove("action");
+        }
+        let envelope = remember::dispatch(
+            resource,
+            &action,
+            body,
+            &remember_deps.token_id,
+            client,
+            remember_deps.db.clone(),
+            remember_deps.semantic.clone(),
+        )
+        .await;
+        return Ok(serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| envelope.to_string()));
+    }
+
     match name {
         // Semantic Search (conditional)
         "semantic_search" => {
@@ -90,7 +131,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
             let default_threshold = if hybrid { 0.45 } else { 0.50 };
             let threshold = args.get("threshold").and_then(|v| v.as_f64()).unwrap_or(default_threshold) as f32;
             let verbose = args.get("verbose").and_then(|v| v.as_bool()).unwrap_or(false);
-            let result = sem.search(&query, limit, threshold, hybrid, verbose, client).await?;
+            let result = sem.search(&query, limit, threshold, hybrid, verbose, client, None).await?;
             format_json(&result)
         }
         "reembed" => {
@@ -126,7 +167,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
         }
         "create_shelf" => {
             let name = arg_str(args, "name")?;
-            let desc = arg_str_default(args, "description", "");
+            let desc = require_description(args, "shelf")?;
             let result = client.create_shelf(&name, &desc).await?;
             Ok(format_shelf_success("Shelf created successfully.", &result, client.base_url()))
         }
@@ -157,7 +198,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
         }
         "create_book" => {
             let name = arg_str(args, "name")?;
-            let desc = arg_str_default(args, "description", "");
+            let desc = require_description(args, "book")?;
             let result = client.create_book(&name, &desc).await?;
             Ok(format_book_success("Book created successfully.", &result, client.base_url()))
         }
@@ -186,14 +227,14 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
         "create_chapter" => {
             let book_id = arg_i64_required(args, "book_id")?;
             let name = arg_str(args, "name")?;
-            let desc = arg_str_default(args, "description", "");
+            let desc = require_description(args, "chapter")?;
             let result = client.create_chapter(book_id, &name, &desc).await?;
             Ok(format_chapter_success("Chapter created successfully.", &result, client.base_url()))
         }
         "update_chapter" => {
             let id = arg_i64_required(args, "chapter_id")?;
             let mut data = filter_string_update_fields(args, &["name", "description"]);
-            if let Some(v) = args.get("book_id").and_then(|v| v.as_i64()) {
+            if let Some(v) = arg_i64_opt(args, "book_id") {
                 data["book_id"] = json!(v);
             }
             let result = client.update_chapter(id, &data).await?;
@@ -217,9 +258,9 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
         }
         "create_page" => {
             let mut data = json!({ "name": arg_str(args, "name")? });
-            if let Some(v) = args.get("chapter_id").and_then(|v| v.as_i64()) {
+            if let Some(v) = arg_i64_opt(args, "chapter_id") {
                 data["chapter_id"] = json!(v);
-            } else if let Some(v) = args.get("book_id").and_then(|v| v.as_i64()) {
+            } else if let Some(v) = arg_i64_opt(args, "book_id") {
                 data["book_id"] = json!(v);
             } else {
                 return Err("Either book_id or chapter_id is required".to_string());
@@ -256,8 +297,8 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
             } else if let Some(v) = args.get("html").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                 data["html"] = json!(strip_duplicate_title(v, &page_name));
             }
-            let move_chapter_id = args.get("chapter_id").and_then(|v| v.as_i64());
-            let move_book_id = args.get("book_id").and_then(|v| v.as_i64());
+            let move_chapter_id = arg_i64_opt(args, "chapter_id");
+            let move_book_id = arg_i64_opt(args, "book_id");
             if move_chapter_id.is_some() && move_book_id.is_some() {
                 return Err("Provide either chapter_id or book_id, not both".to_string());
             }
@@ -386,8 +427,8 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
         // Move operations
         "move_page" => {
             let id = arg_i64_required(args, "page_id")?;
-            let chapter_id = args.get("chapter_id").and_then(|v| v.as_i64());
-            let book_id = args.get("book_id").and_then(|v| v.as_i64());
+            let chapter_id = arg_i64_opt(args, "chapter_id");
+            let book_id = arg_i64_opt(args, "book_id");
             if chapter_id.is_none() && book_id.is_none() {
                 return Err("Either chapter_id or book_id is required".to_string());
             }
@@ -417,7 +458,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
         "move_book_to_shelf" => {
             let book_id = arg_i64_required(args, "book_id")?;
             let target_shelf_id = arg_i64_required(args, "target_shelf_id")?;
-            let remove_from_shelf_id = args.get("remove_from_shelf_id").and_then(|v| v.as_i64());
+            let remove_from_shelf_id = arg_i64_opt(args, "remove_from_shelf_id");
 
             // Add book to target shelf
             let target_shelf = client.get_shelf(target_shelf_id).await?;
@@ -520,7 +561,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
         "list_comments" => {
             let mut query: Vec<(&str, &str)> = vec![];
             let page_id_str;
-            if let Some(v) = args.get("page_id").and_then(|v| v.as_i64()) {
+            if let Some(v) = arg_i64_opt(args, "page_id") {
                 page_id_str = v.to_string();
                 query.push(("filter[page_id]", &page_id_str));
             }
@@ -539,7 +580,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
             } else if let Some(v) = args.get("html").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                 data["html"] = json!(v);
             }
-            if let Some(v) = args.get("parent_id").and_then(|v| v.as_i64()) {
+            if let Some(v) = arg_i64_opt(args, "parent_id") {
                 data["parent_id"] = json!(v);
             }
             format_json(&client.create_comment(&data).await?)
@@ -611,7 +652,7 @@ async fn execute_tool(name: &str, args: &Value, client: &BookStackClient, semant
                 filter.push(("filter[type]", &type_str));
             }
             let uploaded_to_str;
-            if let Some(v) = args.get("uploaded_to").and_then(|v| v.as_i64()) {
+            if let Some(v) = arg_i64_opt(args, "uploaded_to") {
                 uploaded_to_str = v.to_string();
                 filter.push(("filter[uploaded_to]", &uploaded_to_str));
             }
@@ -754,8 +795,25 @@ fn arg_str_default(args: &Value, key: &str, default: &str) -> String {
         .to_string()
 }
 
+/// Extract an integer from a JSON value, accepting both native numbers and
+/// numeric strings (e.g. `1908` or `"1908"`). AI clients commonly serialize
+/// IDs as strings and the server should accept both forms.
+fn value_as_i64(v: &Value) -> Option<i64> {
+    if let Some(n) = v.as_i64() {
+        return Some(n);
+    }
+    if let Some(s) = v.as_str() {
+        return s.trim().parse::<i64>().ok();
+    }
+    None
+}
+
+fn arg_i64_opt(args: &Value, key: &str) -> Option<i64> {
+    args.get(key).and_then(value_as_i64)
+}
+
 fn arg_i64(args: &Value, key: &str, default: i64) -> i64 {
-    args.get(key).and_then(|v| v.as_i64()).unwrap_or(default)
+    arg_i64_opt(args, key).unwrap_or(default)
 }
 
 fn arg_count(args: &Value, default: i64) -> i64 {
@@ -767,13 +825,56 @@ fn arg_offset(args: &Value) -> i64 {
 }
 
 fn arg_i64_required(args: &Value, key: &str) -> Result<i64, String> {
-    args.get(key)
-        .and_then(|v| v.as_i64())
+    arg_i64_opt(args, key)
         .ok_or_else(|| format!("Missing required argument: {key}"))
 }
 
 fn arg_bool(args: &Value, key: &str, default: bool) -> bool {
     args.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
+}
+
+/// Join a path/URL fragment from a BookStack API response with the base URL.
+/// If the fragment is already absolute (http:// or https://), return it as-is
+/// to avoid producing malformed URLs like `http://bookstack-apphttps://kb.example.com/...`.
+fn join_base_url(base_url: &str, path: &str) -> String {
+    if path.starts_with("http://") || path.starts_with("https://") {
+        path.to_string()
+    } else {
+        format!("{base_url}{path}")
+    }
+}
+
+/// Require a non-empty, meaningful description when creating shelves/books/chapters.
+/// Descriptions are surfaced to AI clients in the server's structure listing on connect,
+/// so missing or placeholder descriptions actively degrade future routing decisions.
+fn require_description(args: &Value, kind: &str) -> Result<String, String> {
+    let raw = args.get("description").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if raw.is_empty() {
+        return Err(format!(
+            "description is required when creating a {kind}. \
+             Descriptions are surfaced to all Claude clients that connect to this BookStack, \
+             so they shape placement decisions for every future page created here. \
+             Provide a 1-2 sentence description that answers (1) what kind of content lives in \
+             this {kind}, and (2) what it's for. Avoid placeholders like 'TODO' or 'description'."
+        ));
+    }
+    if raw.len() < 15 {
+        return Err(format!(
+            "description is too short ({} chars) — write a meaningful 1-2 sentence description \
+             that tells future clients what content belongs in this {kind} and what it's for.",
+            raw.len()
+        ));
+    }
+    let lowered = raw.to_lowercase();
+    let placeholders = ["todo", "tbd", "placeholder", "description", "xxx", "fixme", "n/a"];
+    if placeholders.iter().any(|p| lowered == *p || lowered.starts_with(&format!("{p} "))) {
+        return Err(format!(
+            "description looks like a placeholder ('{raw}'). Write a real description that \
+             describes the {kind}'s purpose and contents — it will be shown to every future \
+             Claude client that connects."
+        ));
+    }
+    Ok(raw.to_string())
 }
 
 fn validate_enum(value: &str, allowed: &[&str], name: &str) -> Result<(), String> {
@@ -830,7 +931,7 @@ fn format_search_results(data: &Value, base_url: &str) -> String {
         let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let id = item.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
         let url = item.get("url").and_then(|v| v.as_str())
-            .map(|u| format!("{base_url}{u}"))
+            .map(|u| join_base_url(base_url, u))
             .unwrap_or_default();
         if url.is_empty() {
             lines.push(format!("- [{item_type}] {name} (id: {id})"));
@@ -967,7 +1068,7 @@ fn format_page_success(action: &str, result: &Value, base_url: &str) -> String {
     let book_id = result.get("book_id").and_then(|v| v.as_i64()).unwrap_or(0);
     let revision = result.get("revision_count").and_then(|v| v.as_i64()).unwrap_or(0);
     let url = if let Some(rel) = result.get("url").and_then(|v| v.as_str()) {
-        format!("{base_url}{rel}")
+        join_base_url(base_url, rel)
     } else {
         let book_slug = result.get("book_slug").and_then(|v| v.as_str()).unwrap_or("");
         if !book_slug.is_empty() && !slug.is_empty() {
@@ -1150,6 +1251,22 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool, su
     let instance_desc = env::var("BSMCP_INSTANCE_DESC").unwrap_or_default();
 
     let mut instructions = String::new();
+
+    // Hive memory flow — surface this FIRST so it lands before any other guidance.
+    instructions.push_str(
+        "It's a best practice to always use remember/briefing at the beginning of any session. \
+         The briefing returns the agent's identity manifest, recent journal entries, active topics, \
+         org-required instructions and AI usage policy, and semantic matches against the user's \
+         first message — one structured pull instead of many tool calls. \
+         Call the `remember_briefing` MCP tool (or POST /remember/v1/briefing/read) with the user's \
+         opening message as `user_prompt`.\n\n\
+         If the briefing response includes a `setup_nudge` field, the user hasn't configured their \
+         Hive yet. Walk them through the `suggested_workflow` in that nudge — use search_content + \
+         remember_directory to discover existing structure, propose moves with move_book_to_shelf / \
+         move_chapter / move_page, and lock in the IDs with `remember_config action=write`. The \
+         user can snooze the reminder via `remember_config action=dismiss_setup_nudge days=N`.\n\n"
+    );
+
     if !instance_name.is_empty() {
         instructions.push_str(&instance_name);
         if !instance_desc.is_empty() {
@@ -1193,6 +1310,17 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool, su
          content. If the user asks to create content in a location that doesn't match the \
          target's purpose, push back and suggest the correct location. When unsure, check the \
          shelf/book/chapter descriptions using get_shelf, get_book, or get_chapter.\n\n\
+         IMPORTANT: Descriptions on shelves, books, and chapters are REQUIRED, not optional. \
+         When you call create_shelf, create_book, or create_chapter, you MUST provide a \
+         meaningful 1-2 sentence description. Descriptions are surfaced to every Claude \
+         client that connects to this BookStack — they literally shape how future content \
+         gets routed. A good description answers: (1) what kind of content lives here, and \
+         (2) what is this container for (so a future AI can decide whether new content \
+         belongs here vs elsewhere). Do NOT use placeholders like 'TODO', 'description', or \
+         'n/a' — the server will reject them. If you don't yet know what the container is \
+         for, ask the user before creating it. When you update existing shelves/books/chapters \
+         via update_shelf, update_book, or update_chapter and notice the description is \
+         missing or weak, offer to improve it.\n\n\
          Markdown content is automatically converted to HTML server-side. \
          You can send markdown via the 'markdown' parameter for pages and comments — \
          the server handles conversion reliably, avoiding JSON escaping issues with \
@@ -1364,7 +1492,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             paginated_schema()),
         tool("get_shelf", "Get a shelf by ID, including its books.",
             id_schema("shelf_id")),
-        tool("create_shelf", "Create a new shelf.",
+        tool("create_shelf", "Create a new shelf. Description is REQUIRED — it tells future Claude clients what belongs here.",
             name_desc_schema()),
         tool("update_shelf", "Update a shelf's name, description, or set which books it contains via the 'books' array (replaces all existing book assignments on this shelf).", json!({
             "type": "object",
@@ -1383,7 +1511,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
         tool("list_books", "List all books.", paginated_schema()),
         tool("get_book", "Get a book by ID, including its chapters and pages.",
             id_schema("book_id")),
-        tool("create_book", "Create a new book.",
+        tool("create_book", "Create a new book. Description is REQUIRED — it tells future Claude clients what belongs here.",
             name_desc_schema()),
         tool("update_book", "Update a book.",
             update_schema("book_id", &["name", "description"])),
@@ -1394,14 +1522,17 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
         tool("list_chapters", "List all chapters across all books.", paginated_schema()),
         tool("get_chapter", "Get a chapter by ID, including its pages.",
             id_schema("chapter_id")),
-        tool("create_chapter", "Create a new chapter within a book.", json!({
+        tool("create_chapter", "Create a new chapter within a book. Description is REQUIRED — it tells future Claude clients what belongs here.", json!({
             "type": "object",
             "properties": {
                 "book_id": { "type": "integer", "description": "Book ID to create chapter in" },
                 "name": { "type": "string", "description": "Chapter name" },
-                "description": { "type": "string", "description": "Chapter description", "default": "" }
+                "description": {
+                    "type": "string",
+                    "description": "REQUIRED. A 1-2 sentence description of what content lives in this chapter and what it's for. Surfaced to every Claude client that connects, so it shapes future routing decisions. Do not use placeholders like 'TODO' or 'description'."
+                }
             },
-            "required": ["book_id", "name"]
+            "required": ["book_id", "name", "description"]
         })),
         tool("update_chapter", "Update a chapter's name, description, or move it to a different book by providing book_id.", json!({
             "type": "object",
@@ -1721,7 +1852,167 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             })));
     }
 
+    // Remember protocol tools — one per resource. The `action` arg picks the
+    // operation (read | write | search | delete depending on resource).
+    // All return the same JSON envelope: { ok, data, meta, error }.
+    add_remember_tools(&mut tools);
+
     tools
+}
+
+fn add_remember_tools(tools: &mut Vec<Value>) {
+    fn remember_tool(resource: &str, description: &str, actions: &[&str], extra_props: Value) -> Value {
+        let mut props = json!({
+            "action": {
+                "type": "string",
+                "enum": actions,
+                "description": "Operation to perform on this resource",
+                "default": actions.first().copied().unwrap_or("read"),
+            }
+        });
+        if let Value::Object(extra) = extra_props {
+            if let Value::Object(ref mut p) = props {
+                for (k, v) in extra { p.insert(k, v); }
+            }
+        }
+        tool(
+            &format!("remember_{resource}"),
+            description,
+            json!({ "type": "object", "properties": props }),
+        )
+    }
+
+    let common_collection_props = json!({
+        "id": { "type": ["integer", "string"], "description": "BookStack page ID (for read/write/delete by id)" },
+        "key": { "type": "string", "description": "Natural key (date YYYY-MM-DD for journals, slug for topics, lowercase name for subagents)" },
+        "body": { "type": "string", "description": "Markdown body for write" },
+        "query": { "type": "string", "description": "Search query for action=search" },
+        "limit": { "type": "integer", "default": 25 },
+        "offset": { "type": "integer", "default": 0 },
+        "reason": { "type": "string", "description": "Optional reason for delete (recorded in tombstone)" },
+        "trace_id": { "type": "string", "description": "Optional correlation ID for the audit log" },
+    });
+
+    // Singletons
+    tools.push(remember_tool(
+        "briefing",
+        "Reconstitution dossier — one structured pull replacing the multi-call AI bootstrap. Returns identity manifest, user identity, recent journals, active topics, semantic matches against the user_prompt, and config metadata.",
+        &["read"],
+        json!({
+            "user_prompt": { "type": "string", "description": "First user message — drives semantic prioritization" },
+            "recent_journal_count": { "type": "integer", "description": "Override the configured recent_journal_count" },
+            "active_collage_count": { "type": "integer", "description": "Override the configured active_collage_count" },
+        }),
+    ));
+
+    tools.push(remember_tool(
+        "whoami",
+        "AI agent identity. read returns the manifest page + subagent list + book/chapter pointers. write replaces the manifest page body (frontmatter auto-stamped).",
+        &["read", "write"],
+        json!({
+            "body": { "type": "string", "description": "New manifest markdown for write" },
+        }),
+    ));
+
+    tools.push(remember_tool(
+        "user",
+        "Human user identity. read returns the user's identity page + journal pointer. write replaces the user identity page body.",
+        &["read", "write"],
+        json!({
+            "body": { "type": "string", "description": "New user identity markdown for write" },
+        }),
+    ));
+
+    tools.push(remember_tool(
+        "config",
+        "Per-user settings AND (admin-only) global shelves. read returns both `{settings, global_settings}`. write accepts `settings` (per-user — any user) and/or `global_settings` (admin-only, server-side first-write-wins; pre-set fields cannot be changed and trigger a `global_locked` warning). dismiss_setup_nudge snoozes the briefing's setup reminder for `days` days (default 7, max 365).",
+        &["read", "write", "dismiss_setup_nudge"],
+        json!({
+            "settings": { "type": "object", "description": "Full UserSettings object for per-user write" },
+            "global_settings": { "type": "object", "description": "GlobalSettings object (admin-only). Only null fields are written; set fields are preserved." },
+            "days": { "type": "integer", "description": "For dismiss_setup_nudge: how many days to snooze (default 7, max 365)" },
+        }),
+    ));
+
+    // Collections
+    tools.push(remember_tool(
+        "journal",
+        "AI agent's daily journal entries (book of pages, monthly chapters auto-managed). Key = date YYYY-MM-DD; defaults to today on write if omitted.",
+        &["read", "write", "search", "delete"],
+        common_collection_props.clone(),
+    ));
+
+    tools.push(remember_tool(
+        "collage",
+        "AI agent's active topics. Key = topic slug. Pages live directly in the configured Topics book.",
+        &["read", "write", "search", "delete"],
+        common_collection_props.clone(),
+    ));
+
+    tools.push(remember_tool(
+        "shared_collage",
+        "Cross-agent shared topics. Same shape as collage but a different parent book.",
+        &["read", "write", "search", "delete"],
+        common_collection_props.clone(),
+    ));
+
+    tools.push(remember_tool(
+        "user_journal",
+        "Human user's journal (when configured by the user). Key = date YYYY-MM-DD with monthly chapters auto-managed.",
+        &["read", "write", "search", "delete"],
+        common_collection_props.clone(),
+    ));
+
+    // Audit (read only)
+    tools.push(remember_tool(
+        "audit",
+        "Read the server-side audit log of every /remember write performed by this user. Always scoped to the calling user.",
+        &["read"],
+        json!({
+            "limit": { "type": "integer", "default": 50 },
+            "offset": { "type": "integer", "default": 0 },
+            "since_unix": { "type": "integer", "description": "Only return entries with occurred_at >= this unix timestamp" },
+        }),
+    ));
+
+    // Cross-resource search
+    tools.push(remember_tool(
+        "search",
+        "Cross-resource semantic + keyword search across multiple Hive scopes (journal, collage, shared_collage, user_journal) in one call. Returns results partitioned by scope.",
+        &["read"],
+        json!({
+            "query": { "type": "string", "description": "Search query (required)" },
+            "scopes": { "type": "array", "items": { "type": "string" }, "description": "Resource names to include (e.g., ['journal','collage']). Defaults to all configured." },
+            "limit": { "type": "integer", "default": 10, "description": "Per-scope result cap" },
+        }),
+    ));
+
+    // Identity discovery + creation
+    tools.push(remember_tool(
+        "identity",
+        "List or create AI identities under the global Hive shelf. action=list enumerates existing identities (book + manifest page + OUID per agent). action=create scaffolds a new Identity book + manifest page from a prompt template.",
+        &["list", "create"],
+        json!({
+            "name": { "type": "string", "description": "Display name for the new agent (e.g., 'Pia')" },
+            "ouid": { "type": "string", "description": "Optional stable OUID; a UUID is generated if omitted" },
+            "prompt_template": { "type": "string", "default": "default", "description": "Template name for the manifest body. Currently 'default' is the only built-in." },
+            "custom_prompt": { "type": "string", "description": "Override the template entirely with this markdown" },
+            "additional_details": {
+                "type": "object",
+                "description": "Free-form details merged into the default template (role, focus_areas, voice, notes, etc.)",
+            },
+        }),
+    ));
+
+    // Directory (cross-shelf discovery)
+    tools.push(remember_tool(
+        "directory",
+        "Discover globally-shared resources by kind. action=read with kind='identities' lists books on the Hive shelf; kind='user_journals' lists books on the User Journals shelf. The calling user's BookStack permissions filter what is visible.",
+        &["read"],
+        json!({
+            "kind": { "type": "string", "enum": ["identities", "user_journals"], "description": "Which global shelf to enumerate" },
+        }),
+    ));
 }
 
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {
@@ -1757,9 +2048,12 @@ fn name_desc_schema() -> Value {
         "type": "object",
         "properties": {
             "name": { "type": "string", "description": "Name" },
-            "description": { "type": "string", "description": "Description", "default": "" }
+            "description": {
+                "type": "string",
+                "description": "REQUIRED. A 1-2 sentence description of what content lives here and what it's for. Surfaced to every Claude client that connects, so it shapes future routing decisions. Do not use placeholders like 'TODO' or 'description'."
+            }
         },
-        "required": ["name"]
+        "required": ["name", "description"]
     })
 }
 

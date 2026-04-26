@@ -394,6 +394,18 @@ impl BookStackClient {
         self.get("books", &[("count", "1")]).await
     }
 
+    /// Heuristic admin check: BookStack returns 403 from `/api/users` for
+    /// non-admins. We don't need the user list, just the success/failure.
+    /// Returns Ok(true) on success, Ok(false) on a 403, Err on other failures
+    /// (so callers can distinguish "not admin" from "couldn't reach BookStack").
+    pub async fn is_admin(&self) -> Result<bool, String> {
+        match self.list_users(1, 0).await {
+            Ok(_) => Ok(true),
+            Err(e) if e.contains("403") || e.to_lowercase().contains("forbidden") => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     // --- Permission check ---
 
     /// Check if the user can access a specific page.

@@ -142,7 +142,14 @@ Browser-based config page. Token-gated via the same `/authorize` form, but skips
 
 The page lets users pick their book/chapter IDs from dropdowns (populated from BookStack's list APIs), toggle the semantic-search targets, and configure recent-counts. Save → upserts the `user_settings` row. Re-auth button at the bottom redirects back through `/authorize` with the same return_to flow.
 
-**Global shelves:** the Hive shelf and User Journals shelf are stored in a separate `global_settings` table (single row) and shared across every user on the same BookStack instance. First user to set them wins; subsequent users see the dropdowns rendered as locked. Per-user `ai_hive_shelf_id` is auto-mirrored from the global value.
+**Global shelves:** the Hive shelf and User Journals shelf are stored in a separate `global_settings` table (single row) and shared across every user on the same BookStack instance. **Admin-only and one-shot** — only BookStack admins (probed via `/api/users` access) can set them, and once set they're locked. Non-admin users see the fields rendered as info-only. The MCP tools have no write path for global shelves; they must be set via the `/settings` UI by an admin. Per-user `ai_hive_shelf_id` is auto-mirrored from the global value on save.
+
+**User settings vs global shelves — where to configure:**
+
+| Config | UI (`/settings`) | MCP (`remember_config`) |
+|---|---|---|
+| Per-user settings (book/chapter IDs, semantic toggles, etc.) | yes | yes — `action=read` / `action=write` with full `settings` object |
+| Global shelf IDs | yes (admins only, first-write-wins) | **no** — UI is the only path |
 
 **Auto-create:** every book/chapter setting has a "Create if missing" checkbox. On save, the server creates absent structure in dependency order (shelves → books → chapters) using sensible default names from the naming module. Permission denials surface as warnings rather than blocking the save.
 

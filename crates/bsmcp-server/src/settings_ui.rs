@@ -164,17 +164,19 @@ pub async fn handle_settings_get(
         state.http_client.clone(),
     );
 
-    let (shelves_res, books_res, chapters_res) = tokio::join!(
+    let (shelves_res, books_res, chapters_res, admin_res) = tokio::join!(
         client.list_shelves(500, 0),
         client.list_books(500, 0),
         client.list_chapters(500, 0),
+        client.is_admin(),
     );
 
     let shelves = extract_named_list(shelves_res.ok().as_ref());
     let books = extract_named_list(books_res.ok().as_ref());
     let chapters = extract_named_list(chapters_res.ok().as_ref());
+    let is_admin = admin_res.unwrap_or(false);
 
-    Html(render_settings_page(&settings, &globals, &shelves, &books, &chapters)).into_response()
+    Html(render_settings_page(&settings, &globals, &shelves, &books, &chapters, is_admin)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -300,25 +302,69 @@ pub async fn handle_settings_post(
         system_prompt_page_ids: parse_id_list(form.system_prompt_page_ids),
     };
 
-    // Globals: respect existing values (first-write-wins for the UI; DB allows overwrites).
+    // Globals: server-side first-write-wins, gated to BookStack admins.
+    // Once a global field is set, it cannot be changed via this UI; once set
+    // by a non-admin (shouldn't happen — UI hides the controls), subsequent
+    // form submissions cannot rewrite them either.
     let existing_globals = state.db.get_global_settings().await.unwrap_or_default();
-    let mut globals = GlobalSettings {
-        hive_shelf_id: existing_globals.hive_shelf_id.or(parse_id(form.hive_shelf_id)),
-        user_journals_shelf_id: existing_globals.user_journals_shelf_id.or(parse_id(form.user_journals_shelf_id)),
-        set_by_token_hash: existing_globals.set_by_token_hash.clone(),
-        updated_at: existing_globals.updated_at,
-    };
+    let is_admin = client.is_admin().await.unwrap_or(false);
+
+    let mut globals = existing_globals.clone();
+    let mut global_warnings: Vec<String> = Vec::new();
+    let proposed_hive = parse_id(form.hive_shelf_id);
+    let proposed_user_journals = parse_id(form.user_journals_shelf_id);
+
+    if existing_globals.hive_shelf_id.is_none() {
+        if let Some(new_id) = proposed_hive {
+            if is_admin {
+                globals.hive_shelf_id = Some(new_id);
+            } else {
+                global_warnings.push(
+                    "Ignoring hive_shelf_id submission — only BookStack admins can set global shelves.".into()
+                );
+            }
+        }
+    } else if proposed_hive.is_some() && proposed_hive != existing_globals.hive_shelf_id {
+        global_warnings.push(
+            "Ignoring hive_shelf_id change — global shelves are first-write-wins; current value preserved.".into()
+        );
+    }
+
+    if existing_globals.user_journals_shelf_id.is_none() {
+        if let Some(new_id) = proposed_user_journals {
+            if is_admin {
+                globals.user_journals_shelf_id = Some(new_id);
+            } else {
+                global_warnings.push(
+                    "Ignoring user_journals_shelf_id submission — only BookStack admins can set global shelves.".into()
+                );
+            }
+        }
+    } else if proposed_user_journals.is_some() && proposed_user_journals != existing_globals.user_journals_shelf_id {
+        global_warnings.push(
+            "Ignoring user_journals_shelf_id change — global shelves are first-write-wins; current value preserved.".into()
+        );
+    }
+
+    // Same admin gate for create-if-missing on the global shelves themselves.
+    if !is_admin {
+        if checkbox_on(form.create_hive_shelf.clone()) || checkbox_on(form.create_user_journals_shelf.clone()) {
+            global_warnings.push(
+                "Ignoring create-if-missing for global shelves — only BookStack admins can provision them.".into()
+            );
+        }
+    }
 
     // Auto-provisioning in dependency order. Each step writes back into
     // `settings` / `globals` so later steps can use the just-created IDs.
     let mut provision_log: Vec<String> = Vec::new();
 
-    if globals.hive_shelf_id.is_none() && checkbox_on(form.create_hive_shelf) {
+    if is_admin && globals.hive_shelf_id.is_none() && checkbox_on(form.create_hive_shelf) {
         let r = provision::create_shelf(&client, NamedResource::HiveShelf).await;
         provision_log.push(r.human(NamedResource::HiveShelf));
         if let Some(id) = r.id() { globals.hive_shelf_id = Some(id); }
     }
-    if globals.user_journals_shelf_id.is_none() && checkbox_on(form.create_user_journals_shelf) {
+    if is_admin && globals.user_journals_shelf_id.is_none() && checkbox_on(form.create_user_journals_shelf) {
         let r = provision::create_shelf(&client, NamedResource::UserJournalsShelf).await;
         provision_log.push(r.human(NamedResource::UserJournalsShelf));
         if let Some(id) = r.id() { globals.user_journals_shelf_id = Some(id); }
@@ -420,7 +466,11 @@ pub async fn handle_settings_post(
         eprintln!("Settings: auto-provisioned items:");
         for line in &provision_log { eprintln!("  - {line}"); }
     }
-    eprintln!("Settings: saved for user (token_id_hash={}…)", &token_id_hash[..16.min(token_id_hash.len())]);
+    if !global_warnings.is_empty() {
+        eprintln!("Settings: global-write warnings:");
+        for line in &global_warnings { eprintln!("  - {line}"); }
+    }
+    eprintln!("Settings: saved for user (token_id_hash={}…, admin={is_admin})", &token_id_hash[..16.min(token_id_hash.len())]);
     Redirect::to("/settings?saved=1").into_response()
 }
 
@@ -726,6 +776,7 @@ fn render_settings_page(
     shelves: &[NamedItem],
     books: &[NamedItem],
     chapters: &[NamedItem],
+    is_admin: bool,
 ) -> String {
     let css = r#"
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -982,11 +1033,17 @@ a.reauth:hover { color: #cbd5e1; text-decoration: underline; }
         collage_count = s.active_collage_count,
         system_prompt_ids = html_escape(&format_id_list(&s.system_prompt_page_ids)),
 
-        global_lock_note = if g.updated_at > 0 { "(set globally — locked here)" } else { "" },
-        hive_shelf_select = render_select_locked("hive_shelf_id", shelves, g.hive_shelf_id, g.hive_shelf_id.is_some()),
-        user_journals_shelf_select = render_select_locked("user_journals_shelf_id", shelves, g.user_journals_shelf_id, g.user_journals_shelf_id.is_some()),
-        hive_shelf_create = if g.hive_shelf_id.is_some() { String::new() } else { create_inline("create_hive_shelf", "Create \"Hive\" shelf if missing") },
-        user_journals_shelf_create = if g.user_journals_shelf_id.is_some() { String::new() } else { create_inline("create_user_journals_shelf", "Create \"User Journals\" shelf if missing") },
+        global_lock_note = match (g.updated_at > 0, is_admin) {
+            (true, _) => "(set globally — locked)",
+            (false, true) => "(unset — you are an admin and may set this once)",
+            (false, false) => "(unset — only a BookStack admin can configure this)",
+        },
+        // Lock the field if globals are already set OR the user isn't an admin.
+        hive_shelf_select = render_select_locked("hive_shelf_id", shelves, g.hive_shelf_id, g.hive_shelf_id.is_some() || !is_admin),
+        user_journals_shelf_select = render_select_locked("user_journals_shelf_id", shelves, g.user_journals_shelf_id, g.user_journals_shelf_id.is_some() || !is_admin),
+        // Only show the create checkboxes for admins setting unset globals.
+        hive_shelf_create = if g.hive_shelf_id.is_none() && is_admin { create_inline("create_hive_shelf", "Create \"Hive\" shelf if missing") } else { String::new() },
+        user_journals_shelf_create = if g.user_journals_shelf_id.is_none() && is_admin { create_inline("create_user_journals_shelf", "Create \"User Journals\" shelf if missing") } else { String::new() },
 
         create_ai_identity_book_cb = create_row("create_ai_identity_book", "Create Identity book under the Hive shelf if blank above", s.ai_identity_book_id.is_some()),
         create_ai_hive_journal_book_cb = create_row("create_ai_hive_journal_book", "Create Journal book under the Hive shelf if blank above", s.ai_hive_journal_book_id.is_some()),

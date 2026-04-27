@@ -1,3 +1,4 @@
+pub mod acl;
 pub mod bookstack;
 pub mod chunking;
 pub mod config;

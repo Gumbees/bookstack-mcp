@@ -19,6 +19,10 @@ pub enum NamedResource {
     JournalBook,
     CollageBook,
     SharedCollageBook,
+    UserIdentityBook,
+    UserIdentityPage,
+    UserJournalBook,
+    UserJournalAgentPage,
 }
 
 impl NamedResource {
@@ -32,6 +36,25 @@ impl NamedResource {
             Self::JournalBook => "Journal",
             Self::CollageBook => "Topics",
             Self::SharedCollageBook => "Shared Topics",
+            // Per-user names default to placeholder text — `default_name_for_user`
+            // returns the actual personalized name when a user_id is known.
+            Self::UserIdentityBook => "User Identity",
+            Self::UserIdentityPage => "Identity",
+            Self::UserJournalBook => "Journal",
+            Self::UserJournalAgentPage => "Agent: journal-agent",
+        }
+    }
+
+    /// Personalized name for per-user resources. The non-personalized variants
+    /// just delegate to `default_name`. Stable across runs as long as `user_id`
+    /// is unchanged — used so probe + auto-create can find existing books.
+    pub fn default_name_for_user(self, user_id: &str) -> String {
+        match self {
+            Self::UserIdentityBook => format!("{user_id} — Identity"),
+            Self::UserIdentityPage => "Identity".to_string(),
+            Self::UserJournalBook => format!("{user_id} — Journal"),
+            Self::UserJournalAgentPage => format!("Agent: {user_id}-journal-agent"),
+            _ => self.default_name().to_string(),
         }
     }
 
@@ -52,6 +75,14 @@ impl NamedResource {
                 "AI agent's active topics / collage entries. Auto-created by /remember.",
             Self::SharedCollageBook =>
                 "Cross-agent shared topics. Auto-created by /remember.",
+            Self::UserIdentityBook =>
+                "Per-user identity container — holds the human user's identity page + their personal sub-agent definitions. Auto-created by /remember.",
+            Self::UserIdentityPage =>
+                "Identity page describing the human user — preferences, role, communication style. Keep it updated as you learn more. Auto-created by /remember.",
+            Self::UserJournalBook =>
+                "User's personal journal entries, organized by YYYY-MM chapters. Auto-created by /remember.",
+            Self::UserJournalAgentPage =>
+                "Agent definition for the user's per-user journal-agent. Auto-created by /remember.",
         }
     }
 
@@ -67,6 +98,12 @@ impl NamedResource {
             Self::JournalBook => n == "journal",
             Self::CollageBook => matches!(n.as_str(), "topics" | "collage"),
             Self::SharedCollageBook => matches!(n.as_str(), "shared topics" | "shared collage"),
+            // Per-user resources match by suffix because the prefix is the
+            // user_id which can't be encoded statically.
+            Self::UserIdentityBook => n.ends_with("— identity") || n.ends_with("- identity"),
+            Self::UserIdentityPage => matches!(n.as_str(), "identity" | "about me" | "who am i"),
+            Self::UserJournalBook => n.ends_with("— journal") || n.ends_with("- journal") || n == "journal",
+            Self::UserJournalAgentPage => n.starts_with("agent:") && n.contains("journal-agent"),
         }
     }
 }

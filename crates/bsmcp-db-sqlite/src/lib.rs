@@ -75,6 +75,8 @@ impl SqliteDb {
                  default_ai_identity_ouid TEXT,
                  org_required_instructions_page_ids TEXT,
                  org_ai_usage_policy_page_ids TEXT,
+                 org_identity_page_id INTEGER,
+                 org_domains TEXT,
                  set_by_token_hash TEXT,
                  updated_at INTEGER NOT NULL DEFAULT 0
              );
@@ -96,6 +98,8 @@ impl SqliteDb {
             "ALTER TABLE global_settings ADD COLUMN default_ai_identity_ouid TEXT",
             "ALTER TABLE global_settings ADD COLUMN org_required_instructions_page_ids TEXT",
             "ALTER TABLE global_settings ADD COLUMN org_ai_usage_policy_page_ids TEXT",
+            "ALTER TABLE global_settings ADD COLUMN org_identity_page_id INTEGER",
+            "ALTER TABLE global_settings ADD COLUMN org_domains TEXT",
         ] {
             conn.execute_batch(sql).ok();
         }
@@ -421,6 +425,7 @@ impl DbBackend for SqliteDb {
                         default_ai_identity_page_id, default_ai_identity_name, default_ai_identity_ouid,
                         org_required_instructions_page_ids,
                         org_ai_usage_policy_page_ids,
+                        org_identity_page_id, org_domains,
                         set_by_token_hash, updated_at
                  FROM global_settings WHERE id = 1",
                 [],
@@ -432,8 +437,10 @@ impl DbBackend for SqliteDb {
                     default_ai_identity_ouid: row.get::<_, Option<String>>(4)?,
                     org_required_instructions_page_ids: decode_id_list(row.get::<_, Option<String>>(5)?),
                     org_ai_usage_policy_page_ids: decode_id_list(row.get::<_, Option<String>>(6)?),
-                    set_by_token_hash: row.get::<_, Option<String>>(7)?,
-                    updated_at: row.get::<_, i64>(8)?,
+                    org_identity_page_id: row.get::<_, Option<i64>>(7)?,
+                    org_domains: decode_str_list(row.get::<_, Option<String>>(8)?),
+                    set_by_token_hash: row.get::<_, Option<String>>(9)?,
+                    updated_at: row.get::<_, i64>(10)?,
                 }),
             ).unwrap_or_default();
             Ok(row)
@@ -467,8 +474,10 @@ impl DbBackend for SqliteDb {
                      default_ai_identity_ouid = ?5,
                      org_required_instructions_page_ids = ?6,
                      org_ai_usage_policy_page_ids = ?7,
-                     set_by_token_hash = ?8,
-                     updated_at = ?9
+                     org_identity_page_id = ?8,
+                     org_domains = ?9,
+                     set_by_token_hash = ?10,
+                     updated_at = ?11
                  WHERE id = 1",
                 params![
                     s.hive_shelf_id,
@@ -478,6 +487,8 @@ impl DbBackend for SqliteDb {
                     s.default_ai_identity_ouid,
                     encode_id_list(&s.org_required_instructions_page_ids),
                     encode_id_list(&s.org_ai_usage_policy_page_ids),
+                    s.org_identity_page_id,
+                    encode_str_list(&s.org_domains),
                     final_setter,
                     SqliteDb::now_secs(),
                 ],
@@ -629,6 +640,32 @@ impl SemanticDb for SqliteDb {
             conn.execute_batch(
                 "ALTER TABLE pages ADD COLUMN updated_at TEXT;"
             ).ok();
+
+            // Permission ACL: per-page role visibility populated at embed time.
+            conn.execute_batch(
+                "ALTER TABLE pages ADD COLUMN acl_default_open INTEGER;"
+            ).ok();
+            conn.execute_batch(
+                "ALTER TABLE pages ADD COLUMN acl_computed_at INTEGER;"
+            ).ok();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS page_view_acl (
+                     page_id INTEGER NOT NULL,
+                     role_id INTEGER NOT NULL,
+                     PRIMARY KEY (page_id, role_id)
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_page_view_acl_role ON page_view_acl(role_id, page_id);
+                 CREATE TABLE IF NOT EXISTS user_role_cache (
+                     token_id_hash TEXT PRIMARY KEY,
+                     bookstack_user_id INTEGER NOT NULL,
+                     role_ids TEXT NOT NULL,
+                     fetched_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS acl_reconcile_state (
+                     scope TEXT PRIMARY KEY,
+                     last_full_run INTEGER NOT NULL DEFAULT 0
+                 );"
+            ).map_err(|e| format!("Failed to create ACL tables: {e}"))?;
 
             eprintln!("Semantic: tables initialized");
             Ok(())
@@ -1240,6 +1277,7 @@ impl SemanticDb for SqliteDb {
         limit: usize,
         threshold: f32,
         book_ids: Option<&[i64]>,
+        user_role_ids: Option<&[i64]>,
     ) -> Result<Vec<SearchHit>, String> {
         let conn = self.conn.clone();
         let query_embedding = query_embedding.to_vec();
@@ -1249,27 +1287,54 @@ impl SemanticDb for SqliteDb {
             Some(ids) if !ids.is_empty() => Some(ids.to_vec()),
             _ => None,
         };
+        let role_filter: Option<Vec<i64>> = match user_role_ids {
+            Some(ids) if !ids.is_empty() => Some(ids.to_vec()),
+            _ => None,
+        };
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
 
-            // Note: each branch binds `out` to a Vec before yielding it from
-            // the block. The borrow checker rejects returning the .collect()
-            // expression directly because the temporary MappedRows borrows
-            // `stmt`, and `stmt` is dropped at the end of the block.
-            let all_chunks: Vec<(i64, i64, Vec<u8>)> = if let Some(ids) = book_filter {
-                // Build a parameterized IN list — rusqlite doesn't expand &[i64]
-                // automatically, so we generate "?, ?, ?" placeholders and bind
-                // each id individually.
+            // Build the WHERE clause incrementally based on which filters are
+            // active. ACL semantics match Postgres: a chunk's page is kept iff
+            //   - its ACL hasn't been computed yet (HTTP fallback in semantic.rs), OR
+            //   - it's flagged default-open, OR
+            //   - the user's role list intersects page_view_acl.role_id.
+            let mut where_clauses: Vec<String> = Vec::new();
+            let mut params_dyn: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+            let need_pages_join = book_filter.is_some() || role_filter.is_some();
+
+            if let Some(ref ids) = book_filter {
                 let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+                where_clauses.push(format!("p.book_id IN ({placeholders})"));
+                for id in ids {
+                    params_dyn.push(Box::new(*id));
+                }
+            }
+            if let Some(ref roles) = role_filter {
+                let placeholders = std::iter::repeat("?").take(roles.len()).collect::<Vec<_>>().join(",");
+                where_clauses.push(format!(
+                    "(p.acl_computed_at IS NULL
+                      OR COALESCE(p.acl_default_open, 0) = 1
+                      OR EXISTS (SELECT 1 FROM page_view_acl a
+                                 WHERE a.page_id = p.page_id AND a.role_id IN ({placeholders})))"
+                ));
+                for r in roles {
+                    params_dyn.push(Box::new(*r));
+                }
+            }
+
+            let all_chunks: Vec<(i64, i64, Vec<u8>)> = if need_pages_join {
+                let where_sql = if where_clauses.is_empty() { String::new() }
+                    else { format!("WHERE {}", where_clauses.join(" AND ")) };
                 let sql = format!(
                     "SELECT c.id, c.page_id, c.embedding
                      FROM chunks c JOIN pages p ON c.page_id = p.page_id
-                     WHERE p.book_id IN ({placeholders})"
+                     {where_sql}"
                 );
                 let mut stmt = conn.prepare(&sql).map_err(|e| format!("Prepare failed: {e}"))?;
                 let params_vec: Vec<&dyn rusqlite::ToSql> =
-                    ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+                    params_dyn.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
                 let out: Vec<(i64, i64, Vec<u8>)> = stmt
                     .query_map(params_vec.as_slice(), |row| {
                         Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -1422,6 +1487,127 @@ impl SemanticDb for SqliteDb {
         .await
         .map_err(|e| format!("Task failed: {e}"))?
     }
+
+    async fn upsert_page_acl(&self, acl: &PageAcl) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let acl = acl.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let tx = conn.unchecked_transaction()
+                .map_err(|e| format!("upsert_page_acl tx: {e}"))?;
+            tx.execute("DELETE FROM page_view_acl WHERE page_id = ?1", params![acl.page_id])
+                .map_err(|e| format!("upsert_page_acl delete: {e}"))?;
+            for &role_id in &acl.view_roles {
+                tx.execute(
+                    "INSERT OR IGNORE INTO page_view_acl (page_id, role_id) VALUES (?1, ?2)",
+                    params![acl.page_id, role_id],
+                ).map_err(|e| format!("upsert_page_acl insert: {e}"))?;
+            }
+            let default_open: i64 = if acl.default_open { 1 } else { 0 };
+            tx.execute(
+                "UPDATE pages SET acl_default_open = ?1, acl_computed_at = ?2 WHERE page_id = ?3",
+                params![default_open, acl.computed_at, acl.page_id],
+            ).map_err(|e| format!("upsert_page_acl flag: {e}"))?;
+            tx.commit().map_err(|e| format!("upsert_page_acl commit: {e}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn delete_page_acl(&self, page_id: i64) -> Result<(), String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute("DELETE FROM page_view_acl WHERE page_id = ?1", params![page_id])
+                .map_err(|e| format!("delete_page_acl: {e}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn delete_role_from_acl(&self, role_id: i64) -> Result<(), String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute("DELETE FROM page_view_acl WHERE role_id = ?1", params![role_id])
+                .map_err(|e| format!("delete_role_from_acl: {e}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn list_acl_page_ids(&self) -> Result<Vec<i64>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT page_id FROM pages WHERE acl_computed_at IS NOT NULL")
+                .map_err(|e| format!("Prepare failed: {e}"))?;
+            let out: Vec<i64> = stmt
+                .query_map([], |row| row.get::<_, i64>(0))
+                .map_err(|e| format!("Query failed: {e}"))?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(out)
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn get_cached_user_roles(
+        &self,
+        token_id_hash: &str,
+        max_age_secs: i64,
+    ) -> Result<Option<(i64, Vec<i64>)>, String> {
+        let conn = self.conn.clone();
+        let key = token_id_hash.to_string();
+        tokio::task::spawn_blocking(move || {
+            let cutoff = SqliteDb::now_secs() - max_age_secs;
+            let conn = conn.lock().unwrap();
+            let row: Option<(i64, String, i64)> = conn.query_row(
+                "SELECT bookstack_user_id, role_ids, fetched_at
+                 FROM user_role_cache WHERE token_id_hash = ?1",
+                params![key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).ok();
+            Ok(row.and_then(|(uid, json, fetched)| {
+                if fetched > cutoff {
+                    let roles: Vec<i64> = serde_json::from_str(&json).unwrap_or_default();
+                    Some((uid, roles))
+                } else {
+                    None
+                }
+            }))
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn set_cached_user_roles(
+        &self,
+        token_id_hash: &str,
+        bookstack_user_id: i64,
+        role_ids: &[i64],
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let key = token_id_hash.to_string();
+        let json = serde_json::to_string(role_ids).unwrap_or_else(|_| "[]".to_string());
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO user_role_cache
+                    (token_id_hash, bookstack_user_id, role_ids, fetched_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![key, bookstack_user_id, json, SqliteDb::now_secs()],
+            ).map_err(|e| format!("set_cached_user_roles: {e}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
 }
 
 /// Encode a Vec<i64> as a JSON array string (or NULL when empty so the column
@@ -1431,6 +1617,17 @@ fn encode_id_list(ids: &[i64]) -> Option<String> {
 }
 
 fn decode_id_list(value: Option<String>) -> Vec<i64> {
+    match value {
+        Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn encode_str_list(values: &[String]) -> Option<String> {
+    if values.is_empty() { None } else { serde_json::to_string(values).ok() }
+}
+
+fn decode_str_list(value: Option<String>) -> Vec<String> {
     match value {
         Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_default(),
         _ => Vec::new(),

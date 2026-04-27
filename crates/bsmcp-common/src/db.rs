@@ -128,12 +128,20 @@ pub trait SemanticDb: Send + Sync + 'static {
     /// `book_ids`: when `Some(&[..])`, restrict candidates to chunks whose
     /// parent page lives in one of those books. When `None` or an empty slice,
     /// search across the entire embedded corpus.
+    ///
+    /// `user_role_ids`: when `Some(&[..])`, additionally restrict candidates
+    /// to pages whose `page_view_acl` row matches one of the user's roles.
+    /// Pages with no ACL row are always included (the HTTP fallback path
+    /// in `semantic.rs` still verifies them) so search recall stays correct
+    /// while the embedded ACL eliminates fan-out for pages we already know
+    /// the user can or cannot access.
     async fn vector_search(
         &self,
         query_embedding: &[f32],
         limit: usize,
         threshold: f32,
         book_ids: Option<&[i64]>,
+        user_role_ids: Option<&[i64]>,
     ) -> Result<Vec<SearchHit>, String>;
 
     /// Look up the `book_id` for each requested page in one roundtrip.
@@ -166,4 +174,41 @@ pub trait SemanticDb: Send + Sync + 'static {
 
     /// Set a metadata value by key.
     async fn set_meta(&self, key: &str, value: &str) -> Result<(), String>;
+
+    // --- Permission ACL (page-level role visibility) ---
+
+    /// Replace the ACL row for one page. Deletes any prior `page_view_acl`
+    /// entries for `page_id` then inserts the new role list. `default_open`
+    /// is stored on the `pages` row (`acl_default_open` column) so the
+    /// query path can short-circuit role checks for fully-open pages.
+    async fn upsert_page_acl(&self, acl: &PageAcl) -> Result<(), String>;
+
+    /// Drop a page from the ACL store. Called on `page_delete` events.
+    async fn delete_page_acl(&self, page_id: i64) -> Result<(), String>;
+
+    /// Drop one role from every page's ACL. Called on `role_delete` events.
+    async fn delete_role_from_acl(&self, role_id: i64) -> Result<(), String>;
+
+    /// List page IDs that have a stored ACL. Used by the daily reconciliation
+    /// job to know which pages to refresh.
+    async fn list_acl_page_ids(&self) -> Result<Vec<i64>, String>;
+
+    // --- User role cache (token → BookStack user id → role IDs) ---
+
+    /// Look up cached roles for a token-user. Returns `None` when the
+    /// cache entry is missing or older than `max_age_secs`.
+    async fn get_cached_user_roles(
+        &self,
+        token_id_hash: &str,
+        max_age_secs: i64,
+    ) -> Result<Option<(i64, Vec<i64>)>, String>;
+
+    /// Cache the roles list for a token-user. `bookstack_user_id` is stored
+    /// alongside so callers can use it for per-user permission overrides.
+    async fn set_cached_user_roles(
+        &self,
+        token_id_hash: &str,
+        bookstack_user_id: i64,
+        role_ids: &[i64],
+    ) -> Result<(), String>;
 }

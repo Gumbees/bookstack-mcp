@@ -9,6 +9,7 @@ use fastembed::{
     TokenizerFiles, UserDefinedEmbeddingModel,
 };
 
+use bsmcp_common::acl::{build_role_context, reconcile_all_pages, resolve_page_acl, RoleContext};
 use bsmcp_common::bookstack::BookStackClient;
 use bsmcp_common::chunking;
 use bsmcp_common::db::SemanticDb;
@@ -253,8 +254,42 @@ pub async fn run_pipeline(
 ) -> Result<PipelineResult, String> {
     eprintln!("Pipeline: starting (scope={scope}, job_id={job_id})");
 
+    // ACL-only reconciliation path. Triggered by webhooks for role events or
+    // by the daily reconciliation cron — no embedding work, just refresh
+    // page_view_acl for every previously-stored page.
+    if scope == "acl_reconcile" {
+        match reconcile_all_pages(client, db).await {
+            Ok((processed, failed)) => {
+                eprintln!("Pipeline: ACL reconcile complete — {processed} ok, {failed} failed");
+                db.update_job_progress(job_id, processed as i64, (processed + failed) as i64).await?;
+                return Ok(PipelineResult {
+                    total_pages: processed + failed,
+                    succeeded: processed,
+                    failed_pages: Vec::new(),
+                    aborted: false,
+                });
+            }
+            Err(e) => {
+                eprintln!("Pipeline: ACL reconcile failed: {e}");
+                return Err(e);
+            }
+        }
+    }
+
     // Build shelf lookup for context prefix injection
     let shelf_lookup = build_shelf_lookup(client).await;
+
+    // Resolve role context once per pipeline run for ACL stamping. If the
+    // BookStack token can't list roles (rare — system-level perm), ACL
+    // population is skipped for the whole run; semantic search falls back to
+    // its existing per-page HTTP permission check.
+    let role_ctx = match build_role_context(client).await {
+        Ok(rc) => Some(rc),
+        Err(e) => {
+            eprintln!("Pipeline: role context unavailable, ACL stamping disabled this run: {e}");
+            None
+        }
+    };
 
     // Collect page IDs to embed
     let mut offset = 0i64;
@@ -318,7 +353,7 @@ pub async fn run_pipeline(
     let mut aborted = false;
 
     for (i, page_id) in all_page_ids.iter().enumerate() {
-        match embed_single_page(db, embedder, client, *page_id, force, &shelf_lookup).await {
+        match embed_single_page(db, embedder, client, *page_id, force, &shelf_lookup, role_ctx.as_ref()).await {
             Ok(()) => {
                 succeeded += 1;
                 consecutive_failures = 0;
@@ -373,6 +408,7 @@ async fn embed_single_page(
     page_id: i64,
     force: bool,
     shelf_lookup: &HashMap<i64, String>,
+    role_ctx: Option<&RoleContext>,
 ) -> Result<(), String> {
     let page = client.get_page(page_id).await?;
 
@@ -489,6 +525,23 @@ async fn embed_single_page(
 
     // Store final page metadata with real content_hash — this is the commit marker.
     db.upsert_page(&meta).await?;
+
+    // Stamp the per-page ACL. Best-effort: a failure here doesn't fail the
+    // embed (the page is already searchable), it just means the page falls
+    // through to the HTTP permission check at query time until the next
+    // pipeline run or webhook recompute.
+    if let Some(rc) = role_ctx {
+        match resolve_page_acl(client, page_id, chapter_id, book_id, rc).await {
+            Ok(acl) => {
+                if let Err(e) = db.upsert_page_acl(&acl).await {
+                    eprintln!("Pipeline: page {page_id} ACL upsert failed (non-fatal): {e}");
+                }
+            }
+            Err(e) => {
+                eprintln!("Pipeline: page {page_id} ACL resolve failed (non-fatal): {e}");
+            }
+        }
+    }
 
     Ok(())
 }

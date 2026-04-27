@@ -65,13 +65,39 @@ pub struct UserSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
 
+    /// BookStack user row ID for the calling token's owner. Set automatically
+    /// at /authorize when an admin token can resolve it via `/api/users`, or
+    /// manually via /settings. When set, semantic search resolves the user's
+    /// role IDs once per session (cached in `user_role_cache`) and applies a
+    /// role-level ACL filter to vector candidates — eliminating the per-page
+    /// HTTP fan-out for pages we already know the user can or cannot view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bookstack_user_id: Option<i64>,
+
     /// BookStack page ID of the user's identity page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_identity_page_id: Option<i64>,
 
+    /// BookStack book ID of the user's per-user identity book (where the
+    /// identity page + journal-agent definition page live). Auto-provisioned
+    /// on the user-journals shelf when the user first calls `remember_user`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_identity_book_id: Option<i64>,
+
+    /// BookStack page ID of the auto-provisioned `{user_id}-journal-agent`
+    /// agent definition page (lives in the user's identity book).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_journal_agent_page_id: Option<i64>,
+
     /// BookStack book ID of the user's personal journal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_journal_book_id: Option<i64>,
+
+    /// Domains owned by the user (e.g. `["example.com"]`). Surfaced in the
+    /// briefing's `system_prompt_additions` so the AI can distinguish "ours"
+    /// (URLs/emails on these domains) from external content.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domains: Vec<String>,
 
     // --- Semantic search toggles (default true except full_kb) ---
 
@@ -211,6 +237,19 @@ pub struct GlobalSettings {
     /// "instructions" (how to act). Admin-only. Page IDs only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub org_ai_usage_policy_page_ids: Vec<i64>,
+
+    /// Single page describing the organization itself (mission, structure,
+    /// people, conventions). Pulled verbatim into every briefing's
+    /// `system_prompt_additions` under an `## Organization` section. Pairs
+    /// with `org_domains` to give every agent on the instance a shared baseline.
+    /// Admin-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_identity_page_id: Option<i64>,
+
+    /// Domains owned by the org (e.g. `["example.com", "example.net"]`).
+    /// Surfaced in every briefing's `system_prompt_additions`. Admin-only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub org_domains: Vec<String>,
 
     /// Hash of the first token_id that set these values (informational; does
     /// not gate writes — UI handles the lock-after-set semantics).

@@ -20,6 +20,7 @@ pub mod naming;
 pub mod provision;
 pub mod search;
 pub mod singletons;
+pub mod user_provision;
 
 use std::sync::Arc;
 

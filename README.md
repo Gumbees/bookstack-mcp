@@ -596,6 +596,10 @@ The reason: Step 2 requires the MCP client to make an outbound HTTP POST to the 
 
 If you're using Claude.ai or Claude Desktop, you can still use `upload_image` with the `url` parameter for files that are already web-accessible, or upload through the BookStack web UI directly.
 
+## Development
+
+See [DEVELOPMENT.md](DEVELOPMENT.md) for build instructions, branching model, CI/CD (artifact-before-merge), versioning, and the workflow for adding new tools.
+
 ## License
 
 MIT

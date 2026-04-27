@@ -1,31 +1,45 @@
 name: Generate Repo Artifacts
 
+# Regenerates SBOM.md and STRUCTURE.md and commits any diff back to the PR
+# source branch. Fires on the same trigger family as the image build:
+# `pull_request: opened/synchronize/reopened` against development or release.
+# That way the regenerated artifacts are part of the PR being reviewed/merged
+# — not retroactively dropped onto development after the fact.
+#
+# The auto-commit uses `[skip ci]` to avoid a trigger loop. It will not
+# re-fire either this workflow or `release.yml`.
+#
+# For external fork PRs, GITHUB_TOKEN cannot push back to the fork; the
+# job is skipped in that case (the contributor regenerates locally).
+
 on:
-  push:
-    branches:
-      - development
-      - release
+  pull_request:
+    branches: [development, release]
+    types: [opened, synchronize, reopened]
     paths-ignore:
       - 'SBOM.md'
       - 'STRUCTURE.md'
-  schedule:
-    # Weekly refresh catches upstream license/version metadata changes
-    - cron: '0 6 * * 1'
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: artifacts-${{ github.ref }}
+  group: artifacts-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   generate:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          # PR triggers: check out the PR head so the auto-commit lands on
+          # the PR source branch. Other triggers fall back to the workflow ref.
+          ref: ${{ github.event.pull_request.head.ref || github.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install tooling
         run: sudo apt-get install -y tree jq

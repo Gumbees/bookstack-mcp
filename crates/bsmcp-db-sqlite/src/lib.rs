@@ -1608,6 +1608,20 @@ impl SemanticDb for SqliteDb {
         .await
         .map_err(|e| format!("Task failed: {e}"))?
     }
+
+    async fn delete_user_role_cache_by_bs_id(&self, bookstack_user_id: i64) -> Result<(), String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "DELETE FROM user_role_cache WHERE bookstack_user_id = ?1",
+                params![bookstack_user_id],
+            ).map_err(|e| format!("delete_user_role_cache_by_bs_id: {e}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
 }
 
 /// Encode a Vec<i64> as a JSON array string (or NULL when empty so the column

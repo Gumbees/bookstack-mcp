@@ -802,6 +802,34 @@ impl SemanticState {
                 eprintln!("Semantic: role_delete — queued ACL reconcile job {job_id} (new={is_new})");
             }
 
+            // --- Permission change on a specific entity ---
+            // Fired by BookStack's PermissionsUpdater whenever role/fallback
+            // permissions are edited on a page/chapter/book/shelf. Queue a
+            // full ACL reconcile because the change can cascade to descendants
+            // (book perm change affects every page in it). Cheaper than
+            // computing the cascade ourselves and the cron-style reconcile
+            // path is already battle-tested.
+            "permissions_update" => {
+                let (job_id, is_new) = self.db.create_embed_job("acl_reconcile").await?;
+                eprintln!("Semantic: permissions_update (item={item_id:?}) — queued ACL reconcile job {job_id} (new={is_new})");
+            }
+
+            // --- User events ---
+            // Role assignments live on the user, so updates can change which
+            // roles a token's owner holds. Drop their cached entry so the
+            // next semantic_search re-fetches `/api/users/{id}` and picks up
+            // the new role list.
+            "user_update" | "user_delete" => {
+                if let Some(uid) = item_id {
+                    let _ = self.db.delete_user_role_cache_by_bs_id(uid).await;
+                    eprintln!("Semantic: {event} — invalidated user_role_cache for bookstack_user_id={uid}");
+                }
+            }
+            "user_create" => {
+                // No-op — new users have no cache entry yet, no token mapping
+                // exists until they authorize through the OAuth flow.
+            }
+
             _ => {
                 eprintln!("Semantic: ignoring webhook event {event}");
             }

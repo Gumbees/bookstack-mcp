@@ -211,4 +211,9 @@ pub trait SemanticDb: Send + Sync + 'static {
         bookstack_user_id: i64,
         role_ids: &[i64],
     ) -> Result<(), String>;
+
+    /// Drop every cached entry for the given BookStack user. Called by the
+    /// webhook handler on `user_update` (role assignments may have changed)
+    /// and `user_delete` (account is gone).
+    async fn delete_user_role_cache_by_bs_id(&self, bookstack_user_id: i64) -> Result<(), String>;
 }

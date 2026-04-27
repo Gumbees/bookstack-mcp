@@ -1500,4 +1500,13 @@ impl SemanticDb for PostgresDb {
         .map_err(|e| format!("set_cached_user_roles: {e}"))?;
         Ok(())
     }
+
+    async fn delete_user_role_cache_by_bs_id(&self, bookstack_user_id: i64) -> Result<(), String> {
+        sqlx::query("DELETE FROM user_role_cache WHERE bookstack_user_id = $1")
+            .bind(bookstack_user_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("delete_user_role_cache_by_bs_id: {e}"))?;
+        Ok(())
+    }
 }

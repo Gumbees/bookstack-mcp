@@ -12,6 +12,11 @@ use bsmcp_common::bookstack::BookStackClient;
 use super::envelope::ErrorCode;
 use super::{frontmatter, Context, Outcome};
 
+/// How long a client-pushed timezone is trusted before the briefing flags
+/// it for refresh. 4h covers DST transitions and most travel within a
+/// session; shorter would just churn the user_settings table.
+const TIMEZONE_REFRESH_SECS: i64 = 4 * 60 * 60;
+
 pub async fn read(ctx: &Context) -> Outcome {
     let user_prompt = ctx.body_str("user_prompt").unwrap_or_default();
     let recent_count = ctx
@@ -31,6 +36,33 @@ pub async fn read(ctx: &Context) -> Outcome {
     // their own ai_identity_page_id but the org has a default, use it.
     let globals = ctx.db.get_global_settings().await.unwrap_or_default();
     let resolved = globals.resolve_identity(&ctx.settings);
+
+    // Client-pushed timezone refresh. The AI client (Claude Code etc.)
+    // detects local timezone at session start and passes it as `client_timezone`.
+    // We persist it in user_settings + stamp `timezone_fetched_at` so the
+    // briefing's time block can later flag a refresh when the cache ages out.
+    // No-op when the client doesn't send one — the existing manually-set
+    // setting still works.
+    let client_tz = ctx
+        .body_str("client_timezone")
+        .filter(|tz| tz.parse::<chrono_tz::Tz>().is_ok());
+    let mut effective_settings = ctx.settings.clone();
+    if let Some(tz) = client_tz.clone() {
+        let now = frontmatter::now_unix();
+        let needs_save = effective_settings.timezone.as_deref() != Some(tz.as_str())
+            || effective_settings.timezone_fetched_at.unwrap_or(0) < now - TIMEZONE_REFRESH_SECS;
+        if needs_save {
+            effective_settings.timezone = Some(tz);
+            effective_settings.timezone_fetched_at = Some(now);
+            if let Err(e) = ctx
+                .db
+                .save_user_settings(&ctx.token_id_hash, &effective_settings)
+                .await
+            {
+                eprintln!("Briefing: failed to persist client_timezone (non-fatal): {e}");
+            }
+        }
+    }
 
     // Identity manifest (page) + user manifest (page) — fetch in parallel.
     let identity_fut = fetch_optional_page(&ctx.client, resolved.page_id);
@@ -347,12 +379,7 @@ pub async fn read(ctx: &Context) -> Outcome {
         "shared_collage_semantic_matches": semantic.shared_collage_matches,
         "kb_semantic_matches": kb_matches_envelope(ctx, &semantic.kb_matches),
         "system_prompt_additions": system_prompt,
-        "time": {
-            "now_unix": frontmatter::now_unix(),
-            "now_utc": frontmatter::now_iso_utc(),
-            "timezone": ctx.settings.timezone.clone().unwrap_or_else(|| "UTC".to_string()),
-            "timezone_source": if ctx.settings.timezone.is_some() { "user_settings" } else { "default_utc" },
-        },
+        "time": build_time_block(&effective_settings, client_tz.is_some()),
         "config": {
             "label": ctx.settings.label,
             "role": ctx.settings.role,
@@ -537,6 +564,57 @@ fn kb_matches_envelope(ctx: &Context, results: &[Value]) -> Value {
         "detail": "Top hits from the entire knowledge base, excluding pages already surfaced in per-book sections.",
         "results": results,
     })
+}
+
+/// Build the briefing's `time` block. Surfaces unix + UTC always, plus
+/// timezone-aware fields when the user's timezone is set: `now_local`
+/// (RFC 3339 with offset), `now_human` (e.g. "Saturday, April 26, 2026
+/// at 6:42 PM EDT"), and `timezone_refresh_due` so the client knows when
+/// to re-detect.
+///
+/// `tz_just_pushed` is true when this request carried a fresh
+/// `client_timezone` — the refresh-due flag stays false in that case
+/// even if the cache had been stale, since we just refreshed it.
+fn build_time_block(s: &bsmcp_common::settings::UserSettings, tz_just_pushed: bool) -> Value {
+    let now = chrono::Utc::now();
+    let now_unix = now.timestamp();
+    let now_utc = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+    let (timezone, source) = match s.timezone.as_deref() {
+        Some(tz) => (tz.to_string(), "user_settings"),
+        None => ("UTC".to_string(), "default_utc"),
+    };
+
+    let mut block = json!({
+        "now_unix": now_unix,
+        "now_utc": now_utc,
+        "timezone": timezone,
+        "timezone_source": source,
+    });
+
+    if let Ok(tz) = timezone.parse::<chrono_tz::Tz>() {
+        let local = now.with_timezone(&tz);
+        // RFC 3339 with the local offset, e.g. 2026-04-26T18:42:00-04:00.
+        block["now_local"] = json!(local.format("%Y-%m-%dT%H:%M:%S%:z").to_string());
+        // Human-friendly: "Saturday, April 26, 2026 at 6:42 PM EDT".
+        block["now_human"] = json!(local.format("%A, %B %-d, %Y at %-I:%M %p %Z").to_string());
+    }
+
+    let refresh_due = if tz_just_pushed {
+        false
+    } else {
+        match s.timezone_fetched_at {
+            None => s.timezone.is_some(), // tz set manually long ago — flag for refresh
+            Some(t) => now_unix - t > TIMEZONE_REFRESH_SECS,
+        }
+    };
+    block["timezone_refresh_due"] = json!(refresh_due);
+    block["timezone_refresh_hint"] = json!(
+        "Pass `client_timezone` (IANA name like \"America/New_York\") on the next \
+         remember_briefing call to refresh. Detect via your system's local time."
+    );
+
+    block
 }
 
 /// Per-user fields the setup nudge wants populated. Each entry is a

@@ -1900,12 +1900,14 @@ fn add_remember_tools(tools: &mut Vec<Value>) {
     // Singletons
     tools.push(remember_tool(
         "briefing",
-        "Reconstitution dossier — one structured pull replacing the multi-call AI bootstrap. Returns identity manifest, user identity, recent journals, active topics, semantic matches against the user_prompt, and config metadata.",
+        "Reconstitution dossier — one structured pull replacing the multi-call AI bootstrap. Returns identity manifest, user identity, recent journals, active topics, semantic matches against the user_prompt, config metadata, and a `time` block with now_unix/now_utc/now_local/now_human + the user's timezone. \
+         When the response's `time.timezone_refresh_due` is true, detect the local timezone (IANA name like \"America/New_York\" via `Intl.DateTimeFormat().resolvedOptions().timeZone` or system equivalent) and pass it as `client_timezone` on the next briefing call to refresh the cache (~4h TTL).",
         &["read"],
         json!({
             "user_prompt": { "type": "string", "description": "First user message — drives semantic prioritization" },
             "recent_journal_count": { "type": "integer", "description": "Override the configured recent_journal_count" },
             "active_collage_count": { "type": "integer", "description": "Override the configured active_collage_count" },
+            "client_timezone": { "type": "string", "description": "Client's detected IANA timezone (e.g. \"America/New_York\"). Cached in user_settings; refreshed every 4h. Pass when `time.timezone_refresh_due` was true on the previous response." },
         }),
     ));
 

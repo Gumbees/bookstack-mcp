@@ -105,6 +105,8 @@ This starts two containers sharing a SQLite database file.
 
 ### Run from source
 
+The project distributes as multi-arch (`linux/amd64` + `linux/arm64`) container images on GHCR — `ghcr.io/bees-roadhouse/bsmcp-server` and `ghcr.io/bees-roadhouse/bsmcp-embedder`. Native binaries for **`bsmcp-server` only** are attached to each GitHub Release for `linux-x86_64`, `linux-aarch64`, `darwin-x86_64`, `darwin-aarch64`, and `windows-x86_64`. The embedder is **not** distributed as a bare binary — it depends on ONNX Runtime (a per-platform C++ shared library), so running it outside Docker is awkward. Either run the published embedder container, or build from source:
+
 ```bash
 # Server
 cargo run --release -p bsmcp-server
@@ -112,6 +114,8 @@ cargo run --release -p bsmcp-server
 # Embedder (separate terminal)
 cargo run --release -p bsmcp-embedder
 ```
+
+The server is pure Rust + bundled SQLite and builds cleanly on any target the Rust toolchain supports. The embedder depends on [`fastembed`](https://crates.io/crates/fastembed), which links ONNX Runtime; the crate downloads a matching prebuilt at build time for common targets, but cross-compiling or running on uncommon platforms may require installing ONNX Runtime separately. For most users, running the embedder from the published container avoids that complexity entirely.
 
 ### Configuration
 

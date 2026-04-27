@@ -77,42 +77,68 @@ Breaking changes are orthogonal to type — prefix the **PR title** with `BREAKI
 1. git checkout development && git pull
 2. git checkout -b improvement/my-change      # or feature/, refactor/, bug/
 3. ... commit work (signed via SSH; see Commit Signing below) ...
-4. git push -u origin improvement/my-change
-5. Open PR against development; apply the matching type: + category: labels
-6. CI builds artifact + regenerates SBOM/STRUCTURE on the PR source branch (see CI/CD below)
-7. Squash-merge PR into development; delete the work branch
-8. When ready to ship: open PR from development -> release
+4. scripts/publish-pr-image.sh                # build + push multi-arch images to GHCR
+5. git push -u origin improvement/my-change
+6. Open PR against development; apply the matching type: + category: labels
+7. CI verifies your images and regenerates SBOM/STRUCTURE (see CI/CD below)
+8. Squash-merge PR into development; delete the work branch
+9. When ready to ship: open PR from development -> release
 ```
 
 Direct pushes to `development` stay available — use them for small atomic changes, scaffolding, or emergency hotfixes. The PR flow is the team norm for anything else.
 
 ## CI/CD
 
-**Artifact-before-merge.** Both the Docker images and the SBOM/STRUCTURE doc artifacts are generated on every push to the PR source branch — *before* the merge happens. The PR cannot merge until those builds succeed (enforced via branch protection on `development` and `release`).
+**Contributor-uploads-image.** Heavy multi-arch Docker builds run on the **contributor's machine**, not in CI. Before pushing a PR commit, run `scripts/publish-pr-image.sh` to build and push the per-PR images to GHCR. CI then runs lightweight verification jobs that confirm the images exist and are multi-arch — that's the merge gate. The SBOM/STRUCTURE auto-commit still runs on every PR commit (it's quick).
 
-This is the inversion of the legacy "build on push to development" model: artifacts are part of the gate, not a side effect of merging.
+This trades CI minutes for a small contributor onboarding step. The gate is preserved (PRs cannot merge without verified images); the build cost moves to the engineer who actually edited the source.
+
+### Contributor flow (per PR)
+
+```
+1. git checkout -b improvement/my-change
+2. ... commit work ...
+3. scripts/publish-pr-image.sh        # build + push multi-arch images to GHCR
+4. git push -u origin improvement/my-change
+5. Open PR; build-server / build-embedder verify checks should pass
+6. On every subsequent commit, re-run scripts/publish-pr-image.sh before pushing
+7. Squash-merge into development; delete the work branch
+```
+
+If you push the commit before pushing the image, the verify check fails with a clear error pointing at the script. Run it, then re-trigger the check (push an empty commit or click "Re-run jobs" in GitHub Actions).
+
+**One-time setup:**
+
+```bash
+# Multi-platform builder
+docker buildx create --name multiarch --use --bootstrap
+
+# GHCR login (PAT needs write:packages scope)
+echo $GHCR_PAT | docker login ghcr.io -u <gh-user> --password-stdin
+```
 
 ### What runs on what
 
 | Event | Workflow | What happens |
 |-------|----------|-------------|
 | Push to a work branch with **no open PR** | nothing | test locally |
-| `pull_request: opened/synchronize/reopened` against `development` or `release` | `release.yml` (build jobs) | builds & pushes images tagged `{version}-{branch-slug}-{sha}` (immutable per-commit) and `{version}-{branch-slug}` (rolling per-PR) |
+| `pull_request: opened/synchronize/reopened` against `development` or `release` | `release.yml` (`build-server`, `build-embedder` verify jobs) | confirms the contributor's per-PR images exist on GHCR with both `linux/amd64` and `linux/arm64`. ~30 seconds. No build. |
 | Same trigger | `generate-artifacts.yml` | regenerates `SBOM.md` + `STRUCTURE.md`, commits to PR source branch with `[skip ci]` |
-| `pull_request: closed && merged: true`, base = `development` | `release.yml` (promote job) | retags `{version}-{branch-slug}` -> `dev` + `{version}-dev`. No rebuild. |
-| `pull_request: closed && merged: true`, base = `release` | `release.yml` (promote + github-release-on-merge) | retags `{version}-{branch-slug}` -> `{version}` + `release` + `latest`; creates GitHub Release |
-| `v*` tag push (emergency hotfix only) | `release.yml` (tag-release + github-release-on-tag) | builds & pushes semver-tagged images; creates GitHub Release. Prefer the PR-into-release flow above. |
+| `pull_request: closed && merged: true`, base = `development` | `release.yml` (`promote`) | retags `{version}-{branch-slug}` → `dev` + `{version}-dev`. No rebuild. |
+| `pull_request: closed && merged: true`, base = `release` | `release.yml` (`promote` + `github-release-on-merge` + `release-binaries-on-merge`) | retags → `{version}` + `release` + `latest`; creates GitHub Release; builds `bsmcp-server` native binaries for 5 targets and attaches them to the Release. |
+| `v*` tag push (emergency hotfix only) | `release.yml` (`tag-release` + `github-release-on-tag` + `release-binaries-on-tag`) | builds & pushes semver-tagged images directly in CI (the only build path that still runs in CI), creates the Release, attaches the server binaries. Use only when the contributor cannot push images themselves. |
 
 ### Why this shape
 
-- **PR-source-branch push, not push-to-development.** A push to a work branch with an open PR is the explicit signal "this is ready for review". A push to development is a merge — it's too late to gate. We want the artifact built on the source so the merge is the no-op it should be.
-- **Retag instead of rebuild on merge.** A squash-merge to development produces a new commit SHA, but its source tree is identical to the PR head. Building it again produces a bit-identical image, so we save the CI minutes and just move the rolling tag.
-- **Per-PR rolling tag (`{version}-{branch-slug}`) survives auto-commits.** If `generate-artifacts.yml` appends a `[skip ci]` commit to the PR, the rolling tag still points at the engineer's last manual SHA. Promote uses the rolling tag, not the PR head SHA.
-- **External fork PRs.** The build jobs run for fork PRs too (forks can open PRs even though they can't push to our repo). The artifact-generate job is skipped for forks because `GITHUB_TOKEN` can't push back to a fork's branch.
+- **CI verifies, contributor builds.** The merge gate is preserved: a PR cannot merge unless its per-PR images exist on GHCR. The actual build work moves out of CI onto the engineer's machine, where it amortizes over the local build cache and saves ~15 min of CI minutes per PR push.
+- **Same job names (`build-server`, `build-embedder`) preserved.** Branch protection's required status checks reference these names; renaming them would silently disable the gate until the rule is updated. The job names lie a little — they verify, not build — but the trade-off is worth it.
+- **Retag instead of rebuild on merge.** A squash-merge to development produces a new commit SHA, but its source tree is identical to the PR head. The contributor's image is bit-identical to what a CI build would produce, so promote just moves the rolling tag.
+- **Native binaries: server only.** `bsmcp-server` is pure Rust + bundled SQLite and cross-compiles cleanly. `bsmcp-embedder` depends on `fastembed` → ONNX Runtime → a per-platform C++ shared library; bare binaries would need ONNX Runtime installed on the host. Container is the only supported distribution for the embedder.
+- **External fork PRs are not supported under this model.** Forks cannot push to `ghcr.io/bees-roadhouse/*`, so fork PRs cannot satisfy the verify gate. If outside contribution becomes a real workflow, a maintainer will need to manually build/push the contributor's branch (or use the emergency `v*` tag path).
 
 ### Tag conventions on GHCR
 
-Per-PR (transient, for PR review/testing):
+Per-PR (pushed by the contributor via `scripts/publish-pr-image.sh`):
 - `{version}-{branch-slug}-{sha}` — pinnable to one specific commit
 - `{version}-{branch-slug}` — rolling, moves with each PR push
 
@@ -128,6 +154,20 @@ Release stream (after merge to release or `v*` tag):
 
 Images are published to `ghcr.io/bees-roadhouse/bsmcp-server` and `ghcr.io/bees-roadhouse/bsmcp-embedder` for `linux/amd64` and `linux/arm64`.
 
+### Native binary release artifacts
+
+Each GitHub Release attaches `bsmcp-server` archives for these targets:
+
+| Target | Archive | Runner |
+|--------|---------|--------|
+| `x86_64-unknown-linux-gnu` | `.tar.gz` | ubuntu-22.04 (glibc ≥ 2.35) |
+| `aarch64-unknown-linux-gnu` | `.tar.gz` | ubuntu-22.04 + cross-linker |
+| `x86_64-apple-darwin` | `.tar.gz` | macos-13 |
+| `aarch64-apple-darwin` | `.tar.gz` | macos-14 |
+| `x86_64-pc-windows-msvc` | `.zip` | windows-2022 |
+
+Each archive contains the `bsmcp-server` (or `.exe`) binary plus `README.md` and `LICENSE`.
+
 ### Branch protection
 
 Protection lives at the **organization level** via a GitHub Ruleset (`Release Branch Protection`) targeting `refs/heads/release` on every repo in `bees-roadhouse`:
@@ -138,7 +178,7 @@ Protection lives at the **organization level** via a GitHub Ruleset (`Release Br
 
 `development` is **intentionally unprotected** — direct pushes stay authorized so scaffolding, hotfixes, and small atomic changes don't get stuck in PR ceremony. CI runs on every push regardless, so regressions are still caught.
 
-Required status checks (`build-server`, `build-embedder`) gate the merge into `release` once the PR is open. The artifact-before-merge invariant comes from those checks plus the PR-source-branch trigger, not from blocking direct pushes.
+Required status checks (`build-server`, `build-embedder`) gate the merge into `release` once the PR is open. They now verify rather than build, but the contract from the protection rule's perspective is unchanged.
 
 ### Commit signing
 

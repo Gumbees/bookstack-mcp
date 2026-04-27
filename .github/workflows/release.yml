@@ -1,25 +1,37 @@
 name: Build and Release
 
-# Artifact-before-merge model:
+# Contributor-uploads-image model:
 #
-#   1. PR opened/updated against development or release  ->  `build` jobs
-#      build & push images tagged with the PR's branch slug. This is the
-#      artifact the merge gate requires. The PR cannot merge until both
-#      builds succeed (enforced via branch protection: require status checks
-#      "build-server" and "build-embedder").
+#   1. Before pushing a PR commit, the contributor runs scripts/publish-pr-image.sh
+#      to build & push multi-arch images to GHCR with the per-PR tags
+#      `{version}-{slug}-{sha}` and `{version}-{slug}`. CI does NOT build images
+#      on PR commits — that's the contributor's job and shifts ~15 min of CI
+#      minutes off every push.
 #
-#   2. PR merged                                          ->  `promote` job
-#      retags the existing per-PR image as the appropriate stream tag
+#   2. PR opened/updated against development or release  ->  `build-*` jobs
+#      run lightweight verification: confirm the image manifest exists at the
+#      expected per-PR tag and is multi-arch (linux/amd64 + linux/arm64).
+#      The PR cannot merge until both verify checks pass (enforced via branch
+#      protection: required status checks "build-server" and "build-embedder").
+#      Job names preserved so existing branch protection rulesets keep working.
+#
+#   3. PR merged                                         ->  `promote` job
+#      retags the contributor's per-PR image as the appropriate stream tag
 #      (`dev`/`{version}-dev` for development merges; `{version}`/`release`/
 #      `latest` for release merges). No rebuild — the merge commit shares
 #      the source tree of the PR head.
 #
-#   3. PR merged into release                             ->  `github-release`
-#      creates a GitHub Release entry with image refs in the body.
+#   4. PR merged into release                            ->  `github-release-on-merge`
+#      creates a GitHub Release entry, then `release-binaries-on-merge` builds
+#      `bsmcp-server` native binaries for 5 targets and attaches them to the
+#      Release. The embedder is NOT released as a bare binary (ONNX Runtime
+#      native dep) — Docker is the only supported distribution for it.
 #
-#   4. v* tag push (emergency hotfix path)                ->  `tag-release`
-#      builds & pushes semver-tagged images and creates a GitHub Release.
-#      Prefer the PR-into-release flow above for normal releases.
+#   5. v* tag push (emergency hotfix path)               ->  `tag-release`
+#      builds & pushes semver-tagged images directly in CI (the only build
+#      path that still runs in CI), creates the Release, and attaches the
+#      server binaries. Use only when the contributor cannot push images
+#      themselves.
 
 on:
   pull_request:
@@ -38,22 +50,19 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
+      packages: read
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve version + branch slug
+      - name: Resolve expected tag
         id: vars
         run: |
           VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
-          SHORT_SHA=${GITHUB_SHA::7}
+          HEAD_SHA=${{ github.event.pull_request.head.sha }}
+          SHORT_SHA=${HEAD_SHA:0:7}
           SLUG=$(echo "${{ github.event.pull_request.head.ref }}" | tr '/' '-' | tr -c 'a-zA-Z0-9._-' '-')
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-          echo "slug=${SLUG}" >> "$GITHUB_OUTPUT"
-
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+          echo "tag=${VERSION}-${SLUG}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "image=${{ env.REGISTRY }}/bees-roadhouse/bsmcp-server" >> "$GITHUB_OUTPUT"
 
       - uses: docker/login-action@v3
         with:
@@ -61,43 +70,45 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push server image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/Dockerfile.server
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/bees-roadhouse/bsmcp-server:${{ steps.vars.outputs.version }}-${{ steps.vars.outputs.slug }}-${{ steps.vars.outputs.short_sha }}
-            ${{ env.REGISTRY }}/bees-roadhouse/bsmcp-server:${{ steps.vars.outputs.version }}-${{ steps.vars.outputs.slug }}
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.event.pull_request.head.sha }}
-          cache-from: type=gha,scope=server
-          cache-to: type=gha,mode=max,scope=server
+      - name: Verify image exists and is multi-arch
+        run: |
+          REF="${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.tag }}"
+          echo "Inspecting $REF"
+          if ! docker buildx imagetools inspect --raw "$REF" > manifest.json 2>/tmp/err; then
+            echo "::error::Image not found at $REF"
+            echo "::error::Run scripts/publish-pr-image.sh on your branch to build and push it. See DEVELOPMENT.md."
+            cat /tmp/err
+            exit 1
+          fi
+          # Manifest list must include both linux/amd64 and linux/arm64.
+          ARCHES=$(jq -r '.manifests[]?.platform | "\(.os)/\(.architecture)"' manifest.json | sort -u | tr '\n' ' ')
+          echo "Found arches: $ARCHES"
+          for want in linux/amd64 linux/arm64; do
+            if ! echo " $ARCHES " | grep -q " $want "; then
+              echo "::error::Image is missing platform $want — manifest had: $ARCHES"
+              exit 1
+            fi
+          done
+          echo "OK: $REF is multi-arch (linux/amd64 + linux/arm64)"
 
   build-embedder:
     if: github.event_name == 'pull_request' && github.event.action != 'closed'
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
+      packages: read
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve version + branch slug
+      - name: Resolve expected tag
         id: vars
         run: |
           VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
-          SHORT_SHA=${GITHUB_SHA::7}
+          HEAD_SHA=${{ github.event.pull_request.head.sha }}
+          SHORT_SHA=${HEAD_SHA:0:7}
           SLUG=$(echo "${{ github.event.pull_request.head.ref }}" | tr '/' '-' | tr -c 'a-zA-Z0-9._-' '-')
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-          echo "slug=${SLUG}" >> "$GITHUB_OUTPUT"
-
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+          echo "tag=${VERSION}-${SLUG}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "image=${{ env.REGISTRY }}/bees-roadhouse/bsmcp-embedder" >> "$GITHUB_OUTPUT"
 
       - uses: docker/login-action@v3
         with:
@@ -105,21 +116,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push embedder image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/Dockerfile.embedder
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/bees-roadhouse/bsmcp-embedder:${{ steps.vars.outputs.version }}-${{ steps.vars.outputs.slug }}-${{ steps.vars.outputs.short_sha }}
-            ${{ env.REGISTRY }}/bees-roadhouse/bsmcp-embedder:${{ steps.vars.outputs.version }}-${{ steps.vars.outputs.slug }}
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.event.pull_request.head.sha }}
-          cache-from: type=gha,scope=embedder
-          cache-to: type=gha,mode=max,scope=embedder
+      - name: Verify image exists and is multi-arch
+        run: |
+          REF="${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.tag }}"
+          echo "Inspecting $REF"
+          if ! docker buildx imagetools inspect --raw "$REF" > manifest.json 2>/tmp/err; then
+            echo "::error::Image not found at $REF"
+            echo "::error::Run scripts/publish-pr-image.sh on your branch to build and push it. See DEVELOPMENT.md."
+            cat /tmp/err
+            exit 1
+          fi
+          ARCHES=$(jq -r '.manifests[]?.platform | "\(.os)/\(.architecture)"' manifest.json | sort -u | tr '\n' ' ')
+          echo "Found arches: $ARCHES"
+          for want in linux/amd64 linux/arm64; do
+            if ! echo " $ARCHES " | grep -q " $want "; then
+              echo "::error::Image is missing platform $want — manifest had: $ARCHES"
+              exit 1
+            fi
+          done
+          echo "OK: $REF is multi-arch (linux/amd64 + linux/arm64)"
 
   promote:
     if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true
@@ -176,6 +191,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
+      version: ${{ steps.vars.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -223,6 +241,86 @@ jobs:
             docker pull ghcr.io/bees-roadhouse/bsmcp-server:release
             docker pull ghcr.io/bees-roadhouse/bsmcp-embedder:release
             ```
+
+            ## Native binaries (`bsmcp-server` only)
+
+            Server binaries for common platforms are attached below. The embedder is not released as a bare binary because of its ONNX Runtime dependency — use the container image instead.
+
+  release-binaries-on-merge:
+    if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'release'
+    needs: [github-release-on-merge]
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            archive: tar.gz
+            cross: true
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+            archive: zip
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation linker (Linux aarch64 only)
+        if: matrix.cross == true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<EOF
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+
+      - name: Build server binary
+        run: cargo build --release --locked --target ${{ matrix.target }} -p bsmcp-server
+
+      - name: Package archive (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          STAGE=bsmcp-server-${{ needs.github-release-on-merge.outputs.tag }}-${{ matrix.target }}
+          mkdir "$STAGE"
+          cp target/${{ matrix.target }}/release/bsmcp-server "$STAGE/"
+          cp README.md LICENSE "$STAGE/" 2>/dev/null || true
+          tar czf "$STAGE.tar.gz" "$STAGE"
+          echo "ARCHIVE=$STAGE.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package archive (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $stage = "bsmcp-server-${{ needs.github-release-on-merge.outputs.tag }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/bsmcp-server.exe" "$stage/"
+          if (Test-Path README.md) { Copy-Item README.md "$stage/" }
+          if (Test-Path LICENSE) { Copy-Item LICENSE "$stage/" }
+          Compress-Archive -Path $stage -DestinationPath "$stage.zip"
+          "ARCHIVE=$stage.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Attach archive to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.github-release-on-merge.outputs.tag }}
+          files: ${{ env.ARCHIVE }}
 
   tag-release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
@@ -314,3 +412,83 @@ jobs:
             docker pull ghcr.io/bees-roadhouse/bsmcp-server:${{ steps.vars.outputs.version }}
             docker pull ghcr.io/bees-roadhouse/bsmcp-embedder:${{ steps.vars.outputs.version }}
             ```
+
+            ## Native binaries (`bsmcp-server` only)
+
+            Server binaries for common platforms are attached below. The embedder is not released as a bare binary because of its ONNX Runtime dependency — use the container image instead.
+
+  release-binaries-on-tag:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [github-release-on-tag]
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            archive: tar.gz
+            cross: true
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+            archive: zip
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation linker (Linux aarch64 only)
+        if: matrix.cross == true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<EOF
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+
+      - name: Build server binary
+        run: cargo build --release --locked --target ${{ matrix.target }} -p bsmcp-server
+
+      - name: Package archive (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          STAGE=bsmcp-server-${{ github.ref_name }}-${{ matrix.target }}
+          mkdir "$STAGE"
+          cp target/${{ matrix.target }}/release/bsmcp-server "$STAGE/"
+          cp README.md LICENSE "$STAGE/" 2>/dev/null || true
+          tar czf "$STAGE.tar.gz" "$STAGE"
+          echo "ARCHIVE=$STAGE.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package archive (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $stage = "bsmcp-server-${{ github.ref_name }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/bsmcp-server.exe" "$stage/"
+          if (Test-Path README.md) { Copy-Item README.md "$stage/" }
+          if (Test-Path LICENSE) { Copy-Item LICENSE "$stage/" }
+          Compress-Archive -Path $stage -DestinationPath "$stage.zip"
+          "ARCHIVE=$stage.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Attach archive to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: ${{ env.ARCHIVE }}

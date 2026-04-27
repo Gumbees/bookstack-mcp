@@ -131,7 +131,11 @@ async fn execute_tool(
             let default_threshold = if hybrid { 0.45 } else { 0.50 };
             let threshold = args.get("threshold").and_then(|v| v.as_f64()).unwrap_or(default_threshold) as f32;
             let verbose = args.get("verbose").and_then(|v| v.as_bool()).unwrap_or(false);
-            let result = sem.search(&query, limit, threshold, hybrid, verbose, client, None).await?;
+            // ACL filter is left disabled at the raw `semantic_search` tool
+            // entry point — it has no UserSettings context to look up the
+            // caller's `bookstack_user_id`. The HTTP `filter_by_permission`
+            // fallback inside `sem.search` still enforces access control.
+            let result = sem.search(&query, limit, threshold, hybrid, verbose, client, None, None).await?;
             format_json(&result)
         }
         "reembed" => {
@@ -1916,7 +1920,8 @@ fn add_remember_tools(tools: &mut Vec<Value>) {
 
     tools.push(remember_tool(
         "user",
-        "Human user identity. read returns the user's identity page + journal pointer. write replaces the user identity page body.",
+        "Human user identity. read auto-provisions missing structure (per-user Identity book on the user-journals shelf, Identity page, Agent: {user_id}-journal-agent page, journal book) when `user_id` is set, returning what was created in `auto_provisioned`. write replaces the user identity page body. \
+         IMPORTANT: as you work with the user, learn what they care about, how they prefer to collaborate, and update the identity page to reflect that — the briefing surfaces a refresh reminder after 30 days of inactivity.",
         &["read", "write"],
         json!({
             "body": { "type": "string", "description": "New user identity markdown for write" },
@@ -1925,11 +1930,14 @@ fn add_remember_tools(tools: &mut Vec<Value>) {
 
     tools.push(remember_tool(
         "config",
-        "Per-user settings AND (admin-only) global shelves. read returns both `{settings, global_settings}`. write accepts `settings` (per-user — any user) and/or `global_settings` (admin-only, server-side first-write-wins; pre-set fields cannot be changed and trigger a `global_locked` warning). dismiss_setup_nudge snoozes the briefing's setup reminder for `days` days (default 7, max 365).",
+        "Per-user settings AND (admin-only) global shelves. read returns both `{settings, global_settings}`. write accepts `settings` (per-user — any user) and/or `global_settings` (admin-only, server-side first-write-wins for shelf and org_identity_page IDs; org_domains and org-default identity are tunable). \
+         Per-user fields the AI typically maintains: `domains` (list of strings — owned domains for ours/external classification), `bookstack_user_id` (numeric BookStack user id, enables ACL-filtered semantic search), `user_id` (stable identifier, drives auto-provisioning naming), plus the ai_*/user_* book/page IDs. \
+         Admin-only globals: `hive_shelf_id`, `user_journals_shelf_id`, `org_identity_page_id` (first-write-wins), `org_domains` (replaces on write), and the org-default identity fields. \
+         dismiss_setup_nudge snoozes the briefing's setup reminder for `days` days (default 7, max 365).",
         &["read", "write", "dismiss_setup_nudge"],
         json!({
             "settings": { "type": "object", "description": "Full UserSettings object for per-user write" },
-            "global_settings": { "type": "object", "description": "GlobalSettings object (admin-only). Only null fields are written; set fields are preserved." },
+            "global_settings": { "type": "object", "description": "GlobalSettings object (admin-only). Only null fields are written; set fields are preserved (except org_domains which replaces)." },
             "days": { "type": "integer", "description": "For dismiss_setup_nudge: how many days to snooze (default 7, max 365)" },
         }),
     ));

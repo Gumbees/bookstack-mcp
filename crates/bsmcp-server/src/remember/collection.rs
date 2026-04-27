@@ -4,10 +4,11 @@
 
 use serde_json::{json, Value};
 
-use bsmcp_common::settings::UserSettings;
+use bsmcp_common::settings::{GlobalSettings, UserSettings};
 
 use super::envelope::{ErrorCode, RememberWarning};
 use super::frontmatter;
+use super::provision;
 use super::{Context, Outcome};
 
 /// Book ID where a resource's pages live. Pages may be distributed across
@@ -47,6 +48,14 @@ pub trait CollectionResource: Send + Sync {
     /// from the AI's perspective in a future revision; for v1 all are writable.
     fn writable(&self) -> bool {
         true
+    }
+
+    /// When set, every successful write to this resource ensures the parent
+    /// book lives on the named global shelf — books that have drifted off
+    /// the shelf are reattached on each write. Currently only `user_journal`
+    /// uses this; other collections aren't shelf-pinned.
+    fn shelf_pin(&self, _globals: &GlobalSettings) -> Option<i64> {
+        None
     }
 }
 
@@ -219,6 +228,16 @@ async fn handle_write(
     parent: CollectionParent,
     ctx: &Context,
 ) -> Outcome {
+    // Self-healing shelf pin: if the resource is shelf-pinned (currently
+    // user_journal), reattach the parent book to the configured shelf on
+    // every write. Idempotent — `ensure_book_on_shelf` is a no-op when the
+    // book is already there. Runs before the page write so the new entry
+    // lands in a correctly-attached book.
+    let globals = ctx.db.get_global_settings().await.unwrap_or_default();
+    if let Some(shelf_id) = resource.shelf_pin(&globals) {
+        provision::ensure_book_on_shelf(&ctx.client, parent, shelf_id).await;
+    }
+
     let body_text = match ctx.body_str("body") {
         Some(b) => b,
         None => {
@@ -403,7 +422,22 @@ async fn handle_search(
     // semantic backend doesn't accept book/chapter filters yet.
     let mut warnings = Vec::new();
     let semantic_hits: Vec<Value> = if let Some(sem) = &ctx.semantic {
-        match sem.search(&query, limit * 4, 0.45, true, false, &ctx.client, None).await {
+        let user_roles = sem
+            .resolve_user_roles(&ctx.token_id_hash, ctx.settings.bookstack_user_id, &ctx.client)
+            .await;
+        match sem
+            .search(
+                &query,
+                limit * 4,
+                0.45,
+                true,
+                false,
+                &ctx.client,
+                None,
+                user_roles.as_deref(),
+            )
+            .await
+        {
             Ok(v) => {
                 let results = v.get("results").and_then(|r| r.as_array()).cloned().unwrap_or_default();
                 results.into_iter().filter(|hit| matches_parent(hit, parent)).take(limit).collect()
@@ -567,6 +601,11 @@ pub mod resources {
         fn key_kind(&self) -> KeyKind { KeyKind::Date }
         fn sub_chapter_for_key(&self, key: &str) -> Option<String> {
             if key.len() >= 7 { Some(key[..7].to_string()) } else { None }
+        }
+        fn shelf_pin(&self, globals: &GlobalSettings) -> Option<i64> {
+            // Force every user-journal write to reattach the book to the
+            // global User Journals shelf — self-healing if the book drifts off.
+            globals.user_journals_shelf_id
         }
     }
 }

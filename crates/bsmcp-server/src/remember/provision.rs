@@ -214,6 +214,78 @@ pub async fn lock_to_admin_only(
     }
 }
 
+/// Ensure a book sits on a shelf. Idempotent — no-op if it's already there.
+/// Best-effort: failures are logged and swallowed since shelf attachment is
+/// always recoverable via the BookStack UI.
+pub async fn ensure_book_on_shelf(
+    client: &BookStackClient,
+    book_id: i64,
+    shelf_id: i64,
+) {
+    let shelf = match client.get_shelf(shelf_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Provision: ensure_book_on_shelf({book_id} → {shelf_id}) — get_shelf failed (non-fatal): {e}");
+            return;
+        }
+    };
+    let mut existing: Vec<i64> = shelf
+        .get("books")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|b| b.get("id").and_then(|i| i.as_i64())).collect())
+        .unwrap_or_default();
+    if existing.contains(&book_id) {
+        return;
+    }
+    existing.push(book_id);
+    let payload = json!({ "books": existing });
+    if let Err(e) = client.update_shelf(shelf_id, &payload).await {
+        eprintln!("Provision: ensure_book_on_shelf({book_id} → {shelf_id}) — update_shelf failed (non-fatal): {e}");
+    }
+}
+
+/// Create a book with a personalized name (used by per-user provisioning).
+pub async fn create_named_book(
+    client: &BookStackClient,
+    name: &str,
+    description: &str,
+    parent_shelf_id: Option<i64>,
+) -> ProvisionResult {
+    let book = match client.create_book(name, description).await {
+        Ok(v) => v,
+        Err(e) => return classify_error(&e),
+    };
+    let book_id = match book.get("id").and_then(|i| i.as_i64()) {
+        Some(id) => id,
+        None => return ProvisionResult::Failed { reason: "create_book returned no id".to_string() },
+    };
+    if let Some(shelf_id) = parent_shelf_id {
+        ensure_book_on_shelf(client, book_id, shelf_id).await;
+    }
+    ProvisionResult::Created { id: book_id, name: name.to_string() }
+}
+
+/// Create a page with an arbitrary name + body inside a book.
+pub async fn create_named_page(
+    client: &BookStackClient,
+    name: &str,
+    parent_book_id: i64,
+    markdown: &str,
+) -> ProvisionResult {
+    let payload = json!({
+        "name": name,
+        "book_id": parent_book_id,
+        "markdown": markdown,
+    });
+    match client.create_page(&payload).await {
+        Ok(v) => match v.get("id").and_then(|i| i.as_i64()) {
+            Some(id) => ProvisionResult::Created { id, name: name.to_string() },
+            None => ProvisionResult::Failed { reason: "create_page returned no id".to_string() },
+        },
+        Err(e) => classify_error(&e),
+    }
+}
+
 /// Create a page inside a book or chapter, with the given markdown body.
 #[allow(dead_code)] // reserved for future identity/whoami auto-creation paths
 pub async fn create_page(

@@ -30,6 +30,17 @@ fn decode_id_list(value: Option<String>) -> Vec<i64> {
     }
 }
 
+fn encode_str_list(values: &[String]) -> Option<String> {
+    if values.is_empty() { None } else { serde_json::to_string(values).ok() }
+}
+
+fn decode_str_list(value: Option<String>) -> Vec<String> {
+    match value {
+        Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
 pub struct PostgresDb {
     pool: PgPool,
     encryption_key: Zeroizing<[u8; 32]>,
@@ -129,6 +140,8 @@ impl PostgresDb {
                 default_ai_identity_ouid TEXT,
                 org_required_instructions_page_ids TEXT,
                 org_ai_usage_policy_page_ids TEXT,
+                org_identity_page_id BIGINT,
+                org_domains TEXT,
                 set_by_token_hash TEXT,
                 updated_at BIGINT NOT NULL DEFAULT 0
             )"
@@ -147,6 +160,8 @@ impl PostgresDb {
             "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS default_ai_identity_ouid TEXT",
             "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS org_required_instructions_page_ids TEXT",
             "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS org_ai_usage_policy_page_ids TEXT",
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS org_identity_page_id BIGINT",
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS org_domains TEXT",
         ] {
             sqlx::query(sql).execute(&pool).await.ok();
         }
@@ -427,6 +442,7 @@ impl DbBackend for PostgresDb {
                     default_ai_identity_page_id, default_ai_identity_name, default_ai_identity_ouid,
                     org_required_instructions_page_ids,
                     org_ai_usage_policy_page_ids,
+                    org_identity_page_id, org_domains,
                     set_by_token_hash, updated_at
              FROM global_settings WHERE id = 1"
         )
@@ -442,6 +458,8 @@ impl DbBackend for PostgresDb {
             default_ai_identity_ouid: r.get("default_ai_identity_ouid"),
             org_required_instructions_page_ids: decode_id_list(r.get("org_required_instructions_page_ids")),
             org_ai_usage_policy_page_ids: decode_id_list(r.get("org_ai_usage_policy_page_ids")),
+            org_identity_page_id: r.get("org_identity_page_id"),
+            org_domains: decode_str_list(r.get("org_domains")),
             set_by_token_hash: r.get("set_by_token_hash"),
             updated_at: r.get("updated_at"),
         }).unwrap_or_default())
@@ -470,8 +488,10 @@ impl DbBackend for PostgresDb {
                  default_ai_identity_ouid = $5,
                  org_required_instructions_page_ids = $6,
                  org_ai_usage_policy_page_ids = $7,
-                 set_by_token_hash = $8,
-                 updated_at = $9
+                 org_identity_page_id = $8,
+                 org_domains = $9,
+                 set_by_token_hash = $10,
+                 updated_at = $11
              WHERE id = 1"
         )
         .bind(settings.hive_shelf_id)
@@ -481,6 +501,8 @@ impl DbBackend for PostgresDb {
         .bind(&settings.default_ai_identity_ouid)
         .bind(encode_id_list(&settings.org_required_instructions_page_ids))
         .bind(encode_id_list(&settings.org_ai_usage_policy_page_ids))
+        .bind(settings.org_identity_page_id)
+        .bind(encode_str_list(&settings.org_domains))
         .bind(&final_setter)
         .bind(Self::now_secs())
         .execute(&self.pool)
@@ -594,6 +616,44 @@ impl SemanticDb for PostgresDb {
         // Schema migration: add updated_at column if missing
         sqlx::query("ALTER TABLE pages ADD COLUMN IF NOT EXISTS updated_at TEXT")
             .execute(&self.pool).await.ok();
+
+        // Permission ACL: per-page role visibility, populated at embed time
+        // by walking BookStack content_permissions inheritance.
+        sqlx::query("ALTER TABLE pages ADD COLUMN IF NOT EXISTS acl_default_open BOOLEAN")
+            .execute(&self.pool).await.ok();
+        sqlx::query("ALTER TABLE pages ADD COLUMN IF NOT EXISTS acl_computed_at BIGINT")
+            .execute(&self.pool).await.ok();
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS page_view_acl (
+                page_id BIGINT NOT NULL,
+                role_id BIGINT NOT NULL,
+                PRIMARY KEY (page_id, role_id)
+            )"
+        ).execute(&self.pool).await
+            .map_err(|e| format!("Failed to create page_view_acl: {e}"))?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_page_view_acl_role ON page_view_acl(role_id, page_id)")
+            .execute(&self.pool).await.ok();
+
+        // Cache: BookStack user id + role IDs per token. Refreshed lazily by
+        // semantic.rs on first vector_search per session, ~15 min TTL.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS user_role_cache (
+                token_id_hash TEXT PRIMARY KEY,
+                bookstack_user_id BIGINT NOT NULL,
+                role_ids TEXT NOT NULL,
+                fetched_at BIGINT NOT NULL
+            )"
+        ).execute(&self.pool).await
+            .map_err(|e| format!("Failed to create user_role_cache: {e}"))?;
+
+        // Reconciliation tracker — single-row table for the daily ACL refresh job.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS acl_reconcile_state (
+                scope TEXT PRIMARY KEY,
+                last_full_run BIGINT NOT NULL DEFAULT 0
+            )"
+        ).execute(&self.pool).await
+            .map_err(|e| format!("Failed to create acl_reconcile_state: {e}"))?;
 
         eprintln!("Semantic: PostgreSQL tables initialized");
         Ok(())
@@ -1097,6 +1157,7 @@ impl SemanticDb for PostgresDb {
         limit: usize,
         threshold: f32,
         book_ids: Option<&[i64]>,
+        user_role_ids: Option<&[i64]>,
     ) -> Result<Vec<SearchHit>, String> {
         // Sanity check: detect garbage embeddings (all zeros, NaN, etc.)
         let magnitude: f32 = query_embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -1120,9 +1181,43 @@ impl SemanticDb for PostgresDb {
             Some(ids) if !ids.is_empty() => Some(ids.to_vec()),
             _ => None,
         };
+        // Optional ACL filter. The predicate keeps chunks whose page is either:
+        //   - default-open (no explicit role restrictions anywhere in the
+        //     inheritance chain; HTTP fallback resolves system-level perms),
+        //   - has no ACL row computed yet (HTTP fallback in semantic.rs),
+        //   - has a `page_view_acl` row matching one of the user's roles.
+        // This eliminates pages we already know the user can't view from the
+        // candidate pool without losing recall on as-yet-uncomputed pages.
+        let role_filter: Option<Vec<i64>> = match user_role_ids {
+            Some(ids) if !ids.is_empty() => Some(ids.to_vec()),
+            _ => None,
+        };
 
-        let rows = if let Some(ids) = book_filter {
-            sqlx::query(
+        let rows = match (book_filter, role_filter) {
+            (Some(books), Some(roles)) => sqlx::query(
+                "SELECT c.id, c.page_id, (1 - (c.embedding <=> $1::vector))::FLOAT4 AS score
+                 FROM chunks c
+                 JOIN pages p ON c.page_id = p.page_id
+                 WHERE 1 - (c.embedding <=> $1::vector) > $2::FLOAT8
+                   AND p.book_id = ANY($4)
+                   AND (
+                        p.acl_computed_at IS NULL
+                        OR COALESCE(p.acl_default_open, FALSE) = TRUE
+                        OR EXISTS (
+                            SELECT 1 FROM page_view_acl a
+                            WHERE a.page_id = p.page_id AND a.role_id = ANY($5)
+                        )
+                   )
+                 ORDER BY c.embedding <=> $1::vector
+                 LIMIT $3"
+            )
+            .bind(&vec)
+            .bind(threshold)
+            .bind(limit as i64)
+            .bind(&books)
+            .bind(&roles)
+            .fetch_all(&mut *tx).await,
+            (Some(books), None) => sqlx::query(
                 "SELECT c.id, c.page_id, (1 - (c.embedding <=> $1::vector))::FLOAT4 AS score
                  FROM chunks c
                  JOIN pages p ON c.page_id = p.page_id
@@ -1134,12 +1229,30 @@ impl SemanticDb for PostgresDb {
             .bind(&vec)
             .bind(threshold)
             .bind(limit as i64)
-            .bind(&ids)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| format!("vector_search (scoped) failed: {e}"))?
-        } else {
-            sqlx::query(
+            .bind(&books)
+            .fetch_all(&mut *tx).await,
+            (None, Some(roles)) => sqlx::query(
+                "SELECT c.id, c.page_id, (1 - (c.embedding <=> $1::vector))::FLOAT4 AS score
+                 FROM chunks c
+                 JOIN pages p ON c.page_id = p.page_id
+                 WHERE 1 - (c.embedding <=> $1::vector) > $2::FLOAT8
+                   AND (
+                        p.acl_computed_at IS NULL
+                        OR COALESCE(p.acl_default_open, FALSE) = TRUE
+                        OR EXISTS (
+                            SELECT 1 FROM page_view_acl a
+                            WHERE a.page_id = p.page_id AND a.role_id = ANY($4)
+                        )
+                   )
+                 ORDER BY c.embedding <=> $1::vector
+                 LIMIT $3"
+            )
+            .bind(&vec)
+            .bind(threshold)
+            .bind(limit as i64)
+            .bind(&roles)
+            .fetch_all(&mut *tx).await,
+            (None, None) => sqlx::query(
                 "SELECT id, page_id, (1 - (embedding <=> $1::vector))::FLOAT4 AS score
                  FROM chunks
                  WHERE 1 - (embedding <=> $1::vector) > $2::FLOAT8
@@ -1149,10 +1262,9 @@ impl SemanticDb for PostgresDb {
             .bind(&vec)
             .bind(threshold)
             .bind(limit as i64)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| format!("vector_search failed: {e}"))?
+            .fetch_all(&mut *tx).await,
         };
+        let rows = rows.map_err(|e| format!("vector_search failed: {e}"))?;
 
         tx.commit().await.ok();
 
@@ -1278,6 +1390,123 @@ impl SemanticDb for PostgresDb {
             .execute(&self.pool)
             .await
             .map_err(|e| format!("set_meta: {e}"))?;
+        Ok(())
+    }
+
+    async fn upsert_page_acl(&self, acl: &PageAcl) -> Result<(), String> {
+        let mut tx = self.pool.begin().await
+            .map_err(|e| format!("upsert_page_acl tx: {e}"))?;
+        sqlx::query("DELETE FROM page_view_acl WHERE page_id = $1")
+            .bind(acl.page_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("upsert_page_acl delete: {e}"))?;
+        for &role_id in &acl.view_roles {
+            sqlx::query(
+                "INSERT INTO page_view_acl (page_id, role_id) VALUES ($1, $2)
+                 ON CONFLICT (page_id, role_id) DO NOTHING"
+            )
+            .bind(acl.page_id)
+            .bind(role_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("upsert_page_acl insert: {e}"))?;
+        }
+        sqlx::query(
+            "UPDATE pages SET acl_default_open = $1, acl_computed_at = $2 WHERE page_id = $3"
+        )
+        .bind(acl.default_open)
+        .bind(acl.computed_at)
+        .bind(acl.page_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("upsert_page_acl flag: {e}"))?;
+        tx.commit().await.map_err(|e| format!("upsert_page_acl commit: {e}"))?;
+        Ok(())
+    }
+
+    async fn delete_page_acl(&self, page_id: i64) -> Result<(), String> {
+        sqlx::query("DELETE FROM page_view_acl WHERE page_id = $1")
+            .bind(page_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("delete_page_acl: {e}"))?;
+        Ok(())
+    }
+
+    async fn delete_role_from_acl(&self, role_id: i64) -> Result<(), String> {
+        sqlx::query("DELETE FROM page_view_acl WHERE role_id = $1")
+            .bind(role_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("delete_role_from_acl: {e}"))?;
+        Ok(())
+    }
+
+    async fn list_acl_page_ids(&self) -> Result<Vec<i64>, String> {
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT page_id FROM pages WHERE acl_computed_at IS NOT NULL"
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_acl_page_ids: {e}"))?;
+        Ok(rows.into_iter().map(|r| r.0).collect())
+    }
+
+    async fn get_cached_user_roles(
+        &self,
+        token_id_hash: &str,
+        max_age_secs: i64,
+    ) -> Result<Option<(i64, Vec<i64>)>, String> {
+        let cutoff = Self::now_secs() - max_age_secs;
+        let row: Option<(i64, String, i64)> = sqlx::query_as(
+            "SELECT bookstack_user_id, role_ids, fetched_at
+             FROM user_role_cache WHERE token_id_hash = $1"
+        )
+        .bind(token_id_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("get_cached_user_roles: {e}"))?;
+        match row {
+            Some((uid, json, fetched)) if fetched > cutoff => {
+                let roles: Vec<i64> = serde_json::from_str(&json).unwrap_or_default();
+                Ok(Some((uid, roles)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn set_cached_user_roles(
+        &self,
+        token_id_hash: &str,
+        bookstack_user_id: i64,
+        role_ids: &[i64],
+    ) -> Result<(), String> {
+        let json = serde_json::to_string(role_ids).unwrap_or_else(|_| "[]".to_string());
+        sqlx::query(
+            "INSERT INTO user_role_cache (token_id_hash, bookstack_user_id, role_ids, fetched_at)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (token_id_hash) DO UPDATE SET
+                bookstack_user_id = EXCLUDED.bookstack_user_id,
+                role_ids = EXCLUDED.role_ids,
+                fetched_at = EXCLUDED.fetched_at"
+        )
+        .bind(token_id_hash)
+        .bind(bookstack_user_id)
+        .bind(&json)
+        .bind(Self::now_secs())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("set_cached_user_roles: {e}"))?;
+        Ok(())
+    }
+
+    async fn delete_user_role_cache_by_bs_id(&self, bookstack_user_id: i64) -> Result<(), String> {
+        sqlx::query("DELETE FROM user_role_cache WHERE bookstack_user_id = $1")
+            .bind(bookstack_user_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("delete_user_role_cache_by_bs_id: {e}"))?;
         Ok(())
     }
 }

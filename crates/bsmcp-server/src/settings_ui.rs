@@ -190,8 +190,12 @@ pub struct SettingsForm {
     pub ai_shared_collage_book_id: Option<String>,
     pub ai_hive_journal_book_id: Option<String>,
     pub user_id: Option<String>,
+    pub bookstack_user_id: Option<String>,
     pub user_identity_page_id: Option<String>,
+    pub user_identity_book_id: Option<String>,
+    pub user_journal_agent_page_id: Option<String>,
     pub user_journal_book_id: Option<String>,
+    pub domains: Option<String>,
     pub semantic_against_journal: Option<String>,
     pub semantic_against_collage: Option<String>,
     pub semantic_against_shared_collage: Option<String>,
@@ -220,6 +224,11 @@ pub struct SettingsForm {
     pub default_ai_identity_page_id: Option<String>,
     pub default_ai_identity_name: Option<String>,
     pub default_ai_identity_ouid: Option<String>,
+
+    // Org identity + domains (admins only). org_identity_page_id is
+    // first-write-wins like the shelves; org_domains is tunable.
+    pub org_identity_page_id: Option<String>,
+    pub org_domains: Option<String>,
 }
 
 fn empty_to_none(s: Option<String>) -> Option<String> {
@@ -242,6 +251,28 @@ fn parse_id_list(s: Option<String>) -> Vec<i64> {
     raw.split(|c: char| !c.is_ascii_digit())
         .filter_map(|tok| tok.parse::<i64>().ok())
         .collect()
+}
+
+/// Parse a free-form list of domains / strings. Splits on commas and
+/// whitespace, trims, drops empties, deduplicates.
+fn parse_str_list(s: Option<String>) -> Vec<String> {
+    let Some(raw) = empty_to_none(s) else { return Vec::new(); };
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for tok in raw.split(|c: char| c == ',' || c.is_whitespace()) {
+        let v = tok.trim().to_lowercase();
+        if v.is_empty() {
+            continue;
+        }
+        if seen.insert(v.clone()) {
+            out.push(v);
+        }
+    }
+    out
+}
+
+fn format_str_list(values: &[String]) -> String {
+    values.join(", ")
 }
 
 fn format_id_list(ids: &[i64]) -> String {
@@ -281,8 +312,12 @@ pub async fn handle_settings_post(
         ai_shared_collage_book_id: parse_id(form.ai_shared_collage_book_id),
         ai_hive_journal_book_id: parse_id(form.ai_hive_journal_book_id),
         user_id: empty_to_none(form.user_id.clone()),
+        bookstack_user_id: parse_id(form.bookstack_user_id.clone()),
         user_identity_page_id: parse_id(form.user_identity_page_id),
+        user_identity_book_id: parse_id(form.user_identity_book_id.clone()),
+        user_journal_agent_page_id: parse_id(form.user_journal_agent_page_id.clone()),
         user_journal_book_id: parse_id(form.user_journal_book_id),
+        domains: parse_str_list(form.domains.clone()),
         semantic_against_journal: checkbox_on(form.semantic_against_journal),
         semantic_against_collage: checkbox_on(form.semantic_against_collage),
         semantic_against_shared_collage: checkbox_on(form.semantic_against_shared_collage),
@@ -361,6 +396,39 @@ pub async fn handle_settings_post(
     } else if proposed_default_id.is_some() || proposed_default_name.is_some() || proposed_default_ouid.is_some() {
         global_warnings.push(
             "Ignoring org-default identity submission — only BookStack admins can set the org default.".into()
+        );
+    }
+
+    // Org identity page — first-write-wins (the page itself is structural;
+    // an admin can change its content but the page ID stays put).
+    let proposed_org_identity_page = parse_id(form.org_identity_page_id);
+    if existing_globals.org_identity_page_id.is_none() {
+        if let Some(new_id) = proposed_org_identity_page {
+            if is_admin {
+                globals.org_identity_page_id = Some(new_id);
+            } else {
+                global_warnings.push(
+                    "Ignoring org_identity_page_id submission — only BookStack admins can set org identity.".into()
+                );
+            }
+        }
+    } else if proposed_org_identity_page.is_some()
+        && proposed_org_identity_page != existing_globals.org_identity_page_id
+    {
+        global_warnings.push(
+            "Ignoring org_identity_page_id change — first-write-wins; current value preserved.".into()
+        );
+    }
+
+    // Org domains — admin-editable, replaces the existing list when provided.
+    let proposed_org_domains = parse_str_list(form.org_domains);
+    if is_admin {
+        // Empty list means "user cleared the textarea" — honor the clear.
+        // Non-empty replaces the old list outright.
+        globals.org_domains = proposed_org_domains;
+    } else if !proposed_org_domains.is_empty() {
+        global_warnings.push(
+            "Ignoring org_domains submission — only BookStack admins can edit org domains.".into()
         );
     }
 
@@ -767,6 +835,16 @@ fn render_id_input(name: &str, value: Option<i64>) -> String {
     )
 }
 
+fn render_textarea(name: &str, value: &str, placeholder: &str, rows: usize) -> String {
+    format!(
+        r#"<textarea name="{name}" id="{name}" rows="{rows}" placeholder="{ph}" style="width:100%;padding:0.55rem 0.7rem;border:1px solid #2a3a5c;border-radius:6px;background:#0f1a30;color:#e0e0e0;font-size:0.9rem;font-family:inherit;resize:vertical;">{value}</textarea>"#,
+        name = html_escape(name),
+        rows = rows,
+        ph = html_escape(placeholder),
+        value = html_escape(value),
+    )
+}
+
 fn render_checkbox(name: &str, checked: bool, label: &str) -> String {
     let chk = if checked { " checked" } else { "" };
     format!(
@@ -842,6 +920,21 @@ a.reauth:hover { color: #cbd5e1; text-decoration: underline; }
   <div class="hint">Contains every human user's journal book.</div>
   {user_journals_shelf_create}
 </div>
+</div>
+</div>
+
+<div class="card">
+<h2>Org identity &amp; domains <span style="font-weight:400;font-size:.78rem;color:#94a3b8;">{org_identity_note}</span></h2>
+<p class="subtitle" style="margin-bottom:.75rem;">Page describing the organization itself + the domains it owns. Pulled into every briefing's <code>system_prompt_additions</code> so every agent on the instance has a shared baseline. Page ID is first-write-wins; domains list is editable.</p>
+<div class="field">
+  <label for="org_identity_page_id">Org identity page ID</label>
+  {org_identity_page_input}
+  <div class="hint">Single page describing the org (mission, structure, conventions). First-write-wins.</div>
+</div>
+<div class="field">
+  <label for="org_domains">Org-owned domains</label>
+  {org_domains_input}
+  <div class="hint">One per line, or comma-separated. Merged with each user's <code>domains</code> in the briefing.</div>
 </div>
 </div>
 
@@ -940,16 +1033,42 @@ a.reauth:hover { color: #cbd5e1; text-decoration: underline; }
 <div class="field">
   <label for="user_id">User ID</label>
   {user_id_input}
-  <div class="hint">e.g., your email. Echoed back in the response.</div>
+  <div class="hint">e.g., your email. Echoed back in the response and used as the prefix for auto-provisioned per-user resource names.</div>
 </div>
+<div class="field">
+  <label for="bookstack_user_id">BookStack user row ID</label>
+  {bookstack_user_id_input}
+  <div class="hint">Numeric row ID for your BookStack user. Required for ACL-filtered semantic search — without it, search falls back to per-page HTTP permission checks (slower). Find via <code>/api/users</code> if you're an admin, or ask one to look it up.</div>
+</div>
+</div>
+<div class="row2">
 <div class="field">
   <label for="user_identity_page_id">Your identity page ID</label>
   {user_page_input}
+  <div class="hint">Auto-provisioned on first <code>remember_user action=read</code> once <code>user_id</code> is set.</div>
+</div>
+<div class="field">
+  <label for="user_identity_book_id">Your identity book ID</label>
+  {user_identity_book_id_input}
+  <div class="hint">Container book holding your identity page + per-user agent definitions. Auto-provisioned.</div>
 </div>
 </div>
+<div class="row2">
 <div class="field">
   <label for="user_journal_book_id">Your journal book</label>
   {user_journal_select}
+  <div class="hint">Auto-provisioned and force-attached to the User Journals shelf on every write.</div>
+</div>
+<div class="field">
+  <label for="user_journal_agent_page_id">Your journal-agent page ID</label>
+  {user_journal_agent_page_id_input}
+  <div class="hint">Auto-provisioned page (Agent: {{user_id}}-journal-agent) — fetched into the local agent cache by the bootstrap protocol.</div>
+</div>
+</div>
+<div class="field">
+  <label for="domains">Your owned domains</label>
+  {domains_input}
+  <div class="hint">One per line, or comma-separated. Surfaced in every briefing's <code>system_prompt_additions</code> so the AI can distinguish ours vs external content (URLs, emails). E.g.: <code>example.com</code></div>
 </div>
 </div>
 
@@ -1020,8 +1139,17 @@ a.reauth:hover { color: #cbd5e1; text-decoration: underline; }
         ai_shared_collage_select = render_select("ai_shared_collage_book_id", books, s.ai_shared_collage_book_id, true),
         ai_identity_book_select = render_select("ai_identity_book_id", books, s.ai_identity_book_id, true),
         user_id_input = render_text("user_id", s.user_id.as_deref(), "you@example.com"),
+        bookstack_user_id_input = render_id_input("bookstack_user_id", s.bookstack_user_id),
         user_page_input = render_id_input("user_identity_page_id", s.user_identity_page_id),
+        user_identity_book_id_input = render_id_input("user_identity_book_id", s.user_identity_book_id),
+        user_journal_agent_page_id_input = render_id_input("user_journal_agent_page_id", s.user_journal_agent_page_id),
         user_journal_select = render_select("user_journal_book_id", books, s.user_journal_book_id, true),
+        domains_input = render_textarea(
+            "domains",
+            &format_str_list(&s.domains),
+            "example.com\nexample.net",
+            3,
+        ),
         cb_journal = render_checkbox("semantic_against_journal", s.semantic_against_journal, "AI journal"),
         cb_collage = render_checkbox("semantic_against_collage", s.semantic_against_collage, "Topics / collage"),
         cb_shared_collage = render_checkbox("semantic_against_shared_collage", s.semantic_against_shared_collage, "Shared collage"),
@@ -1044,6 +1172,32 @@ a.reauth:hover { color: #cbd5e1; text-decoration: underline; }
         // Only show the create checkboxes for admins setting unset globals.
         hive_shelf_create = if g.hive_shelf_id.is_none() && is_admin { create_inline("create_hive_shelf", "Create \"Hive\" shelf if missing") } else { String::new() },
         user_journals_shelf_create = if g.user_journals_shelf_id.is_none() && is_admin { create_inline("create_user_journals_shelf", "Create \"User Journals\" shelf if missing") } else { String::new() },
+
+        org_identity_note = match (g.org_identity_page_id.is_some(), is_admin) {
+            (true, true) => "(set globally; page ID is locked, domains list editable)",
+            (false, true) => "(unset — you are an admin and may set this)",
+            (true, false) => "(set globally — read-only)",
+            (false, false) => "(unset — only a BookStack admin can configure)",
+        },
+        org_identity_page_input = if is_admin && g.org_identity_page_id.is_none() {
+            render_id_input("org_identity_page_id", g.org_identity_page_id)
+        } else {
+            render_locked_value(g.org_identity_page_id.map(|v| v.to_string()))
+        },
+        org_domains_input = if is_admin {
+            render_textarea(
+                "org_domains",
+                &format_str_list(&g.org_domains),
+                "example.com\nexample.net",
+                3,
+            )
+        } else {
+            render_locked_value(if g.org_domains.is_empty() {
+                None
+            } else {
+                Some(format_str_list(&g.org_domains))
+            })
+        },
 
         org_default_note = if is_admin { "(admin-editable)" } else { "(read-only — admin only)" },
         default_id_input = if is_admin {

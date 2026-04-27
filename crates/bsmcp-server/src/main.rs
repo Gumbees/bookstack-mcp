@@ -159,11 +159,13 @@ async fn main() {
                     None
                 } else {
                     eprintln!("Semantic: enabled (embedder_url={embedder_url})");
-                    Some(Arc::new(semantic::SemanticState::new(
+                    let state = Arc::new(semantic::SemanticState::new(
                         sdb.clone(),
                         embedder_url,
                         webhook_secret,
-                    )))
+                    ));
+                    state.clone().spawn_acl_reconcile();
+                    Some(state)
                 }
             }
             None => {

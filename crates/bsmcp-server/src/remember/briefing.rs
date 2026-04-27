@@ -89,6 +89,8 @@ pub async fn read(ctx: &Context) -> Outcome {
     let configured_book_ids = configured_semantic_book_ids(&ctx.settings);
     let full_kb = ctx.settings.semantic_against_full_kb;
     let configured_books_for_kb_exclusion = configured_book_ids.clone();
+    let bookstack_user_id = ctx.settings.bookstack_user_id;
+    let token_id_hash = ctx.token_id_hash.clone();
     let semantic_fut = async {
         if user_prompt.is_empty() {
             return SemanticSlice::default();
@@ -114,8 +116,24 @@ pub async fn read(ctx: &Context) -> Outcome {
             Some(configured_book_ids.as_slice())
         };
 
+        // Resolve the user's BookStack roles for ACL filtering. None when
+        // `bookstack_user_id` isn't configured; sem.search then falls through
+        // to the existing HTTP per-page permission check.
+        let user_roles = sem
+            .resolve_user_roles(&token_id_hash, bookstack_user_id, &ctx.client)
+            .await;
+
         let raw = match sem
-            .search(&prompt_for_semantic, 40, 0.40, true, false, &ctx.client, book_filter)
+            .search(
+                &prompt_for_semantic,
+                40,
+                0.40,
+                true,
+                false,
+                &ctx.client,
+                book_filter,
+                user_roles.as_deref(),
+            )
             .await
         {
             Ok(v) => v.get("results").and_then(|r| r.as_array()).cloned().unwrap_or_default(),
@@ -155,10 +173,11 @@ pub async fn read(ctx: &Context) -> Outcome {
         slice
     };
 
-    // Always-on context pages — three sources, all run in parallel:
+    // Always-on context pages — four sources, all run in parallel:
     //   - user-configured (system_prompt_page_ids)
     //   - org-required instructions (admin-mandated page IDs)
     //   - org-required AI usage policy (admin-mandated page IDs)
+    //   - org identity page (single admin-mandated page describing the org)
     let user_pages_fut = fetch_pages_with_source(
         &ctx.client,
         &ctx.settings.system_prompt_page_ids,
@@ -174,8 +193,17 @@ pub async fn read(ctx: &Context) -> Outcome {
         &globals.org_ai_usage_policy_page_ids,
         "org_policy",
     );
+    let org_identity_page_ids: Vec<i64> = globals
+        .org_identity_page_id
+        .map(|id| vec![id])
+        .unwrap_or_default();
+    let org_identity_fut = fetch_pages_with_source(
+        &ctx.client,
+        &org_identity_page_ids,
+        "org_identity",
+    );
 
-    let (identity, user_page, recent_journals, recent_user_journal, active_collage, shared_collage, semantic, user_pages, org_instructions, org_policy) = tokio::join!(
+    let (identity, user_page, recent_journals, recent_user_journal, active_collage, shared_collage, semantic, user_pages, org_instructions, org_policy, org_identity) = tokio::join!(
         identity_fut,
         user_fut,
         recent_journals_fut,
@@ -186,40 +214,77 @@ pub async fn read(ctx: &Context) -> Outcome {
         user_pages_fut,
         org_instructions_fut,
         org_policy_fut,
+        org_identity_fut,
     );
 
-    // Merge the three sources into one flat array. Each entry carries its
-    // `source` field so callers can group/filter as needed.
+    // Merge sources into one flat array. Each entry carries its `source`
+    // field so callers can group/filter as needed. Synthetic entries
+    // (domains list, identity refresh nudge) get a stable virtual page_id
+    // sentinel of 0 so consumers can branch on `page_id == 0` to skip
+    // anything that isn't a real BookStack page.
     let mut system_prompt: Vec<Value> = Vec::with_capacity(
-        user_pages.len() + org_instructions.len() + org_policy.len(),
+        user_pages.len() + org_instructions.len() + org_policy.len() + org_identity.len() + 2,
     );
+    system_prompt.extend(org_identity);
     system_prompt.extend(user_pages);
     system_prompt.extend(org_instructions);
     system_prompt.extend(org_policy);
 
-    // Setup nudge — show when the user hasn't configured anything AND hasn't
-    // snoozed the reminder. Suppressed once they save anything to /settings or
-    // explicitly dismiss via remember_config.
+    // Domains block — merged user + org domains. Surfaced as a synthetic
+    // system_prompt_additions entry so the AI's "owned vs external" check
+    // is always in context, not buried in a config dump.
+    let merged_domains = merge_domains(&ctx.settings.domains, &globals.org_domains);
+    if !merged_domains.is_empty() {
+        system_prompt.push(json!({
+            "page_id": 0,
+            "name": "Owned domains",
+            "markdown": format_domains_block(&merged_domains),
+            "url": Value::Null,
+            "source": "domains",
+        }));
+    }
+
+    // Identity refresh nudge — fires when the user's identity page hasn't
+    // been updated in 30+ days. Skipped silently if no identity page is
+    // configured, or the updated_at can't be parsed.
+    if let Some(stale) = identity_refresh_block(&user_page, ctx.settings.user_identity_page_id) {
+        system_prompt.push(stale);
+    }
+
+    // Setup nudge — show until everything's configured AND not snoozed. The
+    // nudge now lists exactly which user + global fields are still missing
+    // so the AI / user can address them one at a time instead of "your
+    // settings aren't done."
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let snoozed = ctx.settings.settings_nudge_dismissed_until.map(|t| now_unix < t).unwrap_or(false);
-    let setup_nudge = if !ctx.settings.is_configured() && !snoozed {
+    let pending_user = pending_user_fields(&ctx.settings);
+    let pending_global = pending_global_fields(&globals);
+    let any_pending = !pending_user.is_empty() || !pending_global.is_empty();
+    let setup_nudge = if any_pending && !snoozed {
         Some(json!({
             "show": true,
-            "summary": "Your Hive memory settings aren't configured yet. Briefing is running on org defaults (where set) or empty sections.",
+            "summary": format!(
+                "Setup incomplete: {} user field(s), {} global field(s) still need values. Briefing falls back where possible but some sections will be empty until configured.",
+                pending_user.len(), pending_global.len()
+            ),
+            "pending_user": pending_user,
+            "pending_global": pending_global,
             "two_paths": {
                 "ui": "Visit the MCP server's /settings page in a browser — fill in dropdowns or use 'Probe existing Hive' to auto-detect.",
                 "mcp_guided": "Have the AI walk you through it via tool calls (recommended for chat-driven setups). See `suggested_workflow` below."
             },
             "suggested_workflow": [
-                "1. Ask the user what they want: a fresh identity, or to adopt an existing agent/structure that's already in this BookStack.",
-                "2. If existing: call `remember_directory action=read kind=identities` to see what's already on the global Hive shelf, and `remember_directory action=read kind=user_journals` for journals. If those return settings_not_configured, the global shelves themselves aren't set — surface that to the user (only an admin can fix).",
-                "3. Use `search_content` with queries like '{type:book} Identity', '{type:book} Journal', '{type:book} Topics' to find candidate content that may be elsewhere in BookStack and should belong on the Hive shelf.",
-                "4. For each match, propose to the user whether to (a) adopt it as-is by writing the ID into config, or (b) move it onto the Hive shelf first using `move_book_to_shelf` / `move_chapter` / `move_page`, then write the ID.",
-                "5. For brand-new structure, use `remember_identity action=create name=...` to scaffold a full Identity book + manifest + standard chapters in one call.",
-                "6. Save the resolved IDs with `remember_config action=write` and a `settings` object. The next briefing will reflect the new config and the nudge will stop showing."
+                "1. Per-user settings: ask the user what they want — fresh identity, or adopt an existing agent already in this BookStack.",
+                "2. For existing structure: `remember_directory action=read kind=identities` lists Hive-shelf identities; `kind=user_journals` lists journals. settings_not_configured here means the global shelves aren't set (admin task).",
+                "3. Discover candidates anywhere: `search_content` with queries like '{type:book} Identity', '{type:book} Journal', '{type:book} Topics'.",
+                "4. Adopt or relocate: write IDs directly with `remember_config action=write`, OR move the books with `move_book_to_shelf` / `move_chapter` / `move_page` first.",
+                "5. Brand-new structure: `remember_identity action=create name=...` scaffolds Identity book + manifest + chapters in one call.",
+                "6. Domains + identity: fill in the user's `domains` array (their owned domains) — the AI uses it to decide what's ours vs external.",
+                "7. Admin-only globals: org_identity_page_id and org_domains describe the org for every user on the instance. Admins set them once via /settings.",
+                "8. After each save the next briefing reflects the new config; the nudge stops once nothing's pending."
             ],
             "key_tools": [
                 "remember_directory  — discover what's on the global shelves",
@@ -472,6 +537,186 @@ fn kb_matches_envelope(ctx: &Context, results: &[Value]) -> Value {
         "detail": "Top hits from the entire knowledge base, excluding pages already surfaced in per-book sections.",
         "results": results,
     })
+}
+
+/// Per-user fields the setup nudge wants populated. Each entry is a
+/// `{field, why}` pair — `field` matches the UserSettings JSON key so the AI
+/// can write directly via `remember_config action=write settings={...}`.
+fn pending_user_fields(s: &bsmcp_common::settings::UserSettings) -> Vec<Value> {
+    let mut out = Vec::new();
+    if s.user_id.is_none() {
+        out.push(json!({
+            "field": "user_id",
+            "why": "Stable identifier (typically email) — drives per-user resource naming and journal frontmatter.",
+        }));
+    }
+    if s.ai_identity_page_id.is_none() {
+        out.push(json!({
+            "field": "ai_identity_page_id",
+            "why": "AI agent's manifest page. The briefing falls back to org default if set, otherwise identity is empty.",
+        }));
+    }
+    if s.ai_hive_journal_book_id.is_none() {
+        out.push(json!({
+            "field": "ai_hive_journal_book_id",
+            "why": "AI's journal book. `remember_journal action=write` won't work without it.",
+        }));
+    }
+    if s.user_journal_book_id.is_none() {
+        out.push(json!({
+            "field": "user_journal_book_id",
+            "why": "User's personal journal. Auto-provisioned on first `remember_user action=read` once `user_id` is set.",
+        }));
+    }
+    if s.user_identity_page_id.is_none() {
+        out.push(json!({
+            "field": "user_identity_page_id",
+            "why": "User's identity manifest. Auto-provisioned on first `remember_user action=read` once `user_id` is set.",
+        }));
+    }
+    if s.domains.is_empty() {
+        out.push(json!({
+            "field": "domains",
+            "why": "User's owned domains (array of strings). Surfaced in system_prompt_additions so the AI can distinguish ours vs external content.",
+        }));
+    }
+    if s.bookstack_user_id.is_none() {
+        out.push(json!({
+            "field": "bookstack_user_id",
+            "why": "BookStack user row ID — required for ACL-based semantic search filtering. Without it the search falls back to per-page HTTP permission checks (slower).",
+        }));
+    }
+    out
+}
+
+/// Global fields the setup nudge surfaces. Visible to all users in the
+/// briefing response so anyone can flag missing globals to the admin, but
+/// only an admin can actually persist them.
+fn pending_global_fields(g: &bsmcp_common::settings::GlobalSettings) -> Vec<Value> {
+    let mut out = Vec::new();
+    if g.hive_shelf_id.is_none() {
+        out.push(json!({
+            "field": "hive_shelf_id",
+            "why": "Shared shelf containing every AI agent's Identity book. Admin-only, first-write-wins.",
+            "admin_only": true,
+        }));
+    }
+    if g.user_journals_shelf_id.is_none() {
+        out.push(json!({
+            "field": "user_journals_shelf_id",
+            "why": "Shared shelf containing each human user's journal book + identity book. Admin-only, first-write-wins.",
+            "admin_only": true,
+        }));
+    }
+    if g.org_identity_page_id.is_none() {
+        out.push(json!({
+            "field": "org_identity_page_id",
+            "why": "Single page describing the organization (mission, structure, conventions). Pulled into every briefing's system_prompt_additions. Admin-only.",
+            "admin_only": true,
+        }));
+    }
+    if g.org_domains.is_empty() {
+        out.push(json!({
+            "field": "org_domains",
+            "why": "Domains the organization owns. Pairs with org_identity to give every agent a shared baseline of 'where am I'. Admin-only.",
+            "admin_only": true,
+        }));
+    }
+    out
+}
+
+/// Merge user-owned and org-owned domains into a deduplicated list. Order:
+/// user domains first (more specific to the calling user), then org-wide
+/// domains the user hasn't already listed.
+fn merge_domains(user_domains: &[String], org_domains: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(user_domains.len() + org_domains.len());
+    for d in user_domains.iter().chain(org_domains.iter()) {
+        let v = d.trim().to_lowercase();
+        if v.is_empty() {
+            continue;
+        }
+        if seen.insert(v.clone()) {
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// Render the domains list as a markdown block destined for system_prompt_additions.
+fn format_domains_block(domains: &[String]) -> String {
+    let mut s = String::new();
+    s.push_str("## Owned domains\n\n");
+    s.push_str(&domains.join(", "));
+    s.push_str(
+        "\n\n(Treat URLs and email addresses on these domains as ours; \
+         everything else is external. Use this when deciding whether to \
+         redact, share, or treat content as trusted.)\n",
+    );
+    s
+}
+
+/// Build a "refresh due" reminder block when the user's identity page is
+/// older than 30 days. Returns `None` when the page is recent, missing, or
+/// the timestamp can't be parsed.
+fn identity_refresh_block(user_page: &Option<Value>, page_id: Option<i64>) -> Option<Value> {
+    let pid = page_id?;
+    let page = user_page.as_ref()?;
+    let updated = page.get("updated_at").and_then(|v| v.as_str())?;
+    let days = days_since_iso_date(updated)?;
+    if days < 30 {
+        return None;
+    }
+    let body = format!(
+        "## Identity refresh due\n\n\
+         The user's identity page (page {pid}) hasn't been updated in {days} days. \
+         If you've learned anything about how this user works, what they care \
+         about, or how to collaborate with them better, append or replace the \
+         relevant section before the session ends.\n\n\
+         Update via `remember_user action=write` with the full new body."
+    );
+    Some(json!({
+        "page_id": 0,
+        "name": "Identity refresh due",
+        "markdown": body,
+        "url": Value::Null,
+        "source": "identity_refresh_due",
+    }))
+}
+
+/// Parse the YYYY-MM-DD prefix of an ISO 8601 timestamp and return the
+/// number of whole days between that date and today (UTC). Avoids pulling
+/// in chrono for what's effectively a 30-day staleness check.
+fn days_since_iso_date(iso: &str) -> Option<i64> {
+    let date_prefix = iso.get(0..10)?;
+    let mut parts = date_prefix.split('-');
+    let y: i64 = parts.next()?.parse().ok()?;
+    let m: u32 = parts.next()?.parse().ok()?;
+    let d: u32 = parts.next()?.parse().ok()?;
+    let then = ymd_to_unix_days(y, m, d)?;
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    let now_days = now_secs / 86_400;
+    Some(now_days - then)
+}
+
+/// Convert a (year, month, day) triple to days-since-Unix-epoch using the
+/// civil-from-days algorithm (Hinnant 2014). Pure arithmetic; no calendar
+/// libraries required.
+fn ymd_to_unix_days(y: i64, m: u32, d: u32) -> Option<i64> {
+    if m < 1 || m > 12 || d < 1 || d > 31 {
+        return None;
+    }
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = (y - era * 400) as i64;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp as i64 + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
 }
 
 // Suppress unused-import warning when this module is built with other features.

@@ -11,6 +11,7 @@ use bsmcp_common::settings::{GlobalSettings, UserSettings};
 use super::envelope::ErrorCode;
 use super::frontmatter;
 use super::provision;
+use super::user_provision;
 use super::{Context, Outcome};
 
 // --- whoami ---
@@ -108,20 +109,52 @@ pub async fn write_whoami(ctx: &Context) -> Outcome {
 // --- user ---
 
 pub async fn read_user(ctx: &Context) -> Outcome {
-    let page_id = match ctx.settings.user_identity_page_id {
+    // Auto-provision missing per-user structure (Identity book, identity page,
+    // journal book, journal-agent page). No-op when everything's already in
+    // settings or when `user_id` isn't configured. The first read_user call
+    // after a user is set up populates the per-user shelf in one shot, and
+    // subsequent calls are cheap idempotent shelf-membership checks.
+    let globals = ctx.db.get_global_settings().await.unwrap_or_default();
+    let mut working_settings = ctx.settings.clone();
+    let provision_result = user_provision::auto_provision_user_identity(
+        &ctx.client,
+        globals.user_journals_shelf_id,
+        &mut working_settings,
+    )
+    .await;
+    if provision_result.any_changes() {
+        if let Err(e) = ctx
+            .db
+            .save_user_settings(&ctx.token_id_hash, &working_settings)
+            .await
+        {
+            eprintln!("read_user: failed to persist auto-provisioned IDs (non-fatal): {e}");
+        }
+        // Lock the freshly-created journal to owner-only on the same pass,
+        // matching the existing settings-save behavior.
+        provision::lock_journal_books_to_owner(
+            &ctx.client,
+            working_settings.ai_hive_journal_book_id,
+            working_settings.user_journal_book_id,
+        )
+        .await;
+    }
+
+    let page_id = match working_settings.user_identity_page_id {
         Some(id) => id,
         None => {
             // user_id alone is enough for a partial response.
-            if ctx.settings.user_id.is_some() {
+            if working_settings.user_id.is_some() {
                 return Outcome::ok(json!({
-                    "user_id": ctx.settings.user_id,
+                    "user_id": working_settings.user_id,
                     "identity_page": Value::Null,
-                    "journal_book_id": ctx.settings.user_journal_book_id,
+                    "journal_book_id": working_settings.user_journal_book_id,
+                    "auto_provisioned": auto_provision_summary(&provision_result),
                 }));
             }
             return Outcome::error(
                 ErrorCode::SettingsNotConfigured,
-                "user_identity_page_id not configured",
+                "user_identity_page_id not configured (and user_id not set, so auto-provisioning is skipped)",
                 Some("user_identity_page_id"),
             );
         }
@@ -135,7 +168,7 @@ pub async fn read_user(ctx: &Context) -> Outcome {
     let body = frontmatter::strip(raw_md).to_string();
 
     Outcome::ok(json!({
-        "user_id": ctx.settings.user_id,
+        "user_id": working_settings.user_id,
         "identity_page": {
             "page_id": page_id,
             "name": page.get("name").cloned().unwrap_or(Value::Null),
@@ -143,17 +176,62 @@ pub async fn read_user(ctx: &Context) -> Outcome {
             "url": page.get("url").cloned().unwrap_or(Value::Null),
             "updated_at": page.get("updated_at").cloned().unwrap_or(Value::Null),
         },
-        "journal_book_id": ctx.settings.user_journal_book_id,
+        "journal_book_id": working_settings.user_journal_book_id,
+        "identity_book_id": working_settings.user_identity_book_id,
+        "journal_agent_page_id": working_settings.user_journal_agent_page_id,
+        "auto_provisioned": auto_provision_summary(&provision_result),
     }))
 }
 
+/// Summarize a provisioning pass into JSON for the user response. Returns
+/// `Null` when nothing changed so consumers can treat the field as a "did
+/// anything happen" flag.
+fn auto_provision_summary(r: &user_provision::UserProvisionResult) -> Value {
+    if !r.any_changes() && r.warnings.is_empty() {
+        return Value::Null;
+    }
+    json!({
+        "created_identity_book": r.created_identity_book,
+        "created_identity_page": r.created_identity_page,
+        "created_journal_book": r.created_journal_book,
+        "created_journal_agent_page": r.created_journal_agent_page,
+        "moved_to_shelf": r.moved_to_shelf,
+        "warnings": r.warnings,
+    })
+}
+
 pub async fn write_user(ctx: &Context) -> Outcome {
-    let page_id = match ctx.settings.user_identity_page_id {
+    // Auto-provision identical to read_user — guarantees write_user works on
+    // a freshly-configured user without forcing a separate read first.
+    let globals = ctx.db.get_global_settings().await.unwrap_or_default();
+    let mut working_settings = ctx.settings.clone();
+    let provision_result = user_provision::auto_provision_user_identity(
+        &ctx.client,
+        globals.user_journals_shelf_id,
+        &mut working_settings,
+    )
+    .await;
+    if provision_result.any_changes() {
+        if let Err(e) = ctx
+            .db
+            .save_user_settings(&ctx.token_id_hash, &working_settings)
+            .await
+        {
+            eprintln!("write_user: failed to persist auto-provisioned IDs (non-fatal): {e}");
+        }
+        provision::lock_journal_books_to_owner(
+            &ctx.client,
+            working_settings.ai_hive_journal_book_id,
+            working_settings.user_journal_book_id,
+        )
+        .await;
+    }
+    let page_id = match working_settings.user_identity_page_id {
         Some(id) => id,
         None => {
             return Outcome::error(
                 ErrorCode::SettingsNotConfigured,
-                "user_identity_page_id not configured",
+                "user_identity_page_id not configured (auto-provision needs `user_id` and `user_journals_shelf_id` to work)",
                 Some("user_identity_page_id"),
             );
         }

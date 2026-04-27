@@ -1,0 +1,37 @@
+name: Feature request
+description: New capability that doesn't exist yet
+title: "[feature] "
+labels: ["type:enhancement", "category:feature"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What
+      description: One or two sentences. What new capability should bookstack-mcp gain?
+      placeholder: "Add a `diff_page` tool that returns the diff between two page revisions."
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: What problem does this solve? Who would use it and in what scenario?
+    validations:
+      required: true
+
+  - type: textarea
+    id: how
+    attributes:
+      label: Sketch of approach (optional)
+      description: If you have an idea of how to implement it, drop it here. Skip if unsure.
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered (optional)
+      description: Other approaches you weighed and why this one is better.
+    validations:
+      required: false

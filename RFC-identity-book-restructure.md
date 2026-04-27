@@ -277,6 +277,86 @@ Replaced callsites:
 - `auto_provision_user_identity` book/page creation → corresponding find-or-create helpers
 - New: chapter provisioning in `identity::create` and the migration tool → `find_or_create_chapter`
 
+## Programmatic content updates (new actions)
+
+The current `write` action on collections (`journal`, `collage`, `shared_collage`, `user_journal`) and singletons (`whoami`, `user`) is **destructive replace** — `write` with the same `key` overwrites the entire page body. We hit this live during v0.7.4 smoke testing: a single test write to `journal key=2026-04-27` clobbered the day's actual content.
+
+For identity updates and journal additions to be done programmatically — AI just provides content, server handles structural placement and provenance — we add three new actions to the schema. None of them break existing `write` callers; they're purely additive.
+
+### `append` — collections only
+
+Action signature: `journal action=append key=YYYY-MM-DD body="..." timestamp=true`.
+
+Appends `body` to the existing page at `key`. If the page doesn't exist, creates it (same find-or-create semantics as `write`). Optional `timestamp=true` prefixes the appended chunk with a local-IANA-timezone time marker (`## 14:32 EDT`) so multi-append-per-day flows produce a readable timeline.
+
+Use case: the AI realizes mid-conversation it wants to capture a thought in today's journal. It calls `journal action=append body="..." timestamp=true` — no read-modify-write cycle, no risk of clobbering an earlier entry.
+
+Frontmatter: stamps `last_appended_at`, increments `append_count`, preserves `written_at` from the original create. The frontmatter `supersedes_page` field is **not** updated (the append doesn't supersede; it extends).
+
+Available on: `journal`, `user_journal`, `collage`, `shared_collage`. Not on singletons — appending to an identity manifest doesn't have a clear semantic.
+
+### `update_section` — collections + singletons
+
+Action signature: `whoami action=update_section section="Communication style" body="..."` or `journal action=update_section key=YYYY-MM-DD section="Working notes" body="..."`.
+
+Replaces the named H2 section's body, preserving every other section. Match semantics:
+
+- Find the first H2 (`## …`) whose text equals `section` (exact match, case-sensitive, after trimming).
+- The matched section's body runs from the H2 line up to (but not including) the next H2 or end-of-document.
+- Replace that range with `## {section}\n\n{body}\n\n`.
+- If no matching H2 exists, append `## {section}\n\n{body}` to the end of the document.
+
+Use case: the AI learns Nate prefers terse responses. It calls `user action=update_section section="Communication style" body="Terse, direct, no preamble. Shorter beats longer."` — no need to read the rest of the manifest, no risk of clobbering "Working preferences" or "Domains and identities."
+
+Frontmatter: stamps `last_section_update_at` and `last_updated_section: "{section}"`. `supersedes_page` updates as it does for `write` (since this IS a content change to the persistent identity).
+
+Available on: every resource that supports `write` (i.e. all collections + the singletons `whoami`, `user`).
+
+### `append_section` — collections + singletons
+
+Action signature: `whoami action=append_section section="Recurring topics" body="- New project: ATLAS migration"`.
+
+Same matching as `update_section`, but appends `body` to the section's existing body instead of replacing it. If the section doesn't exist, creates it (same as `update_section`'s fallback).
+
+Use case: the AI wants to add one bullet to "Recurring topics" without re-rendering the whole list.
+
+Frontmatter: same as `update_section`.
+
+### Frontmatter timestamps — full set
+
+After these additions:
+
+| Field | Set on | Purpose |
+|---|---|---|
+| `written_at` | first `write` | initial creation timestamp |
+| `last_appended_at` | every `append` | most recent append |
+| `append_count` | every `append` | running counter |
+| `last_section_update_at` | every `update_section` / `append_section` | most recent section edit |
+| `last_updated_section` | every `update_section` / `append_section` | name of last edited section |
+| `supersedes_page` | `write` and section ops | prior page id (lineage) |
+| `written_by` / `ai_identity_ouid` / `user_id` / `trace_id` / `resource` / `key` | every write | provenance (existing) |
+
+All timestamps in UTC ISO-8601; the AI uses the `meta.time` block to render them locally.
+
+### Audit log additions
+
+Every new action emits an audit entry with `action` ∈ `{append, update_section, append_section}` and the same `target_page_id` / `target_key` / `trace_id` shape as today's `write` and `delete`. No schema change required.
+
+### MCP tool surface
+
+The 12 existing `remember_*` tools each grow a few enum values in their `action` argument:
+
+- `remember_journal action`: `read | write | append | update_section | append_section | search | delete`
+- `remember_whoami action`: `read | write | update_section | append_section`
+- `remember_user action`: `read | write | update_section | append_section`
+- Same pattern for `remember_collage`, `remember_shared_collage`, `remember_user_journal`.
+
+No new top-level tools needed. The richer action set keeps the tool surface flat.
+
+### Why not just use `edit_page` / `replace_section` / `append_to_page`?
+
+The bookstack-mcp already exposes those at the BookStack-page level — but they operate on raw page IDs, bypass the `/remember` envelope, and don't stamp provenance frontmatter or hit the audit log. Going through `remember_*` actions keeps every Hive content edit auditable, traceable, and addressed by stable resource keys (`key=YYYY-MM-DD`, `section="Communication style"`) instead of opaque page IDs that the AI shouldn't have to track.
+
 ## Decisions (with rationale)
 
 These were left open in the design discussion. Defaults locked here; PR review can override any of them.
@@ -291,6 +371,8 @@ These were left open in the design discussion. Defaults locked here; PR review c
 
 5. **`auto_migrate` user setting — not added:** Migration is always explicit via `remember_migrate apply`. Rationale: data migration is observable, has cost, and a single failed page move shouldn't be hidden behind a "did it run?" boolean. Briefing's nudge does the prompting; the user/AI decides when to execute.
 
+6. **`write` stays destructive-replace; new actions cover non-destructive cases:** Every existing `write` caller continues to work unchanged. New actions (`append`, `update_section`, `append_section`) handle the cases where AI agents should not be replacing the whole body. Rationale: changing `write` semantics under existing callers would silently break flows; making non-destructive operations their own actions is explicit and lets agents pick the right verb for the intent. The doc-string on `write` will note: "use `append` for journals, `update_section` for identity edits — `write` is full-replace and rarely what you want."
+
 ## Out of scope
 
 - **Subagent conversation write tooling.** The chapter exists; the tool to write to it is a follow-up.
@@ -301,11 +383,12 @@ These were left open in the design discussion. Defaults locked here; PR review c
 
 ## Implementation phasing
 
-Three follow-up PRs, stacked, each independently mergeable:
+Four follow-up PRs, stacked, each independently mergeable:
 
 1. **Phase 1 — `find_or_create_*` helpers + dedup at every existing callsite.** No structural change, no new chapters yet. Just stops the duplicate-creation behavior. Smallest PR; can land first to immediately solve the duplicate-pages problem on the live Hives.
-2. **Phase 2 — schema additions + identity creation flow + journal restructure.** Adds the three chapter columns, wires `Agents`/`Subagent Conversations`/`Journal` chapter creation into `identity::create`, rewrites `remember_journal` to be chapter-scoped with the year-rollover sweep. New identities created after this PR land in the new shape; existing identities still work via the deprecated `ai_hive_journal_book_id` fallback.
-3. **Phase 3 — `remember_migrate` tool + briefing setup_nudge detector.** The opt-in data migration tool plus the legacy-state detector that surfaces the nudge. Migrates Pia and Apis to the new shape on the live Hives.
+2. **Phase 2 — `append` / `update_section` / `append_section` actions.** Pure-additive new actions on existing `remember_*` tools. Doesn't depend on the chapter restructure — could merge before or alongside Phase 3. Solves the destructive-`write` problem for every agent immediately. New frontmatter timestamp fields added at the same time.
+3. **Phase 3 — schema additions + identity creation flow + journal restructure.** Adds the three chapter columns, wires `Agents`/`Subagent Conversations`/`Journal` chapter creation into `identity::create`, rewrites `remember_journal` to be chapter-scoped with the year-rollover sweep. New identities created after this PR land in the new shape; existing identities still work via the deprecated `ai_hive_journal_book_id` fallback.
+4. **Phase 4 — `remember_migrate` tool + briefing setup_nudge detector.** The opt-in data migration tool plus the legacy-state detector that surfaces the nudge. Migrates Pia and Apis to the new shape on the live Hives.
 
 ## Open questions
 

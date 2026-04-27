@@ -169,6 +169,107 @@ impl PostgresDb {
         sqlx::query("INSERT INTO global_settings (id, updated_at) VALUES (1, 0) ON CONFLICT (id) DO NOTHING")
             .execute(&pool).await.ok();
 
+        // v1.0.0 — DB-as-index schema. Mirror of every BookStack content item
+        // we care about. Phase 3 ships the schema only; the reconciliation
+        // worker (Phase 4) populates these tables.
+        for sql in [
+            "CREATE TABLE IF NOT EXISTS bookstack_shelves (
+                shelf_id BIGINT PRIMARY KEY,
+                name TEXT NOT NULL,
+                slug TEXT NOT NULL,
+                shelf_kind TEXT NOT NULL,
+                indexed_at BIGINT NOT NULL,
+                deleted BOOLEAN NOT NULL DEFAULT FALSE
+            )",
+            "CREATE TABLE IF NOT EXISTS bookstack_books (
+                book_id BIGINT PRIMARY KEY,
+                name TEXT NOT NULL,
+                slug TEXT NOT NULL,
+                shelf_id BIGINT,
+                identity_ouid TEXT,
+                book_kind TEXT NOT NULL,
+                indexed_at BIGINT NOT NULL,
+                deleted BOOLEAN NOT NULL DEFAULT FALSE
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_bookstack_books_shelf ON bookstack_books(shelf_id)",
+            "CREATE INDEX IF NOT EXISTS idx_bookstack_books_identity ON bookstack_books(identity_ouid)",
+            "CREATE TABLE IF NOT EXISTS bookstack_chapters (
+                chapter_id BIGINT PRIMARY KEY,
+                book_id BIGINT NOT NULL,
+                name TEXT NOT NULL,
+                slug TEXT NOT NULL,
+                identity_ouid TEXT,
+                chapter_kind TEXT NOT NULL,
+                archive_year INTEGER,
+                indexed_at BIGINT NOT NULL,
+                deleted BOOLEAN NOT NULL DEFAULT FALSE
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_bookstack_chapters_book ON bookstack_chapters(book_id)",
+            "CREATE INDEX IF NOT EXISTS idx_bookstack_chapters_identity ON bookstack_chapters(identity_ouid)",
+            "CREATE TABLE IF NOT EXISTS bookstack_pages (
+                page_id BIGINT PRIMARY KEY,
+                book_id BIGINT NOT NULL,
+                chapter_id BIGINT,
+                name TEXT NOT NULL,
+                slug TEXT NOT NULL,
+                url TEXT,
+                page_created_at TEXT,
+                page_updated_at TEXT,
+                identity_ouid TEXT,
+                page_kind TEXT NOT NULL,
+                page_key TEXT,
+                archive_year INTEGER,
+                indexed_at BIGINT NOT NULL,
+                deleted BOOLEAN NOT NULL DEFAULT FALSE
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_bookstack_pages_book ON bookstack_pages(book_id)",
+            "CREATE INDEX IF NOT EXISTS idx_bookstack_pages_chapter ON bookstack_pages(chapter_id)",
+            "CREATE INDEX IF NOT EXISTS idx_bookstack_pages_identity_kind ON bookstack_pages(identity_ouid, page_kind)",
+            // Dedup enforcement: at most one non-deleted classified page per
+            // (identity, kind, key). NULL identity or NULL key are excluded so
+            // unclassified pages never trip the constraint.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_bookstack_pages_dedup
+                ON bookstack_pages(identity_ouid, page_kind, page_key)
+                WHERE deleted = FALSE AND identity_ouid IS NOT NULL AND page_key IS NOT NULL",
+            // Page-body cache. One row per page; refreshed when BookStack's
+            // page_updated_at advances. Cache hit when our row's
+            // page_updated_at equals bookstack_pages.page_updated_at.
+            "CREATE TABLE IF NOT EXISTS page_cache (
+                page_id BIGINT PRIMARY KEY,
+                markdown TEXT,
+                raw_markdown TEXT,
+                html TEXT,
+                cached_at BIGINT NOT NULL,
+                page_updated_at TEXT
+            )",
+            // Reconciliation job queue. Mirrors `embed_jobs` in shape so the
+            // worker pattern stays familiar.
+            "CREATE TABLE IF NOT EXISTS index_jobs (
+                id BIGSERIAL PRIMARY KEY,
+                scope TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                triggered_by TEXT NOT NULL,
+                started_at BIGINT,
+                finished_at BIGINT,
+                progress BIGINT NOT NULL DEFAULT 0,
+                total BIGINT NOT NULL DEFAULT 0,
+                error TEXT
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_index_jobs_pending ON index_jobs(status) WHERE status = 'pending'",
+            // Singleton bookkeeping for the indexer (last_full_walk_at,
+            // last_delta_walk_at, etc.).
+            "CREATE TABLE IF NOT EXISTS index_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )",
+        ] {
+            sqlx::query(sql)
+                .execute(&pool)
+                .await
+                .map_err(|e| format!("Failed to create v1.0.0 index schema: {e}"))?;
+        }
+
         let hash = sha2::Sha256::digest(encryption_key.as_bytes());
         let mut key = Zeroizing::new([0u8; 32]);
         key.copy_from_slice(&hash);

@@ -1,6 +1,6 @@
 # Repository Structure
 
-_Auto-generated on 2026-04-27 18:50 UTC from commit `15e0083`._
+_Auto-generated on 2026-04-27 21:37 UTC from commit `d9fc605`._
 
 ```
 .
@@ -12,6 +12,7 @@ _Auto-generated on 2026-04-27 18:50 UTC from commit `15e0083`._
 │   │   │   ├── chunking.rs
 │   │   │   ├── config.rs
 │   │   │   ├── db.rs
+│   │   │   ├── index.rs
 │   │   │   ├── lib.rs
 │   │   │   ├── settings.rs
 │   │   │   ├── types.rs
@@ -50,6 +51,8 @@ _Auto-generated on 2026-04-27 18:50 UTC from commit `15e0083`._
 │   ├── Dockerfile.server
 │   ├── docker-compose.sqlite.yml
 │   └── docker-compose.yml
+├── scripts
+│   └── publish-pr-image.sh
 ├── CLAUDE.md
 ├── Cargo.lock
 ├── Cargo.toml
@@ -60,5 +63,5 @@ _Auto-generated on 2026-04-27 18:50 UTC from commit `15e0083`._
 ├── STRUCTURE.md
 └── entrypoint.sh
 
-14 directories, 42 files
+15 directories, 44 files
 ```

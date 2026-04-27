@@ -81,7 +81,103 @@ impl SqliteDb {
                  updated_at INTEGER NOT NULL DEFAULT 0
              );
              INSERT OR IGNORE INTO global_settings (id, updated_at) VALUES (1, 0);
-             DROP TABLE IF EXISTS registrations;",
+             DROP TABLE IF EXISTS registrations;
+             /* v1.0.0 — DB-as-index. Mirror of every BookStack content item we
+                care about. Phase 3 ships the schema only; the reconciliation
+                worker (Phase 4) populates these tables. Distinct from the
+                semantic-search `pages` / `chunks` tables, which track only the
+                embedding state — these tables track the structural reflection
+                used by the briefing/journal/migration paths. */
+             CREATE TABLE IF NOT EXISTS bookstack_shelves (
+                 shelf_id INTEGER PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 slug TEXT NOT NULL,
+                 shelf_kind TEXT NOT NULL,
+                 indexed_at INTEGER NOT NULL,
+                 deleted INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS bookstack_books (
+                 book_id INTEGER PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 slug TEXT NOT NULL,
+                 shelf_id INTEGER,
+                 identity_ouid TEXT,
+                 book_kind TEXT NOT NULL,
+                 indexed_at INTEGER NOT NULL,
+                 deleted INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE INDEX IF NOT EXISTS idx_bookstack_books_shelf ON bookstack_books(shelf_id);
+             CREATE INDEX IF NOT EXISTS idx_bookstack_books_identity ON bookstack_books(identity_ouid);
+             CREATE TABLE IF NOT EXISTS bookstack_chapters (
+                 chapter_id INTEGER PRIMARY KEY,
+                 book_id INTEGER NOT NULL,
+                 name TEXT NOT NULL,
+                 slug TEXT NOT NULL,
+                 identity_ouid TEXT,
+                 chapter_kind TEXT NOT NULL,
+                 archive_year INTEGER,
+                 indexed_at INTEGER NOT NULL,
+                 deleted INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE INDEX IF NOT EXISTS idx_bookstack_chapters_book ON bookstack_chapters(book_id);
+             CREATE INDEX IF NOT EXISTS idx_bookstack_chapters_identity ON bookstack_chapters(identity_ouid);
+             CREATE TABLE IF NOT EXISTS bookstack_pages (
+                 page_id INTEGER PRIMARY KEY,
+                 book_id INTEGER NOT NULL,
+                 chapter_id INTEGER,
+                 name TEXT NOT NULL,
+                 slug TEXT NOT NULL,
+                 url TEXT,
+                 page_created_at TEXT,
+                 page_updated_at TEXT,
+                 identity_ouid TEXT,
+                 page_kind TEXT NOT NULL,
+                 page_key TEXT,
+                 archive_year INTEGER,
+                 indexed_at INTEGER NOT NULL,
+                 deleted INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE INDEX IF NOT EXISTS idx_bookstack_pages_book ON bookstack_pages(book_id);
+             CREATE INDEX IF NOT EXISTS idx_bookstack_pages_chapter ON bookstack_pages(chapter_id);
+             CREATE INDEX IF NOT EXISTS idx_bookstack_pages_identity_kind ON bookstack_pages(identity_ouid, page_kind);
+             /* Dedup enforcement: at most one non-deleted classified page per
+                (identity, kind, key). NULL identity or NULL key are excluded so
+                unclassified pages never trip the constraint. */
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_bookstack_pages_dedup
+                 ON bookstack_pages(identity_ouid, page_kind, page_key)
+                 WHERE deleted = 0 AND identity_ouid IS NOT NULL AND page_key IS NOT NULL;
+             /* Page-body cache. One row per page; refreshed when BookStack's
+                page_updated_at advances. Cache hit when our row's
+                page_updated_at equals bookstack_pages.page_updated_at. */
+             CREATE TABLE IF NOT EXISTS page_cache (
+                 page_id INTEGER PRIMARY KEY,
+                 markdown TEXT,
+                 raw_markdown TEXT,
+                 html TEXT,
+                 cached_at INTEGER NOT NULL,
+                 page_updated_at TEXT
+             );
+             /* Reconciliation job queue. Mirrors `embed_jobs` in shape so the
+                worker pattern stays familiar. */
+             CREATE TABLE IF NOT EXISTS index_jobs (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 scope TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 status TEXT NOT NULL DEFAULT 'pending',
+                 triggered_by TEXT NOT NULL,
+                 started_at INTEGER,
+                 finished_at INTEGER,
+                 progress INTEGER NOT NULL DEFAULT 0,
+                 total INTEGER NOT NULL DEFAULT 0,
+                 error TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_index_jobs_pending ON index_jobs(status) WHERE status = 'pending';
+             /* Singleton bookkeeping for the indexer (last_full_walk_at,
+                last_delta_walk_at, etc.). */
+             CREATE TABLE IF NOT EXISTS index_meta (
+                 key TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             );",
         )
         .expect("Failed to initialize database schema");
 

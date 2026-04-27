@@ -159,49 +159,57 @@ async fn create(ctx: &Context) -> Outcome {
         }
     };
 
-    // 1. Create the Identity book on the Hive shelf — name = the agent's name (e.g., "Pia Identity").
+    // 1. Find-or-create the Identity book on the Hive shelf. Name is
+    //    "{Name} Identity" (e.g., "Pia Identity"). Re-running with the same
+    //    name reuses the existing book instead of duplicating.
     let book_name = format!("{} Identity", name);
     let book_description = format!("Identity book for the AI agent {}. Holds the manifest page.", name);
-    let book = match ctx.client.create_book(&book_name, &book_description).await {
-        Ok(v) => v,
-        Err(e) => return Outcome::error(ErrorCode::BookStackError, format!("create book failed: {e}"), None),
-    };
-    let book_id = match book.get("id").and_then(|i| i.as_i64()) {
+    let book_outcome = provision::find_or_create_book_on_shelf(
+        &ctx.client,
+        hive_shelf_id,
+        &book_name,
+        &book_description,
+    )
+    .await;
+    let book_was_existing = matches!(book_outcome, provision::ProvisionResult::FoundExisting { .. });
+    let book_id = match book_outcome.id() {
         Some(id) => id,
-        None => return Outcome::error(ErrorCode::InternalError, "create_book returned no id", None),
+        None => return Outcome::error(
+            ErrorCode::BookStackError,
+            format!("identity book provisioning failed: {}", book_outcome.human(NamedResource::IdentityBook)),
+            None,
+        ),
     };
 
-    // Attach to the Hive shelf (best-effort).
-    if let Ok(shelf) = ctx.client.get_shelf(hive_shelf_id).await {
-        let mut existing: Vec<i64> = shelf
-            .get("books")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|b| b.get("id").and_then(|i| i.as_i64())).collect())
-            .unwrap_or_default();
-        if !existing.contains(&book_id) {
-            existing.push(book_id);
-        }
-        let _ = ctx.client.update_shelf(hive_shelf_id, &json!({ "books": existing })).await;
-    }
-
-    // 2. Render and create the manifest page.
+    // 2. Find-or-create the manifest page at the book root (loose, no chapter).
+    //    The body is only used at create time; reusing an existing manifest
+    //    page preserves whatever content the AI has accumulated there.
     let prompt_body = render_prompt(&template, &name, &ouid, custom_prompt.as_deref(), &additional_details);
     let manifest_fm = format!(
         "---\nai_identity_ouid: {}\nname: {}\ncreated_at: {}\ntrace_id: {}\n---\n\n",
         ouid, name, frontmatter::today_iso_date(), ctx.trace_id,
     );
-    let page_payload = json!({
-        "name": "Identity",
-        "book_id": book_id,
-        "markdown": format!("{manifest_fm}{prompt_body}"),
-    });
-    let page = match ctx.client.create_page(&page_payload).await {
-        Ok(v) => v,
-        Err(e) => return Outcome::error(ErrorCode::BookStackError, format!("create manifest page failed: {e}"), None),
-    };
-    let page_id = page.get("id").and_then(|i| i.as_i64());
+    let page_outcome = provision::find_or_create_page(
+        &ctx.client,
+        Some(book_id),
+        None,
+        "Identity",
+        &format!("{manifest_fm}{prompt_body}"),
+    )
+    .await;
+    let page_was_existing = matches!(page_outcome, provision::ProvisionResult::FoundExisting { .. });
+    let page_id = page_outcome.id();
+    if page_id.is_none() {
+        return Outcome::error(
+            ErrorCode::BookStackError,
+            format!("manifest page provisioning failed: {}", page_outcome.human(NamedResource::IdentityPage)),
+            None,
+        );
+    }
 
-    // Lock the newly-created Identity book + manifest page to admin-only edit.
+    // Lock the Identity book + manifest page to admin-only edit. Idempotent —
+    // safe to re-run on a found-existing book/page (BookStack overwrites the
+    // permission row each call).
     if let Ok(role) = ctx.client.find_admin_role_id().await {
         provision::lock_to_admin_only(&ctx.client, bsmcp_common::bookstack::ContentType::Book, book_id, role).await;
         if let Some(pid) = page_id {
@@ -209,13 +217,21 @@ async fn create(ctx: &Context) -> Outcome {
         }
     }
 
+    let action_label = match (book_was_existing, page_was_existing) {
+        (true, true) => "found_existing",
+        (false, false) => "created",
+        _ => "partially_created",
+    };
+
     Outcome::ok_with_target(
         json!({
-            "action": "created",
+            "action": action_label,
             "name": name,
             "ouid": ouid,
             "book_id": book_id,
+            "book_was_existing": book_was_existing,
             "manifest_page_id": page_id,
+            "manifest_page_was_existing": page_was_existing,
             "proposed_settings": {
                 "ai_identity_book_id": book_id,
                 "ai_identity_page_id": page_id,

@@ -6,27 +6,39 @@
 //! rather than crashing the settings save.
 
 use bsmcp_common::bookstack::{BookStackClient, ContentType};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::naming::NamedResource;
 
 /// Outcome of one auto-provision attempt.
 #[derive(Clone, Debug)]
 pub enum ProvisionResult {
+    /// Newly created during this call.
     Created { id: i64, name: String },
+    /// Already existed; reused. Returned by the `find_or_create_*` helpers
+    /// when a name-match lookup hits an existing book/chapter/page. Distinct
+    /// from `Created` so the caller can distinguish "I made this" from "this
+    /// was here already" — useful for dedup logging and migration plans.
+    FoundExisting { id: i64, name: String },
     Denied { reason: String },
     Failed { reason: String },
 }
 
 impl ProvisionResult {
     pub fn id(&self) -> Option<i64> {
-        if let Self::Created { id, .. } = self { Some(*id) } else { None }
+        match self {
+            Self::Created { id, .. } | Self::FoundExisting { id, .. } => Some(*id),
+            _ => None,
+        }
     }
 
     pub fn human(&self, resource: NamedResource) -> String {
         match self {
             Self::Created { id, name } => format!(
                 "Created {} \"{name}\" (id={id})", resource.default_name()
+            ),
+            Self::FoundExisting { id, name } => format!(
+                "Found existing {} \"{name}\" (id={id}); reused", resource.default_name()
             ),
             Self::Denied { reason } => format!(
                 "Cannot create {}: permission denied. {reason}", resource.default_name()
@@ -65,11 +77,27 @@ pub async fn create_shelf(
 }
 
 /// Create a book and (optionally) attach it to a shelf.
+///
+/// Backed by [`find_or_create_book_on_shelf`] when a shelf is configured, so
+/// the /settings UI's "Create if missing" buttons reuse an existing
+/// Identity/Journal/Collage book instead of duplicating it. When no shelf
+/// is given, falls back to bare create.
 pub async fn create_book(
     client: &BookStackClient,
     resource: NamedResource,
     parent_shelf_id: Option<i64>,
 ) -> ProvisionResult {
+    if let Some(shelf_id) = parent_shelf_id {
+        return find_or_create_book_on_shelf(
+            client,
+            shelf_id,
+            resource.default_name(),
+            resource.default_description(),
+        )
+        .await;
+    }
+    // No shelf — bare create. See `create_named_book` for why we don't
+    // dedup globally without a known shelf to scope the lookup to.
     let book = match client.create_book(resource.default_name(), resource.default_description()).await {
         Ok(v) => v,
         Err(e) => return classify_error(&e),
@@ -78,26 +106,6 @@ pub async fn create_book(
         Some(id) => id,
         None => return ProvisionResult::Failed { reason: "create_book returned no id".to_string() },
     };
-
-    if let Some(shelf_id) = parent_shelf_id {
-        // Append book to shelf — fetch existing books, then update the shelf with the new list.
-        if let Ok(shelf) = client.get_shelf(shelf_id).await {
-            let mut existing: Vec<i64> = shelf
-                .get("books")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|b| b.get("id").and_then(|i| i.as_i64())).collect())
-                .unwrap_or_default();
-            if !existing.contains(&book_id) {
-                existing.push(book_id);
-            }
-            // Best-effort — don't fail the provision if the shelf update fails.
-            let payload = json!({ "books": existing });
-            if let Err(e) = client.update_shelf(shelf_id, &payload).await {
-                eprintln!("Provision: created book {book_id} but couldn't attach to shelf {shelf_id}: {e}");
-            }
-        }
-    }
-
     ProvisionResult::Created {
         id: book_id,
         name: resource.default_name().to_string(),
@@ -245,12 +253,25 @@ pub async fn ensure_book_on_shelf(
 }
 
 /// Create a book with a personalized name (used by per-user provisioning).
+///
+/// Backed by [`find_or_create_book_on_shelf`] when a shelf is configured, so
+/// re-runs reuse an existing book of the same name instead of duplicating.
+/// When no shelf is given, falls back to bare create (no global dedup —
+/// callers without a configured shelf are typically in an early-setup state
+/// the briefing's setup_nudge already prompts to fix).
 pub async fn create_named_book(
     client: &BookStackClient,
     name: &str,
     description: &str,
     parent_shelf_id: Option<i64>,
 ) -> ProvisionResult {
+    if let Some(shelf_id) = parent_shelf_id {
+        return find_or_create_book_on_shelf(client, shelf_id, name, description).await;
+    }
+    // No shelf — bare create. Without a known shelf to scope the dedup
+    // lookup to, listing every book on the instance to match by name is
+    // expensive and racy. Defer that path to a future helper if the use
+    // case shows up.
     let book = match client.create_book(name, description).await {
         Ok(v) => v,
         Err(e) => return classify_error(&e),
@@ -259,24 +280,197 @@ pub async fn create_named_book(
         Some(id) => id,
         None => return ProvisionResult::Failed { reason: "create_book returned no id".to_string() },
     };
-    if let Some(shelf_id) = parent_shelf_id {
-        ensure_book_on_shelf(client, book_id, shelf_id).await;
-    }
     ProvisionResult::Created { id: book_id, name: name.to_string() }
 }
 
 /// Create a page with an arbitrary name + body inside a book.
+///
+/// Wraps [`find_or_create_page`] with a book-root parent (no chapter) so
+/// re-runs reuse an existing page with the same name instead of duplicating.
 pub async fn create_named_page(
     client: &BookStackClient,
     name: &str,
     parent_book_id: i64,
     markdown: &str,
 ) -> ProvisionResult {
-    let payload = json!({
+    find_or_create_page(client, Some(parent_book_id), None, name, markdown).await
+}
+
+/// Create a page inside a book or chapter, with the given markdown body.
+///
+/// Wraps [`find_or_create_page`] using the resource's default name. Reserved
+/// for callers (identity / whoami auto-creation) that key off a `NamedResource`
+/// rather than a free-form name.
+#[allow(dead_code)] // reserved for future identity/whoami auto-creation paths
+pub async fn create_page(
+    client: &BookStackClient,
+    resource: NamedResource,
+    parent_book_id: Option<i64>,
+    parent_chapter_id: Option<i64>,
+    markdown: &str,
+) -> ProvisionResult {
+    if parent_book_id.is_none() && parent_chapter_id.is_none() {
+        return ProvisionResult::Failed {
+            reason: "create_page requires a book_id or chapter_id".to_string(),
+        };
+    }
+    find_or_create_page(
+        client,
+        parent_book_id,
+        parent_chapter_id,
+        resource.default_name(),
+        markdown,
+    )
+    .await
+}
+
+// --- find-or-create helpers ---
+//
+// Phase 1 of the identity book restructure (RFC: identity-book-restructure):
+// every direct `client.create_*` callsite in the remember module funnels
+// through one of these so re-provisioning never duplicates structure that
+// already exists in BookStack. Match semantics: exact case-sensitive name
+// match, no fuzzy match. Description is only used at create time (existing
+// books/chapters/pages keep their existing description / content).
+//
+// Lookup scope is always narrowed by the parent (shelf, book, or chapter)
+// to keep the lookups cheap and avoid cross-identity confusion (e.g., two
+// identity books on the same shelf both named "Identity").
+
+/// Find a book on a shelf by exact name match, or create it and attach.
+/// Returns `FoundExisting` on hit, `Created` on miss, or a Denied/Failed
+/// outcome when BookStack rejects the request.
+pub async fn find_or_create_book_on_shelf(
+    client: &BookStackClient,
+    shelf_id: i64,
+    name: &str,
+    description: &str,
+) -> ProvisionResult {
+    // 1. Look up — pull the shelf, scan its books for an exact name match.
+    match client.get_shelf(shelf_id).await {
+        Ok(shelf) => {
+            if let Some(books) = shelf.get("books").and_then(|v| v.as_array()) {
+                for book in books {
+                    if book.get("name").and_then(|n| n.as_str()) == Some(name) {
+                        if let Some(id) = book.get("id").and_then(|i| i.as_i64()) {
+                            return ProvisionResult::FoundExisting {
+                                id,
+                                name: name.to_string(),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => return classify_error(&e),
+    }
+
+    // 2. Not found — create and attach to the shelf.
+    let book = match client.create_book(name, description).await {
+        Ok(v) => v,
+        Err(e) => return classify_error(&e),
+    };
+    let book_id = match book.get("id").and_then(|i| i.as_i64()) {
+        Some(id) => id,
+        None => return ProvisionResult::Failed { reason: "create_book returned no id".to_string() },
+    };
+    ensure_book_on_shelf(client, book_id, shelf_id).await;
+    ProvisionResult::Created { id: book_id, name: name.to_string() }
+}
+
+/// Find a chapter inside a book by exact name match, or create it.
+///
+/// Reserved for Phase 3 of the identity book restructure (creating the
+/// `Agents`, `Subagent Conversations`, `Journal`, and `Journal Archive -
+/// {YEAR}` chapters). Phase 1 ships the helper but doesn't wire it in yet.
+#[allow(dead_code)]
+pub async fn find_or_create_chapter(
+    client: &BookStackClient,
+    book_id: i64,
+    name: &str,
+    description: &str,
+) -> ProvisionResult {
+    // 1. Look up — pull the book contents and scan for an existing chapter.
+    match client.get_book(book_id).await {
+        Ok(book) => {
+            if let Some(contents) = book.get("contents").and_then(|v| v.as_array()) {
+                for item in contents {
+                    if item.get("type").and_then(|t| t.as_str()) == Some("chapter")
+                        && item.get("name").and_then(|n| n.as_str()) == Some(name)
+                    {
+                        if let Some(id) = item.get("id").and_then(|i| i.as_i64()) {
+                            return ProvisionResult::FoundExisting {
+                                id,
+                                name: name.to_string(),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => return classify_error(&e),
+    }
+
+    // 2. Not found — create.
+    let chapter = match client.create_chapter(book_id, name, description).await {
+        Ok(v) => v,
+        Err(e) => return classify_error(&e),
+    };
+    let chapter_id = match chapter.get("id").and_then(|i| i.as_i64()) {
+        Some(id) => id,
+        None => return ProvisionResult::Failed { reason: "create_chapter returned no id".to_string() },
+    };
+    ProvisionResult::Created { id: chapter_id, name: name.to_string() }
+}
+
+/// Find a page by exact name match in either a chapter (preferred) or at a
+/// book's root, or create it. Caller specifies the parent via `parent_chapter_id`
+/// (places the page inside the chapter) or `parent_book_id` (places it loose
+/// at the book root). At least one must be `Some`.
+///
+/// Lookup is scoped strictly to the specified parent — a chapter lookup will
+/// not pick up loose pages at the book root, and a book-root lookup will not
+/// pick up pages inside chapters. This is deliberate: if a page exists with
+/// the same name in a different parent, the caller almost certainly does not
+/// want to reuse it.
+pub async fn find_or_create_page(
+    client: &BookStackClient,
+    parent_book_id: Option<i64>,
+    parent_chapter_id: Option<i64>,
+    name: &str,
+    markdown: &str,
+) -> ProvisionResult {
+    // 1. Look up in the specified parent.
+    let existing_id: Option<i64> = if let Some(chapter_id) = parent_chapter_id {
+        match client.get_chapter(chapter_id).await {
+            Ok(chapter) => find_named_page_in_array(&chapter, "pages", name),
+            Err(e) => return classify_error(&e),
+        }
+    } else if let Some(book_id) = parent_book_id {
+        match client.get_book(book_id).await {
+            Ok(book) => find_loose_page_at_book_root(&book, name),
+            Err(e) => return classify_error(&e),
+        }
+    } else {
+        return ProvisionResult::Failed {
+            reason: "find_or_create_page requires book_id or chapter_id".to_string(),
+        };
+    };
+
+    if let Some(id) = existing_id {
+        return ProvisionResult::FoundExisting { id, name: name.to_string() };
+    }
+
+    // 2. Not found — create.
+    let mut payload = json!({
         "name": name,
-        "book_id": parent_book_id,
         "markdown": markdown,
     });
+    if let Some(id) = parent_chapter_id {
+        payload["chapter_id"] = json!(id);
+    } else if let Some(id) = parent_book_id {
+        payload["book_id"] = json!(id);
+    }
     match client.create_page(&payload).await {
         Ok(v) => match v.get("id").and_then(|i| i.as_i64()) {
             Some(id) => ProvisionResult::Created { id, name: name.to_string() },
@@ -286,36 +480,28 @@ pub async fn create_named_page(
     }
 }
 
-/// Create a page inside a book or chapter, with the given markdown body.
-#[allow(dead_code)] // reserved for future identity/whoami auto-creation paths
-pub async fn create_page(
-    client: &BookStackClient,
-    resource: NamedResource,
-    parent_book_id: Option<i64>,
-    parent_chapter_id: Option<i64>,
-    markdown: &str,
-) -> ProvisionResult {
-    let mut payload = json!({
-        "name": resource.default_name(),
-        "markdown": markdown,
-    });
-    if let Some(id) = parent_chapter_id {
-        payload["chapter_id"] = json!(id);
-    } else if let Some(id) = parent_book_id {
-        payload["book_id"] = json!(id);
-    } else {
-        return ProvisionResult::Failed {
-            reason: "create_page requires a book_id or chapter_id".to_string(),
-        };
-    }
-    match client.create_page(&payload).await {
-        Ok(v) => match v.get("id").and_then(|i| i.as_i64()) {
-            Some(id) => ProvisionResult::Created {
-                id,
-                name: resource.default_name().to_string(),
-            },
-            None => ProvisionResult::Failed { reason: "create_page returned no id".to_string() },
-        },
-        Err(e) => classify_error(&e),
-    }
+/// Walk a JSON object's named array and return the first item with a matching
+/// `name` field. Used by the chapter-page lookup path (`get_chapter` returns
+/// `{ pages: [...] }`).
+fn find_named_page_in_array(container: &Value, array_field: &str, name: &str) -> Option<i64> {
+    container
+        .get(array_field)?
+        .as_array()?
+        .iter()
+        .find(|p| p.get("name").and_then(|n| n.as_str()) == Some(name))
+        .and_then(|p| p.get("id").and_then(|i| i.as_i64()))
+}
+
+/// Find a page that lives at the book root (no chapter), matched by exact
+/// name. Pages inside chapters are intentionally excluded — the book-root
+/// lookup is for loose pages only.
+fn find_loose_page_at_book_root(book: &Value, name: &str) -> Option<i64> {
+    book.get("contents")?
+        .as_array()?
+        .iter()
+        .find(|item| {
+            item.get("type").and_then(|t| t.as_str()) == Some("page")
+                && item.get("name").and_then(|n| n.as_str()) == Some(name)
+        })
+        .and_then(|p| p.get("id").and_then(|i| i.as_i64()))
 }

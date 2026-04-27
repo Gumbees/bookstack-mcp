@@ -1942,7 +1942,9 @@ fn add_remember_tools(tools: &mut Vec<Value>) {
     let common_collection_props = json!({
         "id": { "type": ["integer", "string"], "description": "BookStack page ID (for read/write/delete by id)" },
         "key": { "type": "string", "description": "Natural key (date YYYY-MM-DD for journals, slug for topics, lowercase name for subagents)" },
-        "body": { "type": "string", "description": "Markdown body for write" },
+        "body": { "type": "string", "description": "Markdown body for write/append/update_section/append_section" },
+        "section": { "type": "string", "description": "H2 heading text for update_section / append_section. Match is exact (whitespace-trimmed). If the section doesn't exist it gets appended." },
+        "timestamp": { "type": "boolean", "description": "When true on action=append, prefix the appended chunk with a `## HH:MM TZ` heading using the user's local timezone — useful for multi-append-per-day journal entries.", "default": false },
         "query": { "type": "string", "description": "Search query for action=search" },
         "limit": { "type": "integer", "default": 25 },
         "offset": { "type": "integer", "default": 0 },
@@ -1964,20 +1966,29 @@ fn add_remember_tools(tools: &mut Vec<Value>) {
 
     tools.push(remember_tool(
         "whoami",
-        "AI agent identity. read returns the manifest page + subagent list + book/chapter pointers. write replaces the manifest page body (frontmatter auto-stamped).",
-        &["read", "write"],
+        "AI agent identity. read returns the manifest page + subagent list + book/chapter pointers. \
+         write replaces the manifest page body (frontmatter auto-stamped) — destructive. \
+         update_section replaces just the named H2 section's body, preserving every other section. \
+         append_section appends to the named section's body (creates the section if missing). \
+         Prefer update_section / append_section over write for incremental edits — write is full-replace and rarely what you want.",
+        &["read", "write", "update_section", "append_section"],
         json!({
-            "body": { "type": "string", "description": "New manifest markdown for write" },
+            "body": { "type": "string", "description": "New manifest markdown for write, OR section content for update_section/append_section" },
+            "section": { "type": "string", "description": "H2 heading text for update_section / append_section. Match is exact (whitespace-trimmed). If the section doesn't exist it gets appended." },
         }),
     ));
 
     tools.push(remember_tool(
         "user",
-        "Human user identity. read auto-provisions missing structure (per-user Identity book on the user-journals shelf, Identity page, Agent: {user_id}-journal-agent page, journal book) when `user_id` is set, returning what was created in `auto_provisioned`. write replaces the user identity page body. \
-         IMPORTANT: as you work with the user, learn what they care about, how they prefer to collaborate, and update the identity page to reflect that — the briefing surfaces a refresh reminder after 30 days of inactivity.",
-        &["read", "write"],
+        "Human user identity. read auto-provisions missing structure (per-user Identity book on the user-journals shelf, Identity page, Agent: {user_id}-journal-agent page, journal book) when `user_id` is set, returning what was created in `auto_provisioned`. \
+         write replaces the user identity page body — destructive. \
+         update_section replaces just the named H2 section, preserving every other section. \
+         append_section appends to the named section's body (creates the section if missing). \
+         IMPORTANT: as you work with the user, learn what they care about, how they prefer to collaborate, and update the identity page to reflect that — the briefing surfaces a refresh reminder after 30 days of inactivity. Prefer update_section / append_section over write for incremental edits.",
+        &["read", "write", "update_section", "append_section"],
         json!({
-            "body": { "type": "string", "description": "New user identity markdown for write" },
+            "body": { "type": "string", "description": "New user identity markdown for write, OR section content for update_section/append_section" },
+            "section": { "type": "string", "description": "H2 heading text for update_section / append_section. Match is exact (whitespace-trimmed). If the section doesn't exist it gets appended." },
         }),
     ));
 
@@ -1999,28 +2010,28 @@ fn add_remember_tools(tools: &mut Vec<Value>) {
     tools.push(remember_tool(
         "journal",
         "AI agent's daily journal entries (book of pages, monthly chapters auto-managed). Key = date YYYY-MM-DD; defaults to today on write if omitted.",
-        &["read", "write", "search", "delete"],
+        &["read", "write", "append", "update_section", "append_section", "search", "delete"],
         common_collection_props.clone(),
     ));
 
     tools.push(remember_tool(
         "collage",
         "AI agent's active topics. Key = topic slug. Pages live directly in the configured Topics book.",
-        &["read", "write", "search", "delete"],
+        &["read", "write", "append", "update_section", "append_section", "search", "delete"],
         common_collection_props.clone(),
     ));
 
     tools.push(remember_tool(
         "shared_collage",
         "Cross-agent shared topics. Same shape as collage but a different parent book.",
-        &["read", "write", "search", "delete"],
+        &["read", "write", "append", "update_section", "append_section", "search", "delete"],
         common_collection_props.clone(),
     ));
 
     tools.push(remember_tool(
         "user_journal",
         "Human user's journal (when configured by the user). Key = date YYYY-MM-DD with monthly chapters auto-managed.",
-        &["read", "write", "search", "delete"],
+        &["read", "write", "append", "update_section", "append_section", "search", "delete"],
         common_collection_props.clone(),
     ));
 

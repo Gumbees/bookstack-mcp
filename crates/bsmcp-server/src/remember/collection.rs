@@ -28,6 +28,11 @@ pub enum KeyKind {
 pub trait CollectionResource: Send + Sync {
     fn name(&self) -> &'static str;
 
+    /// UserSettings field name for the parent book — used by the
+    /// settings_not_configured error so the AI gets a real field name in
+    /// `error.fix` instead of the resource name.
+    fn setting_field(&self) -> &'static str;
+
     fn parent(&self, settings: &UserSettings) -> Option<CollectionParent>;
 
     fn key_kind(&self) -> KeyKind;
@@ -67,10 +72,13 @@ pub async fn handle(
     let parent = match resource.parent(&ctx.settings) {
         Some(p) => p,
         None => {
-            return Outcome::error(
-                ErrorCode::SettingsNotConfigured,
-                format!("{} parent not configured in settings", resource.name()),
-                Some(resource.name()),
+            return Outcome::settings_not_configured(
+                resource.setting_field(),
+                format!(
+                    "{} requires `{}` to be set. The collection has no parent book to read or write.",
+                    resource.name(),
+                    resource.setting_field()
+                ),
             );
         }
     };
@@ -568,6 +576,7 @@ pub mod resources {
     pub struct Journal;
     impl CollectionResource for Journal {
         fn name(&self) -> &'static str { "journal" }
+        fn setting_field(&self) -> &'static str { "ai_hive_journal_book_id" }
         fn parent(&self, s: &UserSettings) -> Option<CollectionParent> {
             s.ai_hive_journal_book_id        }
         fn key_kind(&self) -> KeyKind { KeyKind::Date }
@@ -580,6 +589,7 @@ pub mod resources {
     pub struct Collage;
     impl CollectionResource for Collage {
         fn name(&self) -> &'static str { "collage" }
+        fn setting_field(&self) -> &'static str { "ai_collage_book_id" }
         fn parent(&self, s: &UserSettings) -> Option<CollectionParent> {
             s.ai_collage_book_id        }
         fn key_kind(&self) -> KeyKind { KeyKind::Slug }
@@ -588,6 +598,7 @@ pub mod resources {
     pub struct SharedCollage;
     impl CollectionResource for SharedCollage {
         fn name(&self) -> &'static str { "shared_collage" }
+        fn setting_field(&self) -> &'static str { "ai_shared_collage_book_id" }
         fn parent(&self, s: &UserSettings) -> Option<CollectionParent> {
             s.ai_shared_collage_book_id        }
         fn key_kind(&self) -> KeyKind { KeyKind::Slug }
@@ -596,6 +607,7 @@ pub mod resources {
     pub struct UserJournal;
     impl CollectionResource for UserJournal {
         fn name(&self) -> &'static str { "user_journal" }
+        fn setting_field(&self) -> &'static str { "user_journal_book_id" }
         fn parent(&self, s: &UserSettings) -> Option<CollectionParent> {
             s.user_journal_book_id        }
         fn key_kind(&self) -> KeyKind { KeyKind::Date }

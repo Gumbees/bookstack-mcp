@@ -327,7 +327,14 @@ pub async fn handle_settings_post(
         recent_journal_count: parse_count(form.recent_journal_count, 3),
         active_collage_count: parse_count(form.active_collage_count, 10),
         system_prompt_page_ids: parse_id_list(form.system_prompt_page_ids),
-        timezone: empty_to_none(form.timezone),
+        timezone: empty_to_none(form.timezone.clone()),
+        // Manual /settings submit counts as a fresh fetch — stamp now so the
+        // briefing's refresh-due flag doesn't immediately fire afterwards.
+        timezone_fetched_at: if empty_to_none(form.timezone).is_some() {
+            Some(crate::remember::frontmatter::now_unix())
+        } else {
+            None
+        },
         // Carry over the existing dismiss timestamp — saving via /settings
         // doesn't change the snooze. (The nudge auto-stops showing once
         // is_configured() is true.)

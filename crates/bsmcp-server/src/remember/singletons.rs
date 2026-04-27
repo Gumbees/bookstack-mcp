@@ -22,10 +22,9 @@ pub async fn read_whoami(ctx: &Context) -> Outcome {
     let page_id = match resolved.page_id {
         Some(id) => id,
         None => {
-            return Outcome::error(
-                ErrorCode::SettingsNotConfigured,
+            return Outcome::settings_not_configured(
+                "ai_identity_page_id",
                 "ai_identity_page_id not configured (no user setting and no org default)",
-                Some("ai_identity_page_id"),
             );
         }
     };
@@ -64,10 +63,9 @@ pub async fn write_whoami(ctx: &Context) -> Outcome {
     let page_id = match ctx.settings.ai_identity_page_id {
         Some(id) => id,
         None => {
-            return Outcome::error(
-                ErrorCode::SettingsNotConfigured,
+            return Outcome::settings_not_configured(
+                "ai_identity_page_id",
                 "ai_identity_page_id not configured — set the manifest page in /settings first",
-                Some("ai_identity_page_id"),
             );
         }
     };
@@ -152,10 +150,9 @@ pub async fn read_user(ctx: &Context) -> Outcome {
                     "auto_provisioned": auto_provision_summary(&provision_result),
                 }));
             }
-            return Outcome::error(
-                ErrorCode::SettingsNotConfigured,
-                "user_identity_page_id not configured (and user_id not set, so auto-provisioning is skipped)",
-                Some("user_identity_page_id"),
+            return Outcome::settings_not_configured(
+                "user_identity_page_id",
+                "user_identity_page_id not configured (and user_id not set, so auto-provisioning is skipped — set user_id first)",
             );
         }
     };
@@ -229,10 +226,9 @@ pub async fn write_user(ctx: &Context) -> Outcome {
     let page_id = match working_settings.user_identity_page_id {
         Some(id) => id,
         None => {
-            return Outcome::error(
-                ErrorCode::SettingsNotConfigured,
-                "user_identity_page_id not configured (auto-provision needs `user_id` and `user_journals_shelf_id` to work)",
-                Some("user_identity_page_id"),
+            return Outcome::settings_not_configured(
+                "user_identity_page_id",
+                "user_identity_page_id not configured (auto-provision needs `user_id` and the global `user_journals_shelf_id` to work)",
             );
         }
     };

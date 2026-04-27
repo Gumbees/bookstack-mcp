@@ -33,10 +33,9 @@ async fn list(ctx: &Context) -> Outcome {
     let shelf_id = match globals.hive_shelf_id {
         Some(id) => id,
         None => {
-            return Outcome::error(
-                ErrorCode::SettingsNotConfigured,
-                "global hive_shelf_id is not set — configure it on /settings first",
-                Some("hive_shelf_id"),
+            return Outcome::settings_not_configured(
+                "hive_shelf_id",
+                "global hive_shelf_id is not set — only a BookStack admin can configure it via /settings or admin-only `remember_config action=write global_settings={hive_shelf_id: <id>}`",
             );
         }
     };
@@ -153,10 +152,9 @@ async fn create(ctx: &Context) -> Outcome {
     let hive_shelf_id = match globals.hive_shelf_id {
         Some(id) => id,
         None => {
-            return Outcome::error(
-                ErrorCode::SettingsNotConfigured,
-                "global hive_shelf_id is not set — configure it on /settings first",
-                Some("hive_shelf_id"),
+            return Outcome::settings_not_configured(
+                "hive_shelf_id",
+                "global hive_shelf_id is not set — admin must configure it before identities can be created",
             );
         }
     };

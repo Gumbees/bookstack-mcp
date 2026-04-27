@@ -32,20 +32,18 @@ pub async fn read(ctx: &Context) -> Outcome {
         "identities" => match globals.hive_shelf_id {
             Some(id) => id,
             None => {
-                return Outcome::error(
-                    ErrorCode::SettingsNotConfigured,
-                    "global hive_shelf_id is not set",
-                    Some("hive_shelf_id"),
+                return Outcome::settings_not_configured(
+                    "hive_shelf_id",
+                    "global hive_shelf_id is not set — admin must configure it before identities can be listed",
                 );
             }
         },
         "user_journals" => match globals.user_journals_shelf_id {
             Some(id) => id,
             None => {
-                return Outcome::error(
-                    ErrorCode::SettingsNotConfigured,
-                    "global user_journals_shelf_id is not set",
-                    Some("user_journals_shelf_id"),
+                return Outcome::settings_not_configured(
+                    "user_journals_shelf_id",
+                    "global user_journals_shelf_id is not set — admin must configure it before user journals can be listed",
                 );
             }
         },

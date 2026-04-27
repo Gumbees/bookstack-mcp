@@ -29,6 +29,10 @@ pub async fn read(ctx: &Context) -> Outcome {
 
     // Resolve identity with org-default fallback. If the user hasn't set
     // their own ai_identity_page_id but the org has a default, use it.
+    //
+    // Note: `client_timezone` refresh is handled centrally by `dispatch`
+    // before this handler runs — `ctx.settings` already reflects any newly-
+    // pushed timezone. No per-handler logic needed here.
     let globals = ctx.db.get_global_settings().await.unwrap_or_default();
     let resolved = globals.resolve_identity(&ctx.settings);
 
@@ -347,12 +351,10 @@ pub async fn read(ctx: &Context) -> Outcome {
         "shared_collage_semantic_matches": semantic.shared_collage_matches,
         "kb_semantic_matches": kb_matches_envelope(ctx, &semantic.kb_matches),
         "system_prompt_additions": system_prompt,
-        "time": {
-            "now_unix": frontmatter::now_unix(),
-            "now_utc": frontmatter::now_iso_utc(),
-            "timezone": ctx.settings.timezone.clone().unwrap_or_else(|| "UTC".to_string()),
-            "timezone_source": if ctx.settings.timezone.is_some() { "user_settings" } else { "default_utc" },
-        },
+        // `time` is now in `meta.time` on every remember response (not just
+        // briefing). Kept here too — readers were already targeting
+        // `data.time` and we don't want to break them in a patch release.
+        "time": super::envelope::build_time_block(&ctx.settings, false),
         "config": {
             "label": ctx.settings.label,
             "role": ctx.settings.role,
@@ -538,6 +540,7 @@ fn kb_matches_envelope(ctx: &Context, results: &[Value]) -> Value {
         "results": results,
     })
 }
+
 
 /// Per-user fields the setup nudge wants populated. Each entry is a
 /// `{field, why}` pair — `field` matches the UserSettings JSON key so the AI

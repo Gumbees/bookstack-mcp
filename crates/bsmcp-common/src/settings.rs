@@ -146,8 +146,21 @@ pub struct UserSettings {
     /// User's IANA timezone name (e.g., "America/New_York"). Surfaced in the
     /// briefing's `time` block so the AI can format timestamps in the user's
     /// local time. If unset, the briefing reports UTC.
+    ///
+    /// Auto-populated by the briefing when the client passes
+    /// `client_timezone`; manually editable on /settings; refreshed every
+    /// `TIMEZONE_REFRESH_SECS` so DST transitions and travel are picked up
+    /// without forcing the user to re-save settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
+
+    /// Unix epoch seconds the timezone was last set/refreshed by the client.
+    /// The briefing surfaces `timezone_refresh_due: true` when the cache is
+    /// older than 4h so the client knows to re-detect and pass `client_timezone`
+    /// on the next call. Manually-set values (via /settings) get a fresh
+    /// fetched_at too — no special casing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone_fetched_at: Option<i64>,
 
     /// Unix epoch seconds until which the briefing's "configure your settings"
     /// nudge is snoozed. When `now < this`, the nudge is suppressed. Set via

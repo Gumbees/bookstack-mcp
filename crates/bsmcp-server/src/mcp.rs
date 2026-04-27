@@ -1872,16 +1872,39 @@ fn add_remember_tools(tools: &mut Vec<Value>) {
                 "enum": actions,
                 "description": "Operation to perform on this resource",
                 "default": actions.first().copied().unwrap_or("read"),
-            }
+            },
+            // client_timezone is accepted by EVERY remember endpoint, not
+            // just briefing. The server caches it in user_settings and
+            // refreshes whenever the cache is stale (>4h) or the value
+            // changes. Pass it whenever `meta.time.timezone_refresh_due`
+            // was true on a previous response.
+            "client_timezone": {
+                "type": "string",
+                "description": "Optional IANA timezone (e.g. \"America/New_York\"). Cached server-side; refresh when `meta.time.timezone_refresh_due` is true. Detect via your client's local time API.",
+            },
         });
         if let Value::Object(extra) = extra_props {
             if let Value::Object(ref mut p) = props {
                 for (k, v) in extra { p.insert(k, v); }
             }
         }
+        // Every remember_* tool ends with the same setup pointer so the AI
+        // knows what to do when a call returns settings_not_configured.
+        // The pointer is identical across tools intentionally — repeating it
+        // beats hoping the AI noticed it once on a different tool.
+        let full_description = format!(
+            "{description}\n\nSETUP: All remember_* tools require user/global settings. \
+             If this returns `settings_not_configured`, the response includes a \
+             structured `error.fix` block with the exact MCP call to make. \
+             Run `remember_briefing action=read` first — its `setup_nudge` enumerates \
+             every pending field and `meta.setup_incomplete` flags partial config on \
+             every response. \
+             TIME: every response carries `meta.time` with now_unix/now_utc/now_local/now_human \
+             and `timezone_refresh_due`. Pass `client_timezone` on any call to refresh."
+        );
         tool(
             &format!("remember_{resource}"),
-            description,
+            &full_description,
             json!({ "type": "object", "properties": props }),
         )
     }
@@ -1900,7 +1923,7 @@ fn add_remember_tools(tools: &mut Vec<Value>) {
     // Singletons
     tools.push(remember_tool(
         "briefing",
-        "Reconstitution dossier — one structured pull replacing the multi-call AI bootstrap. Returns identity manifest, user identity, recent journals, active topics, semantic matches against the user_prompt, and config metadata.",
+        "Reconstitution dossier — one structured pull replacing the multi-call AI bootstrap. Returns identity manifest, user identity, recent journals, active topics, semantic matches against the user_prompt, and config metadata. The full setup_nudge surfaces here when settings are incomplete.",
         &["read"],
         json!({
             "user_prompt": { "type": "string", "description": "First user message — drives semantic prioritization" },

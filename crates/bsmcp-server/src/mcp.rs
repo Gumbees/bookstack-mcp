@@ -1879,9 +1879,21 @@ fn add_remember_tools(tools: &mut Vec<Value>) {
                 for (k, v) in extra { p.insert(k, v); }
             }
         }
+        // Every remember_* tool ends with the same setup pointer so the AI
+        // knows what to do when a call returns settings_not_configured.
+        // The pointer is identical across tools intentionally — repeating it
+        // beats hoping the AI noticed it once on a different tool.
+        let full_description = format!(
+            "{description}\n\nSETUP: All remember_* tools require user/global settings. \
+             If this returns `settings_not_configured`, the response includes a \
+             structured `error.fix` block with the exact MCP call to make. \
+             Run `remember_briefing action=read` first — its `setup_nudge` enumerates \
+             every pending field and `meta.setup_incomplete` flags partial config on \
+             every response."
+        );
         tool(
             &format!("remember_{resource}"),
-            description,
+            &full_description,
             json!({ "type": "object", "properties": props }),
         )
     }

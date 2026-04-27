@@ -102,7 +102,8 @@ pub async fn dispatch(
     }
 
     let elapsed_ms = ctx.started.elapsed().as_millis() as u64;
-    let meta = envelope::build_meta(&trace_id, elapsed_ms, &ctx.settings, outcome.warnings.clone());
+    let globals = db.get_global_settings().await.unwrap_or_default();
+    let meta = envelope::build_meta(&trace_id, elapsed_ms, &ctx.settings, &globals, outcome.warnings.clone());
 
     match outcome.result {
         Ok(data) => json!({
@@ -110,15 +111,21 @@ pub async fn dispatch(
             "data": data,
             "meta": meta,
         }),
-        Err(err) => json!({
-            "ok": false,
-            "error": {
+        Err(err) => {
+            let mut error_obj = json!({
                 "code": err.code.as_str(),
                 "message": err.message,
                 "field": err.field,
-            },
-            "meta": meta,
-        }),
+            });
+            if let Some(fix) = err.fix {
+                error_obj["fix"] = fix;
+            }
+            json!({
+                "ok": false,
+                "error": error_obj,
+                "meta": meta,
+            })
+        }
     }
 }
 
@@ -215,6 +222,25 @@ impl Outcome {
                 code,
                 message: message.into(),
                 field: field.map(|s| s.to_string()),
+                fix: None,
+            }),
+            warnings: Vec::new(),
+            target_page_id: None,
+            target_key: None,
+        }
+    }
+
+    /// Construct a `settings_not_configured` error with the per-field
+    /// `fix` block automatically attached. Prefer this over `error(...)`
+    /// for missing-config errors so the AI gets actionable guidance every
+    /// time, not just on briefing.
+    pub fn settings_not_configured(field: &str, message: impl Into<String>) -> Self {
+        Self {
+            result: Err(RememberError {
+                code: ErrorCode::SettingsNotConfigured,
+                message: message.into(),
+                field: Some(field.to_string()),
+                fix: Some(envelope::fix_for_field(field)),
             }),
             warnings: Vec::new(),
             target_page_id: None,
@@ -240,4 +266,8 @@ pub struct RememberError {
     pub code: ErrorCode,
     pub message: String,
     pub field: Option<String>,
+    /// Optional structured fix instructions — populated for
+    /// `settings_not_configured` errors so the AI knows exactly which
+    /// MCP call to make next. Surfaced as `error.fix` in the envelope.
+    pub fix: Option<serde_json::Value>,
 }

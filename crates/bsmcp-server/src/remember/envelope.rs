@@ -4,6 +4,11 @@ use serde_json::{json, Value};
 
 use bsmcp_common::settings::{GlobalSettings, UserSettings};
 
+/// How long a client-pushed timezone is trusted before the response flags
+/// it for refresh. 4h covers DST transitions and most travel within a
+/// session; shorter would just churn the user_settings table.
+pub const TIMEZONE_REFRESH_SECS: i64 = 4 * 60 * 60;
+
 /// Discriminated error codes — clients can switch on these.
 #[derive(Clone, Copy, Debug)]
 #[allow(dead_code)] // SemanticUnavailable reserved for explicit "semantic required" calls
@@ -50,6 +55,7 @@ pub fn build_meta(
     settings: &UserSettings,
     globals: &GlobalSettings,
     warnings: Vec<RememberWarning>,
+    tz_just_pushed: bool,
 ) -> Value {
     let mut meta = json!({
         "trace_id": trace_id,
@@ -65,6 +71,12 @@ pub fn build_meta(
             "code": w.code,
             "message": w.message,
         })).collect::<Vec<_>>(),
+        // Time block — surfaced on EVERY remember response (not just
+        // briefing) so the AI always knows the current time in the user's
+        // configured timezone without a separate roundtrip. Carries the
+        // refresh-due flag so any endpoint can prompt the client to push
+        // a fresh `client_timezone` on its next call.
+        "time": build_time_block(settings, tz_just_pushed),
     });
 
     // Compact setup-status pointer — surfaced on every response (not just
@@ -76,6 +88,55 @@ pub fn build_meta(
     }
 
     meta
+}
+
+/// Build the time block for a remember response. Surfaces unix + UTC
+/// always, plus timezone-aware fields when the user's timezone is set:
+/// `now_local` (RFC 3339 with offset), `now_human` (e.g. "Saturday,
+/// April 26, 2026 at 6:42 PM EDT"), and `timezone_refresh_due` so the
+/// client knows when to re-detect.
+///
+/// `tz_just_pushed` is true when the request carried a fresh
+/// `client_timezone` — the refresh-due flag stays false in that case
+/// even if the cache had been stale, since we just refreshed it.
+pub fn build_time_block(s: &UserSettings, tz_just_pushed: bool) -> Value {
+    let now = chrono::Utc::now();
+    let now_unix = now.timestamp();
+    let now_utc = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+    let (timezone, source) = match s.timezone.as_deref() {
+        Some(tz) => (tz.to_string(), "user_settings"),
+        None => ("UTC".to_string(), "default_utc"),
+    };
+
+    let mut block = json!({
+        "now_unix": now_unix,
+        "now_utc": now_utc,
+        "timezone": timezone,
+        "timezone_source": source,
+    });
+
+    if let Ok(tz) = timezone.parse::<chrono_tz::Tz>() {
+        let local = now.with_timezone(&tz);
+        block["now_local"] = json!(local.format("%Y-%m-%dT%H:%M:%S%:z").to_string());
+        block["now_human"] = json!(local.format("%A, %B %-d, %Y at %-I:%M %p %Z").to_string());
+    }
+
+    let refresh_due = if tz_just_pushed {
+        false
+    } else {
+        match s.timezone_fetched_at {
+            None => s.timezone.is_some(),
+            Some(t) => now_unix - t > TIMEZONE_REFRESH_SECS,
+        }
+    };
+    block["timezone_refresh_due"] = json!(refresh_due);
+    block["timezone_refresh_hint"] = json!(
+        "Pass `client_timezone` (IANA name like \"America/New_York\") on any \
+         remember_* call to refresh. Detect via your client's local time API."
+    );
+
+    block
 }
 
 /// Build a one-line setup status when anything's still missing. Returns

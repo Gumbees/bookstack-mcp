@@ -1872,7 +1872,16 @@ fn add_remember_tools(tools: &mut Vec<Value>) {
                 "enum": actions,
                 "description": "Operation to perform on this resource",
                 "default": actions.first().copied().unwrap_or("read"),
-            }
+            },
+            // client_timezone is accepted by EVERY remember endpoint, not
+            // just briefing. The server caches it in user_settings and
+            // refreshes whenever the cache is stale (>4h) or the value
+            // changes. Pass it whenever `meta.time.timezone_refresh_due`
+            // was true on a previous response.
+            "client_timezone": {
+                "type": "string",
+                "description": "Optional IANA timezone (e.g. \"America/New_York\"). Cached server-side; refresh when `meta.time.timezone_refresh_due` is true. Detect via your client's local time API.",
+            },
         });
         if let Value::Object(extra) = extra_props {
             if let Value::Object(ref mut p) = props {
@@ -1889,7 +1898,9 @@ fn add_remember_tools(tools: &mut Vec<Value>) {
              structured `error.fix` block with the exact MCP call to make. \
              Run `remember_briefing action=read` first — its `setup_nudge` enumerates \
              every pending field and `meta.setup_incomplete` flags partial config on \
-             every response."
+             every response. \
+             TIME: every response carries `meta.time` with now_unix/now_utc/now_local/now_human \
+             and `timezone_refresh_due`. Pass `client_timezone` on any call to refresh."
         );
         tool(
             &format!("remember_{resource}"),
@@ -1912,14 +1923,12 @@ fn add_remember_tools(tools: &mut Vec<Value>) {
     // Singletons
     tools.push(remember_tool(
         "briefing",
-        "Reconstitution dossier — one structured pull replacing the multi-call AI bootstrap. Returns identity manifest, user identity, recent journals, active topics, semantic matches against the user_prompt, config metadata, and a `time` block with now_unix/now_utc/now_local/now_human + the user's timezone. \
-         When the response's `time.timezone_refresh_due` is true, detect the local timezone (IANA name like \"America/New_York\" via `Intl.DateTimeFormat().resolvedOptions().timeZone` or system equivalent) and pass it as `client_timezone` on the next briefing call to refresh the cache (~4h TTL).",
+        "Reconstitution dossier — one structured pull replacing the multi-call AI bootstrap. Returns identity manifest, user identity, recent journals, active topics, semantic matches against the user_prompt, and config metadata. The full setup_nudge surfaces here when settings are incomplete.",
         &["read"],
         json!({
             "user_prompt": { "type": "string", "description": "First user message — drives semantic prioritization" },
             "recent_journal_count": { "type": "integer", "description": "Override the configured recent_journal_count" },
             "active_collage_count": { "type": "integer", "description": "Override the configured active_collage_count" },
-            "client_timezone": { "type": "string", "description": "Client's detected IANA timezone (e.g. \"America/New_York\"). Cached in user_settings; refreshed every 4h. Pass when `time.timezone_refresh_due` was true on the previous response." },
         }),
     ));
 

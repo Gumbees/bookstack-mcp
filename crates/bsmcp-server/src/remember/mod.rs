@@ -57,7 +57,7 @@ pub async fn dispatch(
     let token_id_hash = hash_token_id(token_id);
 
     // Load user settings — None becomes default (everything disabled).
-    let settings = match db.get_user_settings(&token_id_hash).await {
+    let mut settings = match db.get_user_settings(&token_id_hash).await {
         Ok(Some(s)) => s,
         Ok(None) => UserSettings::default(),
         Err(e) => {
@@ -65,6 +65,36 @@ pub async fn dispatch(
             UserSettings::default()
         }
     };
+
+    // Client-pushed timezone refresh — accepted on every remember endpoint
+    // so the AI can keep the cache fresh from any call, not just briefing.
+    // No-op when the body doesn't carry one or when the cache is already
+    // recent and matches. We persist asynchronously and stamp the local
+    // `settings` immediately so the response's time block reflects the
+    // newly-pushed value.
+    let client_tz: Option<String> = body
+        .get("client_timezone")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s.parse::<chrono_tz::Tz>().is_ok());
+    let mut tz_just_pushed = false;
+    if let Some(ref tz) = client_tz {
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let needs_save = settings.timezone.as_deref() != Some(tz.as_str())
+            || settings.timezone_fetched_at.unwrap_or(0)
+                < now_unix - envelope::TIMEZONE_REFRESH_SECS;
+        if needs_save {
+            settings.timezone = Some(tz.clone());
+            settings.timezone_fetched_at = Some(now_unix);
+            if let Err(e) = db.save_user_settings(&token_id_hash, &settings).await {
+                eprintln!("Remember: failed to persist client_timezone (non-fatal): {e}");
+            }
+        }
+        tz_just_pushed = true;
+    }
 
     let ctx = Context {
         body,
@@ -103,7 +133,14 @@ pub async fn dispatch(
 
     let elapsed_ms = ctx.started.elapsed().as_millis() as u64;
     let globals = db.get_global_settings().await.unwrap_or_default();
-    let meta = envelope::build_meta(&trace_id, elapsed_ms, &ctx.settings, &globals, outcome.warnings.clone());
+    let meta = envelope::build_meta(
+        &trace_id,
+        elapsed_ms,
+        &ctx.settings,
+        &globals,
+        outcome.warnings.clone(),
+        tz_just_pushed,
+    );
 
     match outcome.result {
         Ok(data) => json!({

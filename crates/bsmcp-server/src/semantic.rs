@@ -16,6 +16,32 @@ use bsmcp_common::types::MarkovBlanket;
 
 const PERMISSION_CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
 
+/// Cap a single semantic-match's chunks and truncate each chunk's content.
+/// Shared by every caller that surfaces chunk previews to a model — the
+/// briefing (per-book + kb) and the `semantic_search` MCP tool — so the
+/// truncation rules stay in one place even when the budgets differ per
+/// caller. `sem.search()` itself returns full chunks; trimming is the
+/// caller's responsibility.
+///
+/// Truncated chunks get a `truncated: true` flag and a `…` suffix so
+/// consumers can tell a clipped chunk from a naturally short one. Char-count
+/// is used (not byte-count) so multibyte UTF-8 isn't sliced mid-codepoint.
+pub fn trim_match(mut hit: Value, max_chunks: usize, max_chars: usize) -> Value {
+    let Some(obj) = hit.as_object_mut() else { return hit; };
+    let Some(chunks) = obj.get_mut("chunks").and_then(|v| v.as_array_mut()) else { return hit; };
+    chunks.truncate(max_chunks);
+    for chunk in chunks.iter_mut() {
+        let Some(chunk_obj) = chunk.as_object_mut() else { continue; };
+        let Some(content) = chunk_obj.get("content").and_then(|v| v.as_str()) else { continue; };
+        if content.chars().count() > max_chars {
+            let truncated: String = content.chars().take(max_chars).collect();
+            chunk_obj.insert("content".to_string(), Value::String(format!("{truncated}…")));
+            chunk_obj.insert("truncated".to_string(), Value::Bool(true));
+        }
+    }
+    hit
+}
+
 struct CachedAccess {
     accessible: bool,
     cached_at: Instant,

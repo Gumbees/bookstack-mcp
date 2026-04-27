@@ -11,6 +11,33 @@ use bsmcp_common::bookstack::BookStackClient;
 
 use super::envelope::ErrorCode;
 use super::{frontmatter, Context, Outcome};
+use crate::semantic::trim_match;
+
+/// Per-book semantic-match trim: max chunks per page, max chars per chunk.
+/// Tighter than the `semantic_search` MCP tool because the briefing is
+/// pulled at the start of every session and has to amortize across many
+/// downstream tools. The AI is expected to call `get_page(page_id)` when
+/// it needs more context.
+const PER_BOOK_CHUNK_LIMIT: usize = 3;
+const PER_BOOK_CHUNK_CHARS: usize = 100;
+
+/// `kb_semantic_matches` runs across the entire embedded corpus, so each
+/// hit lands with less surrounding context than the per-book scopes.
+/// Slightly more generous chunk allowance compensates for that.
+const KB_CHUNK_LIMIT: usize = 4;
+const KB_CHUNK_CHARS: usize = 150;
+
+/// Cap on `kb_semantic_matches` results returned. Was 10; lowered to keep
+/// the briefing payload from blowing past response-size budgets when full-KB
+/// search is enabled.
+const KB_MATCH_LIMIT: usize = 6;
+
+/// Surfaced once at the top of the briefing so the AI knows the contract:
+/// matches are deliberately small; `get_page` is the escape hatch.
+const SEMANTIC_MATCHES_HINT: &str =
+    "Each *_semantic_matches entry returns up to 3 chunks of ~100 chars (kb_semantic_matches: up to 4 chunks of ~150 chars). \
+     Truncated chunks have `truncated: true` and end with …. \
+     These are search-result previews, not full page content — call `get_page(page_id)` to read the full markdown when a match looks relevant.";
 
 pub async fn read(ctx: &Context) -> Outcome {
     let user_prompt = ctx.body_str("user_prompt").unwrap_or_default();
@@ -170,8 +197,9 @@ pub async fn read(ctx: &Context) -> Outcome {
                     let bid = h.get("book_id").and_then(|v| v.as_i64()).unwrap_or(0);
                     !exclude.contains(&bid)
                 })
-                .take(10)
+                .take(KB_MATCH_LIMIT)
                 .cloned()
+                .map(|h| trim_match(h, KB_CHUNK_LIMIT, KB_CHUNK_CHARS))
                 .collect();
         }
         slice
@@ -350,6 +378,7 @@ pub async fn read(ctx: &Context) -> Outcome {
         "shared_collage_active": shared_collage,
         "shared_collage_semantic_matches": semantic.shared_collage_matches,
         "kb_semantic_matches": kb_matches_envelope(ctx, &semantic.kb_matches),
+        "semantic_matches_hint": SEMANTIC_MATCHES_HINT,
         "system_prompt_additions": system_prompt,
         // `time` is now in `meta.time` on every remember response (not just
         // briefing). Kept here too — readers were already targeting
@@ -483,6 +512,7 @@ fn filter_by_book(hits: &[Value], book_id: Option<i64>, limit: usize) -> Vec<Val
         .filter(|h| h.get("book_id").and_then(|v| v.as_i64()) == Some(book_id))
         .take(limit)
         .cloned()
+        .map(|h| trim_match(h, PER_BOOK_CHUNK_LIMIT, PER_BOOK_CHUNK_CHARS))
         .collect()
 }
 

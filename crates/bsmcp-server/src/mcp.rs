@@ -9,7 +9,7 @@ use pulldown_cmark::{html, Options, Parser};
 use bsmcp_common::bookstack::{self, BookStackClient, ContentType, ExportFormat};
 use bsmcp_common::db::DbBackend;
 use crate::remember;
-use crate::semantic::SemanticState;
+use crate::semantic::{trim_match, SemanticState};
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
 
@@ -135,7 +135,8 @@ async fn execute_tool(
             // entry point — it has no UserSettings context to look up the
             // caller's `bookstack_user_id`. The HTTP `filter_by_permission`
             // fallback inside `sem.search` still enforces access control.
-            let result = sem.search(&query, limit, threshold, hybrid, verbose, client, None, None).await?;
+            let mut result = sem.search(&query, limit, threshold, hybrid, verbose, client, None, None).await?;
+            trim_semantic_search_payload(&mut result);
             format_json(&result)
         }
         "reembed" => {
@@ -915,6 +916,35 @@ fn filter_string_update_fields(args: &Value, fields: &[&str]) -> Value {
 
 fn format_json(v: &Value) -> Result<String, String> {
     serde_json::to_string_pretty(v).map_err(|e| e.to_string())
+}
+
+/// `semantic_search` MCP-tool payload trim. Caps each result's chunks and
+/// truncates each chunk's content so a wide query doesn't blow past Claude
+/// Code's response-size budget (which would force the response to spill to a
+/// local file). Slightly more generous than the briefing's per-section trim
+/// because the caller asked for these results explicitly and gets one shot at
+/// them; the briefing pulls every session and amortizes across many tools.
+///
+/// Truncation logic itself lives in `crate::semantic::trim_match` — this
+/// function only owns the budget and the response-envelope hint.
+const SEMANTIC_SEARCH_CHUNK_LIMIT: usize = 5;
+const SEMANTIC_SEARCH_CHUNK_CHARS: usize = 200;
+const SEMANTIC_SEARCH_HINT: &str =
+    "Each result returns up to 5 chunks of ~200 chars (truncated chunks have `truncated: true` and end with …). \
+     These are search-result previews, not full page content — call `get_page(page_id)` to read the full markdown when a match looks relevant.";
+
+fn trim_semantic_search_payload(payload: &mut Value) {
+    let Some(obj) = payload.as_object_mut() else { return; };
+    if let Some(results) = obj.get_mut("results").and_then(|v| v.as_array_mut()) {
+        for result in results.iter_mut() {
+            // Drop into the shared helper. take() leaves Value::Null in the slot;
+            // we immediately overwrite it with the trimmed result so no consumer
+            // ever sees the placeholder.
+            let owned = std::mem::take(result);
+            *result = trim_match(owned, SEMANTIC_SEARCH_CHUNK_LIMIT, SEMANTIC_SEARCH_CHUNK_CHARS);
+        }
+    }
+    obj.insert("hint".to_string(), Value::String(SEMANTIC_SEARCH_HINT.to_string()));
 }
 
 fn format_search_results(data: &Value, base_url: &str) -> String {

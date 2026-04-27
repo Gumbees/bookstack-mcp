@@ -52,25 +52,39 @@ docker compose -f docker/docker-compose.sqlite.yml up -d
 
 ## Branching
 
-- `development` — default branch; all PRs land here
-- `release` — stable/production; merged from development when ready to ship
-- `enhancement/{name}` — branched from development for new functionality
-- `problem/{name}` — branched from development for bug fixes
+The canonical reference for the org-wide branching standard is the [Branching Strategy](https://kb.beesroadhouse.com/books/developer-operations-devops/page/branching-strategy) page in the Bee's Roadhouse DevOps book. This file mirrors the policy that applies to this repo specifically.
+
+- `development` — default branch; all active work lands here. Direct pushes are **authorized** (small touchups, scaffolding, emergency hotfixes). Pushes trigger CI build/package.
+- `release` — stable/production; merged from development when ready to ship. The **only** protected branch (org-level ruleset blocks force-push and deletion; PR required).
+- Work branches use the four-prefix taxonomy below.
 
 No `main` or `master` branches exist.
+
+### Work branch prefixes
+
+| Prefix | Use for | GitHub labels | Default semver bump | Example |
+|--------|---------|---------------|---------------------|---------|
+| `feature/{name}` | New capability that didn't exist | `type:enhancement` + `category:feature` | minor | `feature/export-api` |
+| `improvement/{name}` | Existing capability, done better | `type:enhancement` + `category:improvement` | minor | `improvement/search-relevance` |
+| `refactor/{name}` | Design or structure redo | `type:problem` + `category:refactor` | patch (or minor if external behavior changes) | `refactor/auth-flow` |
+| `bug/{name}` | Implementation mistake, something broken | `type:problem` + `category:bug` | patch | `bug/oauth-token-refresh` |
+
+Breaking changes are orthogonal to type — prefix the **PR title** with `BREAKING:` regardless of the branch prefix to force a major-version bump.
 
 ### Workflow
 
 ```
 1. git checkout development && git pull
-2. git checkout -b enhancement/my-feature   (or problem/my-fix)
-3. ... commit work ...
-4. git push -u origin enhancement/my-feature
-5. Open PR against development
-6. CI builds artifact (see CI/CD below) — PR cannot merge until it succeeds
+2. git checkout -b improvement/my-change      # or feature/, refactor/, bug/
+3. ... commit work (signed via SSH; see Commit Signing below) ...
+4. git push -u origin improvement/my-change
+5. Open PR against development; apply the matching type: + category: labels
+6. CI builds artifact + regenerates SBOM/STRUCTURE on the PR source branch (see CI/CD below)
 7. Squash-merge PR into development; delete the work branch
 8. When ready to ship: open PR from development -> release
 ```
+
+Direct pushes to `development` stay available — use them for small atomic changes, scaffolding, or emergency hotfixes. The PR flow is the team norm for anything else.
 
 ## CI/CD
 
@@ -116,20 +130,32 @@ Images are published to `ghcr.io/bees-roadhouse/bsmcp-server` and `ghcr.io/bees-
 
 ### Branch protection
 
-`development` and `release` require:
-- PR (no direct push)
-- Status checks `build-server` and `build-embedder` must pass before merge
-- Squash merges only
+Protection lives at the **organization level** via a GitHub Ruleset (`Release Branch Protection`) targeting `refs/heads/release` on every repo in `bees-roadhouse`:
 
-The required checks are what enforce "artifact must exist before merge". Configure these in **Settings → Branches → Branch protection rules**.
+- `pull_request` (0 required approvals — the gate is CI status, not approver count)
+- `non_fast_forward` (blocks force-push)
+- `deletion` (blocks branch delete)
+
+`development` is **intentionally unprotected** — direct pushes stay authorized so scaffolding, hotfixes, and small atomic changes don't get stuck in PR ceremony. CI runs on every push regardless, so regressions are still caught.
+
+Required status checks (`build-server`, `build-embedder`) gate the merge into `release` once the PR is open. The artifact-before-merge invariant comes from those checks plus the PR-source-branch trigger, not from blocking direct pushes.
+
+### Commit signing
+
+Every commit must be signed via SSH using 1Password's SSH agent. See the [Commit Signing](https://kb.beesroadhouse.com/books/developer-operations-devops/page/commit-signing) page in the DevOps book for full configuration.
 
 ## Versioning
 
 Semantic versioning (`MAJOR.MINOR.PATCH`). Version lives in workspace `Cargo.toml`.
 
-- `enhancement/*` merge to development -> bump minor in the PR
-- `problem/*` merge to development -> bump patch in the PR
-- Release: open PR from development -> release. The release-merge promote job retags with the current `{version}` and creates the GitHub Release.
+Default semver bump per branch prefix (override with `BREAKING:` in the PR title for a major bump):
+
+- `feature/*` — minor
+- `improvement/*` — minor
+- `refactor/*` — patch (minor if external behavior changes)
+- `bug/*` — patch
+
+Release: open PR from development -> release. The release-merge promote job retags with the current `{version}` and creates the GitHub Release.
 
 ## Testing
 

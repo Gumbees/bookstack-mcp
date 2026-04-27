@@ -1,16 +1,195 @@
-# RFC: Identity Book Restructure
+# RFC: Identity Book Restructure + DB-as-Index Architecture
 
 | Field | Value |
 |---|---|
-| Status | Draft — accepting comments via PR review |
-| Target version | v0.8.0 |
-| Branch | `improvement/identity-restructure-rfc` (this RFC), implementation PRs to follow |
+| Status | Draft v2 — accepting comments via PR review |
+| Target version | **v1.0.0** (was v0.8.0 in draft v1) |
+| Original RFC | merged at `4150646` (PR #26) — this PR amends it |
 | Author | Nate Smith |
 | Co-author | Pia (Apiara) |
 
 ## Summary
 
-Collapse each AI identity from three Hive-shelf books (Identity, Journal, Collage) down to **one Identity book** organized by chapters, plus the Collage book staying separate. Add explicit chapter pointers in `UserSettings`. Move the journal from a book to a chapter, with yearly archive chapters created on rollover. Replace every `client.create_*` callsite in the provisioning code with name-scoped `find_or_create_*` helpers so re-runs never duplicate. Migration is opt-in via a new `remember_migrate` MCP tool, surfaced through the briefing's existing `setup_nudge`.
+**v1.0.0 architecture pivot.** Treat our SQLite/Postgres database as the **structural index of every BookStack content item we care about**, plus a **page-body cache** populated by a reconciliation worker. BookStack remains canonical for content (markdown body, page revisions, attachments, permissions, the wiki UX) but our DB owns: metadata, parent-child relationships, identity classification, dedup constraints, and a fresh-enough cache of every page body. Result: most operations that previously required BookStack API calls become local DB queries, briefing latency drops to <100 ms typical, dedup becomes a UNIQUE constraint, and the migration tool's plan is a SQL query.
+
+The original RFC's structural goals — chapters inside the Identity book (`Agents`, `Subagent Conversations`, `Journal`, `Journal Archive - {YEAR}`), Collage staying its own book, year-rollover archive sweep, programmatic update actions (`append` / `update_section` / `append_section`), opt-in `remember_migrate` tool — all stay. The mechanism changes: instead of walking BookStack contents on every call, we query our index; instead of name-match lookup, we hit a UNIQUE constraint; instead of fetching every body for the briefing, we serve from page-cache.
+
+## Architecture: DB as index, BookStack as presentation
+
+### Principle
+
+Every BookStack call falls into one of two buckets:
+
+- **Content bucket.** Read or write the actual markdown body. BookStack API stays in the loop here (`get_page` for a fresh body, `create_page` / `update_page` / `delete_page` / `move_page` for writes). Webhooks tell us when a user edits a page in the BookStack UI so we can refresh.
+- **Structural bucket.** Existence checks, listings, parent-child traversal, identity classification, "what's the page id for today's journal entry," dedup. Under v1.0.0 these all become local SQL.
+
+The page-body cache narrows the content bucket further: most reads (`get_page` for system_prompt_additions, identity manifests, recent journal pages displayed in the briefing) hit a cached row populated by the reconciliation worker. BookStack API is only consulted on cache miss or when we're about to write.
+
+### New DB tables
+
+```sql
+-- Mirror of BookStack's content tree, scoped to the shelves we care about.
+-- Every row is reconciled by the indexer worker. Webhook + periodic delta
+-- walk + initial full walk all converge on these tables.
+
+CREATE TABLE bookstack_shelves (
+    shelf_id INTEGER PRIMARY KEY,           -- BookStack shelf id
+    name TEXT NOT NULL,
+    slug TEXT NOT NULL,
+    shelf_kind TEXT NOT NULL,               -- 'hive' | 'user_journals' | 'unclassified'
+    indexed_at INTEGER NOT NULL,            -- unix ts of most recent reconcile
+    deleted INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE bookstack_books (
+    book_id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    slug TEXT NOT NULL,
+    shelf_id INTEGER,                       -- nullable: shelfless books exist
+    -- structural classification, filled in by classify_book()
+    identity_ouid TEXT,                     -- which AI identity (if any)
+    book_kind TEXT NOT NULL,                -- 'identity' | 'collage' | 'shared_collage'
+                                            -- | 'user_identity' | 'user_journal'
+                                            -- | 'unclassified'
+    indexed_at INTEGER NOT NULL,
+    deleted INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (shelf_id) REFERENCES bookstack_shelves(shelf_id) ON DELETE SET NULL
+);
+
+CREATE TABLE bookstack_chapters (
+    chapter_id INTEGER PRIMARY KEY,
+    book_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    slug TEXT NOT NULL,
+    -- structural classification
+    identity_ouid TEXT,
+    chapter_kind TEXT NOT NULL,             -- 'agents' | 'subagent_conversations'
+                                            -- | 'journal_active' | 'journal_archive'
+                                            -- | 'unclassified'
+    archive_year INTEGER,                   -- non-NULL only for journal_archive
+    indexed_at INTEGER NOT NULL,
+    deleted INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (book_id) REFERENCES bookstack_books(book_id) ON DELETE CASCADE
+);
+
+CREATE TABLE bookstack_pages (
+    page_id INTEGER PRIMARY KEY,
+    book_id INTEGER NOT NULL,
+    chapter_id INTEGER,                     -- NULL for pages loose at book root
+    name TEXT NOT NULL,
+    slug TEXT NOT NULL,
+    url TEXT,
+    page_created_at TEXT,                   -- ISO 8601 from BookStack
+    page_updated_at TEXT,                   -- ditto; webhook signal for cache freshness
+    -- structural classification
+    identity_ouid TEXT,
+    page_kind TEXT NOT NULL,                -- 'manifest' | 'agent' | 'journal_entry'
+                                            -- | 'collage_topic' | 'subagent_conversation'
+                                            -- | 'system_prompt_addition' | 'unclassified'
+    page_key TEXT,                          -- date for journal, slug for collage,
+                                            -- agent-name for agents, etc.
+    archive_year INTEGER,                   -- non-NULL when page is in archive chapter
+    indexed_at INTEGER NOT NULL,
+    deleted INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (book_id) REFERENCES bookstack_books(book_id) ON DELETE CASCADE,
+    FOREIGN KEY (chapter_id) REFERENCES bookstack_chapters(chapter_id) ON DELETE SET NULL
+);
+
+-- Dedup enforcement: at most one non-deleted page per (identity, kind, key).
+CREATE UNIQUE INDEX bookstack_pages_dedup
+    ON bookstack_pages (identity_ouid, page_kind, page_key)
+    WHERE deleted = 0 AND identity_ouid IS NOT NULL AND page_key IS NOT NULL;
+
+-- Page-body cache. One row per page; refreshed by the indexer when the
+-- BookStack `updated_at` advances or on explicit invalidation.
+CREATE TABLE page_cache (
+    page_id INTEGER PRIMARY KEY,
+    markdown TEXT,                          -- frontmatter-stripped body
+    raw_markdown TEXT,                      -- with frontmatter
+    html TEXT,                              -- rendered (if requested)
+    cached_at INTEGER NOT NULL,
+    page_updated_at TEXT,                   -- BookStack updated_at when this body was fetched
+    FOREIGN KEY (page_id) REFERENCES bookstack_pages(page_id) ON DELETE CASCADE
+);
+
+-- Reconciliation job queue. Mirrors `embed_jobs` shape so the worker pattern
+-- is familiar.
+CREATE TABLE index_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope TEXT NOT NULL,                    -- 'page:123' | 'book:45' | 'chapter:67'
+                                            -- | 'shelf:927' | 'all' | 'delta'
+    kind TEXT NOT NULL,                     -- 'index' | 'cache' | 'both'
+    status TEXT NOT NULL DEFAULT 'pending', -- 'pending' | 'running' | 'completed' | 'failed'
+    triggered_by TEXT NOT NULL,             -- 'webhook' | 'cron' | 'startup' | 'admin'
+    started_at INTEGER,
+    finished_at INTEGER,
+    progress INTEGER NOT NULL DEFAULT 0,
+    total INTEGER NOT NULL DEFAULT 0,
+    error TEXT
+);
+CREATE INDEX index_jobs_pending ON index_jobs (status) WHERE status = 'pending';
+
+-- Singleton bookkeeping for the indexer.
+CREATE TABLE index_meta (
+    key TEXT PRIMARY KEY,                   -- 'last_full_walk_at' | 'last_delta_walk_at'
+                                            -- | 'last_webhook_event_at' | etc.
+    value TEXT NOT NULL
+);
+```
+
+### Reconciliation worker
+
+A new background tokio task in `bsmcp-server` (no new binary — see Decisions). Polls `index_jobs` for `pending` rows, processes one at a time with bounded concurrency for fan-outs (matching the embedder's existing pattern). Three trigger sources:
+
+1. **Webhook-triggered.** BookStack already POSTs to `/webhooks/bookstack` on `page.create` / `page.update` / `page.delete`. Today the handler enqueues an embed job. Under v1.0.0 it also enqueues an `index_jobs` row with scope `page:{id}`. The worker pulls the page metadata + body via BookStack API, classifies it (`classify_page()`), upserts into `bookstack_pages` + `page_cache`, and (if the embedder is enabled) enqueues an `embed_jobs` row.
+2. **Periodic delta walk.** Every `BSMCP_INDEX_DELTA_INTERVAL_SECONDS` (default `300` = 5 min), enqueue a `delta` job. Worker calls `list_pages_by_updated > index_meta.last_delta_walk_at`, reconciles each. Catches webhook misses (network blip, BookStack restart, webhook secret rotation).
+3. **Initial full walk.** On bsmcp-server startup, if `index_meta.last_full_walk_at` is NULL, enqueue an `all` job. Worker walks every shelf in `global_settings` (Hive shelf, User Journals shelf), every book on those shelves, every chapter, every page. Populates the entire index from scratch. Idempotent — safe to re-run; classifications converge.
+
+Worker concurrency mirrors the embedder's `tokio::sync::Semaphore(N)` pattern (default 10 concurrent BookStack API calls). Page-cache writes happen alongside index writes in the same transaction.
+
+### Classification
+
+`classify_page()`, `classify_chapter()`, `classify_book()`, `classify_shelf()` are pure functions over (parent context + name + position). Examples:
+
+- A book named `Pia Identity` on the Hive shelf → `book_kind='identity'`, `identity_ouid='019dc66e4dc27d329e4a4abd1bec0c80'` (looked up via the manifest page's frontmatter).
+- A chapter named `Agents` inside an identity book → `chapter_kind='agents'`, inherits `identity_ouid` from the book.
+- A chapter named `Journal Archive - 2025` → `chapter_kind='journal_archive'`, `archive_year=2025`.
+- A page named `Agent: pia-journal-agent` inside an `agents` chapter → `page_kind='agent'`, `page_key='pia-journal-agent'`.
+- A page named `2026-04-27` inside a `journal_active` chapter → `page_kind='journal_entry'`, `page_key='2026-04-27'`.
+
+When classification can't decide (e.g., a user manually creates an arbitrary page), `*_kind = 'unclassified'`. The dedup UNIQUE index is conditional on `identity_ouid IS NOT NULL AND page_key IS NOT NULL`, so unclassified pages never trigger constraint violations.
+
+### Webhook reconciliation flow
+
+Today's `/webhooks/bookstack` handler fires on the embedder side. Under v1.0.0:
+
+1. POST arrives, secret verified.
+2. Handler enqueues an `index_jobs` row (`scope='page:{id}'`, `triggered_by='webhook'`, `kind='both'`).
+3. If embedder is enabled, also enqueues an `embed_jobs` row (existing behavior).
+4. Worker picks up the index job within ms, fetches page via `get_page`, classifies, upserts index + cache.
+
+Webhook latency end-to-end: ~50-200ms for a single-page edit to be reflected in our index/cache. Far below human-perceptible.
+
+### What stays in BookStack vs. moves to DB
+
+| Kind of data | BookStack | DB (index) | DB (cache) |
+|---|---|---|---|
+| Page markdown body | canonical | — | freshness-tracked copy |
+| Page metadata (id, name, parent, created_at, updated_at) | canonical | mirrored | — |
+| Chapter metadata | canonical | mirrored | — |
+| Book metadata | canonical | mirrored | — |
+| Shelf metadata | canonical | mirrored | — |
+| Page revision history | canonical | — | — |
+| Attachments / images | canonical | — | — |
+| Content permissions (owner-only locks etc.) | canonical | — | — |
+| Identity classification (which page is whose manifest, agent, journal entry, …) | inferred via name pattern | **canonical** (computed once, persisted) | — |
+| Dedup constraint | none | **canonical** (UNIQUE index) | — |
+| Audit log | — | canonical (existing `remember_audit`) | — |
+| Embeddings | — | canonical (existing `chunks`) | — |
+
+### Authentication for the indexer
+
+The reconciliation worker uses the `BSMCP_EMBED_TOKEN_*` BookStack token (same one the embedder uses to crawl pages). That token must have read access to every shelf the indexer walks. Permissions on individual locked pages (e.g., owner-only journal pages) may exclude it — those pages get skipped by the indexer with a warning, exactly the same way they'd be skipped today by the embedder. Per-user content access for live MCP requests still uses the user's own token; the indexer's role is structural reconciliation, not per-user query serving.
 
 ## Motivation
 
@@ -373,26 +552,62 @@ These were left open in the design discussion. Defaults locked here; PR review c
 
 6. **`write` stays destructive-replace; new actions cover non-destructive cases:** Every existing `write` caller continues to work unchanged. New actions (`append`, `update_section`, `append_section`) handle the cases where AI agents should not be replacing the whole body. Rationale: changing `write` semantics under existing callers would silently break flows; making non-destructive operations their own actions is explicit and lets agents pick the right verb for the intent. The doc-string on `write` will note: "use `append` for journals, `update_section` for identity edits — `write` is full-replace and rarely what you want."
 
+7. **Reconciliation worker lives in `bsmcp-server`, not a new binary:** Background tokio task using the same job-queue pattern as `embed_jobs`. Rationale: the indexer's work is lightweight (BookStack API calls + DB writes, no heavy compute), the server already has the BookStack credentials and the auth context, and adding a third binary multiplies operational concerns (compose files, container images, restart coordination). The embedder stays a separate binary because it does CPU-intensive ONNX/Ollama/OpenAI work and benefits from process isolation; the indexer doesn't.
+
+8. **`index_jobs` is its own table, not piggybacked on `embed_jobs`:** Separate table with the same shape. Rationale: the two queues have different urgency (indexing should run immediately on webhook for live freshness; embedding can lag by minutes), different retry semantics (a failed embed doesn't invalidate the index; a failed index reconcile leaves stale dedup state), and different concurrency targets. Keeping them separate makes the worker policies tunable independently.
+
+9. **Indexer uses `BSMCP_EMBED_TOKEN_*` for BookStack auth:** Same admin-scoped token the embedder uses to walk pages. Rationale: structural reconciliation needs to see every page on the configured shelves regardless of per-user permissions. Per-user content access for live MCP requests still uses the user's own token; the indexer's role is structural, not query-serving. Pages that the embed token can't access (e.g., owner-only journal pages on a separate user's identity) get logged and skipped, exactly the same way they're skipped by the embedder today.
+
+10. **Page cache is webhook-invalidated, not TTL-based:** A row in `page_cache` is considered fresh if its `page_updated_at` matches the BookStack `updated_at` for that page in `bookstack_pages`. The indexer keeps both in lockstep (same transaction). On read-path cache lookup, if `page_cache.page_updated_at == bookstack_pages.page_updated_at`, serve from cache; otherwise treat as miss. Rationale: TTLs are inherently wrong (either too short = unnecessary refetches, or too long = stale reads); the webhook + delta-walk + matching-updated_at pattern gives us "always fresh modulo webhook latency" with zero unnecessary work.
+
+11. **No new bsmcp-indexer container.** Phase 4's worker ships inside `bsmcp-server`. Rationale: same as decision #7. Operational simplicity wins. If profiling later shows index reconciliation contending with MCP request serving, splitting into a binary is a small refactor — the worker is already a self-contained tokio task.
+
+## Performance targets
+
+Numbers below are post-Phase-5 targets on the Bee's Roadhouse instance (BookStack `v26.03.3`, ~1900 indexed pages, Postgres backend with pgvector HNSW). Phases 1–4 don't aim at these directly; they set up the infrastructure for Phase 5 to deliver them.
+
+| Operation | Today | After Phase 5 | Mechanism |
+|---|---:|---:|---|
+| `remember_briefing` (cold semantic) | ~1500-2500 ms | <300 ms | listings from index; bodies from cache |
+| `remember_briefing` (warm — already-cached prompt context) | ~1500-2500 ms | <100 ms | full hit on index + cache, only semantic search and live embedding fetch hit network |
+| `remember_directory` | ~400-700 ms | <10 ms | DB query |
+| `remember_journal action=read` | ~200-400 ms (BookStack get_page) | <50 ms (cache hit) / ~250 ms (cache miss) | page_cache + bookstack_pages |
+| `remember_identity action=list` | ~1000-1500 ms (per-book pages list) | <20 ms | `SELECT … FROM bookstack_books WHERE book_kind='identity'` |
+| Dedup check on provisioning | ~400-700 ms (get_shelf + scan) | ~1 ms (UNIQUE constraint) | Postgres index lookup |
+| Webhook → index updated | n/a (no index) | ~50-200 ms end-to-end | webhook → enqueue → worker → upsert |
+
+Per-user briefing payload size — already trimmed in v0.7.4. Phase 5 doesn't change shape, just speeds delivery.
+
 ## Out of scope
 
-- **Subagent conversation write tooling.** The chapter exists; the tool to write to it is a follow-up.
+- **Subagent conversation write tooling.** The chapter exists post-Phase-6; the tool to write to it is a follow-up.
 - **Cross-identity migration coordination.** Each identity migrates independently. If a user has multiple AI identities on the same Hive (Pia + a future second identity), each one runs `remember_migrate` separately under its own context.
 - **Collage book restructure.** The Collage book stays a book. This RFC doesn't touch it.
 - **Briefing chunk trim revisions.** The trim work shipped in v0.7.4 is upstream of this RFC and stays.
 - **Removing the deprecated `ai_hive_journal_book_id` column.** Stays as a tombstone field for at least one minor version; removal is a future cleanup PR after every active identity has migrated.
+- **Storing page bodies as the canonical source.** This is **Option C** of the architecture spectrum (full DB-as-source-of-truth) and is explicitly not what we're doing. BookStack remains canonical for content; we're caching, not replacing.
+- **Conflict resolution for concurrent BookStack-UI edit + MCP write.** The cache is webhook-invalidated and writes always go to BookStack first; if a user edits a page via the BookStack UI at the same instant an MCP `write` lands, BookStack's own last-writer-wins applies (same as today). The indexer reconciles on webhook receipt regardless of which side won.
+- **Replicating BookStack's permission model in our DB.** Permissions stay in BookStack. The cache obeys the embed token's read-access; the live MCP request path obeys the user's token's read-access. We don't try to layer ACLs on top of `page_cache`.
 
 ## Implementation phasing
 
-Four follow-up PRs, stacked, each independently mergeable:
+Six follow-up PRs, stacked, each independently mergeable. Phases 1 and 2 ship before the index work; Phases 3–6 land the v1.0.0 architecture in order.
 
-1. **Phase 1 — `find_or_create_*` helpers + dedup at every existing callsite.** No structural change, no new chapters yet. Just stops the duplicate-creation behavior. Smallest PR; can land first to immediately solve the duplicate-pages problem on the live Hives.
-2. **Phase 2 — `append` / `update_section` / `append_section` actions.** Pure-additive new actions on existing `remember_*` tools. Doesn't depend on the chapter restructure — could merge before or alongside Phase 3. Solves the destructive-`write` problem for every agent immediately. New frontmatter timestamp fields added at the same time.
-3. **Phase 3 — schema additions + identity creation flow + journal restructure.** Adds the three chapter columns, wires `Agents`/`Subagent Conversations`/`Journal` chapter creation into `identity::create`, rewrites `remember_journal` to be chapter-scoped with the year-rollover sweep. New identities created after this PR land in the new shape; existing identities still work via the deprecated `ai_hive_journal_book_id` fallback.
-4. **Phase 4 — `remember_migrate` tool + briefing setup_nudge detector.** The opt-in data migration tool plus the legacy-state detector that surfaces the nudge. Migrates Pia and Apis to the new shape on the live Hives.
+1. **Phase 1 — `find_or_create_*` helpers + dedup at every existing callsite.** _Open as PR #27._ No structural change, no new chapters yet. Just stops duplicate-creation. Becomes redundant once Phase 4 ships the index (UNIQUE constraint supersedes name-match), but is the right interim step — immediately fixes the six duplicate agent-page pairs on Pia's Hive without waiting for the rest of v1.0.0.
+2. **Phase 2 — `append` / `update_section` / `append_section` actions.** Pure-additive new actions on existing `remember_*` tools. Independent of the index work; ships either before or alongside Phase 3. Solves destructive-`write` for every agent immediately. New frontmatter timestamp fields (`last_appended_at`, `append_count`, `last_section_update_at`, `last_updated_section`) added at the same time.
+3. **Phase 3 — DB-as-index schema + classification.** Adds `bookstack_shelves`, `bookstack_books`, `bookstack_chapters`, `bookstack_pages`, `page_cache`, `index_jobs`, `index_meta` tables. Adds the `classify_*` pure functions. No worker yet — just empty tables and the classification logic, unit-testable in isolation.
+4. **Phase 4 — Reconciliation worker + initial full walk + webhook + delta cron.** Background tokio task in `bsmcp-server`. On first startup after this PR lands, queues an `all` job and walks every shelf the user has configured, populating the index and page-cache from existing BookStack content. Webhook handler enqueues `page:{id}` jobs. Periodic delta walk catches misses. Once this lands, the index is *live and authoritative* for structural reads; reads still go through BookStack temporarily until Phase 5 cuts them over.
+5. **Phase 5 — Cut over the read paths to use the index.** Rewrite `remember_briefing`, `remember_directory`, `remember_journal action=read`, `remember_identity action=list`, `auto_provision_user_identity`'s discovery half, and `find_or_create_*` helpers (Phase 1) to query the index instead of BookStack. Page-body reads (system_prompt_additions, identity manifest) hit `page_cache` first, fall back to BookStack on miss. Briefing latency target: <100ms typical (vs. ~1-2s today on the BR Hive).
+6. **Phase 6 — Identity book restructure: chapters + chapter-scoped journal + year rollover.** Adds the three chapter columns to `user_settings`, wires `Agents`/`Subagent Conversations`/`Journal` chapter creation into `identity::create`, rewrites `remember_journal` to be chapter-scoped with the year-rollover sweep. Now powered by the index (which makes year rollover a SQL UPDATE plus a fan-out of `move_page` calls).
+7. **Phase 7 — `remember_migrate` tool + briefing setup_nudge detector.** The opt-in data migration tool plus the legacy-state detector that surfaces the nudge. The migration plan is now a query against the index (`SELECT * FROM bookstack_pages WHERE identity_ouid=? AND chapter_id IS NULL AND page_kind='agent'`); the apply step emits BookStack `move_page` calls and updates the index in one transaction. Migrates Pia and Apis to the new shape on the live Hives.
+
+Total: seven phases. Phase 1 (PR #27) is already in review. Phases 2 and 3 can land in parallel after #27. Phases 4–7 are sequential.
 
 ## Open questions
 
-None blocking. PR review on this RFC can flip any of the Decisions above; once locked the implementation phases proceed.
+1. **Index reconciliation under webhook secret rotation.** If `BSMCP_WEBHOOK_SECRET` rotates, in-flight webhook events are dropped. The 5-minute delta walk catches the gap, but during the gap the index can be stale. Acceptable for v1.0.0 — stale-by-up-to-5-minutes is a non-issue for the use cases here. Worth flagging in the deployment docs.
+2. **Initial full-walk duration on large instances.** BR's instance has ~1900 pages; full walk is ~5-10 minutes at default concurrency. Larger instances might want a `BSMCP_INDEX_FULL_WALK_CONCURRENCY` knob. Defer to Phase 4 implementation; if the default isn't enough, add the env var then.
+3. **Multi-tenant deployments.** This RFC assumes one BookStack per `bsmcp-server`. If we ever run multi-tenant (one server fronting multiple BookStack instances per request), the index needs a `bookstack_instance_id` discriminator on every row. Out of scope for v1.0.0.
 
 ---
 

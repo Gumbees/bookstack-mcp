@@ -1,3 +1,4 @@
+mod index_worker;
 mod llm;
 mod mcp;
 mod migrate;
@@ -22,7 +23,7 @@ use serde_json::json;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use bsmcp_common::config::DbBackendType;
-use bsmcp_common::db::{DbBackend, SemanticDb};
+use bsmcp_common::db::{DbBackend, IndexDb, SemanticDb};
 
 #[tokio::main]
 async fn main() {
@@ -53,7 +54,11 @@ async fn main() {
 
     // Select database backend
     let backend_type = DbBackendType::from_env();
-    let (db, semantic_db): (Arc<dyn DbBackend>, Option<Arc<dyn SemanticDb>>) = match backend_type {
+    let (db, semantic_db, index_db): (
+        Arc<dyn DbBackend>,
+        Option<Arc<dyn SemanticDb>>,
+        Arc<dyn IndexDb>,
+    ) = match backend_type {
         DbBackendType::Sqlite => {
             let db_path = env::var("BSMCP_DB_PATH")
                 .map(PathBuf::from)
@@ -63,7 +68,11 @@ async fn main() {
             }
             eprintln!("Database: SQLite ({})", db_path.display());
             let db = Arc::new(bsmcp_db_sqlite::SqliteDb::open(&db_path, &encryption_key));
-            (db.clone(), Some(db as Arc<dyn SemanticDb>))
+            (
+                db.clone() as Arc<dyn DbBackend>,
+                Some(db.clone() as Arc<dyn SemanticDb>),
+                db as Arc<dyn IndexDb>,
+            )
         }
         DbBackendType::Postgres => {
             let database_url = env::var("BSMCP_DATABASE_URL")
@@ -99,7 +108,11 @@ async fn main() {
                     .await
                     .expect("Failed to connect to PostgreSQL"),
             );
-            (db.clone(), Some(db as Arc<dyn SemanticDb>))
+            (
+                db.clone() as Arc<dyn DbBackend>,
+                Some(db.clone() as Arc<dyn SemanticDb>),
+                db as Arc<dyn IndexDb>,
+            )
         }
     };
 
@@ -216,6 +229,49 @@ async fn main() {
         } else {
             eprintln!("Summary: LLM configured but no BookStack service token (set BSMCP_SUMMARY_TOKEN_ID/SECRET or BSMCP_EMBED_TOKEN_ID/SECRET)");
         }
+    }
+
+    // v1.0.0 reconciliation worker — opt-in via BSMCP_INDEX_WORKER. Reuses
+    // the embed token (or its own dedicated BSMCP_INDEX_TOKEN_*) to walk
+    // every shelf the global settings name, classify each item, and upsert
+    // into the bookstack_* index + page_cache. SQLite has the real IndexDb
+    // impl; Postgres returns a clear error from each call until issue #36
+    // lands, so on Postgres deployments the worker is effectively a no-op
+    // that logs each failure (kept opt-in for that reason).
+    if env::var("BSMCP_INDEX_WORKER")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_lowercase();
+            v == "true" || v == "1" || v == "yes"
+        })
+        .unwrap_or(false)
+    {
+        let token_id = env::var("BSMCP_INDEX_TOKEN_ID")
+            .or_else(|_| env::var("BSMCP_EMBED_TOKEN_ID"));
+        let token_secret = env::var("BSMCP_INDEX_TOKEN_SECRET")
+            .or_else(|_| env::var("BSMCP_EMBED_TOKEN_SECRET"));
+        match (token_id, token_secret) {
+            (Ok(tid), Ok(tsec)) => {
+                eprintln!("IndexWorker: enabled");
+                let bs_client = bsmcp_common::bookstack::BookStackClient::new(
+                    &bookstack_url,
+                    &tid,
+                    &tsec,
+                    reqwest::Client::new(),
+                );
+                let worker = index_worker::IndexWorker::new(
+                    bs_client,
+                    db.clone(),
+                    index_db.clone(),
+                );
+                worker.spawn();
+            }
+            _ => eprintln!(
+                "IndexWorker: BSMCP_INDEX_WORKER=true but no BSMCP_INDEX_TOKEN_*/BSMCP_EMBED_TOKEN_* — worker not started"
+            ),
+        }
+    } else {
+        eprintln!("IndexWorker: disabled (set BSMCP_INDEX_WORKER=true to enable)");
     }
 
     let state = sse::AppState::new(

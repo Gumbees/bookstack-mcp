@@ -1,0 +1,222 @@
+name: Build Release Images
+
+# Fires on push to release OR a v* tag push (emergency hotfix path).
+# Builds multi-arch images and pushes :latest / :release / :{version} /
+# :{version}-{sha} tags. Also creates the GitHub Release entry with native
+# bsmcp-server binaries for 5 targets attached.
+#
+# Modeled on dtc-inc/client-portal's build-release.yml. CI builds the
+# images directly.
+
+on:
+  push:
+    branches: [release]
+    tags: ['v*']
+  # Manual trigger when a push event drops.
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  PLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - name: server
+            dockerfile: docker/Dockerfile.server
+            image: bsmcp-server
+          - name: embedder
+            dockerfile: docker/Dockerfile.embedder
+            image: bsmcp-embedder
+          - name: worker
+            dockerfile: docker/Dockerfile.worker
+            image: bsmcp-worker
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve version
+        id: meta
+        run: |
+          # Tag-triggered: derive version from the tag (v1.0.0 -> 1.0.0).
+          # Branch-triggered: read workspace Cargo.toml.
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
+          fi
+          SHORT_SHA=${GITHUB_SHA::7}
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Docker metadata
+        id: docker
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=release
+            type=raw,value=${{ steps.meta.outputs.version }}
+            type=raw,value=${{ steps.meta.outputs.version }}-${{ steps.meta.outputs.short_sha }}
+          flavor: |
+            latest=false
+
+      - name: Build and push ${{ matrix.name }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.docker.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+  # GitHub Release entry + native bsmcp-server binaries. Runs after `build`
+  # finishes so the released images are already tagged when the Release
+  # entry is written.
+  github-release:
+    needs: build
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/release' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.vars.outputs.version }}
+      tag: ${{ steps.vars.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag
+        id: vars
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+            TAG=${GITHUB_REF#refs/tags/}
+          else
+            VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
+            TAG="v${VERSION}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! git rev-parse "${{ steps.vars.outputs.tag }}" >/dev/null 2>&1; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git tag -a "${{ steps.vars.outputs.tag }}" -m "Release ${{ steps.vars.outputs.tag }}" "${GITHUB_SHA}"
+            git push origin "${{ steps.vars.outputs.tag }}"
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${{ steps.vars.outputs.tag }}" >/dev/null 2>&1; then
+            echo "Release ${{ steps.vars.outputs.tag }} already exists, skipping."
+          else
+            gh release create "${{ steps.vars.outputs.tag }}" \
+              --title "${{ steps.vars.outputs.tag }}" \
+              --notes "Multi-arch images: ghcr.io/${{ github.repository_owner }}/bsmcp-server:${{ steps.vars.outputs.version }}, ghcr.io/${{ github.repository_owner }}/bsmcp-embedder:${{ steps.vars.outputs.version }}, ghcr.io/${{ github.repository_owner }}/bsmcp-worker:${{ steps.vars.outputs.version }}. See CHANGELOG / closed PRs for details."
+          fi
+
+  # Native bsmcp-server binaries for 5 targets, attached to the Release.
+  # Embedder and worker stay container-only (embedder pulls ONNX runtime
+  # via fastembed; worker is meaningful only as a long-running container).
+  release-binaries:
+    needs: github-release
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            archive: tar.gz
+            binary: bsmcp-server
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            archive: tar.gz
+            binary: bsmcp-server
+            cross: true
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            archive: tar.gz
+            binary: bsmcp-server
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            archive: tar.gz
+            binary: bsmcp-server
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+            archive: zip
+            binary: bsmcp-server.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-linker (Linux arm64)
+        if: matrix.cross == true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release -p bsmcp-server --target ${{ matrix.target }}
+
+      - name: Package archive
+        shell: bash
+        run: |
+          VERSION="${{ needs.github-release.outputs.version }}"
+          STAGE="bsmcp-server-v${VERSION}-${{ matrix.target }}"
+          mkdir -p "$STAGE"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$STAGE/"
+          cp README.md LICENSE "$STAGE/" 2>/dev/null || true
+          if [ "${{ matrix.archive }}" = "tar.gz" ]; then
+            tar -czf "$STAGE.tar.gz" "$STAGE"
+            echo "ARTIFACT=$STAGE.tar.gz" >> "$GITHUB_ENV"
+          else
+            7z a "$STAGE.zip" "$STAGE"
+            echo "ARTIFACT=$STAGE.zip" >> "$GITHUB_ENV"
+          fi
+
+      - name: Upload to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ needs.github-release.outputs.tag }}" "$ARTIFACT" --clobber

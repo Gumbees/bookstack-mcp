@@ -11,6 +11,7 @@ use bsmcp_common::settings::{GlobalSettings, UserSettings};
 use super::envelope::ErrorCode;
 use super::frontmatter;
 use super::provision;
+use super::section;
 use super::user_provision;
 use super::{Context, Outcome};
 
@@ -102,6 +103,14 @@ pub async fn write_whoami(ctx: &Context) -> Outcome {
         ),
         Err(e) => Outcome::error(ErrorCode::BookStackError, e, None),
     }
+}
+
+pub async fn update_section_whoami(ctx: &Context) -> Outcome {
+    section_op_singleton(ctx, "whoami", false).await
+}
+
+pub async fn append_section_whoami(ctx: &Context) -> Outcome {
+    section_op_singleton(ctx, "whoami", true).await
 }
 
 // --- user ---
@@ -261,6 +270,208 @@ pub async fn write_user(ctx: &Context) -> Outcome {
             None,
         ),
         Err(e) => Outcome::error(ErrorCode::BookStackError, e, None),
+    }
+}
+
+pub async fn update_section_user(ctx: &Context) -> Outcome {
+    section_op_singleton(ctx, "user", false).await
+}
+
+pub async fn append_section_user(ctx: &Context) -> Outcome {
+    section_op_singleton(ctx, "user", true).await
+}
+
+// --- shared section-op machinery for whoami / user singletons ---
+//
+// Resolves the target page for the named singleton, reads its body, runs the
+// section transform, and writes back with refreshed frontmatter that
+// preserves `written_at` (set on first creation) while stamping
+// `last_section_update_at` and `last_updated_section`.
+
+async fn section_op_singleton(ctx: &Context, resource: &'static str, is_append: bool) -> Outcome {
+    let action_label = if is_append { "append_section" } else { "update_section" };
+
+    let section_name = match ctx.body_str("section") {
+        Some(s) => s,
+        None => {
+            return Outcome::error(
+                ErrorCode::InvalidArgument,
+                format!("section field is required for {action_label}"),
+                Some("section"),
+            );
+        }
+    };
+    let body_text = match ctx.body_str("body") {
+        Some(b) => b,
+        None => {
+            return Outcome::error(
+                ErrorCode::InvalidArgument,
+                format!("body field is required for {action_label}"),
+                Some("body"),
+            );
+        }
+    };
+
+    // Resolve page id per resource. `user` runs the same auto-provision
+    // chain as `read_user` / `write_user` so a fresh-token user can update
+    // a section without a prior read.
+    let (page_id, working_settings) = match resource {
+        "whoami" => match ctx.settings.ai_identity_page_id {
+            Some(id) => (id, ctx.settings.clone()),
+            None => {
+                return Outcome::settings_not_configured(
+                    "ai_identity_page_id",
+                    "ai_identity_page_id not configured — set the manifest page in /settings first",
+                );
+            }
+        },
+        "user" => {
+            let globals = ctx.db.get_global_settings().await.unwrap_or_default();
+            let mut ws = ctx.settings.clone();
+            let provision_result = user_provision::auto_provision_user_identity(
+                &ctx.client,
+                globals.user_journals_shelf_id,
+                &mut ws,
+            )
+            .await;
+            if provision_result.any_changes() {
+                if let Err(e) = ctx.db.save_user_settings(&ctx.token_id_hash, &ws).await {
+                    eprintln!("{action_label}_user: persist auto-provisioned IDs failed (non-fatal): {e}");
+                }
+                provision::lock_journal_books_to_owner(
+                    &ctx.client,
+                    ws.ai_hive_journal_book_id,
+                    ws.user_journal_book_id,
+                )
+                .await;
+            }
+            match ws.user_identity_page_id {
+                Some(id) => (id, ws),
+                None => {
+                    return Outcome::settings_not_configured(
+                        "user_identity_page_id",
+                        "user_identity_page_id not configured (auto-provision needs `user_id` — \
+                         try `remember_user action=read` first to trigger whoami auto-discovery)",
+                    );
+                }
+            }
+        }
+        _ => {
+            return Outcome::error(
+                ErrorCode::InternalError,
+                format!("section_op_singleton called with unknown resource: {resource}"),
+                None,
+            );
+        }
+    };
+
+    // Read existing body, run the section transform, write back.
+    let page = match ctx.client.get_page(page_id).await {
+        Ok(p) => p,
+        Err(e) => return Outcome::error(ErrorCode::BookStackError, e, None),
+    };
+    let raw = page.get("markdown").and_then(|v| v.as_str()).unwrap_or("");
+    let existing_body = frontmatter::strip(raw);
+    let preserved_written_at = parse_written_at(raw);
+
+    let new_body = if is_append {
+        section::append_to_section(existing_body, &section_name, &body_text)
+    } else {
+        section::replace_section(existing_body, &section_name, &body_text)
+    };
+
+    let frontmatter_block = build_singleton_section_frontmatter(
+        &working_settings,
+        &ctx.trace_id,
+        resource,
+        Some(page_id),
+        preserved_written_at.as_deref(),
+        &section_name,
+    );
+    let payload = json!({ "markdown": format!("{frontmatter_block}{new_body}") });
+    match ctx.client.update_page(page_id, &payload).await {
+        Ok(updated) => Outcome::ok_with_target(
+            json!({
+                "action": action_label,
+                "id": page_id,
+                "section": section_name,
+                "name": updated.get("name").cloned().unwrap_or(Value::Null),
+                "url": updated.get("url").cloned().unwrap_or(Value::Null),
+                "updated_at": updated.get("updated_at").cloned().unwrap_or(Value::Null),
+            }),
+            Some(page_id),
+            None,
+        ),
+        Err(e) => Outcome::error(ErrorCode::BookStackError, e, None),
+    }
+}
+
+/// Pull `written_at` out of a page's leading YAML frontmatter (if any).
+/// Used to preserve the original creation timestamp across section edits.
+fn parse_written_at(markdown: &str) -> Option<String> {
+    let trimmed = markdown.trim_start();
+    if !trimmed.starts_with("---") {
+        return None;
+    }
+    let mut iter = trimmed.lines();
+    iter.next(); // opening ---
+    for line in iter {
+        let line = line.trim();
+        if line == "---" {
+            break;
+        }
+        if let Some(rest) = line.strip_prefix("written_at:") {
+            return Some(rest.trim().trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
+fn build_singleton_section_frontmatter(
+    settings: &bsmcp_common::settings::UserSettings,
+    trace_id: &str,
+    resource: &str,
+    supersedes_page: Option<i64>,
+    preserved_written_at: Option<&str>,
+    last_section: &str,
+) -> String {
+    let mut out = String::from("---\n");
+    if let Some(name) = &settings.ai_identity_name {
+        out.push_str(&format!("written_by: {}\n", yaml_quote(name)));
+    }
+    if let Some(ouid) = &settings.ai_identity_ouid {
+        out.push_str(&format!("ai_identity_ouid: {}\n", yaml_quote(ouid)));
+    }
+    if let Some(user_id) = &settings.user_id {
+        out.push_str(&format!("user_id: {}\n", yaml_quote(user_id)));
+    }
+    let written_at = preserved_written_at
+        .map(|s| s.to_string())
+        .unwrap_or_else(frontmatter::now_iso_utc);
+    out.push_str(&format!("written_at: {}\n", yaml_quote(&written_at)));
+    out.push_str(&format!(
+        "last_section_update_at: {}\n",
+        yaml_quote(&frontmatter::now_iso_utc())
+    ));
+    out.push_str(&format!("last_updated_section: {}\n", yaml_quote(last_section)));
+    out.push_str(&format!("trace_id: {}\n", yaml_quote(trace_id)));
+    out.push_str(&format!("resource: {}\n", yaml_quote(resource)));
+    if let Some(p) = supersedes_page {
+        out.push_str(&format!("supersedes_page: {p}\n"));
+    }
+    out.push_str("---\n\n");
+    out
+}
+
+fn yaml_quote(s: &str) -> String {
+    let needs_quote = s.is_empty()
+        || s.chars().any(|c| matches!(c, ':' | '#' | '\'' | '"' | '\n' | '{' | '}' | '[' | ']' | ','))
+        || matches!(s, "true" | "false" | "null" | "yes" | "no" | "~");
+    if needs_quote {
+        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\"{escaped}\"")
+    } else {
+        s.to_string()
     }
 }
 

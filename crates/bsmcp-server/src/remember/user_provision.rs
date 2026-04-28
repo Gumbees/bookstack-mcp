@@ -24,6 +24,73 @@ use bsmcp_common::settings::UserSettings;
 use super::naming::NamedResource;
 use super::provision;
 
+/// Discover the authenticated user's BookStack identity via
+/// [`BookStackClient::whoami`] and populate `user_id` and `bookstack_user_id`
+/// in the settings if they're missing. Idempotent — if both fields are
+/// already populated, returns immediately. Failures are non-fatal: the
+/// caller still gets a `UserSettings` it can work with, just without
+/// auto-discovered fields, and the next call will retry.
+///
+/// Records what was discovered on `result.warnings` (informational, not
+/// errors) so the caller can surface "auto-discovered user_id from BookStack"
+/// in the response. The classifier treats user_id as the canonical naming
+/// key for per-user resources, so getting it populated makes
+/// auto-provisioning's "find-or-create by name" more deterministic.
+pub async fn auto_discover_user_identity(
+    client: &BookStackClient,
+    settings: &mut UserSettings,
+) -> Option<String> {
+    let needs_user_id = settings.user_id.as_deref().map(|s| s.is_empty()).unwrap_or(true);
+    let needs_bookstack_user_id = settings.bookstack_user_id.is_none();
+    if !needs_user_id && !needs_bookstack_user_id {
+        return None;
+    }
+    let identity = match client.whoami().await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            // No content yet — nothing to introspect. Caller surfaces the
+            // setup_nudge for `user_id` if still unset.
+            return Some(
+                "whoami: BookStack returned no content for the authenticated user; \
+                 user_id stays unset until the user creates content (or sets it manually)"
+                    .to_string(),
+            );
+        }
+        Err(e) => {
+            eprintln!("auto_discover_user_identity: whoami failed (non-fatal): {e}");
+            return Some(format!("whoami probe failed (non-fatal): {e}"));
+        }
+    };
+
+    let mut summary_parts = Vec::new();
+    if needs_user_id {
+        // Prefer email as user_id (stable, human-readable, unique) — fall back
+        // to BookStack's display name only if email is missing (rare).
+        let chosen = identity
+            .email
+            .clone()
+            .filter(|e| !e.is_empty())
+            .unwrap_or_else(|| identity.name.clone());
+        if !chosen.is_empty() {
+            settings.user_id = Some(chosen.clone());
+            summary_parts.push(format!("user_id={chosen}"));
+        }
+    }
+    if needs_bookstack_user_id {
+        settings.bookstack_user_id = Some(identity.bookstack_user_id);
+        summary_parts.push(format!("bookstack_user_id={}", identity.bookstack_user_id));
+    }
+
+    if summary_parts.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Auto-discovered from BookStack /api/users via whoami probe: {}",
+            summary_parts.join(", ")
+        ))
+    }
+}
+
 /// What changed during a provisioning pass. Returned so the caller (typically
 /// `singletons::read_user`) can persist the new IDs and surface a human
 /// summary in the response.
@@ -61,10 +128,19 @@ pub async fn auto_provision_user_identity(
 ) -> UserProvisionResult {
     let mut result = UserProvisionResult::default();
 
+    // Step 0: try to auto-discover user_id + bookstack_user_id from BookStack
+    // before bailing on a missing user_id. This is what makes the per-user
+    // resources nameable without the user pre-configuring anything.
+    if let Some(summary) = auto_discover_user_identity(client, settings).await {
+        result.warnings.push(summary);
+    }
+
     let user_id = match settings.user_id.as_ref() {
         Some(uid) if !uid.is_empty() => uid.clone(),
         _ => {
-            // No user_id → can't name per-user resources. Quietly skip.
+            // No user_id even after whoami — typically a brand-new BookStack
+            // account with no content yet. Quietly skip; subsequent calls
+            // will retry the whoami probe.
             return result;
         }
     };

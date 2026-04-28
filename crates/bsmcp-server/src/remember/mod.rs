@@ -19,6 +19,7 @@ pub mod identity;
 pub mod naming;
 pub mod provision;
 pub mod search;
+pub mod section;
 pub mod singletons;
 pub mod user_provision;
 
@@ -109,8 +110,12 @@ pub async fn dispatch(
 
     let outcome = route(resource, action, &ctx).await;
 
-    // Best-effort audit logging (only on writes/deletes, not on every read).
-    let log_audit = matches!(action, "write" | "delete");
+    // Best-effort audit logging — every state-changing action is audited.
+    // Reads and dry-run actions are not.
+    let log_audit = matches!(
+        action,
+        "write" | "delete" | "append" | "update_section" | "append_section"
+    );
     if log_audit {
         let ouid = ctx.settings.ai_identity_ouid.clone();
         let user_id = ctx.settings.user_id.clone();
@@ -172,8 +177,12 @@ async fn route(resource: &str, action: &str, ctx: &Context) -> Outcome {
         ("briefing", "read") => briefing::read(ctx).await,
         ("whoami", "read") => singletons::read_whoami(ctx).await,
         ("whoami", "write") => singletons::write_whoami(ctx).await,
+        ("whoami", "update_section") => singletons::update_section_whoami(ctx).await,
+        ("whoami", "append_section") => singletons::append_section_whoami(ctx).await,
         ("user", "read") => singletons::read_user(ctx).await,
         ("user", "write") => singletons::write_user(ctx).await,
+        ("user", "update_section") => singletons::update_section_user(ctx).await,
+        ("user", "append_section") => singletons::append_section_user(ctx).await,
         ("config", "read") => singletons::read_config(ctx).await,
         ("config", "write") => singletons::write_config(ctx).await,
         ("config", "dismiss_setup_nudge") => singletons::dismiss_setup_nudge(ctx).await,

@@ -9,6 +9,7 @@ use bsmcp_common::settings::{GlobalSettings, UserSettings};
 use super::envelope::{ErrorCode, RememberWarning};
 use super::frontmatter;
 use super::provision;
+use super::section;
 use super::{Context, Outcome};
 
 /// Book ID where a resource's pages live. Pages may be distributed across
@@ -94,6 +95,26 @@ pub async fn handle(
                 );
             }
             handle_write(resource, parent, ctx).await
+        }
+        "append" => {
+            if !resource.writable() {
+                return Outcome::error(
+                    ErrorCode::InvalidArgument,
+                    format!("{} is read-only", resource.name()),
+                    None,
+                );
+            }
+            handle_append(resource, parent, ctx).await
+        }
+        "update_section" | "append_section" => {
+            if !resource.writable() {
+                return Outcome::error(
+                    ErrorCode::InvalidArgument,
+                    format!("{} is read-only", resource.name()),
+                    None,
+                );
+            }
+            handle_section_op(resource, parent, ctx, action == "append_section").await
         }
         "search" => handle_search(resource, parent, ctx).await,
         "delete" => {
@@ -386,6 +407,447 @@ async fn find_or_create_chapter(
         .get("id")
         .and_then(|v| v.as_i64())
         .ok_or_else(|| "create_chapter returned no id".to_string())
+}
+
+// --- APPEND (non-destructive write) ---
+//
+// Add `body` to the existing page at `key` (or create the page if missing).
+// Optional `timestamp=true` prefixes the appended chunk with a local time
+// marker (`## HH:MM TZ`) so multi-append-per-day journals produce a readable
+// timeline. The original `written_at` frontmatter field is preserved if the
+// page already exists; provenance for the append shows up as `last_appended_at`
+// + `append_count` (parsed-and-incremented from the existing frontmatter).
+
+async fn handle_append(
+    resource: &dyn CollectionResource,
+    parent: CollectionParent,
+    ctx: &Context,
+) -> Outcome {
+    let globals = ctx.db.get_global_settings().await.unwrap_or_default();
+    if let Some(shelf_id) = resource.shelf_pin(&globals) {
+        provision::ensure_book_on_shelf(&ctx.client, parent, shelf_id).await;
+    }
+
+    let body_text = match ctx.body_str("body") {
+        Some(b) => b,
+        None => {
+            return Outcome::error(
+                ErrorCode::InvalidArgument,
+                "body field is required for append",
+                Some("body"),
+            );
+        }
+    };
+    let timestamp = ctx
+        .body
+        .get("timestamp")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let id_arg = ctx.body_i64("id");
+    let key_arg = ctx.body_str("key").or_else(|| match resource.key_kind() {
+        KeyKind::Date => Some(frontmatter::today_iso_date()),
+        _ => None,
+    });
+
+    if id_arg.is_none() && key_arg.is_none() {
+        return Outcome::error(
+            ErrorCode::InvalidArgument,
+            "either id or key is required for append",
+            Some("key"),
+        );
+    }
+
+    let normalized_key = key_arg.as_deref().map(|k| match resource.key_kind() {
+        KeyKind::Slug => frontmatter::slugify(k),
+        KeyKind::Date => k.to_string(),
+    });
+    let page_name = normalized_key
+        .as_deref()
+        .map(|k| resource.key_to_page_name(k))
+        .unwrap_or_default();
+
+    let existing_id = if let Some(id) = id_arg {
+        Some(id)
+    } else if !page_name.is_empty() {
+        match find_page_by_name(parent, &page_name, ctx).await {
+            Ok(maybe) => maybe,
+            Err(e) => return Outcome::error(ErrorCode::BookStackError, e, None),
+        }
+    } else {
+        None
+    };
+
+    // Build the append chunk body (with optional timestamp prefix). Trimming
+    // the user's body lets the prefix line stand on its own and keeps the
+    // separator newlines clean.
+    let chunk = if timestamp {
+        let stamp = local_time_marker(&ctx.settings);
+        format!("## {stamp}\n\n{body}\n", body = body_text.trim())
+    } else {
+        format!("{}\n", body_text.trim())
+    };
+
+    if let Some(id) = existing_id {
+        // Read existing page body, parse the prior frontmatter to preserve
+        // `written_at` and increment `append_count`, then write back the
+        // concatenated body with refreshed frontmatter.
+        let page = match ctx.client.get_page(id).await {
+            Ok(p) => p,
+            Err(e) => return Outcome::error(ErrorCode::BookStackError, e, None),
+        };
+        let existing_md = page
+            .get("markdown")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let prior_existing_body = frontmatter::strip(existing_md);
+        let prior = parse_provenance(existing_md);
+
+        let new_body = if prior_existing_body.trim().is_empty() {
+            chunk
+        } else {
+            format!("{}\n\n{}", prior_existing_body.trim_end(), chunk)
+        };
+        let new_append_count = prior.append_count.unwrap_or(0) + 1;
+
+        let frontmatter_block = build_append_frontmatter(
+            &ctx.settings,
+            &ctx.trace_id,
+            resource.name(),
+            normalized_key.as_deref(),
+            Some(id),
+            prior.written_at.as_deref(),
+            new_append_count,
+        );
+        let full_body = format!("{frontmatter_block}{new_body}");
+        let payload = if page_name.is_empty() {
+            json!({ "markdown": full_body })
+        } else {
+            json!({ "name": page_name, "markdown": full_body })
+        };
+        match ctx.client.update_page(id, &payload).await {
+            Ok(updated) => Outcome::ok_with_target(
+                build_write_response(&updated, "appended"),
+                Some(id),
+                normalized_key.clone(),
+            ),
+            Err(e) => Outcome::error(ErrorCode::BookStackError, e, None),
+        }
+    } else {
+        // No existing page — fall through to create-with-new-body. Reuses the
+        // standard `write` create path (find/create sub-chapter etc.) since
+        // append-into-nothing is identical to write-with-this-body.
+        let target = match resolve_create_target(resource, parent, normalized_key.as_deref(), ctx).await {
+            Ok(t) => t,
+            Err(e) => return Outcome::error(ErrorCode::BookStackError, e, None),
+        };
+        let frontmatter_block = build_append_frontmatter(
+            &ctx.settings,
+            &ctx.trace_id,
+            resource.name(),
+            normalized_key.as_deref(),
+            None,
+            None,
+            1,
+        );
+        let full_body = format!("{frontmatter_block}{chunk}");
+        let mut payload = json!({ "name": page_name, "markdown": full_body });
+        match target {
+            CreateTarget::Book(id) => { payload["book_id"] = json!(id); }
+            CreateTarget::Chapter(id) => { payload["chapter_id"] = json!(id); }
+        }
+        match ctx.client.create_page(&payload).await {
+            Ok(created) => {
+                let new_id = created.get("id").and_then(|v| v.as_i64());
+                Outcome::ok_with_target(
+                    build_write_response(&created, "created"),
+                    new_id,
+                    normalized_key.clone(),
+                )
+            }
+            Err(e) => Outcome::error(ErrorCode::BookStackError, e, None),
+        }
+    }
+}
+
+// --- UPDATE_SECTION / APPEND_SECTION (section-aware writes) ---
+
+async fn handle_section_op(
+    resource: &dyn CollectionResource,
+    parent: CollectionParent,
+    ctx: &Context,
+    is_append: bool,
+) -> Outcome {
+    let action_label = if is_append { "append_section" } else { "update_section" };
+    let section_name = match ctx.body_str("section") {
+        Some(s) => s,
+        None => {
+            return Outcome::error(
+                ErrorCode::InvalidArgument,
+                format!("section field is required for {action_label}"),
+                Some("section"),
+            );
+        }
+    };
+    let body_text = match ctx.body_str("body") {
+        Some(b) => b,
+        None => {
+            return Outcome::error(
+                ErrorCode::InvalidArgument,
+                format!("body field is required for {action_label}"),
+                Some("body"),
+            );
+        }
+    };
+
+    let id_arg = ctx.body_i64("id");
+    let key_arg = ctx.body_str("key").or_else(|| match resource.key_kind() {
+        KeyKind::Date => Some(frontmatter::today_iso_date()),
+        _ => None,
+    });
+    if id_arg.is_none() && key_arg.is_none() {
+        return Outcome::error(
+            ErrorCode::InvalidArgument,
+            format!("either id or key is required for {action_label}"),
+            Some("key"),
+        );
+    }
+    let normalized_key = key_arg.as_deref().map(|k| match resource.key_kind() {
+        KeyKind::Slug => frontmatter::slugify(k),
+        KeyKind::Date => k.to_string(),
+    });
+    let page_name = normalized_key
+        .as_deref()
+        .map(|k| resource.key_to_page_name(k))
+        .unwrap_or_default();
+
+    let existing_id = if let Some(id) = id_arg {
+        Some(id)
+    } else if !page_name.is_empty() {
+        match find_page_by_name(parent, &page_name, ctx).await {
+            Ok(maybe) => maybe,
+            Err(e) => return Outcome::error(ErrorCode::BookStackError, e, None),
+        }
+    } else {
+        None
+    };
+
+    let (existing_body, prior) = if let Some(id) = existing_id {
+        match ctx.client.get_page(id).await {
+            Ok(page) => {
+                let raw = page.get("markdown").and_then(|v| v.as_str()).unwrap_or("");
+                (frontmatter::strip(raw).to_string(), parse_provenance(raw))
+            }
+            Err(e) => return Outcome::error(ErrorCode::BookStackError, e, None),
+        }
+    } else {
+        // No existing page — section op effectively creates the page with
+        // a single section.
+        (String::new(), Provenance::default())
+    };
+
+    let new_body = if is_append {
+        section::append_to_section(&existing_body, &section_name, &body_text)
+    } else {
+        section::replace_section(&existing_body, &section_name, &body_text)
+    };
+
+    let frontmatter_block = build_section_frontmatter(
+        &ctx.settings,
+        &ctx.trace_id,
+        resource.name(),
+        normalized_key.as_deref(),
+        existing_id,
+        prior.written_at.as_deref(),
+        prior.append_count,
+        &section_name,
+    );
+    let full_body = format!("{frontmatter_block}{new_body}");
+
+    if let Some(id) = existing_id {
+        let payload = if page_name.is_empty() {
+            json!({ "markdown": full_body })
+        } else {
+            json!({ "name": page_name, "markdown": full_body })
+        };
+        match ctx.client.update_page(id, &payload).await {
+            Ok(updated) => Outcome::ok_with_target(
+                build_write_response(&updated, action_label),
+                Some(id),
+                normalized_key.clone(),
+            ),
+            Err(e) => Outcome::error(ErrorCode::BookStackError, e, None),
+        }
+    } else {
+        let target = match resolve_create_target(resource, parent, normalized_key.as_deref(), ctx).await {
+            Ok(t) => t,
+            Err(e) => return Outcome::error(ErrorCode::BookStackError, e, None),
+        };
+        let mut payload = json!({ "name": page_name, "markdown": full_body });
+        match target {
+            CreateTarget::Book(id) => { payload["book_id"] = json!(id); }
+            CreateTarget::Chapter(id) => { payload["chapter_id"] = json!(id); }
+        }
+        match ctx.client.create_page(&payload).await {
+            Ok(created) => {
+                let new_id = created.get("id").and_then(|v| v.as_i64());
+                Outcome::ok_with_target(
+                    build_write_response(&created, "created"),
+                    new_id,
+                    normalized_key.clone(),
+                )
+            }
+            Err(e) => Outcome::error(ErrorCode::BookStackError, e, None),
+        }
+    }
+}
+
+// --- Frontmatter parsing + extended builders ---
+//
+// Phase 2's new actions need to carry a few extra provenance fields beyond
+// what `frontmatter::build` emits — and to do that without rewriting the
+// existing `write` flow, we parse selected fields out of the prior body
+// here and re-stamp.
+
+#[derive(Default, Debug)]
+struct Provenance {
+    written_at: Option<String>,
+    append_count: Option<i64>,
+}
+
+fn parse_provenance(markdown: &str) -> Provenance {
+    let trimmed = markdown.trim_start();
+    if !trimmed.starts_with("---") {
+        return Provenance::default();
+    }
+    let mut out = Provenance::default();
+    let mut iter = trimmed.lines();
+    iter.next(); // opening ---
+    for line in iter {
+        let line = line.trim();
+        if line == "---" {
+            break;
+        }
+        if let Some((key, value)) = line.split_once(':') {
+            let key = key.trim();
+            let value = value.trim().trim_matches('"');
+            match key {
+                "written_at" => out.written_at = Some(value.to_string()),
+                "append_count" => out.append_count = value.parse().ok(),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+fn build_append_frontmatter(
+    settings: &bsmcp_common::settings::UserSettings,
+    trace_id: &str,
+    resource: &str,
+    key: Option<&str>,
+    supersedes_page: Option<i64>,
+    preserved_written_at: Option<&str>,
+    new_append_count: i64,
+) -> String {
+    let mut out = String::from("---\n");
+    if let Some(name) = &settings.ai_identity_name {
+        out.push_str(&format!("written_by: {}\n", yaml_quote(name)));
+    }
+    if let Some(ouid) = &settings.ai_identity_ouid {
+        out.push_str(&format!("ai_identity_ouid: {}\n", yaml_quote(ouid)));
+    }
+    if let Some(user_id) = &settings.user_id {
+        out.push_str(&format!("user_id: {}\n", yaml_quote(user_id)));
+    }
+    let written_at = preserved_written_at
+        .map(|s| s.to_string())
+        .unwrap_or_else(frontmatter::now_iso_utc);
+    out.push_str(&format!("written_at: {}\n", yaml_quote(&written_at)));
+    out.push_str(&format!("last_appended_at: {}\n", yaml_quote(&frontmatter::now_iso_utc())));
+    out.push_str(&format!("append_count: {new_append_count}\n"));
+    out.push_str(&format!("trace_id: {}\n", yaml_quote(trace_id)));
+    out.push_str(&format!("resource: {}\n", yaml_quote(resource)));
+    if let Some(k) = key {
+        out.push_str(&format!("key: {}\n", yaml_quote(k)));
+    }
+    if let Some(p) = supersedes_page {
+        out.push_str(&format!("supersedes_page: {p}\n"));
+    }
+    out.push_str("---\n\n");
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_section_frontmatter(
+    settings: &bsmcp_common::settings::UserSettings,
+    trace_id: &str,
+    resource: &str,
+    key: Option<&str>,
+    supersedes_page: Option<i64>,
+    preserved_written_at: Option<&str>,
+    preserved_append_count: Option<i64>,
+    last_section: &str,
+) -> String {
+    let mut out = String::from("---\n");
+    if let Some(name) = &settings.ai_identity_name {
+        out.push_str(&format!("written_by: {}\n", yaml_quote(name)));
+    }
+    if let Some(ouid) = &settings.ai_identity_ouid {
+        out.push_str(&format!("ai_identity_ouid: {}\n", yaml_quote(ouid)));
+    }
+    if let Some(user_id) = &settings.user_id {
+        out.push_str(&format!("user_id: {}\n", yaml_quote(user_id)));
+    }
+    let written_at = preserved_written_at
+        .map(|s| s.to_string())
+        .unwrap_or_else(frontmatter::now_iso_utc);
+    out.push_str(&format!("written_at: {}\n", yaml_quote(&written_at)));
+    out.push_str(&format!(
+        "last_section_update_at: {}\n",
+        yaml_quote(&frontmatter::now_iso_utc())
+    ));
+    out.push_str(&format!("last_updated_section: {}\n", yaml_quote(last_section)));
+    if let Some(c) = preserved_append_count {
+        out.push_str(&format!("append_count: {c}\n"));
+    }
+    out.push_str(&format!("trace_id: {}\n", yaml_quote(trace_id)));
+    out.push_str(&format!("resource: {}\n", yaml_quote(resource)));
+    if let Some(k) = key {
+        out.push_str(&format!("key: {}\n", yaml_quote(k)));
+    }
+    if let Some(p) = supersedes_page {
+        out.push_str(&format!("supersedes_page: {p}\n"));
+    }
+    out.push_str("---\n\n");
+    out
+}
+
+/// Conservative YAML scalar quoting — same logic as `frontmatter::build`.
+fn yaml_quote(s: &str) -> String {
+    let needs_quote = s.is_empty()
+        || s.chars().any(|c| matches!(c, ':' | '#' | '\'' | '"' | '\n' | '{' | '}' | '[' | ']' | ','))
+        || matches!(s, "true" | "false" | "null" | "yes" | "no" | "~");
+    if needs_quote {
+        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\"{escaped}\"")
+    } else {
+        s.to_string()
+    }
+}
+
+/// Format the user's local time as `HH:MM TZ` for the optional timestamp
+/// prefix on `append`. Falls back to the configured timezone, then UTC.
+fn local_time_marker(settings: &bsmcp_common::settings::UserSettings) -> String {
+    use chrono::Utc;
+    let now_utc = Utc::now();
+    if let Some(tz_name) = settings.timezone.as_deref() {
+        if let Ok(tz) = tz_name.parse::<chrono_tz::Tz>() {
+            let local = now_utc.with_timezone(&tz);
+            return format!("{}", local.format("%H:%M %Z"));
+        }
+    }
+    format!("{} UTC", now_utc.format("%H:%M"))
 }
 
 fn build_write_response(page: &Value, action: &str) -> Value {

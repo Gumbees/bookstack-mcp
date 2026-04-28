@@ -55,9 +55,36 @@ pub struct UserSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_shared_collage_book_id: Option<i64>,
 
-    /// BookStack book ID for the AI's journal.
+    /// **Deprecated, kept for migration:** BookStack book ID for the legacy
+    /// per-identity Journal book. v1.0.0 collapsed this into a chapter inside
+    /// `ai_identity_book_id` — see `ai_identity_journal_chapter_id`. Stays in
+    /// the schema as a tombstone so `remember_migrate` and the briefing's
+    /// `setup_nudge` legacy detector can recognize an un-migrated identity.
+    /// Cleared automatically once `remember_migrate action=apply` finishes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_hive_journal_book_id: Option<i64>,
+
+    /// BookStack chapter ID of the `Agents` chapter inside the AI's Identity
+    /// book. Where agent definition pages (`Agent: <name>`) live. Required
+    /// for write paths that scaffold sub-agent definitions; reads degrade
+    /// gracefully when null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_identity_agents_chapter_id: Option<i64>,
+
+    /// BookStack chapter ID of the `Subagent Conversations` chapter inside
+    /// the AI's Identity book. Where future agent-to-agent transcripts will
+    /// land. Scaffolded empty at identity creation time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_identity_subagent_conversations_chapter_id: Option<i64>,
+
+    /// BookStack chapter ID of the current-year `Journal` chapter inside the
+    /// AI's Identity book. Daily entries (`YYYY-MM-DD`) write here. The
+    /// year-rollover sweep (run on every `journal action=write`) moves any
+    /// stale-year pages into a `Journal Archive - {YEAR}` chapter
+    /// (find-or-created lazily, scoped strictly within
+    /// `ai_identity_book_id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_identity_journal_chapter_id: Option<i64>,
 
     // --- User identity ---
 

@@ -19,6 +19,7 @@
 //! pass. That's how Task #9 (force user_journal to shelf) is enforced.
 
 use bsmcp_common::bookstack::BookStackClient;
+use bsmcp_common::db::IndexDb;
 use bsmcp_common::settings::UserSettings;
 
 use super::naming::NamedResource;
@@ -123,6 +124,7 @@ impl UserProvisionResult {
 /// incomplete" rather than crashing.
 pub async fn auto_provision_user_identity(
     client: &BookStackClient,
+    index_db: &dyn IndexDb,
     user_journals_shelf_id: Option<i64>,
     settings: &mut UserSettings,
 ) -> UserProvisionResult {
@@ -149,7 +151,7 @@ pub async fn auto_provision_user_identity(
     if settings.user_identity_book_id.is_none() {
         let name = NamedResource::UserIdentityBook.default_name_for_user(&user_id);
         let desc = NamedResource::UserIdentityBook.default_description();
-        let book = provision::create_named_book(client, &name, desc, user_journals_shelf_id).await;
+        let book = provision::create_named_book(client, index_db, &name, desc, user_journals_shelf_id).await;
         if let Some(id) = book.id() {
             settings.user_identity_book_id = Some(id);
             result.created_identity_book = Some(id);
@@ -166,7 +168,7 @@ pub async fn auto_provision_user_identity(
         if settings.user_identity_page_id.is_none() {
             let body = identity_page_template(&user_id);
             let page_name = NamedResource::UserIdentityPage.default_name_for_user(&user_id);
-            let page = provision::create_named_page(client, &page_name, book_id, &body).await;
+            let page = provision::create_named_page(client, index_db, &page_name, book_id, &body).await;
             if let Some(id) = page.id() {
                 settings.user_identity_page_id = Some(id);
                 result.created_identity_page = Some(id);
@@ -180,7 +182,7 @@ pub async fn auto_provision_user_identity(
     if settings.user_journal_book_id.is_none() {
         let name = NamedResource::UserJournalBook.default_name_for_user(&user_id);
         let desc = NamedResource::UserJournalBook.default_description();
-        let book = provision::create_named_book(client, &name, desc, user_journals_shelf_id).await;
+        let book = provision::create_named_book(client, index_db, &name, desc, user_journals_shelf_id).await;
         if let Some(id) = book.id() {
             settings.user_journal_book_id = Some(id);
             result.created_journal_book = Some(id);
@@ -204,7 +206,7 @@ pub async fn auto_provision_user_identity(
         if settings.user_journal_agent_page_id.is_none() {
             let body = journal_agent_template(&user_id, journal_book_id);
             let page_name = NamedResource::UserJournalAgentPage.default_name_for_user(&user_id);
-            let page = provision::create_named_page(client, &page_name, book_id, &body).await;
+            let page = provision::create_named_page(client, index_db, &page_name, book_id, &body).await;
             if let Some(id) = page.id() {
                 settings.user_journal_agent_page_id = Some(id);
                 result.created_journal_agent_page = Some(id);

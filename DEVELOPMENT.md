@@ -149,9 +149,10 @@ echo $GHCR_PAT | docker login ghcr.io -u <gh-user> --password-stdin
 | Push to a work branch with **no open PR** | nothing | test locally |
 | `pull_request: opened/synchronize/reopened` against `development` or `release` | `release.yml` (`build-server`, `build-embedder` verify jobs) | confirms the contributor's per-PR images exist on GHCR with both `linux/amd64` and `linux/arm64`. ~30 seconds. No build. |
 | Same trigger | `generate-artifacts.yml` | regenerates `SBOM.md` + `STRUCTURE.md`, commits to PR source branch with `[skip ci]` |
-| `pull_request: closed && merged: true`, base = `development` | `release.yml` (`promote`) | retags `{version}-{branch-slug}` → `dev` + `{version}-dev`. No rebuild. |
-| `pull_request: closed && merged: true`, base = `release` | `release.yml` (`promote` + `github-release-on-merge` + `release-binaries-on-merge`) | retags → `{version}` + `release` + `latest`; creates GitHub Release; builds `bsmcp-server` native binaries for 5 targets and attaches them to the Release. |
+| `push` to `development` (squash-merge or direct push) | `release.yml` (`push-retag`) | retags the contributor's per-PR image to `:dev`, `:dev-{push_sha}`, `:{version}-dev`, `:{version}-dev-{push_sha}`. No rebuild. |
+| `push` to `release` (squash-merge or direct push) | `release.yml` (`push-retag` + `github-release-on-merge` + `release-binaries-on-merge`) | retags to `:{version}`, `:{version}-{push_sha}`, `:release`, `:latest`; creates GitHub Release; builds `bsmcp-server` native binaries for 5 targets and attaches them to the Release. |
 | `v*` tag push (emergency hotfix only) | `release.yml` (`tag-release` + `github-release-on-tag` + `release-binaries-on-tag`) | builds & pushes semver-tagged images directly in CI (the only build path that still runs in CI), creates the Release, attaches the server binaries. Use only when the contributor cannot push images themselves. |
+| `workflow_dispatch` on `release.yml`, ref = `development` or `release` | `release.yml` (`push-retag`) | manual recovery path when a `push` event drops (GitHub Actions occasionally fails to fire workflow runs for squash-merge commits). Run via `gh workflow run "Build and Release" --ref development`. |
 
 ### Why this shape
 

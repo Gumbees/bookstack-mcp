@@ -6,6 +6,7 @@
 //! rather than crashing the settings save.
 
 use bsmcp_common::bookstack::{BookStackClient, ContentType};
+use bsmcp_common::db::IndexDb;
 use serde_json::{json, Value};
 
 use super::naming::NamedResource;
@@ -84,12 +85,14 @@ pub async fn create_shelf(
 /// is given, falls back to bare create.
 pub async fn create_book(
     client: &BookStackClient,
+    index_db: &dyn IndexDb,
     resource: NamedResource,
     parent_shelf_id: Option<i64>,
 ) -> ProvisionResult {
     if let Some(shelf_id) = parent_shelf_id {
         return find_or_create_book_on_shelf(
             client,
+            index_db,
             shelf_id,
             resource.default_name(),
             resource.default_description(),
@@ -261,12 +264,13 @@ pub async fn ensure_book_on_shelf(
 /// the briefing's setup_nudge already prompts to fix).
 pub async fn create_named_book(
     client: &BookStackClient,
+    index_db: &dyn IndexDb,
     name: &str,
     description: &str,
     parent_shelf_id: Option<i64>,
 ) -> ProvisionResult {
     if let Some(shelf_id) = parent_shelf_id {
-        return find_or_create_book_on_shelf(client, shelf_id, name, description).await;
+        return find_or_create_book_on_shelf(client, index_db, shelf_id, name, description).await;
     }
     // No shelf — bare create. Without a known shelf to scope the dedup
     // lookup to, listing every book on the instance to match by name is
@@ -289,11 +293,12 @@ pub async fn create_named_book(
 /// re-runs reuse an existing page with the same name instead of duplicating.
 pub async fn create_named_page(
     client: &BookStackClient,
+    index_db: &dyn IndexDb,
     name: &str,
     parent_book_id: i64,
     markdown: &str,
 ) -> ProvisionResult {
-    find_or_create_page(client, Some(parent_book_id), None, name, markdown).await
+    find_or_create_page(client, index_db, Some(parent_book_id), None, name, markdown).await
 }
 
 /// Create a page inside a book or chapter, with the given markdown body.
@@ -304,6 +309,7 @@ pub async fn create_named_page(
 #[allow(dead_code)] // reserved for future identity/whoami auto-creation paths
 pub async fn create_page(
     client: &BookStackClient,
+    index_db: &dyn IndexDb,
     resource: NamedResource,
     parent_book_id: Option<i64>,
     parent_chapter_id: Option<i64>,
@@ -316,6 +322,7 @@ pub async fn create_page(
     }
     find_or_create_page(
         client,
+        index_db,
         parent_book_id,
         parent_chapter_id,
         resource.default_name(),
@@ -340,13 +347,33 @@ pub async fn create_page(
 /// Find a book on a shelf by exact name match, or create it and attach.
 /// Returns `FoundExisting` on hit, `Created` on miss, or a Denied/Failed
 /// outcome when BookStack rejects the request.
+///
+/// Phase 5c: tries the local index first (no roundtrip), then falls back
+/// to a live BookStack `get_shelf` walk when the index is empty/unavailable
+/// (worker hasn't run, postgres-stub deployment).
 pub async fn find_or_create_book_on_shelf(
     client: &BookStackClient,
+    index_db: &dyn IndexDb,
     shelf_id: i64,
     name: &str,
     description: &str,
 ) -> ProvisionResult {
-    // 1. Look up — pull the shelf, scan its books for an exact name match.
+    // 1a. Try the index — cheap, no BookStack roundtrip. A hit is
+    //     authoritative; a miss falls through to the live BookStack walk
+    //     in case the index is briefly stale (worker reconciles
+    //     asynchronously) or empty (fresh deployment, postgres stub).
+    if let Ok(books) = index_db.list_indexed_books_by_shelf(shelf_id).await {
+        for book in &books {
+            if book.name == name {
+                return ProvisionResult::FoundExisting {
+                    id: book.book_id,
+                    name: name.to_string(),
+                };
+            }
+        }
+    }
+
+    // 1b. Fall back to the live BookStack walk.
     match client.get_shelf(shelf_id).await {
         Ok(shelf) => {
             if let Some(books) = shelf.get("books").and_then(|v| v.as_array()) {
@@ -386,11 +413,24 @@ pub async fn find_or_create_book_on_shelf(
 #[allow(dead_code)]
 pub async fn find_or_create_chapter(
     client: &BookStackClient,
+    index_db: &dyn IndexDb,
     book_id: i64,
     name: &str,
     description: &str,
 ) -> ProvisionResult {
-    // 1. Look up — pull the book contents and scan for an existing chapter.
+    // 1a. Try the index — cheap, no BookStack roundtrip.
+    if let Ok(chapters) = index_db.list_indexed_chapters_by_book(book_id).await {
+        for chapter in &chapters {
+            if chapter.name == name {
+                return ProvisionResult::FoundExisting {
+                    id: chapter.chapter_id,
+                    name: name.to_string(),
+                };
+            }
+        }
+    }
+
+    // 1b. Fall back to the live BookStack walk.
     match client.get_book(book_id).await {
         Ok(book) => {
             if let Some(contents) = book.get("contents").and_then(|v| v.as_array()) {
@@ -435,12 +475,39 @@ pub async fn find_or_create_chapter(
 /// want to reuse it.
 pub async fn find_or_create_page(
     client: &BookStackClient,
+    index_db: &dyn IndexDb,
     parent_book_id: Option<i64>,
     parent_chapter_id: Option<i64>,
     name: &str,
     markdown: &str,
 ) -> ProvisionResult {
-    // 1. Look up in the specified parent.
+    if parent_book_id.is_none() && parent_chapter_id.is_none() {
+        return ProvisionResult::Failed {
+            reason: "find_or_create_page requires book_id or chapter_id".to_string(),
+        };
+    }
+
+    // 1a. Try the index — cheap, no BookStack roundtrip. Lookup is scoped
+    //     to the parent: chapter pages or book-root loose pages, never both.
+    let indexed = if let Some(chapter_id) = parent_chapter_id {
+        index_db.list_indexed_pages_by_chapter(chapter_id).await
+    } else if let Some(book_id) = parent_book_id {
+        index_db.list_indexed_pages_by_book_root(book_id).await
+    } else {
+        Ok(Vec::new())
+    };
+    if let Ok(pages) = indexed {
+        for page in &pages {
+            if page.name == name {
+                return ProvisionResult::FoundExisting {
+                    id: page.page_id,
+                    name: name.to_string(),
+                };
+            }
+        }
+    }
+
+    // 1b. Fall back to the live BookStack walk in the specified parent.
     let existing_id: Option<i64> = if let Some(chapter_id) = parent_chapter_id {
         match client.get_chapter(chapter_id).await {
             Ok(chapter) => find_named_page_in_array(&chapter, "pages", name),
@@ -452,9 +519,7 @@ pub async fn find_or_create_page(
             Err(e) => return classify_error(&e),
         }
     } else {
-        return ProvisionResult::Failed {
-            reason: "find_or_create_page requires book_id or chapter_id".to_string(),
-        };
+        unreachable!("guarded by the early-return above");
     };
 
     if let Some(id) = existing_id {

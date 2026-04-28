@@ -53,6 +53,12 @@ on:
     branches: [development, release]
     tags:
       - 'v*'
+  # Manual trigger for push-retag — used when a push event drops (GitHub
+  # Actions occasionally fails to fire workflow runs for squash-merge
+  # commits). Run via `gh workflow run "Build and Release" --ref development`.
+  # Only push-retag respects this trigger; PR build-* jobs and tag-release
+  # gate on their own event types and stay no-ops.
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
@@ -169,7 +175,7 @@ jobs:
   #     publish-pr-image.sh on that branch beforehand, producing
   #     `{version}-{branch_slug}-{push_sha}`.
   push-retag:
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/development' || github.ref == 'refs/heads/release')
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.ref == 'refs/heads/development' || github.ref == 'refs/heads/release')
     runs-on: ubuntu-latest
     permissions:
       contents: read

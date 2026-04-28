@@ -215,6 +215,7 @@ async fn create(ctx: &Context) -> Outcome {
     let book_description = format!("Identity book for the AI agent {}. Holds the manifest page.", name);
     let book_outcome = provision::find_or_create_book_on_shelf(
         &ctx.client,
+        ctx.index_db.as_ref(),
         hive_shelf_id,
         &book_name,
         &book_description,
@@ -240,6 +241,7 @@ async fn create(ctx: &Context) -> Outcome {
     );
     let page_outcome = provision::find_or_create_page(
         &ctx.client,
+        ctx.index_db.as_ref(),
         Some(book_id),
         None,
         "Identity",

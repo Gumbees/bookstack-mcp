@@ -496,7 +496,7 @@ pub async fn handle_settings_post(
     // Books that live on the Hive shelf.
     let hive_shelf = globals.hive_shelf_id;
     if settings.ai_identity_book_id.is_none() && checkbox_on(form.create_ai_identity_book) {
-        let r = provision::create_book(&client, NamedResource::IdentityBook, hive_shelf).await;
+        let r = provision::create_book(&client, state.index_db.as_ref(), NamedResource::IdentityBook, hive_shelf).await;
         provision_log.push(r.human(NamedResource::IdentityBook));
         if let Some(id) = r.id() {
             settings.ai_identity_book_id = Some(id);
@@ -506,14 +506,14 @@ pub async fn handle_settings_post(
         }
     }
     if settings.ai_hive_journal_book_id.is_none() && checkbox_on(form.create_ai_hive_journal_book) {
-        let r = provision::create_book(&client, NamedResource::JournalBook, hive_shelf).await;
+        let r = provision::create_book(&client, state.index_db.as_ref(), NamedResource::JournalBook, hive_shelf).await;
         provision_log.push(r.human(NamedResource::JournalBook));
         if let Some(id) = r.id() {
             settings.ai_hive_journal_book_id = Some(id);
         }
     }
     if settings.ai_collage_book_id.is_none() && checkbox_on(form.create_ai_collage_book) {
-        let r = provision::create_book(&client, NamedResource::CollageBook, hive_shelf).await;
+        let r = provision::create_book(&client, state.index_db.as_ref(), NamedResource::CollageBook, hive_shelf).await;
         provision_log.push(r.human(NamedResource::CollageBook));
         if let Some(id) = r.id() {
             settings.ai_collage_book_id = Some(id);
@@ -523,7 +523,7 @@ pub async fn handle_settings_post(
         }
     }
     if settings.ai_shared_collage_book_id.is_none() && checkbox_on(form.create_ai_shared_collage_book) {
-        let r = provision::create_book(&client, NamedResource::SharedCollageBook, hive_shelf).await;
+        let r = provision::create_book(&client, state.index_db.as_ref(), NamedResource::SharedCollageBook, hive_shelf).await;
         provision_log.push(r.human(NamedResource::SharedCollageBook));
         if let Some(id) = r.id() {
             settings.ai_shared_collage_book_id = Some(id);

@@ -11,7 +11,8 @@ use sha2::Digest;
 use zeroize::Zeroizing;
 
 use bsmcp_common::config::{access_token_ttl, refresh_token_ttl};
-use bsmcp_common::db::{DbBackend, SemanticDb};
+use bsmcp_common::db::{DbBackend, IndexDb, SemanticDb};
+use bsmcp_common::index::*;
 use bsmcp_common::settings::{GlobalSettings, UserSettings};
 use bsmcp_common::types::*;
 use bsmcp_common::vector;
@@ -1742,6 +1743,673 @@ fn decode_str_list(value: Option<String>) -> Vec<String> {
         Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_default(),
         _ => Vec::new(),
     }
+}
+
+// --- IndexDb impl ---
+//
+// Phase 4a — structural index of BookStack content + page cache + the
+// reconciliation job queue. Methods follow the same spawn_blocking pattern
+// the rest of the SqliteDb impl uses; rusqlite is sync, so each call hops
+// onto a blocking task and acquires the connection mutex.
+
+#[async_trait]
+impl IndexDb for SqliteDb {
+    // --- Shelves ---
+
+    async fn upsert_indexed_shelf(&self, shelf: &IndexedShelf) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let s = shelf.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO bookstack_shelves (shelf_id, name, slug, shelf_kind, indexed_at, deleted)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(shelf_id) DO UPDATE SET
+                     name = excluded.name,
+                     slug = excluded.slug,
+                     shelf_kind = excluded.shelf_kind,
+                     indexed_at = excluded.indexed_at,
+                     deleted = excluded.deleted",
+                params![s.shelf_id, s.name, s.slug, s.shelf_kind.as_str(), s.indexed_at, s.deleted as i64],
+            ).map_err(|e| format!("upsert_indexed_shelf: {e}"))?;
+            Ok(())
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn get_indexed_shelf(&self, shelf_id: i64) -> Result<Option<IndexedShelf>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT shelf_id, name, slug, shelf_kind, indexed_at, deleted FROM bookstack_shelves WHERE shelf_id = ?1"
+            ).map_err(|e| format!("get_indexed_shelf prepare: {e}"))?;
+            let row = stmt.query_row(params![shelf_id], |r| {
+                let kind_str: String = r.get(3)?;
+                Ok(IndexedShelf {
+                    shelf_id: r.get(0)?,
+                    name: r.get(1)?,
+                    slug: r.get(2)?,
+                    shelf_kind: kind_str.parse().unwrap_or(ShelfKind::Unclassified),
+                    indexed_at: r.get(4)?,
+                    deleted: r.get::<_, i64>(5)? != 0,
+                })
+            });
+            match row {
+                Ok(s) => Ok(Some(s)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(format!("get_indexed_shelf: {e}")),
+            }
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn soft_delete_indexed_shelf(&self, shelf_id: i64) -> Result<(), String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "UPDATE bookstack_shelves SET deleted = 1 WHERE shelf_id = ?1",
+                params![shelf_id],
+            ).map_err(|e| format!("soft_delete_indexed_shelf: {e}"))?;
+            Ok(())
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    // --- Books ---
+
+    async fn upsert_indexed_book(&self, book: &IndexedBook) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let b = book.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO bookstack_books (book_id, name, slug, shelf_id, identity_ouid, book_kind, indexed_at, deleted)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(book_id) DO UPDATE SET
+                     name = excluded.name,
+                     slug = excluded.slug,
+                     shelf_id = excluded.shelf_id,
+                     identity_ouid = excluded.identity_ouid,
+                     book_kind = excluded.book_kind,
+                     indexed_at = excluded.indexed_at,
+                     deleted = excluded.deleted",
+                params![b.book_id, b.name, b.slug, b.shelf_id, b.identity_ouid, b.book_kind.as_str(), b.indexed_at, b.deleted as i64],
+            ).map_err(|e| format!("upsert_indexed_book: {e}"))?;
+            Ok(())
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn get_indexed_book(&self, book_id: i64) -> Result<Option<IndexedBook>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT book_id, name, slug, shelf_id, identity_ouid, book_kind, indexed_at, deleted
+                 FROM bookstack_books WHERE book_id = ?1"
+            ).map_err(|e| format!("get_indexed_book prepare: {e}"))?;
+            let row = stmt.query_row(params![book_id], |r| {
+                let kind_str: String = r.get(5)?;
+                Ok(IndexedBook {
+                    book_id: r.get(0)?,
+                    name: r.get(1)?,
+                    slug: r.get(2)?,
+                    shelf_id: r.get(3)?,
+                    identity_ouid: r.get(4)?,
+                    book_kind: kind_str.parse().unwrap_or(BookKind::Unclassified),
+                    indexed_at: r.get(6)?,
+                    deleted: r.get::<_, i64>(7)? != 0,
+                })
+            });
+            match row {
+                Ok(b) => Ok(Some(b)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(format!("get_indexed_book: {e}")),
+            }
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn list_indexed_books_by_shelf(&self, shelf_id: i64) -> Result<Vec<IndexedBook>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT book_id, name, slug, shelf_id, identity_ouid, book_kind, indexed_at, deleted
+                 FROM bookstack_books WHERE shelf_id = ?1 AND deleted = 0
+                 ORDER BY name"
+            ).map_err(|e| format!("list_indexed_books_by_shelf prepare: {e}"))?;
+            let rows = stmt.query_map(params![shelf_id], |r| {
+                let kind_str: String = r.get(5)?;
+                Ok(IndexedBook {
+                    book_id: r.get(0)?,
+                    name: r.get(1)?,
+                    slug: r.get(2)?,
+                    shelf_id: r.get(3)?,
+                    identity_ouid: r.get(4)?,
+                    book_kind: kind_str.parse().unwrap_or(BookKind::Unclassified),
+                    indexed_at: r.get(6)?,
+                    deleted: r.get::<_, i64>(7)? != 0,
+                })
+            }).map_err(|e| format!("list_indexed_books_by_shelf query: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("list_indexed_books_by_shelf collect: {e}"))
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn list_indexed_books_by_identity(&self, identity_ouid: &str) -> Result<Vec<IndexedBook>, String> {
+        let conn = self.conn.clone();
+        let ouid = identity_ouid.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT book_id, name, slug, shelf_id, identity_ouid, book_kind, indexed_at, deleted
+                 FROM bookstack_books WHERE identity_ouid = ?1 AND deleted = 0
+                 ORDER BY book_kind, name"
+            ).map_err(|e| format!("list_indexed_books_by_identity prepare: {e}"))?;
+            let rows = stmt.query_map(params![ouid], |r| {
+                let kind_str: String = r.get(5)?;
+                Ok(IndexedBook {
+                    book_id: r.get(0)?,
+                    name: r.get(1)?,
+                    slug: r.get(2)?,
+                    shelf_id: r.get(3)?,
+                    identity_ouid: r.get(4)?,
+                    book_kind: kind_str.parse().unwrap_or(BookKind::Unclassified),
+                    indexed_at: r.get(6)?,
+                    deleted: r.get::<_, i64>(7)? != 0,
+                })
+            }).map_err(|e| format!("list_indexed_books_by_identity query: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("list_indexed_books_by_identity collect: {e}"))
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn soft_delete_indexed_book(&self, book_id: i64) -> Result<(), String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "UPDATE bookstack_books SET deleted = 1 WHERE book_id = ?1",
+                params![book_id],
+            ).map_err(|e| format!("soft_delete_indexed_book: {e}"))?;
+            Ok(())
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    // --- Chapters ---
+
+    async fn upsert_indexed_chapter(&self, chapter: &IndexedChapter) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let c = chapter.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO bookstack_chapters
+                    (chapter_id, book_id, name, slug, identity_ouid, chapter_kind, archive_year, indexed_at, deleted)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(chapter_id) DO UPDATE SET
+                     book_id = excluded.book_id,
+                     name = excluded.name,
+                     slug = excluded.slug,
+                     identity_ouid = excluded.identity_ouid,
+                     chapter_kind = excluded.chapter_kind,
+                     archive_year = excluded.archive_year,
+                     indexed_at = excluded.indexed_at,
+                     deleted = excluded.deleted",
+                params![
+                    c.chapter_id, c.book_id, c.name, c.slug, c.identity_ouid,
+                    c.chapter_kind.as_str(), c.archive_year, c.indexed_at, c.deleted as i64
+                ],
+            ).map_err(|e| format!("upsert_indexed_chapter: {e}"))?;
+            Ok(())
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn get_indexed_chapter(&self, chapter_id: i64) -> Result<Option<IndexedChapter>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT chapter_id, book_id, name, slug, identity_ouid, chapter_kind, archive_year, indexed_at, deleted
+                 FROM bookstack_chapters WHERE chapter_id = ?1"
+            ).map_err(|e| format!("get_indexed_chapter prepare: {e}"))?;
+            let row = stmt.query_row(params![chapter_id], |r| {
+                let kind_str: String = r.get(5)?;
+                Ok(IndexedChapter {
+                    chapter_id: r.get(0)?,
+                    book_id: r.get(1)?,
+                    name: r.get(2)?,
+                    slug: r.get(3)?,
+                    identity_ouid: r.get(4)?,
+                    chapter_kind: kind_str.parse().unwrap_or(ChapterKind::Unclassified),
+                    archive_year: r.get(6)?,
+                    indexed_at: r.get(7)?,
+                    deleted: r.get::<_, i64>(8)? != 0,
+                })
+            });
+            match row {
+                Ok(c) => Ok(Some(c)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(format!("get_indexed_chapter: {e}")),
+            }
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn list_indexed_chapters_by_book(&self, book_id: i64) -> Result<Vec<IndexedChapter>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT chapter_id, book_id, name, slug, identity_ouid, chapter_kind, archive_year, indexed_at, deleted
+                 FROM bookstack_chapters WHERE book_id = ?1 AND deleted = 0
+                 ORDER BY name"
+            ).map_err(|e| format!("list_indexed_chapters_by_book prepare: {e}"))?;
+            let rows = stmt.query_map(params![book_id], |r| {
+                let kind_str: String = r.get(5)?;
+                Ok(IndexedChapter {
+                    chapter_id: r.get(0)?,
+                    book_id: r.get(1)?,
+                    name: r.get(2)?,
+                    slug: r.get(3)?,
+                    identity_ouid: r.get(4)?,
+                    chapter_kind: kind_str.parse().unwrap_or(ChapterKind::Unclassified),
+                    archive_year: r.get(6)?,
+                    indexed_at: r.get(7)?,
+                    deleted: r.get::<_, i64>(8)? != 0,
+                })
+            }).map_err(|e| format!("list_indexed_chapters_by_book query: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("list_indexed_chapters_by_book collect: {e}"))
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn soft_delete_indexed_chapter(&self, chapter_id: i64) -> Result<(), String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "UPDATE bookstack_chapters SET deleted = 1 WHERE chapter_id = ?1",
+                params![chapter_id],
+            ).map_err(|e| format!("soft_delete_indexed_chapter: {e}"))?;
+            Ok(())
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    // --- Pages ---
+
+    async fn upsert_indexed_page(
+        &self,
+        page: &IndexedPage,
+        cache: Option<&PageCache>,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let p = page.clone();
+        let c = cache.cloned();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.lock().unwrap();
+            // Single transaction so the page row + optional cache row land
+            // atomically — keeps the freshness invariant intact even if the
+            // process is killed mid-write.
+            let tx = conn.transaction().map_err(|e| format!("upsert_indexed_page tx: {e}"))?;
+            tx.execute(
+                "INSERT INTO bookstack_pages
+                    (page_id, book_id, chapter_id, name, slug, url, page_created_at, page_updated_at,
+                     identity_ouid, page_kind, page_key, archive_year, indexed_at, deleted)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                 ON CONFLICT(page_id) DO UPDATE SET
+                     book_id = excluded.book_id,
+                     chapter_id = excluded.chapter_id,
+                     name = excluded.name,
+                     slug = excluded.slug,
+                     url = excluded.url,
+                     page_created_at = excluded.page_created_at,
+                     page_updated_at = excluded.page_updated_at,
+                     identity_ouid = excluded.identity_ouid,
+                     page_kind = excluded.page_kind,
+                     page_key = excluded.page_key,
+                     archive_year = excluded.archive_year,
+                     indexed_at = excluded.indexed_at,
+                     deleted = excluded.deleted",
+                params![
+                    p.page_id, p.book_id, p.chapter_id, p.name, p.slug, p.url,
+                    p.page_created_at, p.page_updated_at, p.identity_ouid,
+                    p.page_kind.as_str(), p.page_key, p.archive_year,
+                    p.indexed_at, p.deleted as i64
+                ],
+            ).map_err(|e| format!("upsert_indexed_page page: {e}"))?;
+
+            if let Some(cache) = c {
+                tx.execute(
+                    "INSERT INTO page_cache (page_id, markdown, raw_markdown, html, cached_at, page_updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(page_id) DO UPDATE SET
+                         markdown = excluded.markdown,
+                         raw_markdown = excluded.raw_markdown,
+                         html = excluded.html,
+                         cached_at = excluded.cached_at,
+                         page_updated_at = excluded.page_updated_at",
+                    params![
+                        cache.page_id, cache.markdown, cache.raw_markdown,
+                        cache.html, cache.cached_at, cache.page_updated_at
+                    ],
+                ).map_err(|e| format!("upsert_indexed_page cache: {e}"))?;
+            }
+            tx.commit().map_err(|e| format!("upsert_indexed_page commit: {e}"))?;
+            Ok(())
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn get_indexed_page(&self, page_id: i64) -> Result<Option<IndexedPage>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            indexed_page_by_predicate(&conn, "page_id = ?1", params![page_id])
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn find_indexed_page_by_key(
+        &self,
+        identity_ouid: &str,
+        page_kind: PageKind,
+        page_key: &str,
+    ) -> Result<Option<IndexedPage>, String> {
+        let conn = self.conn.clone();
+        let ouid = identity_ouid.to_string();
+        let kind = page_kind.as_str().to_string();
+        let key = page_key.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            indexed_page_by_predicate(
+                &conn,
+                "identity_ouid = ?1 AND page_kind = ?2 AND page_key = ?3 AND deleted = 0",
+                params![ouid, kind, key],
+            )
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn list_indexed_pages_by_chapter(&self, chapter_id: i64) -> Result<Vec<IndexedPage>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            indexed_pages_by_predicate(&conn, "chapter_id = ?1 AND deleted = 0 ORDER BY name", params![chapter_id])
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn list_indexed_pages_by_book_root(&self, book_id: i64) -> Result<Vec<IndexedPage>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            indexed_pages_by_predicate(&conn, "book_id = ?1 AND chapter_id IS NULL AND deleted = 0 ORDER BY name", params![book_id])
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn soft_delete_indexed_page(&self, page_id: i64) -> Result<(), String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "UPDATE bookstack_pages SET deleted = 1 WHERE page_id = ?1",
+                params![page_id],
+            ).map_err(|e| format!("soft_delete_indexed_page: {e}"))?;
+            Ok(())
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    // --- Page cache ---
+
+    async fn get_page_cache(&self, page_id: i64) -> Result<Option<PageCache>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT page_id, markdown, raw_markdown, html, cached_at, page_updated_at
+                 FROM page_cache WHERE page_id = ?1"
+            ).map_err(|e| format!("get_page_cache prepare: {e}"))?;
+            let row = stmt.query_row(params![page_id], |r| {
+                Ok(PageCache {
+                    page_id: r.get(0)?,
+                    markdown: r.get(1)?,
+                    raw_markdown: r.get(2)?,
+                    html: r.get(3)?,
+                    cached_at: r.get(4)?,
+                    page_updated_at: r.get(5)?,
+                })
+            });
+            match row {
+                Ok(c) => Ok(Some(c)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(format!("get_page_cache: {e}")),
+            }
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    // --- Index jobs ---
+
+    async fn create_index_job(
+        &self,
+        scope: &str,
+        kind: &str,
+        triggered_by: &str,
+    ) -> Result<(i64, bool), String> {
+        let conn = self.conn.clone();
+        let scope = scope.to_string();
+        let kind = kind.to_string();
+        let triggered_by = triggered_by.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            // Dedup on scope (mirrors create_embed_job): if a pending or
+            // running job with the same scope exists, return that one.
+            let existing: Result<i64, _> = conn.query_row(
+                "SELECT id FROM index_jobs
+                 WHERE scope = ?1 AND status IN ('pending', 'running')
+                 ORDER BY id DESC LIMIT 1",
+                params![scope],
+                |r| r.get(0),
+            );
+            if let Ok(id) = existing {
+                return Ok((id, false));
+            }
+            conn.execute(
+                "INSERT INTO index_jobs (scope, kind, status, triggered_by) VALUES (?1, ?2, 'pending', ?3)",
+                params![scope, kind, triggered_by],
+            ).map_err(|e| format!("create_index_job insert: {e}"))?;
+            let id = conn.last_insert_rowid();
+            Ok((id, true))
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn claim_next_index_job(&self) -> Result<Option<IndexJob>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.lock().unwrap();
+            let tx = conn.transaction().map_err(|e| format!("claim_next_index_job tx: {e}"))?;
+            let job: Option<IndexJob> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id, scope, kind, status, triggered_by, started_at, finished_at, progress, total, error
+                     FROM index_jobs WHERE status = 'pending' ORDER BY id ASC LIMIT 1"
+                ).map_err(|e| format!("claim_next_index_job prepare: {e}"))?;
+                let row = stmt.query_row([], index_job_from_row);
+                match row {
+                    Ok(j) => Some(j),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                    Err(e) => return Err(format!("claim_next_index_job query: {e}")),
+                }
+            };
+            if let Some(ref j) = job {
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+                tx.execute(
+                    "UPDATE index_jobs SET status = 'running', started_at = ?1 WHERE id = ?2",
+                    params![now, j.id],
+                ).map_err(|e| format!("claim_next_index_job update: {e}"))?;
+            }
+            tx.commit().map_err(|e| format!("claim_next_index_job commit: {e}"))?;
+            Ok(job)
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn update_index_job_progress(
+        &self,
+        job_id: i64,
+        progress: i64,
+        total: i64,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "UPDATE index_jobs SET progress = ?1, total = ?2 WHERE id = ?3",
+                params![progress, total, job_id],
+            ).map_err(|e| format!("update_index_job_progress: {e}"))?;
+            Ok(())
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn complete_index_job(&self, job_id: i64, error: Option<&str>) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let error = error.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+            let status = if error.is_some() { "failed" } else { "completed" };
+            conn.execute(
+                "UPDATE index_jobs SET status = ?1, finished_at = ?2, error = ?3 WHERE id = ?4",
+                params![status, now, error, job_id],
+            ).map_err(|e| format!("complete_index_job: {e}"))?;
+            Ok(())
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn list_pending_index_jobs(&self, limit: i64) -> Result<Vec<IndexJob>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT id, scope, kind, status, triggered_by, started_at, finished_at, progress, total, error
+                 FROM index_jobs WHERE status = 'pending' ORDER BY id ASC LIMIT ?1"
+            ).map_err(|e| format!("list_pending_index_jobs prepare: {e}"))?;
+            let rows = stmt.query_map(params![limit], index_job_from_row)
+                .map_err(|e| format!("list_pending_index_jobs query: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("list_pending_index_jobs collect: {e}"))
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn get_latest_index_job(&self) -> Result<Option<IndexJob>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT id, scope, kind, status, triggered_by, started_at, finished_at, progress, total, error
+                 FROM index_jobs ORDER BY id DESC LIMIT 1"
+            ).map_err(|e| format!("get_latest_index_job prepare: {e}"))?;
+            let row = stmt.query_row([], index_job_from_row);
+            match row {
+                Ok(j) => Ok(Some(j)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(format!("get_latest_index_job: {e}")),
+            }
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    // --- Index meta ---
+
+    async fn get_index_meta(&self, key: &str) -> Result<Option<String>, String> {
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let row: Result<String, _> = conn.query_row(
+                "SELECT value FROM index_meta WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            );
+            match row {
+                Ok(v) => Ok(Some(v)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(format!("get_index_meta: {e}")),
+            }
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn set_index_meta(&self, key: &str, value: &str) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        let value = value.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO index_meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            ).map_err(|e| format!("set_index_meta: {e}"))?;
+            Ok(())
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+}
+
+// --- Helpers shared across IndexDb impl methods ---
+
+fn indexed_page_from_row(r: &rusqlite::Row) -> rusqlite::Result<IndexedPage> {
+    let kind_str: String = r.get(9)?;
+    Ok(IndexedPage {
+        page_id: r.get(0)?,
+        book_id: r.get(1)?,
+        chapter_id: r.get(2)?,
+        name: r.get(3)?,
+        slug: r.get(4)?,
+        url: r.get(5)?,
+        page_created_at: r.get(6)?,
+        page_updated_at: r.get(7)?,
+        identity_ouid: r.get(8)?,
+        page_kind: kind_str.parse().unwrap_or(PageKind::Unclassified),
+        page_key: r.get(10)?,
+        archive_year: r.get(11)?,
+        indexed_at: r.get(12)?,
+        deleted: r.get::<_, i64>(13)? != 0,
+    })
+}
+
+fn indexed_page_by_predicate(
+    conn: &rusqlite::Connection,
+    where_clause: &str,
+    params: &[&dyn rusqlite::ToSql],
+) -> Result<Option<IndexedPage>, String> {
+    let sql = format!(
+        "SELECT page_id, book_id, chapter_id, name, slug, url, page_created_at, page_updated_at,
+                identity_ouid, page_kind, page_key, archive_year, indexed_at, deleted
+         FROM bookstack_pages WHERE {where_clause} LIMIT 1"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| format!("indexed_page_by_predicate prepare: {e}"))?;
+    let row = stmt.query_row(params, indexed_page_from_row);
+    match row {
+        Ok(p) => Ok(Some(p)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("indexed_page_by_predicate: {e}")),
+    }
+}
+
+fn indexed_pages_by_predicate(
+    conn: &rusqlite::Connection,
+    where_clause: &str,
+    params: &[&dyn rusqlite::ToSql],
+) -> Result<Vec<IndexedPage>, String> {
+    let sql = format!(
+        "SELECT page_id, book_id, chapter_id, name, slug, url, page_created_at, page_updated_at,
+                identity_ouid, page_kind, page_key, archive_year, indexed_at, deleted
+         FROM bookstack_pages WHERE {where_clause}"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| format!("indexed_pages_by_predicate prepare: {e}"))?;
+    let rows = stmt.query_map(params, indexed_page_from_row).map_err(|e| format!("indexed_pages_by_predicate query: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("indexed_pages_by_predicate collect: {e}"))
+}
+
+fn index_job_from_row(r: &rusqlite::Row) -> rusqlite::Result<IndexJob> {
+    Ok(IndexJob {
+        id: r.get(0)?,
+        scope: r.get(1)?,
+        kind: r.get(2)?,
+        status: r.get(3)?,
+        triggered_by: r.get(4)?,
+        started_at: r.get(5)?,
+        finished_at: r.get(6)?,
+        progress: r.get(7)?,
+        total: r.get(8)?,
+        error: r.get(9)?,
+    })
 }
 
 /// Convert unix days (since epoch) to (year, month, day).

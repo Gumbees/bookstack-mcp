@@ -2138,6 +2138,23 @@ impl IndexDb for SqliteDb {
         }).await.map_err(|e| format!("Task failed: {e}"))?
     }
 
+    async fn list_indexed_pages_recent(&self, book_id: i64, limit: i64) -> Result<Vec<IndexedPage>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            // page_updated_at is TEXT (ISO 8601). String-sort gives us
+            // chronological order because ISO 8601 is lexicographically
+            // monotonic. NULL updated_at sinks to the end via the COALESCE.
+            indexed_pages_by_predicate(
+                &conn,
+                "book_id = ?1 AND deleted = 0 \
+                 ORDER BY COALESCE(page_updated_at, '') DESC \
+                 LIMIT ?2",
+                params![book_id, limit],
+            )
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
     async fn soft_delete_indexed_page(&self, page_id: i64) -> Result<(), String> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {

@@ -40,7 +40,62 @@ async fn list(ctx: &Context) -> Outcome {
         }
     };
 
-    // Fetch the shelf and the books on it.
+    // Phase 5b: try the index first. The reconciliation worker classifies
+    // each book on the Hive shelf and stamps `identity_ouid` from the
+    // manifest's frontmatter at index time. So a single SQL query returns
+    // book + name + ouid per identity — no per-book BookStack roundtrip,
+    // no manifest-page guessing.
+    if let Ok(books) = ctx.index_db.list_indexed_books_by_shelf(shelf_id).await {
+        if !books.is_empty() {
+            let mut identities = Vec::new();
+            for book in books {
+                // Only surface books actually classified as identity-bearing.
+                // Pia's collage and the cross-identity collage live on the
+                // same shelf but aren't agent identities; the previous
+                // implementation included them, which was buggy (#26 RFC
+                // motivation #2).
+                use bsmcp_common::index::BookKind;
+                if !matches!(
+                    book.book_kind,
+                    BookKind::Identity | BookKind::UserIdentity
+                ) {
+                    continue;
+                }
+
+                // Manifest page id: query the index for the loose Identity
+                // page at the book root.
+                let manifest = ctx
+                    .index_db
+                    .list_indexed_pages_by_book_root(book.book_id)
+                    .await
+                    .ok()
+                    .and_then(|pages| {
+                        pages
+                            .into_iter()
+                            .find(|p| NamedResource::IdentityPage.matches(&p.name))
+                    });
+                let (page_id, page_name) = match manifest {
+                    Some(p) => (Some(p.page_id), p.name),
+                    None => (None, String::new()),
+                };
+                identities.push(json!({
+                    "book_id": book.book_id,
+                    "book_name": book.name,
+                    "manifest_page_id": page_id,
+                    "manifest_page_name": page_name,
+                    "ouid": book.identity_ouid,
+                }));
+            }
+            return Outcome::ok(json!({
+                "hive_shelf_id": shelf_id,
+                "count": identities.len(),
+                "identities": identities,
+            }));
+        }
+    }
+
+    // Fallback: the legacy BookStack-walking path. Used when the index is
+    // empty (worker hasn't run yet) or returns an error (postgres stub).
     let shelf = match ctx.client.get_shelf(shelf_id).await {
         Ok(s) => s,
         Err(e) => return Outcome::error(ErrorCode::BookStackError, e, Some("hive_shelf_id")),
@@ -55,11 +110,6 @@ async fn list(ctx: &Context) -> Outcome {
         }).collect())
         .unwrap_or_default();
 
-    // For each book, find the Identity manifest page (matches the naming convention).
-    // Run lookups in parallel. Goes through `list_book_pages_by_updated`
-    // (which uses `get_book`) so the book scope is honored — search would
-    // silently fall through to system-wide results without a positive
-    // keyword term.
     let mut handles = Vec::with_capacity(books.len());
     for (book_id, book_name) in books {
         let client = ctx.client.clone();
@@ -84,7 +134,6 @@ async fn list(ctx: &Context) -> Outcome {
             Some(p) => {
                 let pid = p.get("id").and_then(|i| i.as_i64());
                 let name = p.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
-                // Best-effort OUID extraction from frontmatter.
                 let ouid = match pid {
                     Some(id) => extract_ouid_from_page(&ctx.client, id).await,
                     None => None,

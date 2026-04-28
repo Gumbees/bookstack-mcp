@@ -28,7 +28,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use bsmcp_common::bookstack::BookStackClient;
-use bsmcp_common::db::DbBackend;
+use bsmcp_common::db::{DbBackend, IndexDb};
 use bsmcp_common::settings::{hash_token_id, UserSettings};
 use bsmcp_common::types::AuditEntryInsert;
 
@@ -46,6 +46,7 @@ pub async fn dispatch(
     token_id: &str,
     client: &BookStackClient,
     db: Arc<dyn DbBackend>,
+    index_db: Arc<dyn IndexDb>,
     semantic: Option<Arc<SemanticState>>,
 ) -> Value {
     let started = std::time::Instant::now();
@@ -102,6 +103,7 @@ pub async fn dispatch(
         trace_id: trace_id.clone(),
         client: client.clone(),
         db: db.clone(),
+        index_db: index_db.clone(),
         semantic,
         settings,
         token_id_hash: token_id_hash.clone(),
@@ -210,6 +212,10 @@ pub struct Context {
     pub trace_id: String,
     pub client: BookStackClient,
     pub db: Arc<dyn DbBackend>,
+    /// v1.0.0 reconciliation index. Read paths consult it first; write
+    /// paths can also use it for find-or-create dedup. SQLite has the
+    /// real impl; Postgres returns stub errors per #36.
+    pub index_db: Arc<dyn IndexDb>,
     pub semantic: Option<Arc<SemanticState>>,
     pub settings: UserSettings,
     pub token_id_hash: String,

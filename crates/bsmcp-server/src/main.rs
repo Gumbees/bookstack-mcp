@@ -264,7 +264,11 @@ async fn main() {
                     db.clone(),
                     index_db.clone(),
                 );
-                worker.spawn();
+                let delta_interval: u64 = env::var("BSMCP_INDEX_DELTA_INTERVAL_SECONDS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(300);
+                worker.spawn(delta_interval);
             }
             _ => eprintln!(
                 "IndexWorker: BSMCP_INDEX_WORKER=true but no BSMCP_INDEX_TOKEN_*/BSMCP_EMBED_TOKEN_* — worker not started"
@@ -277,6 +281,7 @@ async fn main() {
     let state = sse::AppState::new(
         bookstack_url,
         db,
+        index_db.clone(),
         known_urls,
         backup_interval_hours,
         backup_path,
@@ -398,6 +403,7 @@ async fn handle_remember_http(
         &token_id,
         &client,
         state.db.clone(),
+        state.index_db.clone(),
         state.semantic.clone(),
     )
     .await;
@@ -461,7 +467,94 @@ async fn handle_webhook(
         eprintln!("Webhook error: {e}");
     }
 
+    // Index reconciliation: enqueue page-scope jobs alongside the existing
+    // embed-job enqueue. Distinct queue (`index_jobs` vs `embed_jobs`) so
+    // worker policies tune independently. Best-effort — failures here
+    // never block the webhook from returning ACCEPTED.
+    if let Err(e) = enqueue_index_jobs_for_webhook(&payload, &state).await {
+        eprintln!("IndexWorker: webhook enqueue failed (non-fatal): {e}");
+    }
+
     StatusCode::ACCEPTED.into_response()
+}
+
+/// Mirror the event-dispatch logic in semantic::handle_webhook for the
+/// index_jobs queue. Page events get a per-page reconcile; chapter/book
+/// events get a per-chapter or per-book walk so descendant pages pick up
+/// reclassification triggered by a parent rename. Shelf events trigger a
+/// full walk because the shelf-kind classification feeds every descendant.
+async fn enqueue_index_jobs_for_webhook(
+    payload: &serde_json::Value,
+    state: &sse::AppState,
+) -> Result<(), String> {
+    let event = payload
+        .get("event")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let related = payload.get("related_item").cloned().unwrap_or(json!(null));
+    let item_id = related.get("id").and_then(|v| v.as_i64());
+
+    match event {
+        "page_create" | "page_update" | "page_restore" | "page_move" => {
+            if let Some(pid) = item_id {
+                let scope = format!("page:{pid}");
+                let (job_id, is_new) = state
+                    .index_db
+                    .create_index_job(&scope, "both", "webhook")
+                    .await?;
+                eprintln!("IndexWorker: {event} — queued {scope} job {job_id} (new={is_new})");
+            }
+        }
+        "page_delete" => {
+            if let Some(pid) = item_id {
+                state.index_db.soft_delete_indexed_page(pid).await?;
+                eprintln!("IndexWorker: page_delete — soft-deleted page {pid} from index");
+            }
+        }
+        "chapter_create" | "chapter_update" | "chapter_delete" | "chapter_move" => {
+            // For now, full walk to pick up chapter-kind reclassification of
+            // descendants. A `chapter:{id}` scope can replace this in a
+            // follow-up.
+            if event == "chapter_delete" {
+                if let Some(cid) = item_id {
+                    state.index_db.soft_delete_indexed_chapter(cid).await?;
+                }
+            }
+            let (job_id, is_new) = state
+                .index_db
+                .create_index_job("all", "both", "webhook")
+                .await?;
+            eprintln!("IndexWorker: {event} — queued full walk job {job_id} (new={is_new})");
+        }
+        "book_update" | "book_sort" | "book_create_from_chapter" | "book_delete" => {
+            if event == "book_delete" {
+                if let Some(bid) = item_id {
+                    state.index_db.soft_delete_indexed_book(bid).await?;
+                }
+            }
+            let (job_id, is_new) = state
+                .index_db
+                .create_index_job("all", "both", "webhook")
+                .await?;
+            eprintln!("IndexWorker: {event} — queued full walk job {job_id} (new={is_new})");
+        }
+        "bookshelf_create_from_book" | "bookshelf_update" | "bookshelf_delete" => {
+            if event == "bookshelf_delete" {
+                if let Some(sid) = item_id {
+                    state.index_db.soft_delete_indexed_shelf(sid).await?;
+                }
+            }
+            let (job_id, is_new) = state
+                .index_db
+                .create_index_job("all", "both", "webhook")
+                .await?;
+            eprintln!("IndexWorker: {event} — queued full walk job {job_id} (new={is_new})");
+        }
+        _ => {
+            // Unknown event — log and ignore, matching semantic.rs's behavior.
+        }
+    }
+    Ok(())
 }
 
 fn html_escape(s: &str) -> String {

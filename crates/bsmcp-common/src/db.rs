@@ -287,6 +287,15 @@ pub trait IndexDb: Send + Sync + 'static {
         &self,
         book_id: i64,
     ) -> Result<Vec<IndexedPage>, String>;
+    /// Most-recently-updated pages within a book, sorted by `page_updated_at`
+    /// descending. Used by the briefing's recent-pages list (Phase 5
+    /// read-path cutover) to replace the live BookStack `get_book` traversal
+    /// with a local indexed lookup.
+    async fn list_indexed_pages_recent(
+        &self,
+        book_id: i64,
+        limit: i64,
+    ) -> Result<Vec<IndexedPage>, String>;
     async fn soft_delete_indexed_page(&self, page_id: i64) -> Result<(), String>;
 
     // --- Page cache ---

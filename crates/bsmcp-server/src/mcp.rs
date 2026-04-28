@@ -18,6 +18,7 @@ const PROTOCOL_VERSION: &str = "2025-03-26";
 /// from sprouting more positional args.
 pub struct RememberDeps {
     pub db: Arc<dyn DbBackend>,
+    pub index_db: Arc<dyn bsmcp_common::db::IndexDb>,
     pub semantic: Option<Arc<SemanticState>>,
     pub token_id: String,
 }
@@ -115,6 +116,7 @@ async fn execute_tool(
             &remember_deps.token_id,
             client,
             remember_deps.db.clone(),
+            remember_deps.index_db.clone(),
             remember_deps.semantic.clone(),
         )
         .await;

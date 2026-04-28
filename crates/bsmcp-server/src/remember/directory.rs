@@ -56,6 +56,38 @@ pub async fn read(ctx: &Context) -> Outcome {
         }
     };
 
+    // Phase 5b: try the index first for the books-on-shelf list. Falls back
+    // to the live BookStack `get_shelf` call on miss/error/empty so the
+    // call stays correct before the worker's first walk and on
+    // postgres-stub deployments.
+    if let Ok(indexed_books) = ctx.index_db.list_indexed_books_by_shelf(shelf_id).await {
+        if !indexed_books.is_empty() {
+            // Resolve shelf metadata from the index too if we have it.
+            let shelf_name = match ctx.index_db.get_indexed_shelf(shelf_id).await {
+                Ok(Some(s)) => Value::String(s.name),
+                _ => Value::Null,
+            };
+            let books: Vec<Value> = indexed_books
+                .into_iter()
+                .map(|b| {
+                    json!({
+                        "book_id": b.book_id,
+                        "name": b.name,
+                        "slug": b.slug,
+                        "url": Value::Null, // index doesn't store url; UI can derive from slug
+                    })
+                })
+                .collect();
+            return Outcome::ok(json!({
+                "kind": kind,
+                "shelf_id": shelf_id,
+                "shelf_name": shelf_name,
+                "count": books.len(),
+                "books": books,
+            }));
+        }
+    }
+
     let shelf = match ctx.client.get_shelf(shelf_id).await {
         Ok(s) => s,
         Err(e) => return Outcome::error(ErrorCode::BookStackError, e, None),

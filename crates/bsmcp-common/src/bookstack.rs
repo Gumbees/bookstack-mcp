@@ -548,6 +548,34 @@ impl BookStackClient {
         ]).await
     }
 
+    /// List pages whose `updated_at` is strictly greater than the given
+    /// ISO 8601 timestamp, sorted oldest-first so the index reconciler
+    /// can advance `last_delta_walk_at` to the newest page seen on each
+    /// pass without losing entries to "process out of order then crash"
+    /// races. Used by the v1.0.0 reconciliation worker's periodic delta
+    /// walk (Phase 4c).
+    pub async fn list_pages_updated_since(
+        &self,
+        since_iso_utc: &str,
+        count: i64,
+    ) -> Result<Vec<Value>, String> {
+        let resp = self
+            .get(
+                "pages",
+                &[
+                    ("count", &count.to_string()),
+                    ("sort", "+updated_at"),
+                    ("filter[updated_at:gt]", since_iso_utc),
+                ],
+            )
+            .await?;
+        Ok(resp
+            .get("data")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default())
+    }
+
     pub async fn get_page(&self, id: i64) -> Result<Value, String> {
         self.get(&format!("pages/{id}"), &[]).await
     }

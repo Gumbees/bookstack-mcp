@@ -63,16 +63,57 @@ impl IndexWorker {
     /// so the caller can hold a reference (or `forget()` it for fire-and-
     /// forget semantics, which matches the existing `spawn_acl_reconcile`
     /// pattern in semantic.rs).
-    pub fn spawn(self) -> tokio::task::JoinHandle<()> {
+    ///
+    /// `delta_interval_secs` controls the periodic delta-walk cadence
+    /// (0 disables it). Webhook-triggered jobs still arrive in real time;
+    /// the periodic walk is a safety net for missed webhooks.
+    pub fn spawn(self, delta_interval_secs: u64) -> tokio::task::JoinHandle<()> {
+        let worker = Arc::new(self);
+        let worker_for_delta = worker.clone();
+
+        // Periodic delta walk timer — independent task that just enqueues
+        // a `delta` job at intervals. The poll loop picks it up and runs
+        // the actual walk. Gated on a non-zero interval so operators can
+        // disable polling entirely (webhook-only mode).
+        if delta_interval_secs > 0 {
+            tokio::spawn(async move {
+                let interval = Duration::from_secs(delta_interval_secs);
+                eprintln!(
+                    "IndexWorker: delta walk cron active — every {delta_interval_secs}s"
+                );
+                // Stagger the first delta so it doesn't race the initial
+                // full walk.
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                loop {
+                    match worker_for_delta
+                        .index_db
+                        .create_index_job("delta", "both", "cron")
+                        .await
+                    {
+                        Ok((id, is_new)) => {
+                            if is_new {
+                                eprintln!("IndexWorker: delta cron — queued job {id}");
+                            }
+                        }
+                        Err(e) => eprintln!("IndexWorker: delta cron enqueue failed: {e}"),
+                    }
+                    tokio::time::sleep(interval).await;
+                }
+            });
+        } else {
+            eprintln!("IndexWorker: delta walk cron disabled (interval=0)");
+        }
+
+        // Main poll loop.
         tokio::spawn(async move {
             // Stagger initial check by a few seconds so server startup
             // isn't immediately followed by a heavy walk.
             tokio::time::sleep(Duration::from_secs(10)).await;
 
-            if let Err(e) = self.maybe_enqueue_initial_walk().await {
+            if let Err(e) = worker.maybe_enqueue_initial_walk().await {
                 eprintln!("IndexWorker: maybe_enqueue_initial_walk failed (non-fatal): {e}");
             }
-            self.poll_loop().await;
+            worker.poll_loop().await;
         })
     }
 
@@ -125,6 +166,7 @@ impl IndexWorker {
     async fn process_job(&self, job: &IndexJob) -> Result<(), String> {
         match job.scope.as_str() {
             "all" => self.walk_all().await,
+            "delta" => self.walk_delta().await,
             scope if scope.starts_with("page:") => {
                 let id: i64 = scope
                     .strip_prefix("page:")
@@ -168,6 +210,77 @@ impl IndexWorker {
         self.index_db
             .set_index_meta("last_full_walk_at", &now.to_string())
             .await
+    }
+
+    /// Periodic delta walk — list pages whose `updated_at` advanced past
+    /// `last_delta_walk_at` (or `last_full_walk_at` on first run) and
+    /// reconcile each. Advances `last_delta_walk_at` to the newest
+    /// `updated_at` seen so a subsequent run resumes from the correct
+    /// boundary even if some pages failed to reconcile.
+    async fn walk_delta(&self) -> Result<(), String> {
+        let last_walk = match self.index_db.get_index_meta("last_delta_walk_at").await? {
+            Some(v) => v,
+            None => match self.index_db.get_index_meta("last_full_walk_at").await? {
+                Some(v) => unix_to_iso(&v),
+                None => {
+                    eprintln!(
+                        "IndexWorker: walk_delta — no last_full_walk_at; full walk first"
+                    );
+                    return Ok(());
+                }
+            },
+        };
+
+        let pages = self
+            .bs_client
+            .list_pages_updated_since(&last_walk, 250)
+            .await?;
+        eprintln!(
+            "IndexWorker: walk_delta since {last_walk} — {} candidate pages",
+            pages.len()
+        );
+
+        let mut newest_seen = last_walk.clone();
+        let mut reconciled = 0usize;
+        for page in pages {
+            let Some(page_id) = page.get("id").and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            let updated_at = page
+                .get("updated_at")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            if let Err(e) = self.reconcile_page(page_id).await {
+                eprintln!(
+                    "IndexWorker: walk_delta reconcile_page({page_id}) failed (non-fatal): {e}"
+                );
+                continue;
+            }
+            reconciled += 1;
+            if let Some(ts) = updated_at {
+                if ts > newest_seen {
+                    newest_seen = ts;
+                }
+            }
+        }
+
+        // Stamp the boundary even on a no-op pass so periodic runs don't
+        // keep re-listing the same window. If newest_seen advanced, future
+        // walks pick up from there; if no pages came back, we use `now`
+        // so we don't redundantly query the same window.
+        let advance_to = if newest_seen != last_walk {
+            newest_seen
+        } else {
+            iso_now()
+        };
+        self.index_db
+            .set_index_meta("last_delta_walk_at", &advance_to)
+            .await?;
+        eprintln!(
+            "IndexWorker: walk_delta complete — {reconciled} reconciled, advanced to {advance_to}"
+        );
+        Ok(())
     }
 
     async fn walk_shelf(&self, shelf_id: i64, globals: &GlobalSettings) -> Result<usize, String> {
@@ -523,6 +636,48 @@ fn current_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Render the current UTC moment as ISO 8601 (e.g. `2026-04-27T03:14:15Z`).
+/// Used by the delta walk's `last_delta_walk_at` checkpoint when no pages
+/// came back in a polling pass.
+fn iso_now() -> String {
+    let secs = current_unix();
+    let (y, mo, d, h, mi, s) = unix_to_components(secs);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+/// Convert a stored unix-seconds value (e.g., from `last_full_walk_at`) to
+/// an ISO 8601 string suitable for the BookStack `filter[updated_at:gt]`
+/// param. Falls back to "1970-01-01T00:00:00Z" on parse failure.
+fn unix_to_iso(stored: &str) -> String {
+    let secs: i64 = stored.parse().unwrap_or(0);
+    let (y, mo, d, h, mi, s) = unix_to_components(secs);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+fn unix_to_components(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
+    let days = secs.div_euclid(86_400);
+    let time = secs.rem_euclid(86_400) as u32;
+    let h = time / 3600;
+    let mi = (time % 3600) / 60;
+    let s = time % 60;
+    let (y, mo, d) = days_to_ymd(days);
+    (y, mo, d, h, mi, s)
+}
+
+fn days_to_ymd(days: i64) -> (i64, u32, u32) {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 fn string_field(v: &Value, key: &str) -> String {

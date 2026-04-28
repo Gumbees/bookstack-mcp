@@ -72,24 +72,24 @@ pub async fn read(ctx: &Context) -> Outcome {
     let recent_journals_fut = list_recent_pages(
         ctx.settings.ai_hive_journal_book_id,
         recent_count,
-        &ctx.client,
+        ctx,
     );
     let recent_user_journal_fut = list_recent_pages(
         ctx.settings.user_journal_book_id,
         recent_count,
-        &ctx.client,
+        ctx,
     );
 
     // Active collage (newest topic pages).
     let active_collage_fut = list_recent_pages(
         ctx.settings.ai_collage_book_id,
         active_count,
-        &ctx.client,
+        ctx,
     );
     let shared_collage_fut = list_recent_pages(
         ctx.settings.ai_shared_collage_book_id,
         active_count,
-        &ctx.client,
+        ctx,
     );
 
     // Semantic search fan-out.
@@ -482,14 +482,46 @@ async fn fetch_optional_page(client: &BookStackClient, page_id: Option<i64>) -> 
     }
 }
 
-/// Lists the most-recently-updated pages within a book, using the
-/// `BookStackClient::list_book_pages_by_updated` helper. The helper sorts
-/// by the page row's `updated_at` from BookStack's database — never from
-/// markdown content. We just narrow the page row down to the four fields
-/// the briefing surfaces.
-async fn list_recent_pages(book_id: Option<i64>, limit: usize, client: &BookStackClient) -> Vec<Value> {
+/// Lists the most-recently-updated pages within a book.
+///
+/// Phase 5 read-path cutover: query the local index first (the
+/// reconciliation worker keeps `bookstack_pages` in lockstep with
+/// BookStack via webhook + delta walk). On miss / error / empty
+/// result, fall back to BookStack's `list_book_pages_by_updated`
+/// so the briefing keeps working before the worker's first full
+/// walk and on Postgres deployments where the IndexDb impl is
+/// still a stub (#36).
+async fn list_recent_pages(book_id: Option<i64>, limit: usize, ctx: &Context) -> Vec<Value> {
     let Some(book_id) = book_id else { return Vec::new(); };
-    match client.list_book_pages_by_updated(book_id, limit).await {
+
+    // Try the index first — typically <10 ms for a 5-page recent list
+    // on the BR Hive.
+    match ctx.index_db.list_indexed_pages_recent(book_id, limit as i64).await {
+        Ok(pages) if !pages.is_empty() => {
+            return pages
+                .into_iter()
+                .map(|p| json!({
+                    "page_id": p.page_id,
+                    "name": p.name,
+                    "url": p.url,
+                    "updated_at": p.page_updated_at,
+                }))
+                .collect();
+        }
+        Ok(_) => {
+            // Empty result is ambiguous — book might genuinely be empty,
+            // or the worker hasn't walked it yet. Fall through to
+            // BookStack to be safe; the briefing degrades to "still
+            // works, just slower" rather than "shows nothing."
+        }
+        Err(e) => {
+            eprintln!(
+                "Briefing: index lookup for book {book_id} failed (falling back to BookStack): {e}"
+            );
+        }
+    }
+
+    match ctx.client.list_book_pages_by_updated(book_id, limit).await {
         Ok(pages) => pages
             .into_iter()
             .map(|p| json!({

@@ -420,6 +420,7 @@ pub async fn handle_message(
     let semantic = state.semantic.as_deref();
     let remember_deps = mcp::RememberDeps {
         db: state.db.clone(),
+        index_db: state.index_db.clone(),
         semantic: state.semantic.clone(),
         token_id: token_id.clone(),
     };
@@ -501,6 +502,7 @@ pub async fn handle_streamable(
     let semantic = state.semantic.as_deref();
     let remember_deps = mcp::RememberDeps {
         db: state.db.clone(),
+        index_db: state.index_db.clone(),
         semantic: state.semantic.clone(),
         token_id: token_id.clone(),
     };

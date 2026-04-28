@@ -1645,6 +1645,7 @@ impl IndexDb for PostgresDb {
     async fn find_indexed_page_by_key(&self, _ouid: &str, _kind: PageKind, _key: &str) -> Result<Option<IndexedPage>, String> { Err(NOT_YET.to_string()) }
     async fn list_indexed_pages_by_chapter(&self, _id: i64) -> Result<Vec<IndexedPage>, String> { Err(NOT_YET.to_string()) }
     async fn list_indexed_pages_by_book_root(&self, _id: i64) -> Result<Vec<IndexedPage>, String> { Err(NOT_YET.to_string()) }
+    async fn list_indexed_pages_recent(&self, _book_id: i64, _limit: i64) -> Result<Vec<IndexedPage>, String> { Err(NOT_YET.to_string()) }
     async fn soft_delete_indexed_page(&self, _id: i64) -> Result<(), String> { Err(NOT_YET.to_string()) }
 
     async fn get_page_cache(&self, _id: i64) -> Result<Option<PageCache>, String> { Err(NOT_YET.to_string()) }

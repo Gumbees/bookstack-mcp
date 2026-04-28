@@ -403,6 +403,7 @@ async fn handle_remember_http(
         &token_id,
         &client,
         state.db.clone(),
+        state.index_db.clone(),
         state.semantic.clone(),
     )
     .await;

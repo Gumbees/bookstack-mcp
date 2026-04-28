@@ -8,6 +8,7 @@ use bsmcp_common::settings::{GlobalSettings, UserSettings};
 
 use super::envelope::{ErrorCode, RememberWarning};
 use super::frontmatter;
+use super::journal_archive;
 use super::provision;
 use super::section;
 use super::{Context, Outcome};
@@ -107,6 +108,18 @@ pub trait CollectionResource: Send + Sync {
     /// the shelf are reattached on each write. Currently only `user_journal`
     /// uses this; other collections aren't shelf-pinned.
     fn shelf_pin(&self, _globals: &GlobalSettings) -> Option<i64> {
+        None
+    }
+
+    /// When set, the resource is the per-identity Journal: pages live in a
+    /// Journal chapter inside the Identity book, with year-rollover sweep
+    /// moving stale-year pages into `Journal Archive - {YEAR}` chapters.
+    /// Returns the Identity book id so the sweep / archive lookup can scope
+    /// chapter operations strictly within that book.
+    ///
+    /// Default: None (every other collection is book-parented, no archive
+    /// rollover, no chapter scope).
+    fn journal_archive_context(&self, _s: &UserSettings) -> Option<i64> {
         None
     }
 }
@@ -228,6 +241,49 @@ async fn read_one_by_key(
     ctx: &Context,
 ) -> Outcome {
     let page_name = resource.key_to_page_name(key);
+
+    // Per-identity journal: route past-year reads into the matching archive
+    // chapter. The current journal chapter only ever holds the current
+    // year's pages (year-rollover sweep moves stale entries on every write).
+    if let (Some(identity_book_id), CollectionParent::Chapter(journal_chapter_id)) =
+        (resource.journal_archive_context(&ctx.settings), parent)
+    {
+        match journal_archive::resolve_read_chapter_for_key(
+            key,
+            &ctx.settings,
+            identity_book_id,
+            journal_chapter_id,
+            ctx,
+        )
+        .await
+        {
+            Ok(Some(chapter_id)) => {
+                let resolved = CollectionParent::Chapter(chapter_id);
+                return match find_page_by_name(resolved, &page_name, ctx).await {
+                    Ok(Some(page_id)) => read_one_by_id(page_id, ctx).await,
+                    Ok(None) => Outcome::error(
+                        ErrorCode::NotFound,
+                        format!("No {} page named {page_name:?}", resource.name()),
+                        Some("key"),
+                    ),
+                    Err(e) => Outcome::error(ErrorCode::BookStackError, e, None),
+                };
+            }
+            Ok(None) => {
+                // No archive chapter for that year — page can't exist.
+                return Outcome::error(
+                    ErrorCode::NotFound,
+                    format!(
+                        "No {} archive chapter exists for the year in key {key:?}",
+                        resource.name()
+                    ),
+                    Some("key"),
+                );
+            }
+            Err(e) => return Outcome::error(ErrorCode::BookStackError, e, None),
+        }
+    }
+
     match find_page_by_name(parent, &page_name, ctx).await {
         Ok(Some(page_id)) => read_one_by_id(page_id, ctx).await,
         Ok(None) => Outcome::error(
@@ -311,6 +367,20 @@ async fn handle_write(
     let globals = ctx.db.get_global_settings().await.unwrap_or_default();
     if let (Some(shelf_id), Some(book_id)) = (resource.shelf_pin(&globals), parent.book_id()) {
         provision::ensure_book_on_shelf(&ctx.client, book_id, shelf_id).await;
+    }
+
+    // Year-rollover sweep for the per-identity journal. Runs before every
+    // write so any stale-year pages are moved into their archive chapter
+    // before the new entry lands. Idempotent and best-effort — failures
+    // log but don't block the user's write.
+    if let (Some(identity_book_id), CollectionParent::Chapter(journal_chapter_id)) =
+        (resource.journal_archive_context(&ctx.settings), parent)
+    {
+        match journal_archive::year_rollover_sweep(journal_chapter_id, identity_book_id, ctx).await {
+            Ok(0) => {}
+            Ok(n) => eprintln!("year_rollover_sweep: archived {n} stale page(s) before {} write", resource.name()),
+            Err(e) => eprintln!("year_rollover_sweep failed (non-fatal, write continues): {e}"),
+        }
     }
 
     let body_text = match ctx.body_str("body") {
@@ -482,6 +552,17 @@ async fn handle_append(
     let globals = ctx.db.get_global_settings().await.unwrap_or_default();
     if let (Some(shelf_id), Some(book_id)) = (resource.shelf_pin(&globals), parent.book_id()) {
         provision::ensure_book_on_shelf(&ctx.client, book_id, shelf_id).await;
+    }
+    // Year-rollover sweep — same as handle_write. Append paths can also
+    // create pages, so the sweep needs to run here too.
+    if let (Some(identity_book_id), CollectionParent::Chapter(journal_chapter_id)) =
+        (resource.journal_archive_context(&ctx.settings), parent)
+    {
+        match journal_archive::year_rollover_sweep(journal_chapter_id, identity_book_id, ctx).await {
+            Ok(0) => {}
+            Ok(n) => eprintln!("year_rollover_sweep: archived {n} stale page(s) before {} append", resource.name()),
+            Err(e) => eprintln!("year_rollover_sweep failed (non-fatal, append continues): {e}"),
+        }
     }
 
     let body_text = match ctx.body_str("body") {
@@ -935,14 +1016,40 @@ async fn handle_search(
     };
 
     let limit = ctx.body_count("limit", 10, 50);
+    let include_archives = ctx
+        .body
+        .get("include_archives")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-    // Always run BookStack keyword search scoped to the parent.
-    let filter = parent_filter(parent);
-    let kw_query = format!("{query} {{type:page}} {filter}");
-    let keyword_hits = match ctx.client.search(&kw_query, 1, limit as i64).await {
-        Ok(v) => v.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default(),
-        Err(e) => return Outcome::error(ErrorCode::BookStackError, e, None),
-    };
+    // Build the keyword filter. Default scope is the configured parent;
+    // for the per-identity journal with `include_archives=true`, walk the
+    // current Journal chapter PLUS every `Journal Archive - *` chapter
+    // inside the same Identity book.
+    let mut search_parents: Vec<CollectionParent> = vec![parent];
+    if include_archives {
+        if let Some(identity_book_id) = resource.journal_archive_context(&ctx.settings) {
+            for archive_id in
+                journal_archive::list_archive_chapter_ids(identity_book_id, ctx).await
+            {
+                search_parents.push(CollectionParent::Chapter(archive_id));
+            }
+        }
+    }
+
+    // Aggregate keyword hits from each scope. BookStack search doesn't
+    // accept multiple `{in_chapter:X}` filters on one query, so we issue
+    // one call per scope and merge.
+    let mut keyword_hits: Vec<Value> = Vec::new();
+    for p in &search_parents {
+        let kw_query = format!("{query} {{type:page}} {}", parent_filter(*p));
+        let hits = match ctx.client.search(&kw_query, 1, limit as i64).await {
+            Ok(v) => v.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default(),
+            Err(e) => return Outcome::error(ErrorCode::BookStackError, e, None),
+        };
+        keyword_hits.extend(hits);
+    }
+    keyword_hits.truncate(limit);
 
     // Optionally augment with semantic — filter by parent post-hoc since the
     // semantic backend doesn't accept book/chapter filters yet.
@@ -966,7 +1073,11 @@ async fn handle_search(
         {
             Ok(v) => {
                 let results = v.get("results").and_then(|r| r.as_array()).cloned().unwrap_or_default();
-                results.into_iter().filter(|hit| matches_parent(hit, parent)).take(limit).collect()
+                results
+                    .into_iter()
+                    .filter(|hit| search_parents.iter().any(|p| matches_parent(hit, *p)))
+                    .take(limit)
+                    .collect()
             }
             Err(e) => {
                 warnings.push(RememberWarning::new(
@@ -1109,6 +1220,13 @@ pub mod resources {
             s.ai_identity_journal_chapter_id.map(CollectionParent::Chapter)
         }
         fn key_kind(&self) -> KeyKind { KeyKind::Date }
+        fn journal_archive_context(&self, s: &UserSettings) -> Option<i64> {
+            // The archive rollover and read-by-key dispatch need the parent
+            // Identity book id to scope chapter lookup. Returns None when
+            // the identity book isn't configured — the journal action then
+            // surfaces a settings_not_configured error before writing.
+            s.ai_identity_book_id
+        }
     }
 
     pub struct Collage;

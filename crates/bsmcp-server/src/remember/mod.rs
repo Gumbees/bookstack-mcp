@@ -16,6 +16,7 @@ pub mod directory;
 pub mod envelope;
 pub mod frontmatter;
 pub mod identity;
+pub mod journal_archive;
 pub mod naming;
 pub mod provision;
 pub mod search;

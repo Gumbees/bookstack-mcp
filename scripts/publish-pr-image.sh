@@ -17,12 +17,12 @@
 #     `echo $GHCR_PAT | docker login ghcr.io -u <gh-user> --password-stdin`
 #
 # Usage:
-#   scripts/publish-pr-image.sh                # both images, path-aware
+#   scripts/publish-pr-image.sh                # all three images, path-aware
 #   scripts/publish-pr-image.sh server         # only bsmcp-server, path-aware
 #   scripts/publish-pr-image.sh embedder       # only bsmcp-embedder, path-aware
-#   scripts/publish-pr-image.sh both --force   # force rebuild even when
-#                                              # paths look unchanged
-#   scripts/publish-pr-image.sh server --force # ditto, server only
+#   scripts/publish-pr-image.sh worker         # only bsmcp-worker, path-aware
+#   scripts/publish-pr-image.sh both --force   # legacy alias: all three, force
+#   scripts/publish-pr-image.sh server --force # force rebuild server only
 
 set -euo pipefail
 
@@ -99,6 +99,20 @@ EMBEDDER_PATHS=(
   "entrypoint.sh"
 )
 
+# Files that, when changed, mean we must rebuild the WORKER binary.
+# Worker depends on bsmcp-common + both DB backends but not bsmcp-server
+# or bsmcp-embedder.
+WORKER_PATHS=(
+  "crates/bsmcp-worker"
+  "crates/bsmcp-common"
+  "crates/bsmcp-db-sqlite"
+  "crates/bsmcp-db-postgres"
+  "Cargo.toml"
+  "Cargo.lock"
+  "docker/Dockerfile.worker"
+  "entrypoint.sh"
+)
+
 paths_changed_since_base() {
   local -a paths=("$@")
   local count
@@ -170,14 +184,15 @@ publish() {
 
 # Argument parsing: first positional is target, optional `--force` flag
 # can appear in any position.
-target="both"
+target="all"
 FORCE_REBUILD=0
 for arg in "$@"; do
   case "$arg" in
-    server|embedder|both) target="$arg" ;;
-    --force)              FORCE_REBUILD=1 ;;
+    server|embedder|worker|all) target="$arg" ;;
+    both)                       target="all" ;; # legacy alias from when there were only two images
+    --force)                    FORCE_REBUILD=1 ;;
     *)
-      echo "usage: $0 [server|embedder|both] [--force]" >&2
+      echo "usage: $0 [server|embedder|worker|all] [--force]" >&2
       exit 2
       ;;
   esac
@@ -203,12 +218,14 @@ case "$BRANCH" in
 esac
 
 case "$target" in
-  server)   publish bsmcp-server  docker/Dockerfile.server   SERVER_PATHS ;;
+  server)   publish bsmcp-server   docker/Dockerfile.server   SERVER_PATHS ;;
   embedder) publish bsmcp-embedder docker/Dockerfile.embedder EMBEDDER_PATHS ;;
-  both)
-    publish bsmcp-server  docker/Dockerfile.server   SERVER_PATHS
+  worker)   publish bsmcp-worker   docker/Dockerfile.worker   WORKER_PATHS ;;
+  all)
+    publish bsmcp-server   docker/Dockerfile.server   SERVER_PATHS
     publish bsmcp-embedder docker/Dockerfile.embedder EMBEDDER_PATHS
+    publish bsmcp-worker   docker/Dockerfile.worker   WORKER_PATHS
     ;;
 esac
 
-echo "Done. Push your branch — the build-server / build-embedder verify checks should pass."
+echo "Done. Push your branch — the build-* verify checks should pass."

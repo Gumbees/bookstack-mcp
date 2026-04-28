@@ -36,7 +36,10 @@ VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
 SHA=$(git rev-parse HEAD)
 SHORT_SHA=${SHA:0:7}
-SLUG=$(echo "$BRANCH" | tr '/' '-' | tr -c 'a-zA-Z0-9._-' '-')
+# `printf '%s'` (not `echo`) — echo's trailing newline gets caught by
+# the complement-set `tr -c` and becomes a stray dash, which leads to
+# tags like `0.7.3-improvement-foo--abc1234` (double dash before the SHA).
+SLUG=$(printf '%s' "$BRANCH" | tr '/' '-' | tr -c 'a-zA-Z0-9._-' '-')
 
 echo "Branch:  $BRANCH"
 echo "Slug:    $SLUG"

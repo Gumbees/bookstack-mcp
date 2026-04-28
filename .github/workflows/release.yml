@@ -28,16 +28,40 @@ name: Build and Release
 #      native dep) — Docker is the only supported distribution for it.
 #
 #   5. v* tag push (emergency hotfix path)               ->  `tag-release`
-#      builds & pushes semver-tagged images directly in CI (the only build
-#      path that still runs in CI), creates the Release, and attaches the
-#      server binaries. Use only when the contributor cannot push images
-#      themselves.
+#      builds & pushes semver-tagged images directly in CI, creates the
+#      Release, and attaches the server binaries. Use only when the
+#      contributor cannot push images themselves.
+#
+#   6. Direct push to development or release              ->  `push-build`
+#      Full multi-arch build in CI + push to the stream's rolling and
+#      immutable per-commit tags. The canonical Branching Strategy
+#      authorizes direct pushes for small/scaffolding/hotfix changes;
+#      this job ensures the dev/release-stream images don't lag behind
+#      the branch when a contributor bypasses the PR flow.
+#
+# Tag map (after PR merge to development):
+#   :dev                              rolling, latest dev
+#   :dev-{merge_sha}                  immutable per-merge
+#   :{version}-dev                    versioned dev rolling
+#   :{version}-dev-{merge_sha}        versioned dev immutable per-merge
+#
+# Tag map (after PR merge to release):
+#   :{version}                        immutable semver
+#   :{version}-{merge_sha}            immutable per-merge
+#   :release, :latest                 rolling release pointers
+#
+# Tag map (after direct push to development):
+#   :dev, :dev-{sha}, :{version}-dev, :{version}-dev-{sha}
+#
+# Tag map (after direct push to release):
+#   :{version}, :{version}-{sha}, :release, :latest
 
 on:
   pull_request:
     branches: [development, release]
     types: [opened, synchronize, reopened, closed]
   push:
+    branches: [development, release]
     tags:
       - 'v*'
 
@@ -60,7 +84,7 @@ jobs:
           VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
           HEAD_SHA=${{ github.event.pull_request.head.sha }}
           SHORT_SHA=${HEAD_SHA:0:7}
-          SLUG=$(echo "${{ github.event.pull_request.head.ref }}" | tr '/' '-' | tr -c 'a-zA-Z0-9._-' '-')
+          SLUG=$(printf '%s' "${{ github.event.pull_request.head.ref }}" | tr '/' '-' | tr -c 'a-zA-Z0-9._-' '-')
           echo "tag=${VERSION}-${SLUG}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
           echo "image=${{ env.REGISTRY }}/bees-roadhouse/bsmcp-server" >> "$GITHUB_OUTPUT"
 
@@ -106,7 +130,7 @@ jobs:
           VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
           HEAD_SHA=${{ github.event.pull_request.head.sha }}
           SHORT_SHA=${HEAD_SHA:0:7}
-          SLUG=$(echo "${{ github.event.pull_request.head.ref }}" | tr '/' '-' | tr -c 'a-zA-Z0-9._-' '-')
+          SLUG=$(printf '%s' "${{ github.event.pull_request.head.ref }}" | tr '/' '-' | tr -c 'a-zA-Z0-9._-' '-')
           echo "tag=${VERSION}-${SLUG}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
           echo "image=${{ env.REGISTRY }}/bees-roadhouse/bsmcp-embedder" >> "$GITHUB_OUTPUT"
 
@@ -136,6 +160,73 @@ jobs:
           done
           echo "OK: $REF is multi-arch (linux/amd64 + linux/arm64)"
 
+  # --- Direct-push fallback ---
+  #
+  # Direct pushes to `development` or `release` (authorized by the canonical
+  # Branching Strategy for small/scaffolding/hotfix changes) bypass the
+  # contributor-uploads-image flow. This job runs a full multi-arch build in
+  # CI and tags the resulting image with the appropriate stream tags so the
+  # rolling `:dev` / `:release` / `:latest` tags don't lag behind the branch.
+  #
+  # PR-merge flow still uses the cheaper `promote` retag path (no rebuild).
+  # CI cost is paid only when someone direct-pushes — incentive structure
+  # stays right (PRs are cheap, direct push is correct but slow).
+  push-build:
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/development' || github.ref == 'refs/heads/release')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: bsmcp-server
+            dockerfile: docker/Dockerfile.server
+            scope: server
+          - image: bsmcp-embedder
+            dockerfile: docker/Dockerfile.embedder
+            scope: embedder
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve stream + tags
+        id: vars
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
+          SHORT_SHA=${GITHUB_SHA:0:7}
+          IMG="${{ env.REGISTRY }}/bees-roadhouse/${{ matrix.image }}"
+          if [[ "${{ github.ref }}" == "refs/heads/development" ]]; then
+            TAGS="$IMG:dev,$IMG:dev-${SHORT_SHA},$IMG:${VERSION}-dev,$IMG:${VERSION}-dev-${SHORT_SHA}"
+          else
+            TAGS="$IMG:${VERSION},$IMG:${VERSION}-${SHORT_SHA},$IMG:release,$IMG:latest"
+          fi
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push tagged image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.vars.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/bees-roadhouse/bookstack-mcp
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.scope }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.scope }}
+
   promote:
     if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true
     runs-on: ubuntu-latest
@@ -149,7 +240,7 @@ jobs:
         id: vars
         run: |
           VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
-          SLUG=$(echo "${{ github.event.pull_request.head.ref }}" | tr '/' '-' | tr -c 'a-zA-Z0-9._-' '-')
+          SLUG=$(printf '%s' "${{ github.event.pull_request.head.ref }}" | tr '/' '-' | tr -c 'a-zA-Z0-9._-' '-')
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "slug=${SLUG}" >> "$GITHUB_OUTPUT"
           echo "base_ref=${{ github.event.pull_request.base.ref }}" >> "$GITHUB_OUTPUT"
@@ -165,21 +256,30 @@ jobs:
       - name: Retag for development merges
         if: steps.vars.outputs.base_ref == 'development'
         run: |
+          # github.sha here is the merge commit's SHA on development —
+          # different from the PR head SHA. We tag with this so the
+          # immutable :dev-{sha} tag pins the merge result, not the PR
+          # head, matching `git log` on development.
+          MERGE_SHORT_SHA=${GITHUB_SHA:0:7}
           for IMAGE in bsmcp-server bsmcp-embedder; do
             SRC="${{ env.REGISTRY }}/bees-roadhouse/${IMAGE}:${{ steps.vars.outputs.version }}-${{ steps.vars.outputs.slug }}"
             docker buildx imagetools create \
               --tag "${{ env.REGISTRY }}/bees-roadhouse/${IMAGE}:dev" \
+              --tag "${{ env.REGISTRY }}/bees-roadhouse/${IMAGE}:dev-${MERGE_SHORT_SHA}" \
               --tag "${{ env.REGISTRY }}/bees-roadhouse/${IMAGE}:${{ steps.vars.outputs.version }}-dev" \
+              --tag "${{ env.REGISTRY }}/bees-roadhouse/${IMAGE}:${{ steps.vars.outputs.version }}-dev-${MERGE_SHORT_SHA}" \
               "$SRC"
           done
 
       - name: Retag for release merges
         if: steps.vars.outputs.base_ref == 'release'
         run: |
+          MERGE_SHORT_SHA=${GITHUB_SHA:0:7}
           for IMAGE in bsmcp-server bsmcp-embedder; do
             SRC="${{ env.REGISTRY }}/bees-roadhouse/${IMAGE}:${{ steps.vars.outputs.version }}-${{ steps.vars.outputs.slug }}"
             docker buildx imagetools create \
               --tag "${{ env.REGISTRY }}/bees-roadhouse/${IMAGE}:${{ steps.vars.outputs.version }}" \
+              --tag "${{ env.REGISTRY }}/bees-roadhouse/${IMAGE}:${{ steps.vars.outputs.version }}-${MERGE_SHORT_SHA}" \
               --tag "${{ env.REGISTRY }}/bees-roadhouse/${IMAGE}:release" \
               --tag "${{ env.REGISTRY }}/bees-roadhouse/${IMAGE}:latest" \
               "$SRC"

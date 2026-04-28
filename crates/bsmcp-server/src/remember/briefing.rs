@@ -357,8 +357,36 @@ pub async fn read(ctx: &Context) -> Outcome {
         None
     };
 
+    // Phase 7: legacy-layout detector. Fires when an identity is on the
+    // pre-v1.0.0 structure (separate journal book + loose agent pages at
+    // book root) so the AI can offer to migrate. Independent of the
+    // generic setup_nudge — this is "you have data to migrate", not
+    // "you have unset settings".
+    let migration_nudge = if super::migrate::is_legacy_layout(&ctx.settings) && !snoozed {
+        Some(json!({
+            "show": true,
+            "summary": "Identity book restructure available: this identity is on the pre-v1.0.0 layout (legacy journal book + agent pages at book root). The new layout uses chapters inside the Identity book.",
+            "recommended_action": "remember_migrate action=plan",
+            "two_paths": {
+                "preview": "remember_migrate action=plan — dry-run, returns a structured list of every move/create that would happen. No writes.",
+                "execute": "remember_migrate action=apply — execute the plan. Idempotent. Returns per-step results."
+            },
+            "what_it_does": [
+                "Scaffolds Agents / Subagent Conversations / Journal chapters inside the Identity book (find-or-create).",
+                "Moves Agent: <name> pages from the book root into the Agents chapter.",
+                "Moves all pages from the legacy journal book into the new Journal chapter.",
+                "Runs year-rollover sweep on the Journal chapter — past-year entries land in 'Journal Archive - {YEAR}' chapters.",
+                "Updates user_settings with the new chapter IDs and clears ai_hive_journal_book_id.",
+            ],
+            "legacy_book_disposition": "The legacy journal book becomes empty after migration but is NOT auto-deleted. Delete via the BookStack UI or `delete_book` MCP tool when ready.",
+        }))
+    } else {
+        None
+    };
+
     Outcome::ok(json!({
         "setup_nudge": setup_nudge,
+        "migration_nudge": migration_nudge,
         "identity": match identity {
             Some(p) => json!({
                 "ouid": resolved.ouid,

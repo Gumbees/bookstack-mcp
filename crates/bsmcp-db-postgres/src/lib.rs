@@ -12,7 +12,8 @@ use sqlx::{PgPool, Row};
 use zeroize::Zeroizing;
 
 use bsmcp_common::config::{access_token_ttl, refresh_token_ttl};
-use bsmcp_common::db::{DbBackend, SemanticDb};
+use bsmcp_common::db::{DbBackend, IndexDb, SemanticDb};
+use bsmcp_common::index::*;
 use bsmcp_common::settings::{GlobalSettings, UserSettings};
 use bsmcp_common::types::*;
 
@@ -1610,4 +1611,51 @@ impl SemanticDb for PostgresDb {
             .map_err(|e| format!("delete_user_role_cache_by_bs_id: {e}"))?;
         Ok(())
     }
+}
+
+// --- IndexDb impl (Phase 4a stubs) ---
+//
+// The Postgres impl is intentionally a thin error-returning stub for now;
+// the SQLite impl is real and Phase 4b will develop and test against it
+// first. A follow-up PR fills in the Postgres SQL — issue #36.
+
+const NOT_YET: &str =
+    "Phase 4a: IndexDb impl on Postgres is a stub — see issue #36. \
+     Run with BSMCP_DB_BACKEND=sqlite for v1.0.0 phase 4 testing.";
+
+#[async_trait]
+impl IndexDb for PostgresDb {
+    async fn upsert_indexed_shelf(&self, _shelf: &IndexedShelf) -> Result<(), String> { Err(NOT_YET.to_string()) }
+    async fn get_indexed_shelf(&self, _id: i64) -> Result<Option<IndexedShelf>, String> { Err(NOT_YET.to_string()) }
+    async fn soft_delete_indexed_shelf(&self, _id: i64) -> Result<(), String> { Err(NOT_YET.to_string()) }
+
+    async fn upsert_indexed_book(&self, _book: &IndexedBook) -> Result<(), String> { Err(NOT_YET.to_string()) }
+    async fn get_indexed_book(&self, _id: i64) -> Result<Option<IndexedBook>, String> { Err(NOT_YET.to_string()) }
+    async fn list_indexed_books_by_shelf(&self, _id: i64) -> Result<Vec<IndexedBook>, String> { Err(NOT_YET.to_string()) }
+    async fn list_indexed_books_by_identity(&self, _ouid: &str) -> Result<Vec<IndexedBook>, String> { Err(NOT_YET.to_string()) }
+    async fn soft_delete_indexed_book(&self, _id: i64) -> Result<(), String> { Err(NOT_YET.to_string()) }
+
+    async fn upsert_indexed_chapter(&self, _chapter: &IndexedChapter) -> Result<(), String> { Err(NOT_YET.to_string()) }
+    async fn get_indexed_chapter(&self, _id: i64) -> Result<Option<IndexedChapter>, String> { Err(NOT_YET.to_string()) }
+    async fn list_indexed_chapters_by_book(&self, _id: i64) -> Result<Vec<IndexedChapter>, String> { Err(NOT_YET.to_string()) }
+    async fn soft_delete_indexed_chapter(&self, _id: i64) -> Result<(), String> { Err(NOT_YET.to_string()) }
+
+    async fn upsert_indexed_page(&self, _page: &IndexedPage, _cache: Option<&PageCache>) -> Result<(), String> { Err(NOT_YET.to_string()) }
+    async fn get_indexed_page(&self, _id: i64) -> Result<Option<IndexedPage>, String> { Err(NOT_YET.to_string()) }
+    async fn find_indexed_page_by_key(&self, _ouid: &str, _kind: PageKind, _key: &str) -> Result<Option<IndexedPage>, String> { Err(NOT_YET.to_string()) }
+    async fn list_indexed_pages_by_chapter(&self, _id: i64) -> Result<Vec<IndexedPage>, String> { Err(NOT_YET.to_string()) }
+    async fn list_indexed_pages_by_book_root(&self, _id: i64) -> Result<Vec<IndexedPage>, String> { Err(NOT_YET.to_string()) }
+    async fn soft_delete_indexed_page(&self, _id: i64) -> Result<(), String> { Err(NOT_YET.to_string()) }
+
+    async fn get_page_cache(&self, _id: i64) -> Result<Option<PageCache>, String> { Err(NOT_YET.to_string()) }
+
+    async fn create_index_job(&self, _scope: &str, _kind: &str, _triggered_by: &str) -> Result<(i64, bool), String> { Err(NOT_YET.to_string()) }
+    async fn claim_next_index_job(&self) -> Result<Option<IndexJob>, String> { Err(NOT_YET.to_string()) }
+    async fn update_index_job_progress(&self, _id: i64, _p: i64, _t: i64) -> Result<(), String> { Err(NOT_YET.to_string()) }
+    async fn complete_index_job(&self, _id: i64, _err: Option<&str>) -> Result<(), String> { Err(NOT_YET.to_string()) }
+    async fn list_pending_index_jobs(&self, _limit: i64) -> Result<Vec<IndexJob>, String> { Err(NOT_YET.to_string()) }
+    async fn get_latest_index_job(&self) -> Result<Option<IndexJob>, String> { Err(NOT_YET.to_string()) }
+
+    async fn get_index_meta(&self, _key: &str) -> Result<Option<String>, String> { Err(NOT_YET.to_string()) }
+    async fn set_index_meta(&self, _key: &str, _value: &str) -> Result<(), String> { Err(NOT_YET.to_string()) }
 }

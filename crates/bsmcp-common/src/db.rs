@@ -2,6 +2,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
+use crate::index::*;
 use crate::settings::{GlobalSettings, UserSettings};
 use crate::types::*;
 
@@ -216,4 +217,111 @@ pub trait SemanticDb: Send + Sync + 'static {
     /// webhook handler on `user_update` (role assignments may have changed)
     /// and `user_delete` (account is gone).
     async fn delete_user_role_cache_by_bs_id(&self, bookstack_user_id: i64) -> Result<(), String>;
+}
+
+/// v1.0.0 reconciliation index — structural mirror of every BookStack item we
+/// care about (shelves, books, chapters, pages) plus a page-body cache. Phase
+/// 4 of the identity-book-restructure RFC. The Phase 4 worker calls upsert_*
+/// to populate; Phase 5 cuts over read paths to use list/get_* in place of
+/// BookStack API calls.
+///
+/// All "soft delete" methods set `deleted = TRUE` rather than removing rows
+/// — that lets a subsequent reconcile distinguish "page never existed" from
+/// "page was deleted upstream" without having to re-query BookStack.
+#[async_trait]
+pub trait IndexDb: Send + Sync + 'static {
+    // --- Shelves ---
+
+    async fn upsert_indexed_shelf(&self, shelf: &IndexedShelf) -> Result<(), String>;
+    async fn get_indexed_shelf(&self, shelf_id: i64) -> Result<Option<IndexedShelf>, String>;
+    async fn soft_delete_indexed_shelf(&self, shelf_id: i64) -> Result<(), String>;
+
+    // --- Books ---
+
+    async fn upsert_indexed_book(&self, book: &IndexedBook) -> Result<(), String>;
+    async fn get_indexed_book(&self, book_id: i64) -> Result<Option<IndexedBook>, String>;
+    async fn list_indexed_books_by_shelf(&self, shelf_id: i64) -> Result<Vec<IndexedBook>, String>;
+    async fn list_indexed_books_by_identity(
+        &self,
+        identity_ouid: &str,
+    ) -> Result<Vec<IndexedBook>, String>;
+    async fn soft_delete_indexed_book(&self, book_id: i64) -> Result<(), String>;
+
+    // --- Chapters ---
+
+    async fn upsert_indexed_chapter(&self, chapter: &IndexedChapter) -> Result<(), String>;
+    async fn get_indexed_chapter(
+        &self,
+        chapter_id: i64,
+    ) -> Result<Option<IndexedChapter>, String>;
+    async fn list_indexed_chapters_by_book(
+        &self,
+        book_id: i64,
+    ) -> Result<Vec<IndexedChapter>, String>;
+    async fn soft_delete_indexed_chapter(&self, chapter_id: i64) -> Result<(), String>;
+
+    // --- Pages ---
+    //
+    // upsert_indexed_page writes both the index row AND the optional
+    // page_cache row in the same transaction. Keeping them in lockstep
+    // is what makes `bookstack_pages.page_updated_at == page_cache.page_updated_at`
+    // a reliable cache-hit invariant.
+
+    async fn upsert_indexed_page(
+        &self,
+        page: &IndexedPage,
+        cache: Option<&PageCache>,
+    ) -> Result<(), String>;
+    async fn get_indexed_page(&self, page_id: i64) -> Result<Option<IndexedPage>, String>;
+    async fn find_indexed_page_by_key(
+        &self,
+        identity_ouid: &str,
+        page_kind: PageKind,
+        page_key: &str,
+    ) -> Result<Option<IndexedPage>, String>;
+    async fn list_indexed_pages_by_chapter(
+        &self,
+        chapter_id: i64,
+    ) -> Result<Vec<IndexedPage>, String>;
+    async fn list_indexed_pages_by_book_root(
+        &self,
+        book_id: i64,
+    ) -> Result<Vec<IndexedPage>, String>;
+    async fn soft_delete_indexed_page(&self, page_id: i64) -> Result<(), String>;
+
+    // --- Page cache ---
+
+    async fn get_page_cache(&self, page_id: i64) -> Result<Option<PageCache>, String>;
+
+    // --- Index jobs (mirrors embed_jobs shape) ---
+    //
+    // create_index_job dedupes on `scope` like create_embed_job does — if a
+    // pending or running job with the same scope exists, it's returned with
+    // `is_new = false` so the caller can decide whether to wait or no-op.
+
+    async fn create_index_job(
+        &self,
+        scope: &str,
+        kind: &str,
+        triggered_by: &str,
+    ) -> Result<(i64, bool), String>;
+    async fn claim_next_index_job(&self) -> Result<Option<IndexJob>, String>;
+    async fn update_index_job_progress(
+        &self,
+        job_id: i64,
+        progress: i64,
+        total: i64,
+    ) -> Result<(), String>;
+    async fn complete_index_job(
+        &self,
+        job_id: i64,
+        error: Option<&str>,
+    ) -> Result<(), String>;
+    async fn list_pending_index_jobs(&self, limit: i64) -> Result<Vec<IndexJob>, String>;
+    async fn get_latest_index_job(&self) -> Result<Option<IndexJob>, String>;
+
+    // --- Index meta (singleton key-value) ---
+
+    async fn get_index_meta(&self, key: &str) -> Result<Option<String>, String>;
+    async fn set_index_meta(&self, key: &str, value: &str) -> Result<(), String>;
 }

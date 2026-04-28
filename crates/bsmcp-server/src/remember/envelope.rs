@@ -221,7 +221,7 @@ pub fn fix_for_field(field: &str) -> Value {
             "summary": "AI journal chapter (Phase 6) is required for remember_journal read/write/search/delete. Lives inside the Identity book.",
             "auto_provision_supported": true,
             "how": [
-                "Quickest: `remember_identity action=create name=<your-agent-name>` scaffolds the Identity book, manifest, and the Agents/Subagent Conversations/Journal chapters in one call. Returned IDs go into `proposed_settings`.",
+                "Quickest: `remember_identity action=create name=<your-agent-name>` scaffolds the Identity book, manifest, and the Agents/Journal chapters in one call. Returned IDs go into `proposed_settings`.",
                 "Then `remember_config action=write settings={\"ai_identity_journal_chapter_id\": <id>}`.",
                 "Or visit /settings and pick the chapter from the dropdown.",
             ],

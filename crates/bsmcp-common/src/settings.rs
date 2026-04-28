@@ -71,12 +71,6 @@ pub struct UserSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_identity_agents_chapter_id: Option<i64>,
 
-    /// BookStack chapter ID of the `Subagent Conversations` chapter inside
-    /// the AI's Identity book. Where future agent-to-agent transcripts will
-    /// land. Scaffolded empty at identity creation time.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ai_identity_subagent_conversations_chapter_id: Option<i64>,
-
     /// BookStack chapter ID of the current-year `Journal` chapter inside the
     /// AI's Identity book. Daily entries (`YYYY-MM-DD`) write here. The
     /// year-rollover sweep (run on every `journal action=write`) moves any

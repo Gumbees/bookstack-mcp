@@ -372,7 +372,7 @@ pub async fn read(ctx: &Context) -> Outcome {
                 "execute": "remember_migrate action=apply — execute the plan. Idempotent. Returns per-step results."
             },
             "what_it_does": [
-                "Scaffolds Agents / Subagent Conversations / Journal chapters inside the Identity book (find-or-create).",
+                "Scaffolds Agents / Journal chapters inside the Identity book (find-or-create).",
                 "Moves Agent: <name> pages from the book root into the Agents chapter.",
                 "Moves all pages from the legacy journal book into the new Journal chapter.",
                 "Runs year-rollover sweep on the Journal chapter — past-year entries land in 'Journal Archive - {YEAR}' chapters.",

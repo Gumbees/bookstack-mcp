@@ -21,7 +21,6 @@ use super::provision;
 use super::{Context, Outcome};
 
 const AGENTS_CHAPTER: &str = "Agents";
-const SUBAGENT_CONVERSATIONS_CHAPTER: &str = "Subagent Conversations";
 const JOURNAL_CHAPTER: &str = "Journal";
 const AGENT_PAGE_PREFIX: &str = "Agent: ";
 
@@ -82,17 +81,14 @@ async fn plan(ctx: &Context) -> Outcome {
     let mut steps: Vec<Value> = Vec::new();
 
     // Step 1: chapter creation (find-or-create — re-runs are no-ops once
-    // the chapters exist).
+    // the chapters exist). No "Subagent Conversations" chapter — agents
+    // log subagent activity in the journal; realtime cross-agent traffic
+    // belongs in the frame app, not BookStack.
     for (name, field, present) in [
         (
             AGENTS_CHAPTER,
             "ai_identity_agents_chapter_id",
             settings.ai_identity_agents_chapter_id.is_some(),
-        ),
-        (
-            SUBAGENT_CONVERSATIONS_CHAPTER,
-            "ai_identity_subagent_conversations_chapter_id",
-            settings.ai_identity_subagent_conversations_chapter_id.is_some(),
         ),
         (
             JOURNAL_CHAPTER,
@@ -245,10 +241,6 @@ async fn apply(ctx: &Context) -> Outcome {
             "Agent definition pages for this AI identity (one page per sub-agent).",
         ),
         (
-            SUBAGENT_CONVERSATIONS_CHAPTER,
-            "Agent-to-agent conversation transcripts. Scaffolded empty.",
-        ),
-        (
             JOURNAL_CHAPTER,
             "Current-year daily journal entries. Year-rollover sweep moves stale entries into 'Journal Archive - {YEAR}' chapters.",
         ),
@@ -271,9 +263,6 @@ async fn apply(ctx: &Context) -> Outcome {
                 }));
                 match name {
                     AGENTS_CHAPTER => settings.ai_identity_agents_chapter_id = Some(id),
-                    SUBAGENT_CONVERSATIONS_CHAPTER => {
-                        settings.ai_identity_subagent_conversations_chapter_id = Some(id);
-                    }
                     JOURNAL_CHAPTER => settings.ai_identity_journal_chapter_id = Some(id),
                     _ => {}
                 }
@@ -287,9 +276,6 @@ async fn apply(ctx: &Context) -> Outcome {
                 }));
                 match name {
                     AGENTS_CHAPTER => settings.ai_identity_agents_chapter_id = Some(id),
-                    SUBAGENT_CONVERSATIONS_CHAPTER => {
-                        settings.ai_identity_subagent_conversations_chapter_id = Some(id);
-                    }
                     JOURNAL_CHAPTER => settings.ai_identity_journal_chapter_id = Some(id),
                     _ => {}
                 }
@@ -474,7 +460,6 @@ async fn finalize_apply(
         "steps": step_results,
         "settings": {
             "ai_identity_agents_chapter_id": settings.ai_identity_agents_chapter_id,
-            "ai_identity_subagent_conversations_chapter_id": settings.ai_identity_subagent_conversations_chapter_id,
             "ai_identity_journal_chapter_id": settings.ai_identity_journal_chapter_id,
             "ai_hive_journal_book_id": settings.ai_hive_journal_book_id,
         },
@@ -515,15 +500,6 @@ async fn status(ctx: &Context) -> Outcome {
             "ai_identity_agents_chapter_id is set"
         } else {
             "ai_identity_agents_chapter_id is not set — run remember_migrate action=apply"
-        },
-    );
-    record(
-        "subagent_conversations_chapter_configured",
-        s.ai_identity_subagent_conversations_chapter_id.is_some(),
-        if s.ai_identity_subagent_conversations_chapter_id.is_some() {
-            "ai_identity_subagent_conversations_chapter_id is set"
-        } else {
-            "ai_identity_subagent_conversations_chapter_id is not set — run remember_migrate action=apply"
         },
     );
     record(

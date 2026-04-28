@@ -258,26 +258,22 @@ async fn create(ctx: &Context) -> Outcome {
         );
     }
 
-    // 3. Find-or-create the three structural chapters inside the Identity
+    // 3. Find-or-create the two structural chapters inside the Identity
     //    book. Phase 6 of the v1.0.0 restructure: agent definitions and
     //    journal entries live in dedicated chapters, not loose at the book
     //    root. Lazy-creating archive chapters at year rollover is a
     //    separate concern in `remember_journal action=write`.
+    //
+    //    No "Subagent Conversations" chapter — agents track who they're
+    //    working with and what their sub-identities are doing in the
+    //    journal. Realtime cross-agent message/response runs in the
+    //    frame application, not BookStack.
     let agents_chapter_id = provision::find_or_create_chapter(
         &ctx.client,
         ctx.index_db.as_ref(),
         book_id,
         "Agents",
         "Agent definition pages for this AI identity (one page per sub-agent).",
-    )
-    .await
-    .id();
-    let subagent_chapter_id = provision::find_or_create_chapter(
-        &ctx.client,
-        ctx.index_db.as_ref(),
-        book_id,
-        "Subagent Conversations",
-        "Agent-to-agent conversation transcripts. Scaffolded empty.",
     )
     .await
     .id();
@@ -335,9 +331,6 @@ async fn create(ctx: &Context) -> Outcome {
     if let Some(id) = agents_chapter_id {
         proposed["ai_identity_agents_chapter_id"] = json!(id);
     }
-    if let Some(id) = subagent_chapter_id {
-        proposed["ai_identity_subagent_conversations_chapter_id"] = json!(id);
-    }
     if let Some(id) = journal_chapter_id {
         proposed["ai_identity_journal_chapter_id"] = json!(id);
     }
@@ -355,7 +348,6 @@ async fn create(ctx: &Context) -> Outcome {
             "manifest_page_id": page_id,
             "manifest_page_was_existing": page_was_existing,
             "agents_chapter_id": agents_chapter_id,
-            "subagent_conversations_chapter_id": subagent_chapter_id,
             "journal_chapter_id": journal_chapter_id,
             "collage_book_id": collage_book_id,
             "proposed_settings": proposed,

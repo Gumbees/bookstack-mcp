@@ -183,6 +183,25 @@ for arg in "$@"; do
   esac
 done
 
+# Auto-force a real build when publishing directly from development or
+# release. The path-aware fast path's retag-from-dev mode is correct for
+# PR work (the merge commit's tree matches the PR head, and the
+# contributor's per-PR image is the right artifact), but for a direct
+# push to development/release we want the resulting image's
+# `org.opencontainers.image.revision` label to match the SHA actually
+# being pushed — otherwise label-SHA and tag-SHA can drift on pure
+# CI/docs commits that piggyback an existing image. Always rebuild on
+# the canonical branches; keep the fast path for everything else.
+case "$BRANCH" in
+  development|release)
+    if [ "$FORCE_REBUILD" != "1" ]; then
+      echo "Branch=$BRANCH: forcing rebuild so the image's revision label matches the push SHA."
+      echo
+      FORCE_REBUILD=1
+    fi
+    ;;
+esac
+
 case "$target" in
   server)   publish bsmcp-server  docker/Dockerfile.server   SERVER_PATHS ;;
   embedder) publish bsmcp-embedder docker/Dockerfile.embedder EMBEDDER_PATHS ;;

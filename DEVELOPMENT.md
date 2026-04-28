@@ -122,6 +122,8 @@ Note that PRs touching `crates/bsmcp-server/` only — like most v1.0.0 phase wo
 
 Override with `scripts/publish-pr-image.sh both --force` if you need to force a full rebuild (e.g., to validate a Dockerfile change that the path filter would otherwise miss).
 
+**Direct push to `development` or `release` always forces a rebuild** regardless of path filter results. The path-aware retag-from-`:dev` shortcut is correct for PR work (the contributor's per-PR image already encodes the PR head's tree, which is bit-identical to the squash-merge commit). But for a direct push to a canonical branch, retagging an older image's manifest would leave `org.opencontainers.image.revision` pointing at the older commit, which drifts from the SHA actually being pushed. The script auto-forces the build in this case so the resulting image's revision label matches the push SHA.
+
 ### Cargo target / registry caching
 
 Both Dockerfiles use BuildKit `--mount=type=cache` for `target/`, `~/.cargo/registry`, and `~/.cargo/git`. The first build is still cold (~15 min on linux/arm64 via QEMU), but subsequent builds reuse the dep-tree compilation across PR pushes. Cache mount IDs include `$TARGETPLATFORM` so linux/amd64 and linux/arm64 don't poison each other's caches.

@@ -410,6 +410,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "bsmcp-worker"
+version = "0.7.3"
+dependencies = [
+ "bsmcp-common",
+ "bsmcp-db-postgres",
+ "bsmcp-db-sqlite",
+ "chrono",
+ "reqwest",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "built"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

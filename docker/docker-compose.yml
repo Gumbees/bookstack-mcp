@@ -81,6 +81,27 @@ services:
       bsmcp-postgres:
         condition: service_healthy
 
+  # Reconciliation worker — owns the index_jobs queue. Same database as
+  # the server (both processes touch index_jobs / bookstack_pages /
+  # page_cache). Runs only when an admin BookStack token is configured.
+  bsmcp-worker:
+    image: ghcr.io/bees-roadhouse/bsmcp-worker:0.7.3
+    environment:
+      BSMCP_DB_BACKEND: postgres
+      BSMCP_DATABASE_URL: postgres://bsmcp:${BSMCP_DB_PASSWORD}@bsmcp-postgres/bsmcp
+      BSMCP_ENCRYPTION_KEY: ${BSMCP_ENCRYPTION_KEY}
+      BSMCP_BOOKSTACK_URL: ${BSMCP_BOOKSTACK_URL}
+      # Prefers BSMCP_INDEX_TOKEN_*; falls back to BSMCP_EMBED_TOKEN_*
+      # so existing single-token deployments work without changes.
+      BSMCP_INDEX_TOKEN_ID: ${BSMCP_INDEX_TOKEN_ID:-${BSMCP_EMBED_TOKEN_ID:-}}
+      BSMCP_INDEX_TOKEN_SECRET: ${BSMCP_INDEX_TOKEN_SECRET:-${BSMCP_EMBED_TOKEN_SECRET:-}}
+      BSMCP_INDEX_DELTA_INTERVAL_SECONDS: ${BSMCP_INDEX_DELTA_INTERVAL_SECONDS:-300}
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+    depends_on:
+      bsmcp-postgres:
+        condition: service_healthy
+
 volumes:
   bsmcp-pgdata:
   bsmcp-models:

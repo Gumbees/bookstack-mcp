@@ -42,6 +42,14 @@ crates/
     src/main.rs          Job queue worker + HTTP /embed endpoint + provider selection
     src/embed.rs         Embedder trait + implementations (LocalEmbedder, OllamaEmbedder, OpenAIEmbedder)
     src/pipeline.rs      Embedding pipeline (fetch pages, chunk, embed, store)
+
+  bsmcp-worker/          Reconciliation worker binary (v1.1.0+)
+    src/main.rs          Env wiring, db init, BookStackClient, IndexWorker spawn
+    src/lib.rs           IndexWorker — owns the index_jobs queue. Initial full
+                         walk on cold start, polls for webhook + cron jobs,
+                         runs the periodic delta walk. Same database as the
+                         server (server's webhook handler enqueues; worker
+                         consumes).
 ```
 
 **Two transports:**

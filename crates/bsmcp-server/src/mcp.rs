@@ -104,6 +104,15 @@ async fn execute_tool(
     // Remember tools share one dispatch path: tool name = "remember_{resource}",
     // action carried as an arg. Keeps the MCP tool count manageable.
     if let Some(resource) = name.strip_prefix("remember_") {
+        if !remember_enabled() {
+            // Defensive: a stale client could have cached the tool list
+            // before BSMCP_REMEMBER_ENABLED was set to false. Reject
+            // explicitly so the caller knows it's not a "tool not found"
+            // case but a deliberate disable.
+            return Err(
+                "Hive memory disabled (BSMCP_REMEMBER_ENABLED=false on this server)".to_string(),
+            );
+        }
         let action = arg_str_default(args, "action", "read");
         let mut body = args.clone();
         if let Value::Object(ref mut map) = body {
@@ -1891,9 +1900,26 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
     // Remember protocol tools — one per resource. The `action` arg picks the
     // operation (read | write | search | delete depending on resource).
     // All return the same JSON envelope: { ok, data, meta, error }.
-    add_remember_tools(&mut tools);
+    // Gated by BSMCP_REMEMBER_ENABLED (default true). When false, the
+    // server runs as a plain BookStack proxy with no Hive memory surface.
+    if remember_enabled() {
+        add_remember_tools(&mut tools);
+    }
 
     tools
+}
+
+/// Whether the Hive memory surface is enabled. Reads BSMCP_REMEMBER_ENABLED;
+/// defaults true. Same parsing as the HTTP-route gate in main.rs so the
+/// MCP and HTTP surfaces flip together.
+fn remember_enabled() -> bool {
+    std::env::var("BSMCP_REMEMBER_ENABLED")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_lowercase();
+            !(v == "false" || v == "0" || v == "no" || v == "off")
+        })
+        .unwrap_or(true)
 }
 
 fn add_remember_tools(tools: &mut Vec<Value>) {

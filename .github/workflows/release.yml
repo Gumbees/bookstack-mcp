@@ -155,6 +155,51 @@ jobs:
           done
           echo "OK: $REF is multi-arch (linux/amd64 + linux/arm64)"
 
+  build-worker:
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve expected tag
+        id: vars
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
+          HEAD_SHA=${{ github.event.pull_request.head.sha }}
+          SHORT_SHA=${HEAD_SHA:0:7}
+          SLUG=$(printf '%s' "${{ github.event.pull_request.head.ref }}" | tr '/' '-' | tr -c 'a-zA-Z0-9._-' '-')
+          echo "tag=${VERSION}-${SLUG}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "image=${{ env.REGISTRY }}/bees-roadhouse/bsmcp-worker" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify image exists and is multi-arch
+        run: |
+          REF="${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.tag }}"
+          echo "Inspecting $REF"
+          if ! docker buildx imagetools inspect --raw "$REF" > manifest.json 2>/tmp/err; then
+            echo "::error::Image not found at $REF"
+            echo "::error::Run scripts/publish-pr-image.sh on your branch to build and push it. See DEVELOPMENT.md."
+            cat /tmp/err
+            exit 1
+          fi
+          ARCHES=$(jq -r '.manifests[]?.platform | "\(.os)/\(.architecture)"' manifest.json | sort -u | tr '\n' ' ')
+          echo "Found arches: $ARCHES"
+          for want in linux/amd64 linux/arm64; do
+            if ! echo " $ARCHES " | grep -q " $want "; then
+              echo "::error::Image is missing platform $want — manifest had: $ARCHES"
+              exit 1
+            fi
+          done
+          echo "OK: $REF is multi-arch (linux/amd64 + linux/arm64)"
+
   # --- Push-to-stream retag ---
   #
   # Fires on every push to development or release — covers BOTH direct
@@ -235,7 +280,7 @@ jobs:
       - name: Retag stream tags
         run: |
           set -euo pipefail
-          for IMAGE in bsmcp-server bsmcp-embedder; do
+          for IMAGE in bsmcp-server bsmcp-embedder bsmcp-worker; do
             SRC="${{ env.REGISTRY }}/bees-roadhouse/${IMAGE}:${{ steps.vars.outputs.version }}-${{ steps.vars.outputs.src_slug }}-${{ steps.vars.outputs.src_short_sha }}"
             echo "Source: $SRC"
             if ! docker buildx imagetools inspect --raw "$SRC" >/dev/null 2>&1; then

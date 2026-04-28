@@ -17,6 +17,7 @@ cargo build --release
 # Individual crates
 cargo build --release -p bsmcp-server
 cargo build --release -p bsmcp-embedder
+cargo build --release -p bsmcp-worker
 
 # Check without building
 cargo check
@@ -36,6 +37,7 @@ Then:
 ```bash
 cargo run -p bsmcp-server
 cargo run -p bsmcp-embedder  # optional, for semantic search
+cargo run -p bsmcp-worker    # optional, for v1.0.0 reconciliation index
 ```
 
 ## Docker Compose
@@ -100,7 +102,7 @@ This trades CI minutes for a small contributor onboarding step. The gate is pres
 2. ... commit work ...
 3. scripts/publish-pr-image.sh        # build + push multi-arch images to GHCR
 4. git push -u origin improvement/my-change
-5. Open PR; build-server / build-embedder verify checks should pass
+5. Open PR; build-server / build-embedder / build-worker verify checks should pass
 6. On every subsequent commit, re-run scripts/publish-pr-image.sh before pushing
 7. Squash-merge into development; delete the work branch
 ```
@@ -117,6 +119,7 @@ What counts as "changed paths":
 |---|---|
 | `bsmcp-server` | `crates/bsmcp-server/`, `crates/bsmcp-common/`, `crates/bsmcp-db-sqlite/`, `crates/bsmcp-db-postgres/`, `Cargo.toml`, `Cargo.lock`, `docker/Dockerfile.server`, `entrypoint.sh` |
 | `bsmcp-embedder` | `crates/bsmcp-embedder/`, `crates/bsmcp-common/`, `crates/bsmcp-db-sqlite/`, `crates/bsmcp-db-postgres/`, `Cargo.toml`, `Cargo.lock`, `docker/Dockerfile.embedder`, `entrypoint.sh` |
+| `bsmcp-worker` | `crates/bsmcp-worker/`, `crates/bsmcp-common/`, `crates/bsmcp-db-sqlite/`, `crates/bsmcp-db-postgres/`, `Cargo.toml`, `Cargo.lock`, `docker/Dockerfile.worker`, `entrypoint.sh` |
 
 Note that PRs touching `crates/bsmcp-server/` only — like most v1.0.0 phase work — skip the embedder rebuild entirely. That's the change that takes a typical PR from ~25 min of multi-arch build time down to ~10 min.
 
@@ -147,7 +150,7 @@ echo $GHCR_PAT | docker login ghcr.io -u <gh-user> --password-stdin
 | Event | Workflow | What happens |
 |-------|----------|-------------|
 | Push to a work branch with **no open PR** | nothing | test locally |
-| `pull_request: opened/synchronize/reopened` against `development` or `release` | `release.yml` (`build-server`, `build-embedder` verify jobs) | confirms the contributor's per-PR images exist on GHCR with both `linux/amd64` and `linux/arm64`. ~30 seconds. No build. |
+| `pull_request: opened/synchronize/reopened` against `development` or `release` | `release.yml` (`build-server`, `build-embedder`, `build-worker` verify jobs) | confirms the contributor's per-PR images exist on GHCR with both `linux/amd64` and `linux/arm64`. ~30 seconds. No build. |
 | Same trigger | `generate-artifacts.yml` | regenerates `SBOM.md` + `STRUCTURE.md`, commits to PR source branch with `[skip ci]` |
 | `push` to `development` (squash-merge or direct push) | `release.yml` (`push-retag`) | retags the contributor's per-PR image to `:dev`, `:dev-{push_sha}`, `:{version}-dev`, `:{version}-dev-{push_sha}`. No rebuild. |
 | `push` to `release` (squash-merge or direct push) | `release.yml` (`push-retag` + `github-release-on-merge` + `release-binaries-on-merge`) | retags to `:{version}`, `:{version}-{push_sha}`, `:release`, `:latest`; creates GitHub Release; builds `bsmcp-server` native binaries for 5 targets and attaches them to the Release. |
@@ -157,7 +160,7 @@ echo $GHCR_PAT | docker login ghcr.io -u <gh-user> --password-stdin
 ### Why this shape
 
 - **CI verifies, contributor builds.** The merge gate is preserved: a PR cannot merge unless its per-PR images exist on GHCR. The actual build work moves out of CI onto the engineer's machine, where it amortizes over the local build cache and saves ~15 min of CI minutes per PR push.
-- **Same job names (`build-server`, `build-embedder`) preserved.** Branch protection's required status checks reference these names; renaming them would silently disable the gate until the rule is updated. The job names lie a little — they verify, not build — but the trade-off is worth it.
+- **Stable job names (`build-server`, `build-embedder`, `build-worker`).** Branch protection's required status checks reference these names; renaming them would silently disable the gate until the rule is updated. The job names lie a little — they verify, not build — but the trade-off is worth it.
 - **Retag instead of rebuild on merge.** A squash-merge to development produces a new commit SHA, but its source tree is identical to the PR head. The contributor's image is bit-identical to what a CI build would produce, so promote just moves the rolling tag.
 - **Native binaries: server only.** `bsmcp-server` is pure Rust + bundled SQLite and cross-compiles cleanly. `bsmcp-embedder` depends on `fastembed` → ONNX Runtime → a per-platform C++ shared library; bare binaries would need ONNX Runtime installed on the host. Container is the only supported distribution for the embedder.
 - **External fork PRs are not supported under this model.** Forks cannot push to `ghcr.io/bees-roadhouse/*`, so fork PRs cannot satisfy the verify gate. If outside contribution becomes a real workflow, a maintainer will need to manually build/push the contributor's branch (or use the emergency `v*` tag path).
@@ -178,7 +181,7 @@ Release stream (after merge to release or `v*` tag):
 - `{version}` — pinned semver (e.g., `0.7.4`)
 - `{major}.{minor}`, `{major}` — broader semver pointers (only emitted on `v*` tag push)
 
-Images are published to `ghcr.io/bees-roadhouse/bsmcp-server` and `ghcr.io/bees-roadhouse/bsmcp-embedder` for `linux/amd64` and `linux/arm64`.
+Images are published to `ghcr.io/bees-roadhouse/bsmcp-server`, `ghcr.io/bees-roadhouse/bsmcp-embedder`, and `ghcr.io/bees-roadhouse/bsmcp-worker` for `linux/amd64` and `linux/arm64`.
 
 ### Native binary release artifacts
 

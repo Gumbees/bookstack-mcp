@@ -1,4 +1,3 @@
-mod index_worker;
 mod llm;
 mod mcp;
 mod migrate;
@@ -231,52 +230,10 @@ async fn main() {
         }
     }
 
-    // v1.0.0 reconciliation worker — opt-in via BSMCP_INDEX_WORKER. Reuses
-    // the embed token (or its own dedicated BSMCP_INDEX_TOKEN_*) to walk
-    // every shelf the global settings name, classify each item, and upsert
-    // into the bookstack_* index + page_cache. SQLite has the real IndexDb
-    // impl; Postgres returns a clear error from each call until issue #36
-    // lands, so on Postgres deployments the worker is effectively a no-op
-    // that logs each failure (kept opt-in for that reason).
-    if env::var("BSMCP_INDEX_WORKER")
-        .ok()
-        .map(|v| {
-            let v = v.trim().to_lowercase();
-            v == "true" || v == "1" || v == "yes"
-        })
-        .unwrap_or(false)
-    {
-        let token_id = env::var("BSMCP_INDEX_TOKEN_ID")
-            .or_else(|_| env::var("BSMCP_EMBED_TOKEN_ID"));
-        let token_secret = env::var("BSMCP_INDEX_TOKEN_SECRET")
-            .or_else(|_| env::var("BSMCP_EMBED_TOKEN_SECRET"));
-        match (token_id, token_secret) {
-            (Ok(tid), Ok(tsec)) => {
-                eprintln!("IndexWorker: enabled");
-                let bs_client = bsmcp_common::bookstack::BookStackClient::new(
-                    &bookstack_url,
-                    &tid,
-                    &tsec,
-                    reqwest::Client::new(),
-                );
-                let worker = index_worker::IndexWorker::new(
-                    bs_client,
-                    db.clone(),
-                    index_db.clone(),
-                );
-                let delta_interval: u64 = env::var("BSMCP_INDEX_DELTA_INTERVAL_SECONDS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(300);
-                worker.spawn(delta_interval);
-            }
-            _ => eprintln!(
-                "IndexWorker: BSMCP_INDEX_WORKER=true but no BSMCP_INDEX_TOKEN_*/BSMCP_EMBED_TOKEN_* — worker not started"
-            ),
-        }
-    } else {
-        eprintln!("IndexWorker: disabled (set BSMCP_INDEX_WORKER=true to enable)");
-    }
+    // v1.1.0+: reconciliation worker runs in its own binary (`bsmcp-worker`).
+    // The server's webhook handler still enqueues into `index_jobs`; the
+    // worker process polls + executes those jobs against the same DB.
+    // See crates/bsmcp-worker.
 
     let state = sse::AppState::new(
         bookstack_url,
@@ -291,6 +248,19 @@ async fn main() {
     state.spawn_cleanup();
     state.spawn_backup();
     settings_ui::spawn_settings_cleanup(state.settings_sessions.clone());
+
+    // BSMCP_REMEMBER_ENABLED gates the entire Hive memory surface — both
+    // the /remember/v1/* HTTP endpoint and the remember_* MCP tools. Default
+    // true (back-compat). Set to false to run bookstack-mcp purely as a
+    // BookStack proxy (e.g., when a separate frame application like Forager
+    // owns the memory layer).
+    let remember_enabled = env::var("BSMCP_REMEMBER_ENABLED")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_lowercase();
+            !(v == "false" || v == "0" || v == "no" || v == "off")
+        })
+        .unwrap_or(true);
 
     let mut app = Router::new()
         .route("/mcp/sse", get(sse::handle_sse).post(sse::handle_streamable))
@@ -308,12 +278,16 @@ async fn main() {
             "/settings/probe",
             get(settings_ui::handle_settings_probe_get).post(settings_ui::handle_settings_probe_post),
         )
-        .route(
+        .route("/health", get(|| async { Json(json!({"status": "ok"})) }));
+    if remember_enabled {
+        app = app.route(
             "/remember/v1/{resource}/{action}",
             axum::routing::post(handle_remember_http),
-        )
-        .route("/health", get(|| async { Json(json!({"status": "ok"})) }));
-    eprintln!("Remember: HTTP endpoint active at POST /remember/v1/{{resource}}/{{action}}");
+        );
+        eprintln!("Remember: HTTP endpoint active at POST /remember/v1/{{resource}}/{{action}}");
+    } else {
+        eprintln!("Remember: DISABLED (set BSMCP_REMEMBER_ENABLED=true to enable)");
+    }
     eprintln!("Settings: UI active at GET/POST /settings");
 
     // Staging upload endpoint for file uploads (50MB limit)

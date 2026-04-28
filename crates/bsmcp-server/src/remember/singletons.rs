@@ -125,6 +125,7 @@ pub async fn read_user(ctx: &Context) -> Outcome {
     let mut working_settings = ctx.settings.clone();
     let provision_result = user_provision::auto_provision_user_identity(
         &ctx.client,
+        ctx.index_db.as_ref(),
         globals.user_journals_shelf_id,
         &mut working_settings,
     )
@@ -213,6 +214,7 @@ pub async fn write_user(ctx: &Context) -> Outcome {
     let mut working_settings = ctx.settings.clone();
     let provision_result = user_provision::auto_provision_user_identity(
         &ctx.client,
+        ctx.index_db.as_ref(),
         globals.user_journals_shelf_id,
         &mut working_settings,
     )
@@ -330,6 +332,7 @@ async fn section_op_singleton(ctx: &Context, resource: &'static str, is_append: 
             let mut ws = ctx.settings.clone();
             let provision_result = user_provision::auto_provision_user_identity(
                 &ctx.client,
+                ctx.index_db.as_ref(),
                 globals.user_journals_shelf_id,
                 &mut ws,
             )

@@ -22,7 +22,7 @@ use serde_json::json;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use bsmcp_common::config::DbBackendType;
-use bsmcp_common::db::{DbBackend, SemanticDb};
+use bsmcp_common::db::{DbBackend, IndexDb, SemanticDb};
 
 #[tokio::main]
 async fn main() {
@@ -53,7 +53,11 @@ async fn main() {
 
     // Select database backend
     let backend_type = DbBackendType::from_env();
-    let (db, semantic_db): (Arc<dyn DbBackend>, Option<Arc<dyn SemanticDb>>) = match backend_type {
+    let (db, semantic_db, index_db): (
+        Arc<dyn DbBackend>,
+        Option<Arc<dyn SemanticDb>>,
+        Arc<dyn IndexDb>,
+    ) = match backend_type {
         DbBackendType::Sqlite => {
             let db_path = env::var("BSMCP_DB_PATH")
                 .map(PathBuf::from)
@@ -63,7 +67,11 @@ async fn main() {
             }
             eprintln!("Database: SQLite ({})", db_path.display());
             let db = Arc::new(bsmcp_db_sqlite::SqliteDb::open(&db_path, &encryption_key));
-            (db.clone(), Some(db as Arc<dyn SemanticDb>))
+            (
+                db.clone() as Arc<dyn DbBackend>,
+                Some(db.clone() as Arc<dyn SemanticDb>),
+                db as Arc<dyn IndexDb>,
+            )
         }
         DbBackendType::Postgres => {
             let database_url = env::var("BSMCP_DATABASE_URL")
@@ -99,7 +107,11 @@ async fn main() {
                     .await
                     .expect("Failed to connect to PostgreSQL"),
             );
-            (db.clone(), Some(db as Arc<dyn SemanticDb>))
+            (
+                db.clone() as Arc<dyn DbBackend>,
+                Some(db.clone() as Arc<dyn SemanticDb>),
+                db as Arc<dyn IndexDb>,
+            )
         }
     };
 
@@ -159,11 +171,13 @@ async fn main() {
                     None
                 } else {
                     eprintln!("Semantic: enabled (embedder_url={embedder_url})");
-                    Some(Arc::new(semantic::SemanticState::new(
+                    let state = Arc::new(semantic::SemanticState::new(
                         sdb.clone(),
                         embedder_url,
                         webhook_secret,
-                    )))
+                    ));
+                    state.clone().spawn_acl_reconcile();
+                    Some(state)
                 }
             }
             None => {
@@ -216,9 +230,15 @@ async fn main() {
         }
     }
 
+    // v1.1.0+: reconciliation worker runs in its own binary (`bsmcp-worker`).
+    // The server's webhook handler still enqueues into `index_jobs`; the
+    // worker process polls + executes those jobs against the same DB.
+    // See crates/bsmcp-worker.
+
     let state = sse::AppState::new(
         bookstack_url,
         db,
+        index_db.clone(),
         known_urls,
         backup_interval_hours,
         backup_path,
@@ -228,6 +248,19 @@ async fn main() {
     state.spawn_cleanup();
     state.spawn_backup();
     settings_ui::spawn_settings_cleanup(state.settings_sessions.clone());
+
+    // BSMCP_REMEMBER_ENABLED gates the entire Hive memory surface — both
+    // the /remember/v1/* HTTP endpoint and the remember_* MCP tools. Default
+    // true (back-compat). Set to false to run bookstack-mcp purely as a
+    // BookStack proxy (e.g., when a separate frame application like Forager
+    // owns the memory layer).
+    let remember_enabled = env::var("BSMCP_REMEMBER_ENABLED")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_lowercase();
+            !(v == "false" || v == "0" || v == "no" || v == "off")
+        })
+        .unwrap_or(true);
 
     let mut app = Router::new()
         .route("/mcp/sse", get(sse::handle_sse).post(sse::handle_streamable))
@@ -245,12 +278,16 @@ async fn main() {
             "/settings/probe",
             get(settings_ui::handle_settings_probe_get).post(settings_ui::handle_settings_probe_post),
         )
-        .route(
+        .route("/health", get(|| async { Json(json!({"status": "ok"})) }));
+    if remember_enabled {
+        app = app.route(
             "/remember/v1/{resource}/{action}",
             axum::routing::post(handle_remember_http),
-        )
-        .route("/health", get(|| async { Json(json!({"status": "ok"})) }));
-    eprintln!("Remember: HTTP endpoint active at POST /remember/v1/{{resource}}/{{action}}");
+        );
+        eprintln!("Remember: HTTP endpoint active at POST /remember/v1/{{resource}}/{{action}}");
+    } else {
+        eprintln!("Remember: DISABLED (set BSMCP_REMEMBER_ENABLED=true to enable)");
+    }
     eprintln!("Settings: UI active at GET/POST /settings");
 
     // Staging upload endpoint for file uploads (50MB limit)
@@ -340,6 +377,7 @@ async fn handle_remember_http(
         &token_id,
         &client,
         state.db.clone(),
+        state.index_db.clone(),
         state.semantic.clone(),
     )
     .await;
@@ -403,7 +441,94 @@ async fn handle_webhook(
         eprintln!("Webhook error: {e}");
     }
 
+    // Index reconciliation: enqueue page-scope jobs alongside the existing
+    // embed-job enqueue. Distinct queue (`index_jobs` vs `embed_jobs`) so
+    // worker policies tune independently. Best-effort — failures here
+    // never block the webhook from returning ACCEPTED.
+    if let Err(e) = enqueue_index_jobs_for_webhook(&payload, &state).await {
+        eprintln!("IndexWorker: webhook enqueue failed (non-fatal): {e}");
+    }
+
     StatusCode::ACCEPTED.into_response()
+}
+
+/// Mirror the event-dispatch logic in semantic::handle_webhook for the
+/// index_jobs queue. Page events get a per-page reconcile; chapter/book
+/// events get a per-chapter or per-book walk so descendant pages pick up
+/// reclassification triggered by a parent rename. Shelf events trigger a
+/// full walk because the shelf-kind classification feeds every descendant.
+async fn enqueue_index_jobs_for_webhook(
+    payload: &serde_json::Value,
+    state: &sse::AppState,
+) -> Result<(), String> {
+    let event = payload
+        .get("event")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let related = payload.get("related_item").cloned().unwrap_or(json!(null));
+    let item_id = related.get("id").and_then(|v| v.as_i64());
+
+    match event {
+        "page_create" | "page_update" | "page_restore" | "page_move" => {
+            if let Some(pid) = item_id {
+                let scope = format!("page:{pid}");
+                let (job_id, is_new) = state
+                    .index_db
+                    .create_index_job(&scope, "both", "webhook")
+                    .await?;
+                eprintln!("IndexWorker: {event} — queued {scope} job {job_id} (new={is_new})");
+            }
+        }
+        "page_delete" => {
+            if let Some(pid) = item_id {
+                state.index_db.soft_delete_indexed_page(pid).await?;
+                eprintln!("IndexWorker: page_delete — soft-deleted page {pid} from index");
+            }
+        }
+        "chapter_create" | "chapter_update" | "chapter_delete" | "chapter_move" => {
+            // For now, full walk to pick up chapter-kind reclassification of
+            // descendants. A `chapter:{id}` scope can replace this in a
+            // follow-up.
+            if event == "chapter_delete" {
+                if let Some(cid) = item_id {
+                    state.index_db.soft_delete_indexed_chapter(cid).await?;
+                }
+            }
+            let (job_id, is_new) = state
+                .index_db
+                .create_index_job("all", "both", "webhook")
+                .await?;
+            eprintln!("IndexWorker: {event} — queued full walk job {job_id} (new={is_new})");
+        }
+        "book_update" | "book_sort" | "book_create_from_chapter" | "book_delete" => {
+            if event == "book_delete" {
+                if let Some(bid) = item_id {
+                    state.index_db.soft_delete_indexed_book(bid).await?;
+                }
+            }
+            let (job_id, is_new) = state
+                .index_db
+                .create_index_job("all", "both", "webhook")
+                .await?;
+            eprintln!("IndexWorker: {event} — queued full walk job {job_id} (new={is_new})");
+        }
+        "bookshelf_create_from_book" | "bookshelf_update" | "bookshelf_delete" => {
+            if event == "bookshelf_delete" {
+                if let Some(sid) = item_id {
+                    state.index_db.soft_delete_indexed_shelf(sid).await?;
+                }
+            }
+            let (job_id, is_new) = state
+                .index_db
+                .create_index_job("all", "both", "webhook")
+                .await?;
+            eprintln!("IndexWorker: {event} — queued full walk job {job_id} (new={is_new})");
+        }
+        _ => {
+            // Unknown event — log and ignore, matching semantic.rs's behavior.
+        }
+    }
+    Ok(())
 }
 
 fn html_escape(s: &str) -> String {

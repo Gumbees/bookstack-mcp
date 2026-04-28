@@ -1,0 +1,37 @@
+name: Refactor
+description: Design or structure is wrong — restructuring needed (different from a bug)
+title: "[refactor] "
+labels: ["type:problem", "category:refactor"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What is wrong with the current shape?
+      description: Why is the design or structure itself the problem (not just an implementation mistake)?
+      placeholder: "The remember module mixes briefing assembly, search dispatch, and response shaping in one file — the seams need to be pulled apart so each can be tested in isolation."
+    validations:
+      required: true
+
+  - type: textarea
+    id: redesign
+    attributes:
+      label: Proposed redesign
+      description: New shape, briefly. External behavior change? Backward compatible?
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Affected modules / files
+      description: Which parts of the codebase change.
+    validations:
+      required: false
+
+  - type: textarea
+    id: risk
+    attributes:
+      label: Migration / risk notes
+      description: What breaks during the transition, what tests cover the change.
+    validations:
+      required: false

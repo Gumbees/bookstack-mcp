@@ -6,11 +6,14 @@ An MCP (Model Context Protocol) server that gives Claude full access to a [BookS
 
 - Full CRUD on all core BookStack resources (shelves, books, chapters, pages, attachments)
 - Full-text search with BookStack query operators
-- **Semantic vector search** — natural language search across all content via embeddings (optional)
+- **Semantic vector search** — natural language search across all content via embeddings (optional). Hybrid (vector + keyword) with Markov-blanket re-ranking; ACL-filtered when the caller's BookStack user ID is configured.
+- **Hive memory flow (`/remember`)** — server-side reconstitution + memory CRUD that replaces the multi-call AI bootstrap with one structured `briefing` pull. 12 `remember_*` MCP tools cover identity, journals, topics, search, audit, directory, and per-user/global config. Auto-provisions per-user identity + journal structure on first call.
+- **Settings UI (`/settings`)** — browser-based admin/user configuration page (token-gated via the same `/authorize` flow). Pick book/chapter IDs from dropdowns populated by BookStack; toggle semantic-search scopes; one-shot admin-only globals (Hive shelf, User Journals shelf, org identity page, org domains).
 - **Pluggable database** — SQLite for simple deployments, PostgreSQL + pgvector for production
 - **Separate embedder** — background embedding service with pluggable backends (local ONNX, Ollama, OpenAI)
 - **Server-side markdown to HTML conversion** — send markdown, server converts before sending to BookStack
 - **Staging upload flow** — upload local images and attachments through a two-step staging endpoint without exposing local paths to the container ([see below](#uploading-local-files-images--attachments))
+- **Time-aware responses** — every `/remember` response carries a `meta.time` block (now_unix/now_utc/now_local/now_human/timezone) sourced from a per-user cached IANA timezone. Lets agents reason about "yesterday" / "this morning" without re-deriving it.
 - **OAuth 2.1 support** — use as a Claude.ai or Claude Desktop custom connector without config files
 - **Encrypted token storage** — OAuth tokens encrypted at rest with AES-256-GCM
 - **Dual transport** — SSE (MCP 2024-11-05) and Streamable HTTP (MCP 2025-03-26)
@@ -39,7 +42,7 @@ docker/
 
 The MCP server handles all client-facing protocol, OAuth, and search. The embedder runs separately, polling a database-backed job queue to embed pages and serving a `/embed` HTTP endpoint for query-time embedding. The embedder supports three backends: local ONNX models (fastembed), Ollama, or OpenAI-compatible APIs.
 
-## Available Tools (61)
+## Available Tools (61 BookStack + 12 Hive memory = 73)
 
 | Category | Tools |
 |----------|-------|
@@ -51,6 +54,7 @@ The MCP server handles all client-facing protocol, OAuth, and search. The embedd
 | **Pages** | `list_pages`, `get_page`, `create_page`, `update_page`, `delete_page`, `edit_page`, `append_to_page`, `replace_section`, `insert_after` |
 | **Move** | `move_page`, `move_chapter`, `move_book_to_shelf` |
 | **Attachments** | `list_attachments`, `get_attachment`, `create_attachment`, `update_attachment`, `delete_attachment`, `upload_attachment` |
+| **Staging** | `prepare_upload` (used with `upload_image` / `upload_attachment` for local file uploads) |
 | **Exports** | `export_page`, `export_chapter`, `export_book` (markdown, plaintext, html) |
 | **Comments** | `list_comments`, `get_comment`, `create_comment`, `update_comment`, `delete_comment` |
 | **Recycle Bin** | `list_recycle_bin`, `restore_recycle_bin_item`, `destroy_recycle_bin_item` |
@@ -60,8 +64,11 @@ The MCP server handles all client-facing protocol, OAuth, and search. The embedd
 | **Images** | `list_images`, `get_image`, `upload_image`, `update_image`, `delete_image` |
 | **Permissions** | `get_content_permissions`, `update_content_permissions` |
 | **Roles** | `list_roles`, `get_role` |
+| **Hive memory (`/remember`)** | `remember_briefing`, `remember_whoami`, `remember_user`, `remember_config`, `remember_identity`, `remember_directory`, `remember_journal`, `remember_collage`, `remember_shared_collage`, `remember_user_journal`, `remember_audit`, `remember_search` |
 
-Semantic tools (`semantic_search`, `reembed`, `embedding_status`) only appear when `BSMCP_SEMANTIC_SEARCH=true` and an embedder is running. Without semantic search: 58 tools.
+Semantic tools (`semantic_search`, `reembed`, `embedding_status`) only appear when `BSMCP_SEMANTIC_SEARCH=true` and an embedder is running. Without semantic search: 58 BookStack + 12 Hive = 70 tools.
+
+Hive memory tools require user/global settings. The `remember_briefing` tool returns a `setup_nudge` listing every pending field with the exact MCP call to fix it; configure via the `/settings` UI or `remember_config action=write`.
 
 ## Setup
 
@@ -98,6 +105,8 @@ This starts two containers sharing a SQLite database file.
 
 ### Run from source
 
+The project distributes as multi-arch (`linux/amd64` + `linux/arm64`) container images on GHCR — `ghcr.io/bees-roadhouse/bsmcp-server` and `ghcr.io/bees-roadhouse/bsmcp-embedder`. Native binaries for **`bsmcp-server` only** are attached to each GitHub Release for `linux-x86_64`, `linux-aarch64`, `darwin-x86_64`, `darwin-aarch64`, and `windows-x86_64`. The embedder is **not** distributed as a bare binary — it depends on ONNX Runtime (a per-platform C++ shared library), so running it outside Docker is awkward. Either run the published embedder container, or build from source:
+
 ```bash
 # Server
 cargo run --release -p bsmcp-server
@@ -105,6 +114,8 @@ cargo run --release -p bsmcp-server
 # Embedder (separate terminal)
 cargo run --release -p bsmcp-embedder
 ```
+
+The server is pure Rust + bundled SQLite and builds cleanly on any target the Rust toolchain supports. The embedder depends on [`fastembed`](https://crates.io/crates/fastembed), which links ONNX Runtime; the crate downloads a matching prebuilt at build time for common targets, but cross-compiling or running on uncommon platforms may require installing ONNX Runtime separately. For most users, running the embedder from the published container avoids that complexity entirely.
 
 ### Configuration
 
@@ -258,6 +269,57 @@ The token ID and secret come from your BookStack API token (created under **My A
 ## Upgrading
 
 All schema migrations are automatic on startup (CREATE TABLE IF NOT EXISTS, ALTER TABLE for new columns). No manual SQL is needed.
+
+### From v0.7.3 to v0.7.4 (this release)
+
+#### What's new
+
+- **Briefing payload trimmed** — `*_semantic_matches` entries now cap at 3 chunks of ~100 chars each (kb_semantic_matches: 4 × 150). Truncated chunks carry `truncated: true` and a `…` suffix. A new top-level `semantic_matches_hint` field tells consumers to call `get_page(page_id)` for full content. Briefing responses shrink ~50% in typical use, well under Claude Code's response-size threshold.
+- **`semantic_search` tool trimmed** — same shape, slightly more headroom (5 chunks × ~200 chars). New top-level `hint` field on the tool response.
+- **Shared trim helper** — chunk-truncation logic lives in one place (`semantic::trim_match`), each caller passes its own budget.
+
+#### What's automatic
+
+- No env vars, no schema changes, drop-in.
+
+### From v0.7.2 to v0.7.3
+
+#### What's new
+
+- **`meta.time` block** on every `/remember` response — `now_unix`, `now_utc`, `now_local`, `now_human`, `timezone`, `timezone_source`, `timezone_refresh_due`. Per-user timezone cached server-side; refresh by passing `client_timezone` (IANA name) on any `remember_*` call.
+- **Actionable setup errors** — `settings_not_configured` errors now carry an `error.fix` block with the exact MCP call to make.
+- **Per-call elapsed timing** exposed in `meta.elapsed_ms`.
+
+### From v0.7.0 to v0.7.2
+
+#### What's new
+
+- **Briefing latency cut** — book-scoped semantic-search candidate filtering, parallel KB fetches, batched DB lookups. `remember_briefing` is significantly faster on instances with large embedded corpora.
+- **`kb_semantic_matches` reshape** — now an envelope `{enabled, reason, detail, results}` so consumers can branch on `enabled` rather than guessing whether an empty list means opt-out vs. zero hits.
+- **Permission ACL filtering** for semantic search — set `bookstack_user_id` in user settings to enable role-based filtering at the candidate-pool layer (much faster than the per-page HTTP fallback).
+- **Per-user identity auto-provisioning** — first call to `remember_user action=read` creates the per-user Identity book + Identity page + journal-agent page if missing, returning what was created in `auto_provisioned`.
+- **Global org settings** — admin-only `org_identity_page_id`, `org_domains`, `org_required_instructions_page_ids`, `org_ai_usage_policy_page_ids` shared across every user on the instance. First-write-wins for the structural IDs.
+- **Owner-only journal pages** — auto-applied content permission lock so journal entries are visible only to the owning agent/user.
+
+### From v0.6.x to v0.7.0
+
+#### What's new
+
+- **`/remember` protocol** — server-side reconstitution + memory CRUD. 12 MCP tools: `remember_briefing`, `remember_whoami`, `remember_user`, `remember_config`, `remember_identity`, `remember_directory`, `remember_journal`, `remember_collage`, `remember_shared_collage`, `remember_user_journal`, `remember_audit`, `remember_search`. HTTP form: `POST /remember/v1/{resource}/{action}`.
+- **`/settings` UI** — browser-based configuration page, token-gated via `/authorize`. Settings session cookie stored server-side (in-memory, 8h TTL).
+- **YAML-frontmatter provenance** — every collection write stamps `written_by`, `ai_identity_ouid`, `user_id`, `written_at`, `trace_id`, `resource`, `key`, `supersedes_page` at the top of the page body. Invisible in BookStack's renderer; readable by tools.
+- **Soft delete** — `remember_*_collection action=delete` prepends `[archived]` to the page name and stamps `deleted: true` in frontmatter rather than hard-deleting.
+- **`remember_audit` log** — server-side audit table, scoped to the calling user, captures every write with trace_id and target_page_id.
+
+### From v0.5.3 to v0.6.x
+
+#### What's new
+
+- **Image upload & file attachment tools** — `upload_image` and `upload_attachment` accept either a `staging_id` (from `prepare_upload`), a public `url`, or BookStack's standard direct-upload form data.
+- **Staging upload flow** — two-step `prepare_upload` → POST file to returned URL → call `upload_image`/`upload_attachment` with the staging ID. Lets containerized servers receive local files without exposing client paths. 5-minute TTL, single-use, 50MB cap.
+- **Move operations** — dedicated `move_page`, `move_chapter`, `move_book_to_shelf` tools (cleaner than the implicit move via update operations).
+- **`embed` parameter** on `upload_image` — auto-appends the uploaded image into the target page's content.
+- **DNS rebinding protection** — reqwest client pins validated DNS addresses to prevent SSRF via DNS rebinding attacks.
 
 ### From v0.5.2 to v0.5.3
 
@@ -595,6 +657,10 @@ If the file is already hosted at a public URL the MCP server can reach, you can 
 The reason: Step 2 requires the MCP client to make an outbound HTTP POST to the MCP server's staging endpoint with the file bytes. Claude Code runs locally and has shell access (via its `Bash` tool), so it can `curl` the file directly. Claude.ai's remote MCP connector runs the MCP client inside Anthropic's sandboxed proxy infrastructure, which does not expose a mechanism for the client to make arbitrary HTTP file uploads to third-party hosts. Claude Desktop has similar limitations today.
 
 If you're using Claude.ai or Claude Desktop, you can still use `upload_image` with the `url` parameter for files that are already web-accessible, or upload through the BookStack web UI directly.
+
+## Development
+
+See [DEVELOPMENT.md](DEVELOPMENT.md) for build instructions, branching model, CI/CD (artifact-before-merge), versioning, and the workflow for adding new tools.
 
 ## License
 

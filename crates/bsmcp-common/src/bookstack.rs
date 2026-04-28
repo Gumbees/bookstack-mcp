@@ -183,6 +183,16 @@ const MAX_ERROR_BODY_SIZE: usize = 4096; // 4KB for error messages
 /// (e.g. from Clone, format!, auth_header()) and reqwest HeaderValue copies may remain
 /// in freed memory until overwritten by the allocator.
 /// This is a best-effort defense-in-depth measure, not a guarantee against memory forensics.
+/// What `BookStackClient::whoami()` returns when it can identify the
+/// authenticated user. `email` is `None` only when BookStack returns a user
+/// row without one (rare — typically only seeded service accounts).
+#[derive(Clone, Debug)]
+pub struct UserIdentity {
+    pub bookstack_user_id: i64,
+    pub email: Option<String>,
+    pub name: String,
+}
+
 #[derive(Clone)]
 pub struct BookStackClient {
     client: Client,
@@ -538,6 +548,34 @@ impl BookStackClient {
         ]).await
     }
 
+    /// List pages whose `updated_at` is strictly greater than the given
+    /// ISO 8601 timestamp, sorted oldest-first so the index reconciler
+    /// can advance `last_delta_walk_at` to the newest page seen on each
+    /// pass without losing entries to "process out of order then crash"
+    /// races. Used by the v1.0.0 reconciliation worker's periodic delta
+    /// walk (Phase 4c).
+    pub async fn list_pages_updated_since(
+        &self,
+        since_iso_utc: &str,
+        count: i64,
+    ) -> Result<Vec<Value>, String> {
+        let resp = self
+            .get(
+                "pages",
+                &[
+                    ("count", &count.to_string()),
+                    ("sort", "+updated_at"),
+                    ("filter[updated_at:gt]", since_iso_utc),
+                ],
+            )
+            .await?;
+        Ok(resp
+            .get("data")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default())
+    }
+
     pub async fn get_page(&self, id: i64) -> Result<Value, String> {
         self.get(&format!("pages/{id}"), &[]).await
     }
@@ -597,6 +635,52 @@ impl BookStackClient {
                 .map(|n| n.eq_ignore_ascii_case(name))
                 .unwrap_or(false)
         }))
+    }
+
+    /// Find a page inside a chapter by exact (case-insensitive) name.
+    /// Returns the page row if found, or `None`. One `get_chapter` call.
+    /// Used by chapter-scoped collection resources (Phase 6 journal).
+    pub async fn find_page_in_chapter(
+        &self,
+        chapter_id: i64,
+        name: &str,
+    ) -> Result<Option<Value>, String> {
+        let chapter = self.get_chapter(chapter_id).await?;
+        let pages = chapter
+            .get("pages")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(pages.into_iter().find(|p| {
+            p.get("name")
+                .and_then(|n| n.as_str())
+                .map(|n| n.eq_ignore_ascii_case(name))
+                .unwrap_or(false)
+        }))
+    }
+
+    /// List pages inside a chapter, ordered by `updated_at` descending.
+    /// Returns up to `limit` pages. Used by chapter-scoped collections to
+    /// list recent entries.
+    pub async fn list_chapter_pages_by_updated(
+        &self,
+        chapter_id: i64,
+        limit: usize,
+    ) -> Result<Vec<Value>, String> {
+        let chapter = self.get_chapter(chapter_id).await?;
+        let mut pages = chapter
+            .get("pages")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        // Sort by updated_at descending (lexicographic on ISO-8601 == time order)
+        pages.sort_by(|a, b| {
+            let av = a.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
+            let bv = b.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
+            bv.cmp(av)
+        });
+        pages.truncate(limit);
+        Ok(pages)
     }
 
     /// Find a chapter in a book by exact (case-insensitive) name. Returns
@@ -721,6 +805,64 @@ impl BookStackClient {
 
     pub async fn get_user(&self, id: i64) -> Result<Value, String> {
         self.get(&format!("users/{id}"), &[]).await
+    }
+
+    /// Discover the authenticated user's BookStack identity (id + email + name)
+    /// without requiring user configuration.
+    ///
+    /// BookStack has no `/api/users/me` endpoint, but its search API resolves
+    /// `{created_by:me}` server-side. We probe by searching for any single
+    /// page the user has created, extract `created_by.id` from the result,
+    /// then fetch `/api/users/{id}` to get email + name (the search response
+    /// only carries id/name/slug — email lives on the user record).
+    ///
+    /// Returns `Ok(None)` when the user has no content yet (brand-new accounts)
+    /// — the caller should retry on first write or fall back to manual config.
+    /// Returns `Err` only when BookStack is unreachable or rejects the call
+    /// for non-empty-result reasons.
+    pub async fn whoami(&self) -> Result<Option<UserIdentity>, String> {
+        // Probe via search. Single-page results, page-type only, created-by-self.
+        let resp = self
+            .search("{type:page} {created_by:me}", 1, 1)
+            .await?;
+        let candidates = resp.get("data").and_then(|v| v.as_array());
+        let Some(items) = candidates else {
+            return Ok(None);
+        };
+        for item in items {
+            // Each result has a `preview_html` block plus the underlying entity
+            // shape. The created_by ref is at the top level on page rows.
+            let created_by = match item.get("created_by") {
+                Some(v) => v,
+                None => continue,
+            };
+            let user_id = match created_by.get("id").and_then(|v| v.as_i64()) {
+                Some(id) => id,
+                None => continue,
+            };
+            // Fetch the user record for email — search responses don't carry it.
+            // Reading your own user row works for any authenticated user; admin
+            // is only required to read OTHER users.
+            let user = match self.get_user(user_id).await {
+                Ok(u) => u,
+                Err(e) => return Err(format!("whoami: get_user({user_id}) failed: {e}")),
+            };
+            let email = user
+                .get("email")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let name = user
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            return Ok(Some(UserIdentity {
+                bookstack_user_id: user_id,
+                email,
+                name,
+            }));
+        }
+        Ok(None)
     }
 
     // --- Audit Log ---

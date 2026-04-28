@@ -46,6 +46,10 @@ pub struct AppState {
     pub summary_cache: crate::summary::SummaryCache,
     pub staging: crate::staging::StagingStore,
     pub settings_sessions: crate::settings_ui::SettingsSessionStore,
+    /// Index db is always present (sqlite has full impl, postgres returns
+    /// stub errors per #36). Webhook handler enqueues page:{id} index jobs
+    /// here when BookStack page events arrive.
+    pub index_db: Arc<dyn bsmcp_common::db::IndexDb>,
 }
 
 pub(crate) struct RateLimit {
@@ -96,6 +100,7 @@ impl AppState {
     pub fn new(
         bookstack_url: String,
         db: Arc<dyn DbBackend>,
+        index_db: Arc<dyn bsmcp_common::db::IndexDb>,
         known_urls: Vec<String>,
         backup_interval_hours: Option<u64>,
         backup_path: PathBuf,
@@ -124,6 +129,7 @@ impl AppState {
             summary_cache,
             staging: crate::staging::new_staging_store(),
             settings_sessions: crate::settings_ui::new_settings_store(),
+            index_db,
         }
     }
 
@@ -414,6 +420,7 @@ pub async fn handle_message(
     let semantic = state.semantic.as_deref();
     let remember_deps = mcp::RememberDeps {
         db: state.db.clone(),
+        index_db: state.index_db.clone(),
         semantic: state.semantic.clone(),
         token_id: token_id.clone(),
     };
@@ -495,6 +502,7 @@ pub async fn handle_streamable(
     let semantic = state.semantic.as_deref();
     let remember_deps = mcp::RememberDeps {
         db: state.db.clone(),
+        index_db: state.index_db.clone(),
         semantic: state.semantic.clone(),
         token_id: token_id.clone(),
     };

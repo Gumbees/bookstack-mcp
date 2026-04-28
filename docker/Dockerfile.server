@@ -1,4 +1,18 @@
+# syntax=docker/dockerfile:1.7
+#
+# bsmcp-server — MCP protocol, OAuth, /remember, semantic search.
+#
+# This image has zero ONNX/fastembed dependencies (verified via
+# `cargo tree -p bsmcp-server`). It only needs bsmcp-common + the db
+# crates, and is comparatively cheap to build vs the embedder.
+#
+# Build performance: BuildKit `--mount=type=cache` for the cargo target
+# dir + crate registry + git index keeps iterative builds fast. Subsequent
+# builds with an unchanged Cargo.lock only recompile changed-crate sources.
+
 FROM ubuntu:24.04 AS builder
+
+ARG TARGETPLATFORM
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl build-essential pkg-config libssl-dev ca-certificates \
@@ -11,7 +25,16 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 
-RUN cargo build --release -p bsmcp-server
+# Cache mounts persist the cargo target dir + registry across builds.
+# After cargo finishes, copy the binary OUT of the cache mount into a
+# regular layer (`/out/`) so the final-stage COPY can reach it — content
+# inside cache mounts is not present in the produced image filesystem.
+RUN --mount=type=cache,target=/app/target,id=server-target-${TARGETPLATFORM} \
+    --mount=type=cache,target=/root/.cargo/registry,id=cargo-registry-${TARGETPLATFORM} \
+    --mount=type=cache,target=/root/.cargo/git,id=cargo-git-${TARGETPLATFORM} \
+    cargo build --release -p bsmcp-server \
+ && mkdir -p /out \
+ && cp /app/target/release/bsmcp-server /out/bsmcp-server
 
 FROM ubuntu:24.04
 
@@ -19,7 +42,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libssl3t64 gosu \
  && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/bsmcp-server /usr/local/bin/bsmcp-server
+COPY --from=builder /out/bsmcp-server /usr/local/bin/bsmcp-server
 COPY entrypoint.sh /entrypoint.sh
 RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 

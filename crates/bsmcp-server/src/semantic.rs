@@ -16,6 +16,32 @@ use bsmcp_common::types::MarkovBlanket;
 
 const PERMISSION_CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
 
+/// Cap a single semantic-match's chunks and truncate each chunk's content.
+/// Shared by every caller that surfaces chunk previews to a model — the
+/// briefing (per-book + kb) and the `semantic_search` MCP tool — so the
+/// truncation rules stay in one place even when the budgets differ per
+/// caller. `sem.search()` itself returns full chunks; trimming is the
+/// caller's responsibility.
+///
+/// Truncated chunks get a `truncated: true` flag and a `…` suffix so
+/// consumers can tell a clipped chunk from a naturally short one. Char-count
+/// is used (not byte-count) so multibyte UTF-8 isn't sliced mid-codepoint.
+pub fn trim_match(mut hit: Value, max_chunks: usize, max_chars: usize) -> Value {
+    let Some(obj) = hit.as_object_mut() else { return hit; };
+    let Some(chunks) = obj.get_mut("chunks").and_then(|v| v.as_array_mut()) else { return hit; };
+    chunks.truncate(max_chunks);
+    for chunk in chunks.iter_mut() {
+        let Some(chunk_obj) = chunk.as_object_mut() else { continue; };
+        let Some(content) = chunk_obj.get("content").and_then(|v| v.as_str()) else { continue; };
+        if content.chars().count() > max_chars {
+            let truncated: String = content.chars().take(max_chars).collect();
+            chunk_obj.insert("content".to_string(), Value::String(format!("{truncated}…")));
+            chunk_obj.insert("truncated".to_string(), Value::Bool(true));
+        }
+    }
+    hit
+}
+
 struct CachedAccess {
     accessible: bool,
     cached_at: Instant,
@@ -52,6 +78,40 @@ impl SemanticState {
 
     pub fn webhook_secret(&self) -> &str {
         &self.webhook_secret
+    }
+
+    /// Spawn the daily ACL reconciliation cron. Wakes every
+    /// `BSMCP_ACL_RECONCILE_HOURS` (default 24) and queues an `acl_reconcile`
+    /// embed job — the embedder pipeline picks it up and refreshes
+    /// `page_view_acl` for every stored page. This is the safety net for
+    /// permission changes that webhook events miss (e.g., webhook drops, role
+    /// detail edits that don't fire `role_update` for some reason).
+    pub fn spawn_acl_reconcile(self: Arc<Self>) {
+        let interval_hours: u64 = std::env::var("BSMCP_ACL_RECONCILE_HOURS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(24);
+        if interval_hours == 0 {
+            eprintln!("Semantic: ACL reconciliation disabled (BSMCP_ACL_RECONCILE_HOURS=0)");
+            return;
+        }
+        let interval = Duration::from_secs(interval_hours * 3600);
+        eprintln!("Semantic: ACL reconcile cron active — every {interval_hours}h");
+        tokio::spawn(async move {
+            // Stagger initial run so server startup isn't immediately followed
+            // by a heavy reconcile. 5 minutes is enough for the embedder to
+            // come up and pull pending jobs first.
+            tokio::time::sleep(Duration::from_secs(5 * 60)).await;
+            loop {
+                match self.db.create_embed_job("acl_reconcile").await {
+                    Ok((job_id, is_new)) => eprintln!(
+                        "Semantic: ACL reconcile cron — queued job {job_id} (new={is_new})"
+                    ),
+                    Err(e) => eprintln!("Semantic: ACL reconcile cron — queue failed: {e}"),
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
     }
 
     /// Embed a query by calling the external embedder service.
@@ -192,6 +252,56 @@ impl SemanticState {
         accessible
     }
 
+    /// Resolve the calling user's BookStack roles. Cached per token (15 min
+    /// TTL) so the role list is fetched once per session.
+    ///
+    /// Returns `None` (skip ACL filtering, fall back to HTTP per-page check)
+    /// when we can't determine the user's roles — e.g. settings haven't stamped
+    /// `bookstack_user_id` yet, or `/api/users/{id}` returned an error.
+    pub async fn resolve_user_roles(
+        &self,
+        token_id_hash: &str,
+        bookstack_user_id: Option<i64>,
+        client: &BookStackClient,
+    ) -> Option<Vec<i64>> {
+        // 15-minute cache window — short enough that a role grant or revoke
+        // applied during a working session takes effect on the next search,
+        // long enough to amortize the user fetch across the cache TTL.
+        const ROLE_CACHE_TTL_SECS: i64 = 15 * 60;
+
+        if let Ok(Some((_uid, roles))) = self
+            .db
+            .get_cached_user_roles(token_id_hash, ROLE_CACHE_TTL_SECS)
+            .await
+        {
+            return Some(roles);
+        }
+
+        let user_id = bookstack_user_id?;
+        let user = match client.get_user(user_id).await {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("ACL: failed to fetch /api/users/{user_id} for role resolution: {e}");
+                return None;
+            }
+        };
+        let roles: Vec<i64> = user
+            .get("roles")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|r| r.get("id").and_then(|i| i.as_i64())).collect())
+            .unwrap_or_default();
+        if roles.is_empty() {
+            // Empty roles list means BookStack returned the user but they're
+            // role-less — skip ACL filtering rather than blocking everything.
+            eprintln!("ACL: user {user_id} has no roles; skipping ACL filter for this session");
+            return None;
+        }
+        if let Err(e) = self.db.set_cached_user_roles(token_id_hash, user_id, &roles).await {
+            eprintln!("ACL: failed to cache user roles (non-fatal): {e}");
+        }
+        Some(roles)
+    }
+
     /// Hybrid search: vector + keyword + blanket re-ranking.
     ///
     /// `book_filter`: when `Some(&[..])`, restricts the vector pass to chunks
@@ -200,6 +310,10 @@ impl SemanticState {
     /// just smaller from the outset, which proportionally shrinks the
     /// permission filter and per-result fan-out. `None` keeps the old
     /// whole-corpus behavior.
+    ///
+    /// `user_role_ids`: when `Some(&[..])`, applies a role-level ACL filter
+    /// to candidates via `page_view_acl`. Pages whose ACL hasn't been
+    /// computed are still included (the HTTP fallback below verifies them).
     pub async fn search(
         &self,
         query: &str,
@@ -209,6 +323,7 @@ impl SemanticState {
         verbose: bool,
         client: &BookStackClient,
         book_filter: Option<&[i64]>,
+        user_role_ids: Option<&[i64]>,
     ) -> Result<Value, String> {
         let start = Instant::now();
 
@@ -219,6 +334,9 @@ impl SemanticState {
         let book_filter_owned: Option<Vec<i64>> = book_filter
             .filter(|s| !s.is_empty())
             .map(|s| s.to_vec());
+        let role_filter_owned: Option<Vec<i64>> = user_role_ids
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_vec());
         let vector_future = async {
             let query_vec = self.embed_query(query).await?;
             self.db
@@ -227,6 +345,7 @@ impl SemanticState {
                     limit * 2,
                     threshold,
                     book_filter_owned.as_deref(),
+                    role_filter_owned.as_deref(),
                 )
                 .await
         };
@@ -629,8 +748,12 @@ impl SemanticState {
             }
             "page_delete" => {
                 if let Some(pid) = item_id {
+                    // delete_page CASCADE-removes chunks + relationships;
+                    // page_view_acl rows are explicitly cleared so the per-role
+                    // index doesn't accumulate dead entries.
                     self.db.delete_page(pid).await?;
-                    eprintln!("Semantic: deleted embeddings for page {pid}");
+                    let _ = self.db.delete_page_acl(pid).await;
+                    eprintln!("Semantic: deleted embeddings + ACL for page {pid}");
                 }
             }
 
@@ -679,10 +802,58 @@ impl SemanticState {
             // --- Shelf events (full re-embed) ---
             // Shelf changes affect the context prefix for all pages on that shelf.
             // We can't efficiently determine which books belong to a shelf from
-            // the webhook payload, so trigger a full re-embed.
+            // the webhook payload, so trigger a full re-embed. The re-embed
+            // pipeline restamps page_view_acl as a side-effect, so shelf-level
+            // permission changes propagate naturally.
             "bookshelf_create_from_book" | "bookshelf_update" | "bookshelf_delete" => {
                 let (job_id, is_new) = self.db.create_embed_job("all").await?;
                 eprintln!("Semantic: {event} — queued full re-embed job {job_id} (new={is_new})");
+            }
+
+            // --- Role events (ACL-only reconciliation) ---
+            // Role permission changes don't affect embeddings — they only
+            // change which roles can view existing content. Queue an
+            // `acl_reconcile` job (handled by the embedder pipeline) so the
+            // ACL store is refreshed without paying the cost of re-embedding.
+            "role_create" | "role_update" => {
+                let (job_id, is_new) = self.db.create_embed_job("acl_reconcile").await?;
+                eprintln!("Semantic: {event} — queued ACL reconcile job {job_id} (new={is_new})");
+            }
+            "role_delete" => {
+                if let Some(rid) = item_id {
+                    let _ = self.db.delete_role_from_acl(rid).await;
+                    eprintln!("Semantic: role_delete — purged role {rid} from page_view_acl");
+                }
+                let (job_id, is_new) = self.db.create_embed_job("acl_reconcile").await?;
+                eprintln!("Semantic: role_delete — queued ACL reconcile job {job_id} (new={is_new})");
+            }
+
+            // --- Permission change on a specific entity ---
+            // Fired by BookStack's PermissionsUpdater whenever role/fallback
+            // permissions are edited on a page/chapter/book/shelf. Queue a
+            // full ACL reconcile because the change can cascade to descendants
+            // (book perm change affects every page in it). Cheaper than
+            // computing the cascade ourselves and the cron-style reconcile
+            // path is already battle-tested.
+            "permissions_update" => {
+                let (job_id, is_new) = self.db.create_embed_job("acl_reconcile").await?;
+                eprintln!("Semantic: permissions_update (item={item_id:?}) — queued ACL reconcile job {job_id} (new={is_new})");
+            }
+
+            // --- User events ---
+            // Role assignments live on the user, so updates can change which
+            // roles a token's owner holds. Drop their cached entry so the
+            // next semantic_search re-fetches `/api/users/{id}` and picks up
+            // the new role list.
+            "user_update" | "user_delete" => {
+                if let Some(uid) = item_id {
+                    let _ = self.db.delete_user_role_cache_by_bs_id(uid).await;
+                    eprintln!("Semantic: {event} — invalidated user_role_cache for bookstack_user_id={uid}");
+                }
+            }
+            "user_create" => {
+                // No-op — new users have no cache entry yet, no token mapping
+                // exists until they authorize through the OAuth flow.
             }
 
             _ => {

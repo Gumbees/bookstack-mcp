@@ -2,6 +2,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
+use crate::index::*;
 use crate::settings::{GlobalSettings, UserSettings};
 use crate::types::*;
 
@@ -128,12 +129,20 @@ pub trait SemanticDb: Send + Sync + 'static {
     /// `book_ids`: when `Some(&[..])`, restrict candidates to chunks whose
     /// parent page lives in one of those books. When `None` or an empty slice,
     /// search across the entire embedded corpus.
+    ///
+    /// `user_role_ids`: when `Some(&[..])`, additionally restrict candidates
+    /// to pages whose `page_view_acl` row matches one of the user's roles.
+    /// Pages with no ACL row are always included (the HTTP fallback path
+    /// in `semantic.rs` still verifies them) so search recall stays correct
+    /// while the embedded ACL eliminates fan-out for pages we already know
+    /// the user can or cannot access.
     async fn vector_search(
         &self,
         query_embedding: &[f32],
         limit: usize,
         threshold: f32,
         book_ids: Option<&[i64]>,
+        user_role_ids: Option<&[i64]>,
     ) -> Result<Vec<SearchHit>, String>;
 
     /// Look up the `book_id` for each requested page in one roundtrip.
@@ -166,4 +175,162 @@ pub trait SemanticDb: Send + Sync + 'static {
 
     /// Set a metadata value by key.
     async fn set_meta(&self, key: &str, value: &str) -> Result<(), String>;
+
+    // --- Permission ACL (page-level role visibility) ---
+
+    /// Replace the ACL row for one page. Deletes any prior `page_view_acl`
+    /// entries for `page_id` then inserts the new role list. `default_open`
+    /// is stored on the `pages` row (`acl_default_open` column) so the
+    /// query path can short-circuit role checks for fully-open pages.
+    async fn upsert_page_acl(&self, acl: &PageAcl) -> Result<(), String>;
+
+    /// Drop a page from the ACL store. Called on `page_delete` events.
+    async fn delete_page_acl(&self, page_id: i64) -> Result<(), String>;
+
+    /// Drop one role from every page's ACL. Called on `role_delete` events.
+    async fn delete_role_from_acl(&self, role_id: i64) -> Result<(), String>;
+
+    /// List page IDs that have a stored ACL. Used by the daily reconciliation
+    /// job to know which pages to refresh.
+    async fn list_acl_page_ids(&self) -> Result<Vec<i64>, String>;
+
+    // --- User role cache (token → BookStack user id → role IDs) ---
+
+    /// Look up cached roles for a token-user. Returns `None` when the
+    /// cache entry is missing or older than `max_age_secs`.
+    async fn get_cached_user_roles(
+        &self,
+        token_id_hash: &str,
+        max_age_secs: i64,
+    ) -> Result<Option<(i64, Vec<i64>)>, String>;
+
+    /// Cache the roles list for a token-user. `bookstack_user_id` is stored
+    /// alongside so callers can use it for per-user permission overrides.
+    async fn set_cached_user_roles(
+        &self,
+        token_id_hash: &str,
+        bookstack_user_id: i64,
+        role_ids: &[i64],
+    ) -> Result<(), String>;
+
+    /// Drop every cached entry for the given BookStack user. Called by the
+    /// webhook handler on `user_update` (role assignments may have changed)
+    /// and `user_delete` (account is gone).
+    async fn delete_user_role_cache_by_bs_id(&self, bookstack_user_id: i64) -> Result<(), String>;
+}
+
+/// v1.0.0 reconciliation index — structural mirror of every BookStack item we
+/// care about (shelves, books, chapters, pages) plus a page-body cache. Phase
+/// 4 of the identity-book-restructure RFC. The Phase 4 worker calls upsert_*
+/// to populate; Phase 5 cuts over read paths to use list/get_* in place of
+/// BookStack API calls.
+///
+/// All "soft delete" methods set `deleted = TRUE` rather than removing rows
+/// — that lets a subsequent reconcile distinguish "page never existed" from
+/// "page was deleted upstream" without having to re-query BookStack.
+#[async_trait]
+pub trait IndexDb: Send + Sync + 'static {
+    // --- Shelves ---
+
+    async fn upsert_indexed_shelf(&self, shelf: &IndexedShelf) -> Result<(), String>;
+    async fn get_indexed_shelf(&self, shelf_id: i64) -> Result<Option<IndexedShelf>, String>;
+    async fn soft_delete_indexed_shelf(&self, shelf_id: i64) -> Result<(), String>;
+
+    // --- Books ---
+
+    async fn upsert_indexed_book(&self, book: &IndexedBook) -> Result<(), String>;
+    async fn get_indexed_book(&self, book_id: i64) -> Result<Option<IndexedBook>, String>;
+    async fn list_indexed_books_by_shelf(&self, shelf_id: i64) -> Result<Vec<IndexedBook>, String>;
+    async fn list_indexed_books_by_identity(
+        &self,
+        identity_ouid: &str,
+    ) -> Result<Vec<IndexedBook>, String>;
+    async fn soft_delete_indexed_book(&self, book_id: i64) -> Result<(), String>;
+
+    // --- Chapters ---
+
+    async fn upsert_indexed_chapter(&self, chapter: &IndexedChapter) -> Result<(), String>;
+    async fn get_indexed_chapter(
+        &self,
+        chapter_id: i64,
+    ) -> Result<Option<IndexedChapter>, String>;
+    async fn list_indexed_chapters_by_book(
+        &self,
+        book_id: i64,
+    ) -> Result<Vec<IndexedChapter>, String>;
+    async fn soft_delete_indexed_chapter(&self, chapter_id: i64) -> Result<(), String>;
+
+    // --- Pages ---
+    //
+    // upsert_indexed_page writes both the index row AND the optional
+    // page_cache row in the same transaction. Keeping them in lockstep
+    // is what makes `bookstack_pages.page_updated_at == page_cache.page_updated_at`
+    // a reliable cache-hit invariant.
+
+    async fn upsert_indexed_page(
+        &self,
+        page: &IndexedPage,
+        cache: Option<&PageCache>,
+    ) -> Result<(), String>;
+    async fn get_indexed_page(&self, page_id: i64) -> Result<Option<IndexedPage>, String>;
+    async fn find_indexed_page_by_key(
+        &self,
+        identity_ouid: &str,
+        page_kind: PageKind,
+        page_key: &str,
+    ) -> Result<Option<IndexedPage>, String>;
+    async fn list_indexed_pages_by_chapter(
+        &self,
+        chapter_id: i64,
+    ) -> Result<Vec<IndexedPage>, String>;
+    async fn list_indexed_pages_by_book_root(
+        &self,
+        book_id: i64,
+    ) -> Result<Vec<IndexedPage>, String>;
+    /// Most-recently-updated pages within a book, sorted by `page_updated_at`
+    /// descending. Used by the briefing's recent-pages list (Phase 5
+    /// read-path cutover) to replace the live BookStack `get_book` traversal
+    /// with a local indexed lookup.
+    async fn list_indexed_pages_recent(
+        &self,
+        book_id: i64,
+        limit: i64,
+    ) -> Result<Vec<IndexedPage>, String>;
+    async fn soft_delete_indexed_page(&self, page_id: i64) -> Result<(), String>;
+
+    // --- Page cache ---
+
+    async fn get_page_cache(&self, page_id: i64) -> Result<Option<PageCache>, String>;
+
+    // --- Index jobs (mirrors embed_jobs shape) ---
+    //
+    // create_index_job dedupes on `scope` like create_embed_job does — if a
+    // pending or running job with the same scope exists, it's returned with
+    // `is_new = false` so the caller can decide whether to wait or no-op.
+
+    async fn create_index_job(
+        &self,
+        scope: &str,
+        kind: &str,
+        triggered_by: &str,
+    ) -> Result<(i64, bool), String>;
+    async fn claim_next_index_job(&self) -> Result<Option<IndexJob>, String>;
+    async fn update_index_job_progress(
+        &self,
+        job_id: i64,
+        progress: i64,
+        total: i64,
+    ) -> Result<(), String>;
+    async fn complete_index_job(
+        &self,
+        job_id: i64,
+        error: Option<&str>,
+    ) -> Result<(), String>;
+    async fn list_pending_index_jobs(&self, limit: i64) -> Result<Vec<IndexJob>, String>;
+    async fn get_latest_index_job(&self) -> Result<Option<IndexJob>, String>;
+
+    // --- Index meta (singleton key-value) ---
+
+    async fn get_index_meta(&self, key: &str) -> Result<Option<String>, String>;
+    async fn set_index_meta(&self, key: &str, value: &str) -> Result<(), String>;
 }

@@ -2,6 +2,8 @@
 
 Rust MCP server that bridges Claude to a BookStack instance via SSE and Streamable HTTP transports. Organized as a Cargo workspace with pluggable database backends and a separate embedder service.
 
+> Build, branching, CI/CD, versioning, and contributor workflow live in [DEVELOPMENT.md](DEVELOPMENT.md). This file is the architectural map and project-shape context for AI agents working in the codebase.
+
 ## Architecture
 
 ```
@@ -40,6 +42,14 @@ crates/
     src/main.rs          Job queue worker + HTTP /embed endpoint + provider selection
     src/embed.rs         Embedder trait + implementations (LocalEmbedder, OllamaEmbedder, OpenAIEmbedder)
     src/pipeline.rs      Embedding pipeline (fetch pages, chunk, embed, store)
+
+  bsmcp-worker/          Reconciliation worker binary (v1.1.0+)
+    src/main.rs          Env wiring, db init, BookStackClient, IndexWorker spawn
+    src/lib.rs           IndexWorker — owns the index_jobs queue. Initial full
+                         walk on cold start, polls for webhook + cron jobs,
+                         runs the periodic delta walk. Same database as the
+                         server (server's webhook handler enqueues; worker
+                         consumes).
 ```
 
 **Two transports:**
@@ -194,7 +204,6 @@ Used by `remember_identity action=list`, `remember_directory`, and the settings 
 - **User/Role CRUD** - Creating/deleting users/roles is admin-level; read-only is sufficient.
 - **PDF/ZIP export** - Binary formats can't be returned as MCP text content.
 
-
 ## Adding a New Tool
 
 1. **bookstack.rs** - Add the API method(s) to `BookStackClient`
@@ -220,55 +229,6 @@ The server implements OAuth 2.1 (authorization code + PKCE) with a browser-based
 1. **Form-based (primary):** Claude opens /authorize → user enters BookStack API token → server validates → stores credentials with auth code → redirects → code exchange issues access token.
 2. **Legacy Bearer:** `Authorization: Bearer token_id:token_secret` on SSE/messages endpoints (Claude Code direct connection).
 
-## Building
-
-```bash
-# Local build (both binaries)
-cargo build --release
-
-# Individual
-cargo build --release -p bsmcp-server
-cargo build --release -p bsmcp-embedder
-
-# Multi-arch Docker
-docker buildx build --builder multiarch --platform linux/amd64,linux/arm64 \
-  -f docker/Dockerfile.server \
-  -t ghcr.io/bees-roadhouse/bsmcp-server:VERSION --push .
-
-docker buildx build --builder multiarch --platform linux/amd64,linux/arm64 \
-  -f docker/Dockerfile.embedder \
-  -t ghcr.io/bees-roadhouse/bsmcp-embedder:VERSION --push .
-```
-
-Images:
-- `ghcr.io/bees-roadhouse/bsmcp-server` — MCP server (~35MB)
-- `ghcr.io/bees-roadhouse/bsmcp-embedder` — Embedder with ONNX (~45MB)
-
-## Docker Compose
-
-Two deployment options:
-
-- `docker/docker-compose.yml` — PostgreSQL (bsmcp-postgres + bsmcp-server + bsmcp-embedder)
-- `docker/docker-compose.sqlite.yml` — SQLite (bsmcp-server + bsmcp-embedder sharing a file)
-
-## Migration
-
-**SQLite → PostgreSQL auto-migration:** When `BSMCP_DB_BACKEND=postgres` and a SQLite DB exists at `BSMCP_DB_PATH`, the server auto-migrates on startup and renames the file to `.db.migrated`.
-
-**Manual migration:**
-```bash
-bsmcp-server migrate --from-sqlite /path/to/db --to-postgres postgres://user:pass@host/db
-```
-
-Migrates: access_tokens, pages, chunks (BLOB→pgvector), relationships, embed_jobs. Validates row counts.
-
-## Branch Info
-
-- `development` - default branch, active work lands here
-- `release` - stable/production branch, merged from development when ready
-- `enhancement/{name}` - branched from development for new functionality
-- `problem/{name}` - branched from development for bug fixes
-
 ## Breaking Changes Log
 
 ### v0.3.0 (from v0.2.x)
@@ -282,16 +242,3 @@ Migrates: access_tokens, pages, chunks (BLOB→pgvector), relationships, embed_j
 - `BSMCP_PUBLIC_URL` removed, replaced by `BSMCP_PUBLIC_DOMAIN` (domain only, not full URL)
 - Docker volume renamed `mcp-data` → `bsmcp-data` — data migration needed
 - OAuth now enforces PKCE (S256)
-
-## Git Workflow
-
-**Branching Model:**
-* `development` — default branch (HEAD), active work lands here
-* `release` — stable/production branch, merged from development when ready
-* `enhancement/{name}` — branched from development for new functionality
-* `problem/{name}` — branched from development for bug fixes and issue resolution
-* No `main` or `master` branches
-
-**GitHub Issues & Labels:**
-* New functionality uses the **enhancement** label, not "feature"
-* Configure repository labels accordingly

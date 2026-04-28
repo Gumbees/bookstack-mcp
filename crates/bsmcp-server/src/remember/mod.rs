@@ -16,17 +16,21 @@ pub mod directory;
 pub mod envelope;
 pub mod frontmatter;
 pub mod identity;
+pub mod journal_archive;
+pub mod migrate;
 pub mod naming;
 pub mod provision;
 pub mod search;
+pub mod section;
 pub mod singletons;
+pub mod user_provision;
 
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 
 use bsmcp_common::bookstack::BookStackClient;
-use bsmcp_common::db::DbBackend;
+use bsmcp_common::db::{DbBackend, IndexDb};
 use bsmcp_common::settings::{hash_token_id, UserSettings};
 use bsmcp_common::types::AuditEntryInsert;
 
@@ -44,6 +48,7 @@ pub async fn dispatch(
     token_id: &str,
     client: &BookStackClient,
     db: Arc<dyn DbBackend>,
+    index_db: Arc<dyn IndexDb>,
     semantic: Option<Arc<SemanticState>>,
 ) -> Value {
     let started = std::time::Instant::now();
@@ -56,7 +61,7 @@ pub async fn dispatch(
     let token_id_hash = hash_token_id(token_id);
 
     // Load user settings — None becomes default (everything disabled).
-    let settings = match db.get_user_settings(&token_id_hash).await {
+    let mut settings = match db.get_user_settings(&token_id_hash).await {
         Ok(Some(s)) => s,
         Ok(None) => UserSettings::default(),
         Err(e) => {
@@ -65,11 +70,42 @@ pub async fn dispatch(
         }
     };
 
+    // Client-pushed timezone refresh — accepted on every remember endpoint
+    // so the AI can keep the cache fresh from any call, not just briefing.
+    // No-op when the body doesn't carry one or when the cache is already
+    // recent and matches. We persist asynchronously and stamp the local
+    // `settings` immediately so the response's time block reflects the
+    // newly-pushed value.
+    let client_tz: Option<String> = body
+        .get("client_timezone")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s.parse::<chrono_tz::Tz>().is_ok());
+    let mut tz_just_pushed = false;
+    if let Some(ref tz) = client_tz {
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let needs_save = settings.timezone.as_deref() != Some(tz.as_str())
+            || settings.timezone_fetched_at.unwrap_or(0)
+                < now_unix - envelope::TIMEZONE_REFRESH_SECS;
+        if needs_save {
+            settings.timezone = Some(tz.clone());
+            settings.timezone_fetched_at = Some(now_unix);
+            if let Err(e) = db.save_user_settings(&token_id_hash, &settings).await {
+                eprintln!("Remember: failed to persist client_timezone (non-fatal): {e}");
+            }
+        }
+        tz_just_pushed = true;
+    }
+
     let ctx = Context {
         body,
         trace_id: trace_id.clone(),
         client: client.clone(),
         db: db.clone(),
+        index_db: index_db.clone(),
         semantic,
         settings,
         token_id_hash: token_id_hash.clone(),
@@ -78,8 +114,12 @@ pub async fn dispatch(
 
     let outcome = route(resource, action, &ctx).await;
 
-    // Best-effort audit logging (only on writes/deletes, not on every read).
-    let log_audit = matches!(action, "write" | "delete");
+    // Best-effort audit logging — every state-changing action is audited.
+    // Reads and dry-run actions are not.
+    let log_audit = matches!(
+        action,
+        "write" | "delete" | "append" | "update_section" | "append_section"
+    );
     if log_audit {
         let ouid = ctx.settings.ai_identity_ouid.clone();
         let user_id = ctx.settings.user_id.clone();
@@ -101,7 +141,15 @@ pub async fn dispatch(
     }
 
     let elapsed_ms = ctx.started.elapsed().as_millis() as u64;
-    let meta = envelope::build_meta(&trace_id, elapsed_ms, &ctx.settings, outcome.warnings.clone());
+    let globals = db.get_global_settings().await.unwrap_or_default();
+    let meta = envelope::build_meta(
+        &trace_id,
+        elapsed_ms,
+        &ctx.settings,
+        &globals,
+        outcome.warnings.clone(),
+        tz_just_pushed,
+    );
 
     match outcome.result {
         Ok(data) => json!({
@@ -109,15 +157,21 @@ pub async fn dispatch(
             "data": data,
             "meta": meta,
         }),
-        Err(err) => json!({
-            "ok": false,
-            "error": {
+        Err(err) => {
+            let mut error_obj = json!({
                 "code": err.code.as_str(),
                 "message": err.message,
                 "field": err.field,
-            },
-            "meta": meta,
-        }),
+            });
+            if let Some(fix) = err.fix {
+                error_obj["fix"] = fix;
+            }
+            json!({
+                "ok": false,
+                "error": error_obj,
+                "meta": meta,
+            })
+        }
     }
 }
 
@@ -127,8 +181,12 @@ async fn route(resource: &str, action: &str, ctx: &Context) -> Outcome {
         ("briefing", "read") => briefing::read(ctx).await,
         ("whoami", "read") => singletons::read_whoami(ctx).await,
         ("whoami", "write") => singletons::write_whoami(ctx).await,
+        ("whoami", "update_section") => singletons::update_section_whoami(ctx).await,
+        ("whoami", "append_section") => singletons::append_section_whoami(ctx).await,
         ("user", "read") => singletons::read_user(ctx).await,
         ("user", "write") => singletons::write_user(ctx).await,
+        ("user", "update_section") => singletons::update_section_user(ctx).await,
+        ("user", "append_section") => singletons::append_section_user(ctx).await,
         ("config", "read") => singletons::read_config(ctx).await,
         ("config", "write") => singletons::write_config(ctx).await,
         ("config", "dismiss_setup_nudge") => singletons::dismiss_setup_nudge(ctx).await,
@@ -144,6 +202,7 @@ async fn route(resource: &str, action: &str, ctx: &Context) -> Outcome {
         ("search", "read") => search::read(ctx).await,
         ("identity", a) => identity::handle(a, ctx).await,
         ("directory", "read") => directory::read(ctx).await,
+        ("migrate", a) => migrate::handle(a, ctx).await,
 
         _ => Outcome::error(ErrorCode::UnknownAction, format!("Unknown {resource}/{action}"), None),
     }
@@ -156,6 +215,10 @@ pub struct Context {
     pub trace_id: String,
     pub client: BookStackClient,
     pub db: Arc<dyn DbBackend>,
+    /// v1.0.0 reconciliation index. Read paths consult it first; write
+    /// paths can also use it for find-or-create dedup. SQLite has the
+    /// real impl; Postgres returns stub errors per #36.
+    pub index_db: Arc<dyn IndexDb>,
     pub semantic: Option<Arc<SemanticState>>,
     pub settings: UserSettings,
     pub token_id_hash: String,
@@ -214,6 +277,25 @@ impl Outcome {
                 code,
                 message: message.into(),
                 field: field.map(|s| s.to_string()),
+                fix: None,
+            }),
+            warnings: Vec::new(),
+            target_page_id: None,
+            target_key: None,
+        }
+    }
+
+    /// Construct a `settings_not_configured` error with the per-field
+    /// `fix` block automatically attached. Prefer this over `error(...)`
+    /// for missing-config errors so the AI gets actionable guidance every
+    /// time, not just on briefing.
+    pub fn settings_not_configured(field: &str, message: impl Into<String>) -> Self {
+        Self {
+            result: Err(RememberError {
+                code: ErrorCode::SettingsNotConfigured,
+                message: message.into(),
+                field: Some(field.to_string()),
+                fix: Some(envelope::fix_for_field(field)),
             }),
             warnings: Vec::new(),
             target_page_id: None,
@@ -239,4 +321,8 @@ pub struct RememberError {
     pub code: ErrorCode,
     pub message: String,
     pub field: Option<String>,
+    /// Optional structured fix instructions — populated for
+    /// `settings_not_configured` errors so the AI knows exactly which
+    /// MCP call to make next. Surfaced as `error.fix` in the envelope.
+    pub fix: Option<serde_json::Value>,
 }

@@ -32,20 +32,18 @@ pub async fn read(ctx: &Context) -> Outcome {
         "identities" => match globals.hive_shelf_id {
             Some(id) => id,
             None => {
-                return Outcome::error(
-                    ErrorCode::SettingsNotConfigured,
-                    "global hive_shelf_id is not set",
-                    Some("hive_shelf_id"),
+                return Outcome::settings_not_configured(
+                    "hive_shelf_id",
+                    "global hive_shelf_id is not set — admin must configure it before identities can be listed",
                 );
             }
         },
         "user_journals" => match globals.user_journals_shelf_id {
             Some(id) => id,
             None => {
-                return Outcome::error(
-                    ErrorCode::SettingsNotConfigured,
-                    "global user_journals_shelf_id is not set",
-                    Some("user_journals_shelf_id"),
+                return Outcome::settings_not_configured(
+                    "user_journals_shelf_id",
+                    "global user_journals_shelf_id is not set — admin must configure it before user journals can be listed",
                 );
             }
         },
@@ -57,6 +55,38 @@ pub async fn read(ctx: &Context) -> Outcome {
             );
         }
     };
+
+    // Phase 5b: try the index first for the books-on-shelf list. Falls back
+    // to the live BookStack `get_shelf` call on miss/error/empty so the
+    // call stays correct before the worker's first walk and on
+    // postgres-stub deployments.
+    if let Ok(indexed_books) = ctx.index_db.list_indexed_books_by_shelf(shelf_id).await {
+        if !indexed_books.is_empty() {
+            // Resolve shelf metadata from the index too if we have it.
+            let shelf_name = match ctx.index_db.get_indexed_shelf(shelf_id).await {
+                Ok(Some(s)) => Value::String(s.name),
+                _ => Value::Null,
+            };
+            let books: Vec<Value> = indexed_books
+                .into_iter()
+                .map(|b| {
+                    json!({
+                        "book_id": b.book_id,
+                        "name": b.name,
+                        "slug": b.slug,
+                        "url": Value::Null, // index doesn't store url; UI can derive from slug
+                    })
+                })
+                .collect();
+            return Outcome::ok(json!({
+                "kind": kind,
+                "shelf_id": shelf_id,
+                "shelf_name": shelf_name,
+                "count": books.len(),
+                "books": books,
+            }));
+        }
+    }
 
     let shelf = match ctx.client.get_shelf(shelf_id).await {
         Ok(s) => s,

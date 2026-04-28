@@ -55,9 +55,30 @@ pub struct UserSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_shared_collage_book_id: Option<i64>,
 
-    /// BookStack book ID for the AI's journal.
+    /// **Deprecated, kept for migration:** BookStack book ID for the legacy
+    /// per-identity Journal book. v1.0.0 collapsed this into a chapter inside
+    /// `ai_identity_book_id` — see `ai_identity_journal_chapter_id`. Stays in
+    /// the schema as a tombstone so `remember_migrate` and the briefing's
+    /// `setup_nudge` legacy detector can recognize an un-migrated identity.
+    /// Cleared automatically once `remember_migrate action=apply` finishes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_hive_journal_book_id: Option<i64>,
+
+    /// BookStack chapter ID of the `Agents` chapter inside the AI's Identity
+    /// book. Where agent definition pages (`Agent: <name>`) live. Required
+    /// for write paths that scaffold sub-agent definitions; reads degrade
+    /// gracefully when null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_identity_agents_chapter_id: Option<i64>,
+
+    /// BookStack chapter ID of the current-year `Journal` chapter inside the
+    /// AI's Identity book. Daily entries (`YYYY-MM-DD`) write here. The
+    /// year-rollover sweep (run on every `journal action=write`) moves any
+    /// stale-year pages into a `Journal Archive - {YEAR}` chapter
+    /// (find-or-created lazily, scoped strictly within
+    /// `ai_identity_book_id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_identity_journal_chapter_id: Option<i64>,
 
     // --- User identity ---
 
@@ -65,13 +86,39 @@ pub struct UserSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
 
+    /// BookStack user row ID for the calling token's owner. Set automatically
+    /// at /authorize when an admin token can resolve it via `/api/users`, or
+    /// manually via /settings. When set, semantic search resolves the user's
+    /// role IDs once per session (cached in `user_role_cache`) and applies a
+    /// role-level ACL filter to vector candidates — eliminating the per-page
+    /// HTTP fan-out for pages we already know the user can or cannot view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bookstack_user_id: Option<i64>,
+
     /// BookStack page ID of the user's identity page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_identity_page_id: Option<i64>,
 
+    /// BookStack book ID of the user's per-user identity book (where the
+    /// identity page + journal-agent definition page live). Auto-provisioned
+    /// on the user-journals shelf when the user first calls `remember_user`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_identity_book_id: Option<i64>,
+
+    /// BookStack page ID of the auto-provisioned `{user_id}-journal-agent`
+    /// agent definition page (lives in the user's identity book).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_journal_agent_page_id: Option<i64>,
+
     /// BookStack book ID of the user's personal journal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_journal_book_id: Option<i64>,
+
+    /// Domains owned by the user (e.g. `["example.com"]`). Surfaced in the
+    /// briefing's `system_prompt_additions` so the AI can distinguish "ours"
+    /// (URLs/emails on these domains) from external content.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domains: Vec<String>,
 
     // --- Semantic search toggles (default true except full_kb) ---
 
@@ -120,8 +167,21 @@ pub struct UserSettings {
     /// User's IANA timezone name (e.g., "America/New_York"). Surfaced in the
     /// briefing's `time` block so the AI can format timestamps in the user's
     /// local time. If unset, the briefing reports UTC.
+    ///
+    /// Auto-populated by the briefing when the client passes
+    /// `client_timezone`; manually editable on /settings; refreshed every
+    /// `TIMEZONE_REFRESH_SECS` so DST transitions and travel are picked up
+    /// without forcing the user to re-save settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
+
+    /// Unix epoch seconds the timezone was last set/refreshed by the client.
+    /// The briefing surfaces `timezone_refresh_due: true` when the cache is
+    /// older than 4h so the client knows to re-detect and pass `client_timezone`
+    /// on the next call. Manually-set values (via /settings) get a fresh
+    /// fetched_at too — no special casing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone_fetched_at: Option<i64>,
 
     /// Unix epoch seconds until which the briefing's "configure your settings"
     /// nudge is snoozed. When `now < this`, the nudge is suppressed. Set via
@@ -211,6 +271,19 @@ pub struct GlobalSettings {
     /// "instructions" (how to act). Admin-only. Page IDs only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub org_ai_usage_policy_page_ids: Vec<i64>,
+
+    /// Single page describing the organization itself (mission, structure,
+    /// people, conventions). Pulled verbatim into every briefing's
+    /// `system_prompt_additions` under an `## Organization` section. Pairs
+    /// with `org_domains` to give every agent on the instance a shared baseline.
+    /// Admin-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_identity_page_id: Option<i64>,
+
+    /// Domains owned by the org (e.g. `["example.com", "example.net"]`).
+    /// Surfaced in every briefing's `system_prompt_additions`. Admin-only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub org_domains: Vec<String>,
 
     /// Hash of the first token_id that set these values (informational; does
     /// not gate writes — UI handles the lock-after-set semantics).

@@ -33,15 +33,69 @@ async fn list(ctx: &Context) -> Outcome {
     let shelf_id = match globals.hive_shelf_id {
         Some(id) => id,
         None => {
-            return Outcome::error(
-                ErrorCode::SettingsNotConfigured,
-                "global hive_shelf_id is not set — configure it on /settings first",
-                Some("hive_shelf_id"),
+            return Outcome::settings_not_configured(
+                "hive_shelf_id",
+                "global hive_shelf_id is not set — only a BookStack admin can configure it via /settings or admin-only `remember_config action=write global_settings={hive_shelf_id: <id>}`",
             );
         }
     };
 
-    // Fetch the shelf and the books on it.
+    // Phase 5b: try the index first. The reconciliation worker classifies
+    // each book on the Hive shelf and stamps `identity_ouid` from the
+    // manifest's frontmatter at index time. So a single SQL query returns
+    // book + name + ouid per identity — no per-book BookStack roundtrip,
+    // no manifest-page guessing.
+    if let Ok(books) = ctx.index_db.list_indexed_books_by_shelf(shelf_id).await {
+        if !books.is_empty() {
+            let mut identities = Vec::new();
+            for book in books {
+                // Only surface books actually classified as identity-bearing.
+                // Pia's collage and the cross-identity collage live on the
+                // same shelf but aren't agent identities; the previous
+                // implementation included them, which was buggy (#26 RFC
+                // motivation #2).
+                use bsmcp_common::index::BookKind;
+                if !matches!(
+                    book.book_kind,
+                    BookKind::Identity | BookKind::UserIdentity
+                ) {
+                    continue;
+                }
+
+                // Manifest page id: query the index for the loose Identity
+                // page at the book root.
+                let manifest = ctx
+                    .index_db
+                    .list_indexed_pages_by_book_root(book.book_id)
+                    .await
+                    .ok()
+                    .and_then(|pages| {
+                        pages
+                            .into_iter()
+                            .find(|p| NamedResource::IdentityPage.matches(&p.name))
+                    });
+                let (page_id, page_name) = match manifest {
+                    Some(p) => (Some(p.page_id), p.name),
+                    None => (None, String::new()),
+                };
+                identities.push(json!({
+                    "book_id": book.book_id,
+                    "book_name": book.name,
+                    "manifest_page_id": page_id,
+                    "manifest_page_name": page_name,
+                    "ouid": book.identity_ouid,
+                }));
+            }
+            return Outcome::ok(json!({
+                "hive_shelf_id": shelf_id,
+                "count": identities.len(),
+                "identities": identities,
+            }));
+        }
+    }
+
+    // Fallback: the legacy BookStack-walking path. Used when the index is
+    // empty (worker hasn't run yet) or returns an error (postgres stub).
     let shelf = match ctx.client.get_shelf(shelf_id).await {
         Ok(s) => s,
         Err(e) => return Outcome::error(ErrorCode::BookStackError, e, Some("hive_shelf_id")),
@@ -56,11 +110,6 @@ async fn list(ctx: &Context) -> Outcome {
         }).collect())
         .unwrap_or_default();
 
-    // For each book, find the Identity manifest page (matches the naming convention).
-    // Run lookups in parallel. Goes through `list_book_pages_by_updated`
-    // (which uses `get_book`) so the book scope is honored — search would
-    // silently fall through to system-wide results without a positive
-    // keyword term.
     let mut handles = Vec::with_capacity(books.len());
     for (book_id, book_name) in books {
         let client = ctx.client.clone();
@@ -85,7 +134,6 @@ async fn list(ctx: &Context) -> Outcome {
             Some(p) => {
                 let pid = p.get("id").and_then(|i| i.as_i64());
                 let name = p.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
-                // Best-effort OUID extraction from frontmatter.
                 let ouid = match pid {
                     Some(id) => extract_ouid_from_page(&ctx.client, id).await,
                     None => None,
@@ -153,57 +201,114 @@ async fn create(ctx: &Context) -> Outcome {
     let hive_shelf_id = match globals.hive_shelf_id {
         Some(id) => id,
         None => {
-            return Outcome::error(
-                ErrorCode::SettingsNotConfigured,
-                "global hive_shelf_id is not set — configure it on /settings first",
-                Some("hive_shelf_id"),
+            return Outcome::settings_not_configured(
+                "hive_shelf_id",
+                "global hive_shelf_id is not set — admin must configure it before identities can be created",
             );
         }
     };
 
-    // 1. Create the Identity book on the Hive shelf — name = the agent's name (e.g., "Pia Identity").
+    // 1. Find-or-create the Identity book on the Hive shelf. Name is
+    //    "{Name} Identity" (e.g., "Pia Identity"). Re-running with the same
+    //    name reuses the existing book instead of duplicating.
     let book_name = format!("{} Identity", name);
     let book_description = format!("Identity book for the AI agent {}. Holds the manifest page.", name);
-    let book = match ctx.client.create_book(&book_name, &book_description).await {
-        Ok(v) => v,
-        Err(e) => return Outcome::error(ErrorCode::BookStackError, format!("create book failed: {e}"), None),
-    };
-    let book_id = match book.get("id").and_then(|i| i.as_i64()) {
+    let book_outcome = provision::find_or_create_book_on_shelf(
+        &ctx.client,
+        ctx.index_db.as_ref(),
+        hive_shelf_id,
+        &book_name,
+        &book_description,
+    )
+    .await;
+    let book_was_existing = matches!(book_outcome, provision::ProvisionResult::FoundExisting { .. });
+    let book_id = match book_outcome.id() {
         Some(id) => id,
-        None => return Outcome::error(ErrorCode::InternalError, "create_book returned no id", None),
+        None => return Outcome::error(
+            ErrorCode::BookStackError,
+            format!("identity book provisioning failed: {}", book_outcome.human(NamedResource::IdentityBook)),
+            None,
+        ),
     };
 
-    // Attach to the Hive shelf (best-effort).
-    if let Ok(shelf) = ctx.client.get_shelf(hive_shelf_id).await {
-        let mut existing: Vec<i64> = shelf
-            .get("books")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|b| b.get("id").and_then(|i| i.as_i64())).collect())
-            .unwrap_or_default();
-        if !existing.contains(&book_id) {
-            existing.push(book_id);
-        }
-        let _ = ctx.client.update_shelf(hive_shelf_id, &json!({ "books": existing })).await;
-    }
-
-    // 2. Render and create the manifest page.
+    // 2. Find-or-create the manifest page at the book root (loose, no chapter).
+    //    The body is only used at create time; reusing an existing manifest
+    //    page preserves whatever content the AI has accumulated there.
     let prompt_body = render_prompt(&template, &name, &ouid, custom_prompt.as_deref(), &additional_details);
     let manifest_fm = format!(
         "---\nai_identity_ouid: {}\nname: {}\ncreated_at: {}\ntrace_id: {}\n---\n\n",
         ouid, name, frontmatter::today_iso_date(), ctx.trace_id,
     );
-    let page_payload = json!({
-        "name": "Identity",
-        "book_id": book_id,
-        "markdown": format!("{manifest_fm}{prompt_body}"),
-    });
-    let page = match ctx.client.create_page(&page_payload).await {
-        Ok(v) => v,
-        Err(e) => return Outcome::error(ErrorCode::BookStackError, format!("create manifest page failed: {e}"), None),
-    };
-    let page_id = page.get("id").and_then(|i| i.as_i64());
+    let page_outcome = provision::find_or_create_page(
+        &ctx.client,
+        ctx.index_db.as_ref(),
+        Some(book_id),
+        None,
+        "Identity",
+        &format!("{manifest_fm}{prompt_body}"),
+    )
+    .await;
+    let page_was_existing = matches!(page_outcome, provision::ProvisionResult::FoundExisting { .. });
+    let page_id = page_outcome.id();
+    if page_id.is_none() {
+        return Outcome::error(
+            ErrorCode::BookStackError,
+            format!("manifest page provisioning failed: {}", page_outcome.human(NamedResource::IdentityPage)),
+            None,
+        );
+    }
 
-    // Lock the newly-created Identity book + manifest page to admin-only edit.
+    // 3. Find-or-create the two structural chapters inside the Identity
+    //    book. Phase 6 of the v1.0.0 restructure: agent definitions and
+    //    journal entries live in dedicated chapters, not loose at the book
+    //    root. Lazy-creating archive chapters at year rollover is a
+    //    separate concern in `remember_journal action=write`.
+    //
+    //    No "Subagent Conversations" chapter — agents track who they're
+    //    working with and what their sub-identities are doing in the
+    //    journal. Realtime cross-agent message/response runs in the
+    //    frame application, not BookStack.
+    let agents_chapter_id = provision::find_or_create_chapter(
+        &ctx.client,
+        ctx.index_db.as_ref(),
+        book_id,
+        "Agents",
+        "Agent definition pages for this AI identity (one page per sub-agent).",
+    )
+    .await
+    .id();
+    let journal_chapter_id = provision::find_or_create_chapter(
+        &ctx.client,
+        ctx.index_db.as_ref(),
+        book_id,
+        "Journal",
+        "Current-year daily journal entries. Year-rollover sweep moves stale entries into 'Journal Archive - {YEAR}' chapters.",
+    )
+    .await
+    .id();
+
+    // 4. Find-or-create the Collage book on the Hive shelf. Stays a separate
+    //    book per RFC: per-identity content discovery worked well in book
+    //    form and the shape doesn't conflict with the structural enforcement
+    //    we want for the identity book.
+    let collage_book_name = format!("{name}'s Collage");
+    let collage_book_description = format!(
+        "Topic/collage book for {name}. Active topics and content discovery."
+    );
+    let collage_outcome = provision::find_or_create_book_on_shelf(
+        &ctx.client,
+        ctx.index_db.as_ref(),
+        hive_shelf_id,
+        &collage_book_name,
+        &collage_book_description,
+    )
+    .await;
+    let collage_book_id = collage_outcome.id();
+
+    // Lock the Identity book + manifest page to admin-only edit. Idempotent —
+    // safe to re-run on a found-existing book/page (BookStack overwrites the
+    // permission row each call). The chapters inherit the book's permissions
+    // by default; locking individual chapters is unnecessary.
     if let Ok(role) = ctx.client.find_admin_role_id().await {
         provision::lock_to_admin_only(&ctx.client, bsmcp_common::bookstack::ContentType::Book, book_id, role).await;
         if let Some(pid) = page_id {
@@ -211,19 +316,41 @@ async fn create(ctx: &Context) -> Outcome {
         }
     }
 
+    let action_label = match (book_was_existing, page_was_existing) {
+        (true, true) => "found_existing",
+        (false, false) => "created",
+        _ => "partially_created",
+    };
+
+    let mut proposed = json!({
+        "ai_identity_book_id": book_id,
+        "ai_identity_page_id": page_id,
+        "ai_identity_name": name,
+        "ai_identity_ouid": ouid,
+    });
+    if let Some(id) = agents_chapter_id {
+        proposed["ai_identity_agents_chapter_id"] = json!(id);
+    }
+    if let Some(id) = journal_chapter_id {
+        proposed["ai_identity_journal_chapter_id"] = json!(id);
+    }
+    if let Some(id) = collage_book_id {
+        proposed["ai_collage_book_id"] = json!(id);
+    }
+
     Outcome::ok_with_target(
         json!({
-            "action": "created",
+            "action": action_label,
             "name": name,
             "ouid": ouid,
             "book_id": book_id,
+            "book_was_existing": book_was_existing,
             "manifest_page_id": page_id,
-            "proposed_settings": {
-                "ai_identity_book_id": book_id,
-                "ai_identity_page_id": page_id,
-                "ai_identity_name": name,
-                "ai_identity_ouid": ouid,
-            },
+            "manifest_page_was_existing": page_was_existing,
+            "agents_chapter_id": agents_chapter_id,
+            "journal_chapter_id": journal_chapter_id,
+            "collage_book_id": collage_book_id,
+            "proposed_settings": proposed,
         }),
         page_id,
         Some(name.clone()),

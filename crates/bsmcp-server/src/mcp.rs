@@ -9,7 +9,7 @@ use pulldown_cmark::{html, Options, Parser};
 use bsmcp_common::bookstack::{self, BookStackClient, ContentType, ExportFormat};
 use bsmcp_common::db::DbBackend;
 use crate::remember;
-use crate::semantic::SemanticState;
+use crate::semantic::{trim_match, SemanticState};
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
 
@@ -18,6 +18,7 @@ const PROTOCOL_VERSION: &str = "2025-03-26";
 /// from sprouting more positional args.
 pub struct RememberDeps {
     pub db: Arc<dyn DbBackend>,
+    pub index_db: Arc<dyn bsmcp_common::db::IndexDb>,
     pub semantic: Option<Arc<SemanticState>>,
     pub token_id: String,
 }
@@ -103,6 +104,15 @@ async fn execute_tool(
     // Remember tools share one dispatch path: tool name = "remember_{resource}",
     // action carried as an arg. Keeps the MCP tool count manageable.
     if let Some(resource) = name.strip_prefix("remember_") {
+        if !remember_enabled() {
+            // Defensive: a stale client could have cached the tool list
+            // before BSMCP_REMEMBER_ENABLED was set to false. Reject
+            // explicitly so the caller knows it's not a "tool not found"
+            // case but a deliberate disable.
+            return Err(
+                "Hive memory disabled (BSMCP_REMEMBER_ENABLED=false on this server)".to_string(),
+            );
+        }
         let action = arg_str_default(args, "action", "read");
         let mut body = args.clone();
         if let Value::Object(ref mut map) = body {
@@ -115,6 +125,7 @@ async fn execute_tool(
             &remember_deps.token_id,
             client,
             remember_deps.db.clone(),
+            remember_deps.index_db.clone(),
             remember_deps.semantic.clone(),
         )
         .await;
@@ -131,7 +142,12 @@ async fn execute_tool(
             let default_threshold = if hybrid { 0.45 } else { 0.50 };
             let threshold = args.get("threshold").and_then(|v| v.as_f64()).unwrap_or(default_threshold) as f32;
             let verbose = args.get("verbose").and_then(|v| v.as_bool()).unwrap_or(false);
-            let result = sem.search(&query, limit, threshold, hybrid, verbose, client, None).await?;
+            // ACL filter is left disabled at the raw `semantic_search` tool
+            // entry point — it has no UserSettings context to look up the
+            // caller's `bookstack_user_id`. The HTTP `filter_by_permission`
+            // fallback inside `sem.search` still enforces access control.
+            let mut result = sem.search(&query, limit, threshold, hybrid, verbose, client, None, None).await?;
+            trim_semantic_search_payload(&mut result);
             format_json(&result)
         }
         "reembed" => {
@@ -911,6 +927,35 @@ fn filter_string_update_fields(args: &Value, fields: &[&str]) -> Value {
 
 fn format_json(v: &Value) -> Result<String, String> {
     serde_json::to_string_pretty(v).map_err(|e| e.to_string())
+}
+
+/// `semantic_search` MCP-tool payload trim. Caps each result's chunks and
+/// truncates each chunk's content so a wide query doesn't blow past Claude
+/// Code's response-size budget (which would force the response to spill to a
+/// local file). Slightly more generous than the briefing's per-section trim
+/// because the caller asked for these results explicitly and gets one shot at
+/// them; the briefing pulls every session and amortizes across many tools.
+///
+/// Truncation logic itself lives in `crate::semantic::trim_match` — this
+/// function only owns the budget and the response-envelope hint.
+const SEMANTIC_SEARCH_CHUNK_LIMIT: usize = 5;
+const SEMANTIC_SEARCH_CHUNK_CHARS: usize = 200;
+const SEMANTIC_SEARCH_HINT: &str =
+    "Each result returns up to 5 chunks of ~200 chars (truncated chunks have `truncated: true` and end with …). \
+     These are search-result previews, not full page content — call `get_page(page_id)` to read the full markdown when a match looks relevant.";
+
+fn trim_semantic_search_payload(payload: &mut Value) {
+    let Some(obj) = payload.as_object_mut() else { return; };
+    if let Some(results) = obj.get_mut("results").and_then(|v| v.as_array_mut()) {
+        for result in results.iter_mut() {
+            // Drop into the shared helper. take() leaves Value::Null in the slot;
+            // we immediately overwrite it with the trimmed result so no consumer
+            // ever sees the placeholder.
+            let owned = std::mem::take(result);
+            *result = trim_match(owned, SEMANTIC_SEARCH_CHUNK_LIMIT, SEMANTIC_SEARCH_CHUNK_CHARS);
+        }
+    }
+    obj.insert("hint".to_string(), Value::String(SEMANTIC_SEARCH_HINT.to_string()));
 }
 
 fn format_search_results(data: &Value, base_url: &str) -> String {
@@ -1855,9 +1900,26 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
     // Remember protocol tools — one per resource. The `action` arg picks the
     // operation (read | write | search | delete depending on resource).
     // All return the same JSON envelope: { ok, data, meta, error }.
-    add_remember_tools(&mut tools);
+    // Gated by BSMCP_REMEMBER_ENABLED (default true). When false, the
+    // server runs as a plain BookStack proxy with no Hive memory surface.
+    if remember_enabled() {
+        add_remember_tools(&mut tools);
+    }
 
     tools
+}
+
+/// Whether the Hive memory surface is enabled. Reads BSMCP_REMEMBER_ENABLED;
+/// defaults true. Same parsing as the HTTP-route gate in main.rs so the
+/// MCP and HTTP surfaces flip together.
+fn remember_enabled() -> bool {
+    std::env::var("BSMCP_REMEMBER_ENABLED")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_lowercase();
+            !(v == "false" || v == "0" || v == "no" || v == "off")
+        })
+        .unwrap_or(true)
 }
 
 fn add_remember_tools(tools: &mut Vec<Value>) {
@@ -1868,16 +1930,39 @@ fn add_remember_tools(tools: &mut Vec<Value>) {
                 "enum": actions,
                 "description": "Operation to perform on this resource",
                 "default": actions.first().copied().unwrap_or("read"),
-            }
+            },
+            // client_timezone is accepted by EVERY remember endpoint, not
+            // just briefing. The server caches it in user_settings and
+            // refreshes whenever the cache is stale (>4h) or the value
+            // changes. Pass it whenever `meta.time.timezone_refresh_due`
+            // was true on a previous response.
+            "client_timezone": {
+                "type": "string",
+                "description": "Optional IANA timezone (e.g. \"America/New_York\"). Cached server-side; refresh when `meta.time.timezone_refresh_due` is true. Detect via your client's local time API.",
+            },
         });
         if let Value::Object(extra) = extra_props {
             if let Value::Object(ref mut p) = props {
                 for (k, v) in extra { p.insert(k, v); }
             }
         }
+        // Every remember_* tool ends with the same setup pointer so the AI
+        // knows what to do when a call returns settings_not_configured.
+        // The pointer is identical across tools intentionally — repeating it
+        // beats hoping the AI noticed it once on a different tool.
+        let full_description = format!(
+            "{description}\n\nSETUP: All remember_* tools require user/global settings. \
+             If this returns `settings_not_configured`, the response includes a \
+             structured `error.fix` block with the exact MCP call to make. \
+             Run `remember_briefing action=read` first — its `setup_nudge` enumerates \
+             every pending field and `meta.setup_incomplete` flags partial config on \
+             every response. \
+             TIME: every response carries `meta.time` with now_unix/now_utc/now_local/now_human \
+             and `timezone_refresh_due`. Pass `client_timezone` on any call to refresh."
+        );
         tool(
             &format!("remember_{resource}"),
-            description,
+            &full_description,
             json!({ "type": "object", "properties": props }),
         )
     }
@@ -1885,7 +1970,9 @@ fn add_remember_tools(tools: &mut Vec<Value>) {
     let common_collection_props = json!({
         "id": { "type": ["integer", "string"], "description": "BookStack page ID (for read/write/delete by id)" },
         "key": { "type": "string", "description": "Natural key (date YYYY-MM-DD for journals, slug for topics, lowercase name for subagents)" },
-        "body": { "type": "string", "description": "Markdown body for write" },
+        "body": { "type": "string", "description": "Markdown body for write/append/update_section/append_section" },
+        "section": { "type": "string", "description": "H2 heading text for update_section / append_section. Match is exact (whitespace-trimmed). If the section doesn't exist it gets appended." },
+        "timestamp": { "type": "boolean", "description": "When true on action=append, prefix the appended chunk with a `## HH:MM TZ` heading using the user's local timezone — useful for multi-append-per-day journal entries.", "default": false },
         "query": { "type": "string", "description": "Search query for action=search" },
         "limit": { "type": "integer", "default": 25 },
         "offset": { "type": "integer", "default": 0 },
@@ -1896,7 +1983,7 @@ fn add_remember_tools(tools: &mut Vec<Value>) {
     // Singletons
     tools.push(remember_tool(
         "briefing",
-        "Reconstitution dossier — one structured pull replacing the multi-call AI bootstrap. Returns identity manifest, user identity, recent journals, active topics, semantic matches against the user_prompt, and config metadata.",
+        "Reconstitution dossier — one structured pull replacing the multi-call AI bootstrap. Returns identity manifest, user identity, recent journals, active topics, semantic matches against the user_prompt, and config metadata. The full setup_nudge surfaces here when settings are incomplete.",
         &["read"],
         json!({
             "user_prompt": { "type": "string", "description": "First user message — drives semantic prioritization" },
@@ -1907,29 +1994,42 @@ fn add_remember_tools(tools: &mut Vec<Value>) {
 
     tools.push(remember_tool(
         "whoami",
-        "AI agent identity. read returns the manifest page + subagent list + book/chapter pointers. write replaces the manifest page body (frontmatter auto-stamped).",
-        &["read", "write"],
+        "AI agent identity. read returns the manifest page + subagent list + book/chapter pointers. \
+         write replaces the manifest page body (frontmatter auto-stamped) — destructive. \
+         update_section replaces just the named H2 section's body, preserving every other section. \
+         append_section appends to the named section's body (creates the section if missing). \
+         Prefer update_section / append_section over write for incremental edits — write is full-replace and rarely what you want.",
+        &["read", "write", "update_section", "append_section"],
         json!({
-            "body": { "type": "string", "description": "New manifest markdown for write" },
+            "body": { "type": "string", "description": "New manifest markdown for write, OR section content for update_section/append_section" },
+            "section": { "type": "string", "description": "H2 heading text for update_section / append_section. Match is exact (whitespace-trimmed). If the section doesn't exist it gets appended." },
         }),
     ));
 
     tools.push(remember_tool(
         "user",
-        "Human user identity. read returns the user's identity page + journal pointer. write replaces the user identity page body.",
-        &["read", "write"],
+        "Human user identity. read auto-provisions missing structure (per-user Identity book on the user-journals shelf, Identity page, Agent: {user_id}-journal-agent page, journal book) when `user_id` is set, returning what was created in `auto_provisioned`. \
+         write replaces the user identity page body — destructive. \
+         update_section replaces just the named H2 section, preserving every other section. \
+         append_section appends to the named section's body (creates the section if missing). \
+         IMPORTANT: as you work with the user, learn what they care about, how they prefer to collaborate, and update the identity page to reflect that — the briefing surfaces a refresh reminder after 30 days of inactivity. Prefer update_section / append_section over write for incremental edits.",
+        &["read", "write", "update_section", "append_section"],
         json!({
-            "body": { "type": "string", "description": "New user identity markdown for write" },
+            "body": { "type": "string", "description": "New user identity markdown for write, OR section content for update_section/append_section" },
+            "section": { "type": "string", "description": "H2 heading text for update_section / append_section. Match is exact (whitespace-trimmed). If the section doesn't exist it gets appended." },
         }),
     ));
 
     tools.push(remember_tool(
         "config",
-        "Per-user settings AND (admin-only) global shelves. read returns both `{settings, global_settings}`. write accepts `settings` (per-user — any user) and/or `global_settings` (admin-only, server-side first-write-wins; pre-set fields cannot be changed and trigger a `global_locked` warning). dismiss_setup_nudge snoozes the briefing's setup reminder for `days` days (default 7, max 365).",
+        "Per-user settings AND (admin-only) global shelves. read returns both `{settings, global_settings}`. write accepts `settings` (per-user — any user) and/or `global_settings` (admin-only, server-side first-write-wins for shelf and org_identity_page IDs; org_domains and org-default identity are tunable). \
+         Per-user fields the AI typically maintains: `domains` (list of strings — owned domains for ours/external classification), `bookstack_user_id` (numeric BookStack user id, enables ACL-filtered semantic search), `user_id` (stable identifier, drives auto-provisioning naming), plus the ai_*/user_* book/page IDs. \
+         Admin-only globals: `hive_shelf_id`, `user_journals_shelf_id`, `org_identity_page_id` (first-write-wins), `org_domains` (replaces on write), and the org-default identity fields. \
+         dismiss_setup_nudge snoozes the briefing's setup reminder for `days` days (default 7, max 365).",
         &["read", "write", "dismiss_setup_nudge"],
         json!({
             "settings": { "type": "object", "description": "Full UserSettings object for per-user write" },
-            "global_settings": { "type": "object", "description": "GlobalSettings object (admin-only). Only null fields are written; set fields are preserved." },
+            "global_settings": { "type": "object", "description": "GlobalSettings object (admin-only). Only null fields are written; set fields are preserved (except org_domains which replaces)." },
             "days": { "type": "integer", "description": "For dismiss_setup_nudge: how many days to snooze (default 7, max 365)" },
         }),
     ));
@@ -1938,28 +2038,28 @@ fn add_remember_tools(tools: &mut Vec<Value>) {
     tools.push(remember_tool(
         "journal",
         "AI agent's daily journal entries (book of pages, monthly chapters auto-managed). Key = date YYYY-MM-DD; defaults to today on write if omitted.",
-        &["read", "write", "search", "delete"],
+        &["read", "write", "append", "update_section", "append_section", "search", "delete"],
         common_collection_props.clone(),
     ));
 
     tools.push(remember_tool(
         "collage",
         "AI agent's active topics. Key = topic slug. Pages live directly in the configured Topics book.",
-        &["read", "write", "search", "delete"],
+        &["read", "write", "append", "update_section", "append_section", "search", "delete"],
         common_collection_props.clone(),
     ));
 
     tools.push(remember_tool(
         "shared_collage",
         "Cross-agent shared topics. Same shape as collage but a different parent book.",
-        &["read", "write", "search", "delete"],
+        &["read", "write", "append", "update_section", "append_section", "search", "delete"],
         common_collection_props.clone(),
     ));
 
     tools.push(remember_tool(
         "user_journal",
         "Human user's journal (when configured by the user). Key = date YYYY-MM-DD with monthly chapters auto-managed.",
-        &["read", "write", "search", "delete"],
+        &["read", "write", "append", "update_section", "append_section", "search", "delete"],
         common_collection_props.clone(),
     ));
 
@@ -2012,6 +2112,14 @@ fn add_remember_tools(tools: &mut Vec<Value>) {
         json!({
             "kind": { "type": "string", "enum": ["identities", "user_journals"], "description": "Which global shelf to enumerate" },
         }),
+    ));
+
+    // Migrate (Phase 7 v1.0.0 chapter restructure)
+    tools.push(remember_tool(
+        "migrate",
+        "Migrate an AI identity from the legacy book layout to the v1.0.0 chapter structure. action=plan dry-runs and returns the proposed steps. action=apply executes the plan: scaffolds Agents/Journal chapters, moves loose Agent: pages into the Agents chapter, moves legacy journal book pages into the Journal chapter, runs the year-rollover sweep, and clears the legacy ai_hive_journal_book_id pointer. Idempotent — safe to re-run after partial failures. action=status returns a per-check breakdown of whether the identity is fully migrated.",
+        &["plan", "apply", "status"],
+        json!({}),
     ));
 }
 

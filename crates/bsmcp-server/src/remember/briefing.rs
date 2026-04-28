@@ -67,13 +67,25 @@ pub async fn read(ctx: &Context) -> Outcome {
     let identity_fut = fetch_optional_page(&ctx.client, resolved.page_id);
     let user_fut = fetch_optional_page(&ctx.client, ctx.settings.user_identity_page_id);
 
-    // Recent journals (newest pages in each journal book — both the AI's
-    // reflection journal and the user's personal journal).
-    let recent_journals_fut = list_recent_pages(
-        ctx.settings.ai_hive_journal_book_id,
-        recent_count,
-        ctx,
-    );
+    // Recent journals — Phase 6 reads from the per-identity Journal
+    // chapter when configured (`ai_identity_journal_chapter_id`); falls
+    // back to the legacy journal book pointer for un-migrated identities
+    // (`ai_hive_journal_book_id`). Once `remember_migrate apply` clears
+    // the legacy field, only the chapter path runs.
+    let recent_journals_fut: futures::future::BoxFuture<'_, Vec<Value>> =
+        if ctx.settings.ai_identity_journal_chapter_id.is_some() {
+            Box::pin(list_recent_pages_in_chapter(
+                ctx.settings.ai_identity_journal_chapter_id,
+                recent_count,
+                ctx,
+            ))
+        } else {
+            Box::pin(list_recent_pages(
+                ctx.settings.ai_hive_journal_book_id,
+                recent_count,
+                ctx,
+            ))
+        };
     let recent_user_journal_fut = list_recent_pages(
         ctx.settings.user_journal_book_id,
         recent_count,
@@ -175,7 +187,13 @@ pub async fn read(ctx: &Context) -> Outcome {
         };
 
         if ctx.settings.semantic_against_journal {
-            slice.journal_matches = filter_by_book(&raw, ctx.settings.ai_hive_journal_book_id, 5);
+            // Phase 6: chapter-parented journal first, fall back to legacy
+            // book pointer for un-migrated identities.
+            slice.journal_matches = if ctx.settings.ai_identity_journal_chapter_id.is_some() {
+                filter_by_chapter(&raw, ctx.settings.ai_identity_journal_chapter_id, 5)
+            } else {
+                filter_by_book(&raw, ctx.settings.ai_hive_journal_book_id, 5)
+            };
         }
         if ctx.settings.semantic_against_collage {
             slice.collage_matches = filter_by_book(&raw, ctx.settings.ai_collage_book_id, 5);
@@ -491,6 +509,51 @@ async fn fetch_optional_page(client: &BookStackClient, page_id: Option<i64>) -> 
 /// so the briefing keeps working before the worker's first full
 /// walk and on Postgres deployments where the IndexDb impl is
 /// still a stub (#36).
+/// List the most-recently-updated pages inside a chapter, using the index
+/// first and falling back to live BookStack. Sibling of
+/// `list_recent_pages`; used for the per-identity journal which now lives
+/// in a chapter rather than a book.
+async fn list_recent_pages_in_chapter(
+    chapter_id: Option<i64>,
+    limit: usize,
+    ctx: &Context,
+) -> Vec<Value> {
+    let Some(chapter_id) = chapter_id else { return Vec::new(); };
+
+    if let Ok(pages) = ctx.index_db.list_indexed_pages_by_chapter(chapter_id).await {
+        if !pages.is_empty() {
+            let mut sorted = pages;
+            sorted.sort_by(|a, b| b.page_updated_at.cmp(&a.page_updated_at));
+            return sorted
+                .into_iter()
+                .take(limit)
+                .map(|p| json!({
+                    "page_id": p.page_id,
+                    "name": p.name,
+                    "url": p.url,
+                    "updated_at": p.page_updated_at,
+                }))
+                .collect();
+        }
+    }
+
+    match ctx.client.list_chapter_pages_by_updated(chapter_id, limit).await {
+        Ok(pages) => pages
+            .into_iter()
+            .map(|p| json!({
+                "page_id": p.get("id").cloned().unwrap_or(Value::Null),
+                "name": p.get("name").cloned().unwrap_or(Value::Null),
+                "url": p.get("url").cloned().unwrap_or(Value::Null),
+                "updated_at": p.get("updated_at").cloned().unwrap_or(Value::Null),
+            }))
+            .collect(),
+        Err(e) => {
+            eprintln!("Briefing: list_chapter_pages_by_updated({chapter_id}) failed: {e}");
+            Vec::new()
+        }
+    }
+}
+
 async fn list_recent_pages(book_id: Option<i64>, limit: usize, ctx: &Context) -> Vec<Value> {
     let Some(book_id) = book_id else { return Vec::new(); };
 
@@ -548,6 +611,19 @@ fn filter_by_book(hits: &[Value], book_id: Option<i64>, limit: usize) -> Vec<Val
         .collect()
 }
 
+/// Same as [`filter_by_book`] but matches `chapter_id` instead. Used by the
+/// per-identity journal section since pages live in a chapter rather than
+/// directly in a book.
+fn filter_by_chapter(hits: &[Value], chapter_id: Option<i64>, limit: usize) -> Vec<Value> {
+    let Some(chapter_id) = chapter_id else { return Vec::new(); };
+    hits.iter()
+        .filter(|h| h.get("chapter_id").and_then(|v| v.as_i64()) == Some(chapter_id))
+        .take(limit)
+        .cloned()
+        .map(|h| trim_match(h, PER_BOOK_CHUNK_LIMIT, PER_BOOK_CHUNK_CHARS))
+        .collect()
+}
+
 /// Collect the book IDs that the user has configured AND has the matching
 /// semantic toggle on for. Used as the vector-search scope when
 /// `semantic_against_full_kb` is off — we only embed against books the user
@@ -556,7 +632,15 @@ fn filter_by_book(hits: &[Value], book_id: Option<i64>, limit: usize) -> Vec<Val
 fn configured_semantic_book_ids(s: &bsmcp_common::settings::UserSettings) -> Vec<i64> {
     let mut ids: Vec<i64> = Vec::with_capacity(4);
     if s.semantic_against_journal {
-        if let Some(id) = s.ai_hive_journal_book_id { ids.push(id); }
+        // Phase 6: journal pages live inside the Identity book (in the
+        // Journal chapter). The vector backend doesn't accept chapter
+        // filters yet, so we widen the scope to the whole Identity book
+        // and rely on the post-filter (`filter_by_chapter`) to narrow
+        // results back to journal entries. Falls back to the legacy
+        // journal-book pointer for un-migrated identities.
+        if let Some(id) = s.ai_identity_book_id.or(s.ai_hive_journal_book_id) {
+            ids.push(id);
+        }
     }
     if s.semantic_against_collage {
         if let Some(id) = s.ai_collage_book_id { ids.push(id); }
@@ -621,10 +705,15 @@ fn pending_user_fields(s: &bsmcp_common::settings::UserSettings) -> Vec<Value> {
             "why": "AI agent's manifest page. The briefing falls back to org default if set, otherwise identity is empty.",
         }));
     }
-    if s.ai_hive_journal_book_id.is_none() {
+    // Phase 6: writes go to `ai_identity_journal_chapter_id` (chapter-
+    // parented). Surface a missing-config nudge when *neither* the new
+    // chapter nor the legacy book pointer is set; un-migrated identities
+    // with the legacy book stay quiet here and get the migrate nudge
+    // from `setup_nudge` instead.
+    if s.ai_identity_journal_chapter_id.is_none() && s.ai_hive_journal_book_id.is_none() {
         out.push(json!({
-            "field": "ai_hive_journal_book_id",
-            "why": "AI's journal book. `remember_journal action=write` won't work without it.",
+            "field": "ai_identity_journal_chapter_id",
+            "why": "AI's journal chapter. `remember_journal action=write` won't work without it. Run `remember_identity action=create` to scaffold the Identity book + chapters.",
         }));
     }
     if s.user_journal_book_id.is_none() {

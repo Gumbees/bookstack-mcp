@@ -1,6 +1,6 @@
 # Repository Structure
 
-_Auto-generated on 2026-04-28 04:35 UTC from commit `77626af`._
+_Auto-generated on 2026-04-28 05:07 UTC from commit `14ff8d0`._
 
 ```
 .
@@ -32,24 +32,29 @@ _Auto-generated on 2026-04-28 04:35 UTC from commit `77626af`._
 │   │   │   ├── main.rs
 │   │   │   └── pipeline.rs
 │   │   └── Cargo.toml
-│   └── bsmcp-server
+│   ├── bsmcp-server
+│   │   ├── src
+│   │   │   ├── remember
+│   │   │   ├── llm.rs
+│   │   │   ├── main.rs
+│   │   │   ├── mcp.rs
+│   │   │   ├── migrate.rs
+│   │   │   ├── oauth.rs
+│   │   │   ├── semantic.rs
+│   │   │   ├── settings_ui.rs
+│   │   │   ├── sse.rs
+│   │   │   ├── staging.rs
+│   │   │   └── summary.rs
+│   │   └── Cargo.toml
+│   └── bsmcp-worker
 │       ├── src
-│       │   ├── remember
-│       │   ├── index_worker.rs
-│       │   ├── llm.rs
-│       │   ├── main.rs
-│       │   ├── mcp.rs
-│       │   ├── migrate.rs
-│       │   ├── oauth.rs
-│       │   ├── semantic.rs
-│       │   ├── settings_ui.rs
-│       │   ├── sse.rs
-│       │   ├── staging.rs
-│       │   └── summary.rs
+│       │   ├── lib.rs
+│       │   └── main.rs
 │       └── Cargo.toml
 ├── docker
 │   ├── Dockerfile.embedder
 │   ├── Dockerfile.server
+│   ├── Dockerfile.worker
 │   ├── docker-compose.sqlite.yml
 │   └── docker-compose.yml
 ├── scripts
@@ -64,5 +69,5 @@ _Auto-generated on 2026-04-28 04:35 UTC from commit `77626af`._
 ├── STRUCTURE.md
 └── entrypoint.sh
 
-15 directories, 45 files
+17 directories, 48 files
 ```

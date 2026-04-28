@@ -1,4 +1,25 @@
+# syntax=docker/dockerfile:1.7
+#
+# bsmcp-embedder — built-in ONNX/Ollama/OpenAI embedding worker.
+#
+# OPT-IN deployment: required only when running the bundled embedder
+# provider. Deployments configured for external embedders (Ollama on a
+# separate host, OpenAI API, etc.) don't need this image at all — they
+# only need bsmcp-server, which talks to the external endpoint.
+#
+# Build performance: this image links ONNX Runtime via fastembed, which
+# means a cold build is dominated by compiling fastembed/ort (especially
+# on linux/arm64 via QEMU emulation — 15+ minutes). To keep iterative
+# builds fast, this Dockerfile uses BuildKit `--mount=type=cache` for the
+# cargo target dir + crate registry + git index. Subsequent builds reuse
+# the dep-tree compilation across PR pushes.
+#
+# Cache mount IDs include $TARGETPLATFORM so linux/amd64 and linux/arm64
+# don't poison each other's caches.
+
 FROM ubuntu:24.04 AS builder
+
+ARG TARGETPLATFORM
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl build-essential pkg-config libssl-dev ca-certificates \
@@ -11,7 +32,20 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 
-RUN cargo build --release -p bsmcp-embedder
+# BuildKit cache mounts so cargo's target dir + registry + git index
+# persist across builds. The first build is still cold (~15min on arm64
+# via QEMU); every subsequent build with an unchanged Cargo.lock is
+# incremental and only recompiles changed-crate sources (~30s typical).
+#
+# After cargo finishes, copy the binary OUT of the cache mount into a
+# regular layer (`/out/`) so the final-stage COPY can reach it — content
+# inside cache mounts is not present in the produced image filesystem.
+RUN --mount=type=cache,target=/app/target,id=embedder-target-${TARGETPLATFORM} \
+    --mount=type=cache,target=/root/.cargo/registry,id=cargo-registry-${TARGETPLATFORM} \
+    --mount=type=cache,target=/root/.cargo/git,id=cargo-git-${TARGETPLATFORM} \
+    cargo build --release -p bsmcp-embedder \
+ && mkdir -p /out \
+ && cp /app/target/release/bsmcp-embedder /out/bsmcp-embedder
 
 FROM ubuntu:24.04
 
@@ -19,7 +53,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libssl3t64 gosu \
  && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/bsmcp-embedder /usr/local/bin/bsmcp-embedder
+COPY --from=builder /out/bsmcp-embedder /usr/local/bin/bsmcp-embedder
 COPY entrypoint.sh /entrypoint.sh
 RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 

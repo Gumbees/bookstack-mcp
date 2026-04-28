@@ -107,6 +107,29 @@ This trades CI minutes for a small contributor onboarding step. The gate is pres
 
 If you push the commit before pushing the image, the verify check fails with a clear error pointing at the script. Run it, then re-trigger the check (push an empty commit or click "Re-run jobs" in GitHub Actions).
 
+### Path-aware fast path (`scripts/publish-pr-image.sh`)
+
+The publish script diffs your branch against `origin/development` and skips the rebuild for any binary whose dependency files didn't change. It retags the latest published `:dev` image as the per-PR tags instead — a manifest-only operation that takes seconds.
+
+What counts as "changed paths":
+
+| Binary | Paths that trigger a rebuild |
+|---|---|
+| `bsmcp-server` | `crates/bsmcp-server/`, `crates/bsmcp-common/`, `crates/bsmcp-db-sqlite/`, `crates/bsmcp-db-postgres/`, `Cargo.toml`, `Cargo.lock`, `docker/Dockerfile.server`, `entrypoint.sh` |
+| `bsmcp-embedder` | `crates/bsmcp-embedder/`, `crates/bsmcp-common/`, `crates/bsmcp-db-sqlite/`, `crates/bsmcp-db-postgres/`, `Cargo.toml`, `Cargo.lock`, `docker/Dockerfile.embedder`, `entrypoint.sh` |
+
+Note that PRs touching `crates/bsmcp-server/` only — like most v1.0.0 phase work — skip the embedder rebuild entirely. That's the change that takes a typical PR from ~25 min of multi-arch build time down to ~10 min.
+
+Override with `scripts/publish-pr-image.sh both --force` if you need to force a full rebuild (e.g., to validate a Dockerfile change that the path filter would otherwise miss).
+
+### Cargo target / registry caching
+
+Both Dockerfiles use BuildKit `--mount=type=cache` for `target/`, `~/.cargo/registry`, and `~/.cargo/git`. The first build is still cold (~15 min on linux/arm64 via QEMU), but subsequent builds reuse the dep-tree compilation across PR pushes. Cache mount IDs include `$TARGETPLATFORM` so linux/amd64 and linux/arm64 don't poison each other's caches.
+
+### Embedder is opt-in for deployments
+
+`bsmcp-embedder` is required only when running the **built-in** embedder provider (the default `BSMCP_EMBED_PROVIDER=local` ONNX model). Deployments configured for external providers (`ollama`, `openai`) don't need the embedder container at all — `bsmcp-server` talks to the external endpoint directly.
+
 **One-time setup:**
 
 ```bash

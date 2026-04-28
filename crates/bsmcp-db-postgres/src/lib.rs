@@ -1613,50 +1613,649 @@ impl SemanticDb for PostgresDb {
     }
 }
 
-// --- IndexDb impl (Phase 4a stubs) ---
+// --- IndexDb impl (closes #36) ---
 //
-// The Postgres impl is intentionally a thin error-returning stub for now;
-// the SQLite impl is real and Phase 4b will develop and test against it
-// first. A follow-up PR fills in the Postgres SQL — issue #36.
-
-const NOT_YET: &str =
-    "Phase 4a: IndexDb impl on Postgres is a stub — see issue #36. \
-     Run with BSMCP_DB_BACKEND=sqlite for v1.0.0 phase 4 testing.";
+// Mirrors the SQLite impl in `bsmcp-db-sqlite/src/lib.rs`. Postgres
+// differences from SQLite worth noting:
+//   - $1/$2 placeholders, not ?1/?2.
+//   - Real BOOLEAN type (no 0/1 conversion needed).
+//   - BIGSERIAL on `index_jobs.id`, so create_index_job uses RETURNING id
+//     instead of last_insert_rowid().
+//   - claim_next_index_job uses FOR UPDATE SKIP LOCKED so multiple worker
+//     processes can run safely against the same database.
+//   - upsert_indexed_page wraps the page row + optional page_cache row in
+//     a single transaction, same as SQLite.
 
 #[async_trait]
 impl IndexDb for PostgresDb {
-    async fn upsert_indexed_shelf(&self, _shelf: &IndexedShelf) -> Result<(), String> { Err(NOT_YET.to_string()) }
-    async fn get_indexed_shelf(&self, _id: i64) -> Result<Option<IndexedShelf>, String> { Err(NOT_YET.to_string()) }
-    async fn soft_delete_indexed_shelf(&self, _id: i64) -> Result<(), String> { Err(NOT_YET.to_string()) }
+    // --- Shelves ---
 
-    async fn upsert_indexed_book(&self, _book: &IndexedBook) -> Result<(), String> { Err(NOT_YET.to_string()) }
-    async fn get_indexed_book(&self, _id: i64) -> Result<Option<IndexedBook>, String> { Err(NOT_YET.to_string()) }
-    async fn list_indexed_books_by_shelf(&self, _id: i64) -> Result<Vec<IndexedBook>, String> { Err(NOT_YET.to_string()) }
-    async fn list_indexed_books_by_identity(&self, _ouid: &str) -> Result<Vec<IndexedBook>, String> { Err(NOT_YET.to_string()) }
-    async fn soft_delete_indexed_book(&self, _id: i64) -> Result<(), String> { Err(NOT_YET.to_string()) }
+    async fn upsert_indexed_shelf(&self, shelf: &IndexedShelf) -> Result<(), String> {
+        sqlx::query(
+            "INSERT INTO bookstack_shelves (shelf_id, name, slug, shelf_kind, indexed_at, deleted)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (shelf_id) DO UPDATE SET
+                 name = EXCLUDED.name,
+                 slug = EXCLUDED.slug,
+                 shelf_kind = EXCLUDED.shelf_kind,
+                 indexed_at = EXCLUDED.indexed_at,
+                 deleted = EXCLUDED.deleted",
+        )
+        .bind(shelf.shelf_id)
+        .bind(&shelf.name)
+        .bind(&shelf.slug)
+        .bind(shelf.shelf_kind.as_str())
+        .bind(shelf.indexed_at)
+        .bind(shelf.deleted)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("upsert_indexed_shelf: {e}"))?;
+        Ok(())
+    }
 
-    async fn upsert_indexed_chapter(&self, _chapter: &IndexedChapter) -> Result<(), String> { Err(NOT_YET.to_string()) }
-    async fn get_indexed_chapter(&self, _id: i64) -> Result<Option<IndexedChapter>, String> { Err(NOT_YET.to_string()) }
-    async fn list_indexed_chapters_by_book(&self, _id: i64) -> Result<Vec<IndexedChapter>, String> { Err(NOT_YET.to_string()) }
-    async fn soft_delete_indexed_chapter(&self, _id: i64) -> Result<(), String> { Err(NOT_YET.to_string()) }
+    async fn get_indexed_shelf(&self, shelf_id: i64) -> Result<Option<IndexedShelf>, String> {
+        let row = sqlx::query(
+            "SELECT shelf_id, name, slug, shelf_kind, indexed_at, deleted
+             FROM bookstack_shelves WHERE shelf_id = $1",
+        )
+        .bind(shelf_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("get_indexed_shelf: {e}"))?;
+        Ok(row.map(|r| {
+            let kind_str: String = r.get("shelf_kind");
+            IndexedShelf {
+                shelf_id: r.get("shelf_id"),
+                name: r.get("name"),
+                slug: r.get("slug"),
+                shelf_kind: kind_str.parse().unwrap_or(ShelfKind::Unclassified),
+                indexed_at: r.get("indexed_at"),
+                deleted: r.get("deleted"),
+            }
+        }))
+    }
 
-    async fn upsert_indexed_page(&self, _page: &IndexedPage, _cache: Option<&PageCache>) -> Result<(), String> { Err(NOT_YET.to_string()) }
-    async fn get_indexed_page(&self, _id: i64) -> Result<Option<IndexedPage>, String> { Err(NOT_YET.to_string()) }
-    async fn find_indexed_page_by_key(&self, _ouid: &str, _kind: PageKind, _key: &str) -> Result<Option<IndexedPage>, String> { Err(NOT_YET.to_string()) }
-    async fn list_indexed_pages_by_chapter(&self, _id: i64) -> Result<Vec<IndexedPage>, String> { Err(NOT_YET.to_string()) }
-    async fn list_indexed_pages_by_book_root(&self, _id: i64) -> Result<Vec<IndexedPage>, String> { Err(NOT_YET.to_string()) }
-    async fn list_indexed_pages_recent(&self, _book_id: i64, _limit: i64) -> Result<Vec<IndexedPage>, String> { Err(NOT_YET.to_string()) }
-    async fn soft_delete_indexed_page(&self, _id: i64) -> Result<(), String> { Err(NOT_YET.to_string()) }
+    async fn soft_delete_indexed_shelf(&self, shelf_id: i64) -> Result<(), String> {
+        sqlx::query("UPDATE bookstack_shelves SET deleted = TRUE WHERE shelf_id = $1")
+            .bind(shelf_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("soft_delete_indexed_shelf: {e}"))?;
+        Ok(())
+    }
 
-    async fn get_page_cache(&self, _id: i64) -> Result<Option<PageCache>, String> { Err(NOT_YET.to_string()) }
+    // --- Books ---
 
-    async fn create_index_job(&self, _scope: &str, _kind: &str, _triggered_by: &str) -> Result<(i64, bool), String> { Err(NOT_YET.to_string()) }
-    async fn claim_next_index_job(&self) -> Result<Option<IndexJob>, String> { Err(NOT_YET.to_string()) }
-    async fn update_index_job_progress(&self, _id: i64, _p: i64, _t: i64) -> Result<(), String> { Err(NOT_YET.to_string()) }
-    async fn complete_index_job(&self, _id: i64, _err: Option<&str>) -> Result<(), String> { Err(NOT_YET.to_string()) }
-    async fn list_pending_index_jobs(&self, _limit: i64) -> Result<Vec<IndexJob>, String> { Err(NOT_YET.to_string()) }
-    async fn get_latest_index_job(&self) -> Result<Option<IndexJob>, String> { Err(NOT_YET.to_string()) }
+    async fn upsert_indexed_book(&self, book: &IndexedBook) -> Result<(), String> {
+        sqlx::query(
+            "INSERT INTO bookstack_books
+                (book_id, name, slug, shelf_id, identity_ouid, book_kind, indexed_at, deleted)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (book_id) DO UPDATE SET
+                 name = EXCLUDED.name,
+                 slug = EXCLUDED.slug,
+                 shelf_id = EXCLUDED.shelf_id,
+                 identity_ouid = EXCLUDED.identity_ouid,
+                 book_kind = EXCLUDED.book_kind,
+                 indexed_at = EXCLUDED.indexed_at,
+                 deleted = EXCLUDED.deleted",
+        )
+        .bind(book.book_id)
+        .bind(&book.name)
+        .bind(&book.slug)
+        .bind(book.shelf_id)
+        .bind(book.identity_ouid.as_deref())
+        .bind(book.book_kind.as_str())
+        .bind(book.indexed_at)
+        .bind(book.deleted)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("upsert_indexed_book: {e}"))?;
+        Ok(())
+    }
 
-    async fn get_index_meta(&self, _key: &str) -> Result<Option<String>, String> { Err(NOT_YET.to_string()) }
-    async fn set_index_meta(&self, _key: &str, _value: &str) -> Result<(), String> { Err(NOT_YET.to_string()) }
+    async fn get_indexed_book(&self, book_id: i64) -> Result<Option<IndexedBook>, String> {
+        let row = sqlx::query(
+            "SELECT book_id, name, slug, shelf_id, identity_ouid, book_kind, indexed_at, deleted
+             FROM bookstack_books WHERE book_id = $1",
+        )
+        .bind(book_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("get_indexed_book: {e}"))?;
+        Ok(row.map(book_from_row))
+    }
+
+    async fn list_indexed_books_by_shelf(&self, shelf_id: i64) -> Result<Vec<IndexedBook>, String> {
+        let rows = sqlx::query(
+            "SELECT book_id, name, slug, shelf_id, identity_ouid, book_kind, indexed_at, deleted
+             FROM bookstack_books WHERE shelf_id = $1 AND deleted = FALSE
+             ORDER BY name",
+        )
+        .bind(shelf_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_indexed_books_by_shelf: {e}"))?;
+        Ok(rows.into_iter().map(book_from_row).collect())
+    }
+
+    async fn list_indexed_books_by_identity(
+        &self,
+        identity_ouid: &str,
+    ) -> Result<Vec<IndexedBook>, String> {
+        let rows = sqlx::query(
+            "SELECT book_id, name, slug, shelf_id, identity_ouid, book_kind, indexed_at, deleted
+             FROM bookstack_books WHERE identity_ouid = $1 AND deleted = FALSE
+             ORDER BY book_kind, name",
+        )
+        .bind(identity_ouid)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_indexed_books_by_identity: {e}"))?;
+        Ok(rows.into_iter().map(book_from_row).collect())
+    }
+
+    async fn soft_delete_indexed_book(&self, book_id: i64) -> Result<(), String> {
+        sqlx::query("UPDATE bookstack_books SET deleted = TRUE WHERE book_id = $1")
+            .bind(book_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("soft_delete_indexed_book: {e}"))?;
+        Ok(())
+    }
+
+    // --- Chapters ---
+
+    async fn upsert_indexed_chapter(&self, chapter: &IndexedChapter) -> Result<(), String> {
+        sqlx::query(
+            "INSERT INTO bookstack_chapters
+                (chapter_id, book_id, name, slug, identity_ouid, chapter_kind, archive_year, indexed_at, deleted)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             ON CONFLICT (chapter_id) DO UPDATE SET
+                 book_id = EXCLUDED.book_id,
+                 name = EXCLUDED.name,
+                 slug = EXCLUDED.slug,
+                 identity_ouid = EXCLUDED.identity_ouid,
+                 chapter_kind = EXCLUDED.chapter_kind,
+                 archive_year = EXCLUDED.archive_year,
+                 indexed_at = EXCLUDED.indexed_at,
+                 deleted = EXCLUDED.deleted",
+        )
+        .bind(chapter.chapter_id)
+        .bind(chapter.book_id)
+        .bind(&chapter.name)
+        .bind(&chapter.slug)
+        .bind(chapter.identity_ouid.as_deref())
+        .bind(chapter.chapter_kind.as_str())
+        .bind(chapter.archive_year)
+        .bind(chapter.indexed_at)
+        .bind(chapter.deleted)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("upsert_indexed_chapter: {e}"))?;
+        Ok(())
+    }
+
+    async fn get_indexed_chapter(
+        &self,
+        chapter_id: i64,
+    ) -> Result<Option<IndexedChapter>, String> {
+        let row = sqlx::query(
+            "SELECT chapter_id, book_id, name, slug, identity_ouid, chapter_kind, archive_year, indexed_at, deleted
+             FROM bookstack_chapters WHERE chapter_id = $1",
+        )
+        .bind(chapter_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("get_indexed_chapter: {e}"))?;
+        Ok(row.map(chapter_from_row))
+    }
+
+    async fn list_indexed_chapters_by_book(
+        &self,
+        book_id: i64,
+    ) -> Result<Vec<IndexedChapter>, String> {
+        let rows = sqlx::query(
+            "SELECT chapter_id, book_id, name, slug, identity_ouid, chapter_kind, archive_year, indexed_at, deleted
+             FROM bookstack_chapters WHERE book_id = $1 AND deleted = FALSE
+             ORDER BY name",
+        )
+        .bind(book_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_indexed_chapters_by_book: {e}"))?;
+        Ok(rows.into_iter().map(chapter_from_row).collect())
+    }
+
+    async fn soft_delete_indexed_chapter(&self, chapter_id: i64) -> Result<(), String> {
+        sqlx::query("UPDATE bookstack_chapters SET deleted = TRUE WHERE chapter_id = $1")
+            .bind(chapter_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("soft_delete_indexed_chapter: {e}"))?;
+        Ok(())
+    }
+
+    // --- Pages ---
+
+    async fn upsert_indexed_page(
+        &self,
+        page: &IndexedPage,
+        cache: Option<&PageCache>,
+    ) -> Result<(), String> {
+        // Single transaction: page row + optional cache row land atomically
+        // so the freshness invariant (page.page_updated_at == cache.page_updated_at
+        // means cache is fresh) holds even on mid-write process kills.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| format!("upsert_indexed_page tx: {e}"))?;
+        sqlx::query(
+            "INSERT INTO bookstack_pages
+                (page_id, book_id, chapter_id, name, slug, url, page_created_at, page_updated_at,
+                 identity_ouid, page_kind, page_key, archive_year, indexed_at, deleted)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+             ON CONFLICT (page_id) DO UPDATE SET
+                 book_id = EXCLUDED.book_id,
+                 chapter_id = EXCLUDED.chapter_id,
+                 name = EXCLUDED.name,
+                 slug = EXCLUDED.slug,
+                 url = EXCLUDED.url,
+                 page_created_at = EXCLUDED.page_created_at,
+                 page_updated_at = EXCLUDED.page_updated_at,
+                 identity_ouid = EXCLUDED.identity_ouid,
+                 page_kind = EXCLUDED.page_kind,
+                 page_key = EXCLUDED.page_key,
+                 archive_year = EXCLUDED.archive_year,
+                 indexed_at = EXCLUDED.indexed_at,
+                 deleted = EXCLUDED.deleted",
+        )
+        .bind(page.page_id)
+        .bind(page.book_id)
+        .bind(page.chapter_id)
+        .bind(&page.name)
+        .bind(&page.slug)
+        .bind(page.url.as_deref())
+        .bind(page.page_created_at.as_deref())
+        .bind(page.page_updated_at.as_deref())
+        .bind(page.identity_ouid.as_deref())
+        .bind(page.page_kind.as_str())
+        .bind(page.page_key.as_deref())
+        .bind(page.archive_year)
+        .bind(page.indexed_at)
+        .bind(page.deleted)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("upsert_indexed_page page: {e}"))?;
+
+        if let Some(cache) = cache {
+            sqlx::query(
+                "INSERT INTO page_cache (page_id, markdown, raw_markdown, html, cached_at, page_updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (page_id) DO UPDATE SET
+                     markdown = EXCLUDED.markdown,
+                     raw_markdown = EXCLUDED.raw_markdown,
+                     html = EXCLUDED.html,
+                     cached_at = EXCLUDED.cached_at,
+                     page_updated_at = EXCLUDED.page_updated_at",
+            )
+            .bind(cache.page_id)
+            .bind(cache.markdown.as_deref())
+            .bind(cache.raw_markdown.as_deref())
+            .bind(cache.html.as_deref())
+            .bind(cache.cached_at)
+            .bind(cache.page_updated_at.as_deref())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("upsert_indexed_page cache: {e}"))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| format!("upsert_indexed_page commit: {e}"))?;
+        Ok(())
+    }
+
+    async fn get_indexed_page(&self, page_id: i64) -> Result<Option<IndexedPage>, String> {
+        let row = sqlx::query(INDEXED_PAGE_SELECT_ONE)
+            .bind(page_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| format!("get_indexed_page: {e}"))?;
+        Ok(row.map(page_from_row))
+    }
+
+    async fn find_indexed_page_by_key(
+        &self,
+        identity_ouid: &str,
+        page_kind: PageKind,
+        page_key: &str,
+    ) -> Result<Option<IndexedPage>, String> {
+        let row = sqlx::query(
+            "SELECT page_id, book_id, chapter_id, name, slug, url, page_created_at, page_updated_at,
+                    identity_ouid, page_kind, page_key, archive_year, indexed_at, deleted
+             FROM bookstack_pages
+             WHERE identity_ouid = $1 AND page_kind = $2 AND page_key = $3 AND deleted = FALSE
+             LIMIT 1",
+        )
+        .bind(identity_ouid)
+        .bind(page_kind.as_str())
+        .bind(page_key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("find_indexed_page_by_key: {e}"))?;
+        Ok(row.map(page_from_row))
+    }
+
+    async fn list_indexed_pages_by_chapter(
+        &self,
+        chapter_id: i64,
+    ) -> Result<Vec<IndexedPage>, String> {
+        let rows = sqlx::query(
+            "SELECT page_id, book_id, chapter_id, name, slug, url, page_created_at, page_updated_at,
+                    identity_ouid, page_kind, page_key, archive_year, indexed_at, deleted
+             FROM bookstack_pages WHERE chapter_id = $1 AND deleted = FALSE
+             ORDER BY name",
+        )
+        .bind(chapter_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_indexed_pages_by_chapter: {e}"))?;
+        Ok(rows.into_iter().map(page_from_row).collect())
+    }
+
+    async fn list_indexed_pages_by_book_root(
+        &self,
+        book_id: i64,
+    ) -> Result<Vec<IndexedPage>, String> {
+        let rows = sqlx::query(
+            "SELECT page_id, book_id, chapter_id, name, slug, url, page_created_at, page_updated_at,
+                    identity_ouid, page_kind, page_key, archive_year, indexed_at, deleted
+             FROM bookstack_pages WHERE book_id = $1 AND chapter_id IS NULL AND deleted = FALSE
+             ORDER BY name",
+        )
+        .bind(book_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_indexed_pages_by_book_root: {e}"))?;
+        Ok(rows.into_iter().map(page_from_row).collect())
+    }
+
+    async fn list_indexed_pages_recent(
+        &self,
+        book_id: i64,
+        limit: i64,
+    ) -> Result<Vec<IndexedPage>, String> {
+        // page_updated_at is TEXT (ISO 8601) — string-sort gives chrono
+        // order because ISO 8601 is lexicographically monotonic. NULL
+        // updated_at sinks to the end via COALESCE (matches SQLite).
+        let rows = sqlx::query(
+            "SELECT page_id, book_id, chapter_id, name, slug, url, page_created_at, page_updated_at,
+                    identity_ouid, page_kind, page_key, archive_year, indexed_at, deleted
+             FROM bookstack_pages WHERE book_id = $1 AND deleted = FALSE
+             ORDER BY COALESCE(page_updated_at, '') DESC
+             LIMIT $2",
+        )
+        .bind(book_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_indexed_pages_recent: {e}"))?;
+        Ok(rows.into_iter().map(page_from_row).collect())
+    }
+
+    async fn soft_delete_indexed_page(&self, page_id: i64) -> Result<(), String> {
+        sqlx::query("UPDATE bookstack_pages SET deleted = TRUE WHERE page_id = $1")
+            .bind(page_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("soft_delete_indexed_page: {e}"))?;
+        Ok(())
+    }
+
+    // --- Page cache ---
+
+    async fn get_page_cache(&self, page_id: i64) -> Result<Option<PageCache>, String> {
+        let row = sqlx::query(
+            "SELECT page_id, markdown, raw_markdown, html, cached_at, page_updated_at
+             FROM page_cache WHERE page_id = $1",
+        )
+        .bind(page_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("get_page_cache: {e}"))?;
+        Ok(row.map(|r| PageCache {
+            page_id: r.get("page_id"),
+            markdown: r.get("markdown"),
+            raw_markdown: r.get("raw_markdown"),
+            html: r.get("html"),
+            cached_at: r.get("cached_at"),
+            page_updated_at: r.get("page_updated_at"),
+        }))
+    }
+
+    // --- Index jobs ---
+
+    async fn create_index_job(
+        &self,
+        scope: &str,
+        kind: &str,
+        triggered_by: &str,
+    ) -> Result<(i64, bool), String> {
+        // Dedup on scope (mirrors create_embed_job): if a pending or running
+        // job exists for the same scope, return that one. Wrapped in a
+        // transaction so the check + insert is atomic.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| format!("create_index_job tx: {e}"))?;
+
+        let existing = sqlx::query(
+            "SELECT id FROM index_jobs
+             WHERE scope = $1 AND status IN ('pending', 'running')
+             ORDER BY id DESC LIMIT 1
+             FOR UPDATE",
+        )
+        .bind(scope)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("create_index_job check: {e}"))?;
+
+        if let Some(row) = existing {
+            tx.commit().await.map_err(|e| format!("create_index_job commit: {e}"))?;
+            return Ok((row.get("id"), false));
+        }
+
+        let inserted = sqlx::query(
+            "INSERT INTO index_jobs (scope, kind, status, triggered_by)
+             VALUES ($1, $2, 'pending', $3)
+             RETURNING id",
+        )
+        .bind(scope)
+        .bind(kind)
+        .bind(triggered_by)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| format!("create_index_job insert: {e}"))?;
+
+        tx.commit().await.map_err(|e| format!("create_index_job commit: {e}"))?;
+        Ok((inserted.get("id"), true))
+    }
+
+    async fn claim_next_index_job(&self) -> Result<Option<IndexJob>, String> {
+        // FOR UPDATE SKIP LOCKED enables multiple worker processes to run
+        // safely against the same database without claiming the same job.
+        let row = sqlx::query(
+            "UPDATE index_jobs SET status = 'running', started_at = $1
+             WHERE id = (
+                 SELECT id FROM index_jobs WHERE status = 'pending'
+                 ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED
+             )
+             RETURNING id, scope, kind, status, triggered_by, started_at,
+                       finished_at, progress, total, error",
+        )
+        .bind(Self::now_secs())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("claim_next_index_job: {e}"))?;
+        Ok(row.map(index_job_from_row))
+    }
+
+    async fn update_index_job_progress(
+        &self,
+        job_id: i64,
+        progress: i64,
+        total: i64,
+    ) -> Result<(), String> {
+        sqlx::query("UPDATE index_jobs SET progress = $1, total = $2 WHERE id = $3")
+            .bind(progress)
+            .bind(total)
+            .bind(job_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("update_index_job_progress: {e}"))?;
+        Ok(())
+    }
+
+    async fn complete_index_job(
+        &self,
+        job_id: i64,
+        error: Option<&str>,
+    ) -> Result<(), String> {
+        let status = if error.is_some() { "failed" } else { "completed" };
+        sqlx::query(
+            "UPDATE index_jobs SET status = $1, finished_at = $2, error = $3 WHERE id = $4",
+        )
+        .bind(status)
+        .bind(Self::now_secs())
+        .bind(error)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("complete_index_job: {e}"))?;
+        Ok(())
+    }
+
+    async fn list_pending_index_jobs(&self, limit: i64) -> Result<Vec<IndexJob>, String> {
+        let rows = sqlx::query(
+            "SELECT id, scope, kind, status, triggered_by, started_at, finished_at,
+                    progress, total, error
+             FROM index_jobs WHERE status = 'pending'
+             ORDER BY id ASC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_pending_index_jobs: {e}"))?;
+        Ok(rows.into_iter().map(index_job_from_row).collect())
+    }
+
+    async fn get_latest_index_job(&self) -> Result<Option<IndexJob>, String> {
+        let row = sqlx::query(
+            "SELECT id, scope, kind, status, triggered_by, started_at, finished_at,
+                    progress, total, error
+             FROM index_jobs ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("get_latest_index_job: {e}"))?;
+        Ok(row.map(index_job_from_row))
+    }
+
+    // --- Index meta ---
+
+    async fn get_index_meta(&self, key: &str) -> Result<Option<String>, String> {
+        let row = sqlx::query("SELECT value FROM index_meta WHERE key = $1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| format!("get_index_meta: {e}"))?;
+        Ok(row.map(|r| r.get("value")))
+    }
+
+    async fn set_index_meta(&self, key: &str, value: &str) -> Result<(), String> {
+        sqlx::query(
+            "INSERT INTO index_meta (key, value) VALUES ($1, $2)
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("set_index_meta: {e}"))?;
+        Ok(())
+    }
+}
+
+// --- Row → struct helpers (shared across IndexDb methods) ---
+
+const INDEXED_PAGE_SELECT_ONE: &str =
+    "SELECT page_id, book_id, chapter_id, name, slug, url, page_created_at, page_updated_at,
+            identity_ouid, page_kind, page_key, archive_year, indexed_at, deleted
+     FROM bookstack_pages WHERE page_id = $1";
+
+fn book_from_row(r: sqlx::postgres::PgRow) -> IndexedBook {
+    let kind_str: String = r.get("book_kind");
+    IndexedBook {
+        book_id: r.get("book_id"),
+        name: r.get("name"),
+        slug: r.get("slug"),
+        shelf_id: r.get("shelf_id"),
+        identity_ouid: r.get("identity_ouid"),
+        book_kind: kind_str.parse().unwrap_or(BookKind::Unclassified),
+        indexed_at: r.get("indexed_at"),
+        deleted: r.get("deleted"),
+    }
+}
+
+fn chapter_from_row(r: sqlx::postgres::PgRow) -> IndexedChapter {
+    let kind_str: String = r.get("chapter_kind");
+    IndexedChapter {
+        chapter_id: r.get("chapter_id"),
+        book_id: r.get("book_id"),
+        name: r.get("name"),
+        slug: r.get("slug"),
+        identity_ouid: r.get("identity_ouid"),
+        chapter_kind: kind_str.parse().unwrap_or(ChapterKind::Unclassified),
+        archive_year: r.get("archive_year"),
+        indexed_at: r.get("indexed_at"),
+        deleted: r.get("deleted"),
+    }
+}
+
+fn page_from_row(r: sqlx::postgres::PgRow) -> IndexedPage {
+    let kind_str: String = r.get("page_kind");
+    IndexedPage {
+        page_id: r.get("page_id"),
+        book_id: r.get("book_id"),
+        chapter_id: r.get("chapter_id"),
+        name: r.get("name"),
+        slug: r.get("slug"),
+        url: r.get("url"),
+        page_created_at: r.get("page_created_at"),
+        page_updated_at: r.get("page_updated_at"),
+        identity_ouid: r.get("identity_ouid"),
+        page_kind: kind_str.parse().unwrap_or(PageKind::Unclassified),
+        page_key: r.get("page_key"),
+        archive_year: r.get("archive_year"),
+        indexed_at: r.get("indexed_at"),
+        deleted: r.get("deleted"),
+    }
+}
+
+fn index_job_from_row(r: sqlx::postgres::PgRow) -> IndexJob {
+    IndexJob {
+        id: r.get("id"),
+        scope: r.get("scope"),
+        kind: r.get("kind"),
+        status: r.get("status"),
+        triggered_by: r.get("triggered_by"),
+        started_at: r.get("started_at"),
+        finished_at: r.get("finished_at"),
+        progress: r.get("progress"),
+        total: r.get("total"),
+        error: r.get("error"),
+    }
 }

@@ -2087,6 +2087,14 @@ fn add_remember_tools(tools: &mut Vec<Value>) {
             "kind": { "type": "string", "enum": ["identities", "user_journals"], "description": "Which global shelf to enumerate" },
         }),
     ));
+
+    // Migrate (Phase 7 v1.0.0 chapter restructure)
+    tools.push(remember_tool(
+        "migrate",
+        "Migrate an AI identity from the legacy book layout to the v1.0.0 chapter structure. action=plan dry-runs and returns the proposed steps. action=apply executes the plan: scaffolds Agents/Journal chapters, moves loose Agent: pages into the Agents chapter, moves legacy journal book pages into the Journal chapter, runs the year-rollover sweep, and clears the legacy ai_hive_journal_book_id pointer. Idempotent — safe to re-run after partial failures. action=status returns a per-check breakdown of whether the identity is fully migrated.",
+        &["plan", "apply", "status"],
+        json!({}),
+    ));
 }
 
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {

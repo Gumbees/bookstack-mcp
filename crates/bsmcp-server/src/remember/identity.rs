@@ -258,9 +258,57 @@ async fn create(ctx: &Context) -> Outcome {
         );
     }
 
+    // 3. Find-or-create the two structural chapters inside the Identity
+    //    book. Phase 6 of the v1.0.0 restructure: agent definitions and
+    //    journal entries live in dedicated chapters, not loose at the book
+    //    root. Lazy-creating archive chapters at year rollover is a
+    //    separate concern in `remember_journal action=write`.
+    //
+    //    No "Subagent Conversations" chapter — agents track who they're
+    //    working with and what their sub-identities are doing in the
+    //    journal. Realtime cross-agent message/response runs in the
+    //    frame application, not BookStack.
+    let agents_chapter_id = provision::find_or_create_chapter(
+        &ctx.client,
+        ctx.index_db.as_ref(),
+        book_id,
+        "Agents",
+        "Agent definition pages for this AI identity (one page per sub-agent).",
+    )
+    .await
+    .id();
+    let journal_chapter_id = provision::find_or_create_chapter(
+        &ctx.client,
+        ctx.index_db.as_ref(),
+        book_id,
+        "Journal",
+        "Current-year daily journal entries. Year-rollover sweep moves stale entries into 'Journal Archive - {YEAR}' chapters.",
+    )
+    .await
+    .id();
+
+    // 4. Find-or-create the Collage book on the Hive shelf. Stays a separate
+    //    book per RFC: per-identity content discovery worked well in book
+    //    form and the shape doesn't conflict with the structural enforcement
+    //    we want for the identity book.
+    let collage_book_name = format!("{name}'s Collage");
+    let collage_book_description = format!(
+        "Topic/collage book for {name}. Active topics and content discovery."
+    );
+    let collage_outcome = provision::find_or_create_book_on_shelf(
+        &ctx.client,
+        ctx.index_db.as_ref(),
+        hive_shelf_id,
+        &collage_book_name,
+        &collage_book_description,
+    )
+    .await;
+    let collage_book_id = collage_outcome.id();
+
     // Lock the Identity book + manifest page to admin-only edit. Idempotent —
     // safe to re-run on a found-existing book/page (BookStack overwrites the
-    // permission row each call).
+    // permission row each call). The chapters inherit the book's permissions
+    // by default; locking individual chapters is unnecessary.
     if let Ok(role) = ctx.client.find_admin_role_id().await {
         provision::lock_to_admin_only(&ctx.client, bsmcp_common::bookstack::ContentType::Book, book_id, role).await;
         if let Some(pid) = page_id {
@@ -274,6 +322,22 @@ async fn create(ctx: &Context) -> Outcome {
         _ => "partially_created",
     };
 
+    let mut proposed = json!({
+        "ai_identity_book_id": book_id,
+        "ai_identity_page_id": page_id,
+        "ai_identity_name": name,
+        "ai_identity_ouid": ouid,
+    });
+    if let Some(id) = agents_chapter_id {
+        proposed["ai_identity_agents_chapter_id"] = json!(id);
+    }
+    if let Some(id) = journal_chapter_id {
+        proposed["ai_identity_journal_chapter_id"] = json!(id);
+    }
+    if let Some(id) = collage_book_id {
+        proposed["ai_collage_book_id"] = json!(id);
+    }
+
     Outcome::ok_with_target(
         json!({
             "action": action_label,
@@ -283,12 +347,10 @@ async fn create(ctx: &Context) -> Outcome {
             "book_was_existing": book_was_existing,
             "manifest_page_id": page_id,
             "manifest_page_was_existing": page_was_existing,
-            "proposed_settings": {
-                "ai_identity_book_id": book_id,
-                "ai_identity_page_id": page_id,
-                "ai_identity_name": name,
-                "ai_identity_ouid": ouid,
-            },
+            "agents_chapter_id": agents_chapter_id,
+            "journal_chapter_id": journal_chapter_id,
+            "collage_book_id": collage_book_id,
+            "proposed_settings": proposed,
         }),
         page_id,
         Some(name.clone()),

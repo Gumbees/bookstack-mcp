@@ -158,7 +158,9 @@ fn pending_user_summary(s: &UserSettings) -> Vec<&'static str> {
     let mut out = Vec::new();
     if s.user_id.is_none() { out.push("user_id"); }
     if s.ai_identity_page_id.is_none() { out.push("ai_identity_page_id"); }
-    if s.ai_hive_journal_book_id.is_none() { out.push("ai_hive_journal_book_id"); }
+    if s.ai_identity_journal_chapter_id.is_none() && s.ai_hive_journal_book_id.is_none() {
+        out.push("ai_identity_journal_chapter_id");
+    }
     if s.user_journal_book_id.is_none() { out.push("user_journal_book_id"); }
     if s.user_identity_page_id.is_none() { out.push("user_identity_page_id"); }
     if s.domains.is_empty() { out.push("domains"); }
@@ -208,11 +210,20 @@ pub fn fix_for_field(field: &str) -> Value {
             ],
         }),
         "ai_hive_journal_book_id" => json!({
-            "summary": "AI journal book is required for remember_journal read/write/search/delete.",
+            "summary": "Legacy AI journal book pointer. Phase 6 superseded by `ai_identity_journal_chapter_id` (chapter inside the Identity book). Run `remember_migrate action=plan` to see the migration plan.",
             "auto_provision_supported": false,
             "how": [
-                "Visit /settings — \"AI Journal & Topics\" card has a dropdown plus a \"create if missing\" checkbox.",
-                "Or via MCP: `remember_config action=write settings={\"ai_hive_journal_book_id\": <id>}` if you already have a journal book to adopt.",
+                "Run `remember_identity action=create name=<your-agent-name>` to scaffold the new Identity book + Journal chapter.",
+                "Then `remember_migrate action=apply` to move existing entries from the legacy book into the new chapter and clear this field.",
+            ],
+        }),
+        "ai_identity_journal_chapter_id" => json!({
+            "summary": "AI journal chapter (Phase 6) is required for remember_journal read/write/search/delete. Lives inside the Identity book.",
+            "auto_provision_supported": true,
+            "how": [
+                "Quickest: `remember_identity action=create name=<your-agent-name>` scaffolds the Identity book, manifest, and the Agents/Journal chapters in one call. Returned IDs go into `proposed_settings`.",
+                "Then `remember_config action=write settings={\"ai_identity_journal_chapter_id\": <id>}`.",
+                "Or visit /settings and pick the chapter from the dropdown.",
             ],
         }),
         "ai_collage_book_id" => json!({

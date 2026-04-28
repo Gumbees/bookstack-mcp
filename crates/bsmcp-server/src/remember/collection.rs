@@ -8,14 +8,61 @@ use bsmcp_common::settings::{GlobalSettings, UserSettings};
 
 use super::envelope::{ErrorCode, RememberWarning};
 use super::frontmatter;
+use super::journal_archive;
 use super::provision;
 use super::section;
 use super::{Context, Outcome};
 
-/// Book ID where a resource's pages live. Pages may be distributed across
-/// sub-chapters per `sub_chapter_for_key` (e.g., journals split into YYYY-MM
-/// monthly chapters).
-pub type CollectionParent = i64;
+/// Where a resource's pages live. Either a book (collage, shared_collage,
+/// user_journal, legacy journal) or a chapter (Phase 6 journal — pages live
+/// flat inside the per-identity Journal chapter, year-rollover sweep moves
+/// stale entries into `Journal Archive - {YEAR}` chapters scoped within the
+/// same Identity book).
+#[derive(Clone, Copy, Debug)]
+pub enum CollectionParent {
+    Book(i64),
+    Chapter(i64),
+}
+
+impl CollectionParent {
+    /// Returns the parent's book id when book-parented, `None` otherwise.
+    /// Used by code paths that only make sense for books — shelf-pin
+    /// reattachment, the search `{in_book:N}` filter, list/find walks.
+    pub fn book_id(&self) -> Option<i64> {
+        match self {
+            CollectionParent::Book(id) => Some(*id),
+            CollectionParent::Chapter(_) => None,
+        }
+    }
+
+    /// Find a page by exact-name match within this parent's scope. Books
+    /// walk every page in the book; chapters scope strictly to pages
+    /// inside that chapter.
+    pub async fn find_page_by_name(
+        &self,
+        client: &bsmcp_common::bookstack::BookStackClient,
+        name: &str,
+    ) -> Result<Option<i64>, String> {
+        let row = match self {
+            CollectionParent::Book(id) => client.find_page_in_book(*id, name).await?,
+            CollectionParent::Chapter(id) => client.find_page_in_chapter(*id, name).await?,
+        };
+        Ok(row.and_then(|p| p.get("id").and_then(|v| v.as_i64())))
+    }
+
+    /// List the most-recently-updated pages within this parent's scope,
+    /// up to `limit`. Used by the read-without-key list path and search.
+    pub async fn list_pages_by_updated(
+        &self,
+        client: &bsmcp_common::bookstack::BookStackClient,
+        limit: usize,
+    ) -> Result<Vec<Value>, String> {
+        match self {
+            CollectionParent::Book(id) => client.list_book_pages_by_updated(*id, limit).await,
+            CollectionParent::Chapter(id) => client.list_chapter_pages_by_updated(*id, limit).await,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum KeyKind {
@@ -61,6 +108,18 @@ pub trait CollectionResource: Send + Sync {
     /// the shelf are reattached on each write. Currently only `user_journal`
     /// uses this; other collections aren't shelf-pinned.
     fn shelf_pin(&self, _globals: &GlobalSettings) -> Option<i64> {
+        None
+    }
+
+    /// When set, the resource is the per-identity Journal: pages live in a
+    /// Journal chapter inside the Identity book, with year-rollover sweep
+    /// moving stale-year pages into `Journal Archive - {YEAR}` chapters.
+    /// Returns the Identity book id so the sweep / archive lookup can scope
+    /// chapter operations strictly within that book.
+    ///
+    /// Default: None (every other collection is book-parented, no archive
+    /// rollover, no chapter scope).
+    fn journal_archive_context(&self, _s: &UserSettings) -> Option<i64> {
         None
     }
 }
@@ -182,6 +241,49 @@ async fn read_one_by_key(
     ctx: &Context,
 ) -> Outcome {
     let page_name = resource.key_to_page_name(key);
+
+    // Per-identity journal: route past-year reads into the matching archive
+    // chapter. The current journal chapter only ever holds the current
+    // year's pages (year-rollover sweep moves stale entries on every write).
+    if let (Some(identity_book_id), CollectionParent::Chapter(journal_chapter_id)) =
+        (resource.journal_archive_context(&ctx.settings), parent)
+    {
+        match journal_archive::resolve_read_chapter_for_key(
+            key,
+            &ctx.settings,
+            identity_book_id,
+            journal_chapter_id,
+            ctx,
+        )
+        .await
+        {
+            Ok(Some(chapter_id)) => {
+                let resolved = CollectionParent::Chapter(chapter_id);
+                return match find_page_by_name(resolved, &page_name, ctx).await {
+                    Ok(Some(page_id)) => read_one_by_id(page_id, ctx).await,
+                    Ok(None) => Outcome::error(
+                        ErrorCode::NotFound,
+                        format!("No {} page named {page_name:?}", resource.name()),
+                        Some("key"),
+                    ),
+                    Err(e) => Outcome::error(ErrorCode::BookStackError, e, None),
+                };
+            }
+            Ok(None) => {
+                // No archive chapter for that year — page can't exist.
+                return Outcome::error(
+                    ErrorCode::NotFound,
+                    format!(
+                        "No {} archive chapter exists for the year in key {key:?}",
+                        resource.name()
+                    ),
+                    Some("key"),
+                );
+            }
+            Err(e) => return Outcome::error(ErrorCode::BookStackError, e, None),
+        }
+    }
+
     match find_page_by_name(parent, &page_name, ctx).await {
         Ok(Some(page_id)) => read_one_by_id(page_id, ctx).await,
         Ok(None) => Outcome::error(
@@ -200,14 +302,11 @@ async fn list_pages(
 ) -> Outcome {
     let limit = ctx.body_count("limit", 25, 200);
     let offset = ctx.body.get("offset").and_then(|v| v.as_i64()).unwrap_or(0).max(0) as usize;
-    // Pull (limit + offset) most-recently-updated pages from the book and
-    // skip to the requested offset. Goes through the BookStackClient helper
-    // so we get database `updated_at` ordering, not search-relevance.
-    match ctx
-        .client
-        .list_book_pages_by_updated(parent, limit + offset)
-        .await
-    {
+    // Pull (limit + offset) most-recently-updated pages from the parent
+    // (book or chapter, depending on the resource) and skip to the offset.
+    // Goes through `CollectionParent::list_pages_by_updated` so we get
+    // database `updated_at` ordering, not search-relevance.
+    match parent.list_pages_by_updated(&ctx.client, limit + offset).await {
         Ok(rows) => {
             let pages: Vec<Value> = rows
                 .into_iter()
@@ -235,19 +334,21 @@ async fn find_page_by_name(
     name: &str,
     ctx: &Context,
 ) -> Result<Option<i64>, String> {
-    // Goes through `get_book` + flatten — never `search` — so the book scope
-    // is honored. Exact-name match (case-insensitive) is done client-side.
-    match ctx.client.find_page_in_book(parent, name).await? {
-        Some(page) => Ok(page.get("id").and_then(|v| v.as_i64())),
-        None => Ok(None),
-    }
+    // Goes through `get_book`/`get_chapter` + flatten — never `search` — so
+    // the parent scope is honored. Exact-name match (case-insensitive) is
+    // done client-side.
+    parent.find_page_by_name(&ctx.client, name).await
 }
 
 /// Used only by `handle_search`, which prepends a positive keyword term —
 /// so the filter is honored. Listing/lookup paths must NOT use this; go
-/// through `list_book_pages_by_updated` / `find_page_in_book` instead.
-fn parent_filter(book_id: CollectionParent) -> String {
-    format!("{{in_book:{book_id}}}")
+/// through `CollectionParent::list_pages_by_updated` /
+/// `CollectionParent::find_page_by_name` instead.
+fn parent_filter(parent: CollectionParent) -> String {
+    match parent {
+        CollectionParent::Book(id) => format!("{{in_book:{id}}}"),
+        CollectionParent::Chapter(id) => format!("{{in_chapter:{id}}}"),
+    }
 }
 
 // --- WRITE ---
@@ -258,13 +359,28 @@ async fn handle_write(
     ctx: &Context,
 ) -> Outcome {
     // Self-healing shelf pin: if the resource is shelf-pinned (currently
-    // user_journal), reattach the parent book to the configured shelf on
-    // every write. Idempotent — `ensure_book_on_shelf` is a no-op when the
-    // book is already there. Runs before the page write so the new entry
-    // lands in a correctly-attached book.
+    // user_journal) AND the parent is a book, reattach it to the configured
+    // shelf on every write. Idempotent — `ensure_book_on_shelf` is a no-op
+    // when the book is already there. Chapter-parented resources don't have
+    // a shelf to pin themselves to (they live inside an Identity book that
+    // sits on the Hive shelf, locked separately).
     let globals = ctx.db.get_global_settings().await.unwrap_or_default();
-    if let Some(shelf_id) = resource.shelf_pin(&globals) {
-        provision::ensure_book_on_shelf(&ctx.client, parent, shelf_id).await;
+    if let (Some(shelf_id), Some(book_id)) = (resource.shelf_pin(&globals), parent.book_id()) {
+        provision::ensure_book_on_shelf(&ctx.client, book_id, shelf_id).await;
+    }
+
+    // Year-rollover sweep for the per-identity journal. Runs before every
+    // write so any stale-year pages are moved into their archive chapter
+    // before the new entry lands. Idempotent and best-effort — failures
+    // log but don't block the user's write.
+    if let (Some(identity_book_id), CollectionParent::Chapter(journal_chapter_id)) =
+        (resource.journal_archive_context(&ctx.settings), parent)
+    {
+        match journal_archive::year_rollover_sweep(journal_chapter_id, identity_book_id, ctx).await {
+            Ok(0) => {}
+            Ok(n) => eprintln!("year_rollover_sweep: archived {n} stale page(s) before {} write", resource.name()),
+            Err(e) => eprintln!("year_rollover_sweep failed (non-fatal, write continues): {e}"),
+        }
     }
 
     let body_text = match ctx.body_str("body") {
@@ -374,17 +490,27 @@ enum CreateTarget {
 
 async fn resolve_create_target(
     resource: &dyn CollectionResource,
-    book_id: CollectionParent,
+    parent: CollectionParent,
     key: Option<&str>,
     ctx: &Context,
 ) -> Result<CreateTarget, String> {
-    // If the resource splits by sub-chapter, find or create it.
-    let sub_chapter_name = key.and_then(|k| resource.sub_chapter_for_key(k));
-    if let Some(chapter_name) = sub_chapter_name {
-        let chapter_id = find_or_create_chapter(book_id, &chapter_name, ctx).await?;
-        Ok(CreateTarget::Chapter(chapter_id))
-    } else {
-        Ok(CreateTarget::Book(book_id))
+    match parent {
+        CollectionParent::Chapter(id) => {
+            // Chapter-parented resources land all writes directly in the
+            // chapter; sub-chapter splitting doesn't apply.
+            Ok(CreateTarget::Chapter(id))
+        }
+        CollectionParent::Book(book_id) => {
+            // Book-parented: if the resource splits by sub-chapter (e.g.
+            // user_journal's monthly chapters), find or create it.
+            let sub_chapter_name = key.and_then(|k| resource.sub_chapter_for_key(k));
+            if let Some(chapter_name) = sub_chapter_name {
+                let chapter_id = find_or_create_chapter(book_id, &chapter_name, ctx).await?;
+                Ok(CreateTarget::Chapter(chapter_id))
+            } else {
+                Ok(CreateTarget::Book(book_id))
+            }
+        }
     }
 }
 
@@ -424,8 +550,19 @@ async fn handle_append(
     ctx: &Context,
 ) -> Outcome {
     let globals = ctx.db.get_global_settings().await.unwrap_or_default();
-    if let Some(shelf_id) = resource.shelf_pin(&globals) {
-        provision::ensure_book_on_shelf(&ctx.client, parent, shelf_id).await;
+    if let (Some(shelf_id), Some(book_id)) = (resource.shelf_pin(&globals), parent.book_id()) {
+        provision::ensure_book_on_shelf(&ctx.client, book_id, shelf_id).await;
+    }
+    // Year-rollover sweep — same as handle_write. Append paths can also
+    // create pages, so the sweep needs to run here too.
+    if let (Some(identity_book_id), CollectionParent::Chapter(journal_chapter_id)) =
+        (resource.journal_archive_context(&ctx.settings), parent)
+    {
+        match journal_archive::year_rollover_sweep(journal_chapter_id, identity_book_id, ctx).await {
+            Ok(0) => {}
+            Ok(n) => eprintln!("year_rollover_sweep: archived {n} stale page(s) before {} append", resource.name()),
+            Err(e) => eprintln!("year_rollover_sweep failed (non-fatal, append continues): {e}"),
+        }
     }
 
     let body_text = match ctx.body_str("body") {
@@ -879,14 +1016,40 @@ async fn handle_search(
     };
 
     let limit = ctx.body_count("limit", 10, 50);
+    let include_archives = ctx
+        .body
+        .get("include_archives")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-    // Always run BookStack keyword search scoped to the parent.
-    let filter = parent_filter(parent);
-    let kw_query = format!("{query} {{type:page}} {filter}");
-    let keyword_hits = match ctx.client.search(&kw_query, 1, limit as i64).await {
-        Ok(v) => v.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default(),
-        Err(e) => return Outcome::error(ErrorCode::BookStackError, e, None),
-    };
+    // Build the keyword filter. Default scope is the configured parent;
+    // for the per-identity journal with `include_archives=true`, walk the
+    // current Journal chapter PLUS every `Journal Archive - *` chapter
+    // inside the same Identity book.
+    let mut search_parents: Vec<CollectionParent> = vec![parent];
+    if include_archives {
+        if let Some(identity_book_id) = resource.journal_archive_context(&ctx.settings) {
+            for archive_id in
+                journal_archive::list_archive_chapter_ids(identity_book_id, ctx).await
+            {
+                search_parents.push(CollectionParent::Chapter(archive_id));
+            }
+        }
+    }
+
+    // Aggregate keyword hits from each scope. BookStack search doesn't
+    // accept multiple `{in_chapter:X}` filters on one query, so we issue
+    // one call per scope and merge.
+    let mut keyword_hits: Vec<Value> = Vec::new();
+    for p in &search_parents {
+        let kw_query = format!("{query} {{type:page}} {}", parent_filter(*p));
+        let hits = match ctx.client.search(&kw_query, 1, limit as i64).await {
+            Ok(v) => v.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default(),
+            Err(e) => return Outcome::error(ErrorCode::BookStackError, e, None),
+        };
+        keyword_hits.extend(hits);
+    }
+    keyword_hits.truncate(limit);
 
     // Optionally augment with semantic — filter by parent post-hoc since the
     // semantic backend doesn't accept book/chapter filters yet.
@@ -910,7 +1073,11 @@ async fn handle_search(
         {
             Ok(v) => {
                 let results = v.get("results").and_then(|r| r.as_array()).cloned().unwrap_or_default();
-                results.into_iter().filter(|hit| matches_parent(hit, parent)).take(limit).collect()
+                results
+                    .into_iter()
+                    .filter(|hit| search_parents.iter().any(|p| matches_parent(hit, *p)))
+                    .take(limit)
+                    .collect()
             }
             Err(e) => {
                 warnings.push(RememberWarning::new(
@@ -940,8 +1107,15 @@ async fn handle_search(
     outcome
 }
 
-fn matches_parent(hit: &Value, book_id: CollectionParent) -> bool {
-    hit.get("book_id").and_then(|v| v.as_i64()) == Some(book_id)
+fn matches_parent(hit: &Value, parent: CollectionParent) -> bool {
+    match parent {
+        CollectionParent::Book(id) => {
+            hit.get("book_id").and_then(|v| v.as_i64()) == Some(id)
+        }
+        CollectionParent::Chapter(id) => {
+            hit.get("chapter_id").and_then(|v| v.as_i64()) == Some(id)
+        }
+    }
 }
 
 // --- DELETE (soft) ---
@@ -1038,13 +1212,20 @@ pub mod resources {
     pub struct Journal;
     impl CollectionResource for Journal {
         fn name(&self) -> &'static str { "journal" }
-        fn setting_field(&self) -> &'static str { "ai_hive_journal_book_id" }
+        fn setting_field(&self) -> &'static str { "ai_identity_journal_chapter_id" }
         fn parent(&self, s: &UserSettings) -> Option<CollectionParent> {
-            s.ai_hive_journal_book_id        }
+            // Phase 6: chapter-parented. Pages live flat inside the
+            // current-year Journal chapter; year-rollover sweep moves stale
+            // entries into 'Journal Archive - {YEAR}' chapters.
+            s.ai_identity_journal_chapter_id.map(CollectionParent::Chapter)
+        }
         fn key_kind(&self) -> KeyKind { KeyKind::Date }
-        fn sub_chapter_for_key(&self, key: &str) -> Option<String> {
-            // YYYY-MM-DD → YYYY-MM monthly chapter
-            if key.len() >= 7 { Some(key[..7].to_string()) } else { None }
+        fn journal_archive_context(&self, s: &UserSettings) -> Option<i64> {
+            // The archive rollover and read-by-key dispatch need the parent
+            // Identity book id to scope chapter lookup. Returns None when
+            // the identity book isn't configured — the journal action then
+            // surfaces a settings_not_configured error before writing.
+            s.ai_identity_book_id
         }
     }
 
@@ -1053,7 +1234,8 @@ pub mod resources {
         fn name(&self) -> &'static str { "collage" }
         fn setting_field(&self) -> &'static str { "ai_collage_book_id" }
         fn parent(&self, s: &UserSettings) -> Option<CollectionParent> {
-            s.ai_collage_book_id        }
+            s.ai_collage_book_id.map(CollectionParent::Book)
+        }
         fn key_kind(&self) -> KeyKind { KeyKind::Slug }
     }
 
@@ -1062,7 +1244,8 @@ pub mod resources {
         fn name(&self) -> &'static str { "shared_collage" }
         fn setting_field(&self) -> &'static str { "ai_shared_collage_book_id" }
         fn parent(&self, s: &UserSettings) -> Option<CollectionParent> {
-            s.ai_shared_collage_book_id        }
+            s.ai_shared_collage_book_id.map(CollectionParent::Book)
+        }
         fn key_kind(&self) -> KeyKind { KeyKind::Slug }
     }
 
@@ -1071,7 +1254,8 @@ pub mod resources {
         fn name(&self) -> &'static str { "user_journal" }
         fn setting_field(&self) -> &'static str { "user_journal_book_id" }
         fn parent(&self, s: &UserSettings) -> Option<CollectionParent> {
-            s.user_journal_book_id        }
+            s.user_journal_book_id.map(CollectionParent::Book)
+        }
         fn key_kind(&self) -> KeyKind { KeyKind::Date }
         fn sub_chapter_for_key(&self, key: &str) -> Option<String> {
             if key.len() >= 7 { Some(key[..7].to_string()) } else { None }

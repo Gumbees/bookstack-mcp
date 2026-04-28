@@ -407,10 +407,11 @@ pub async fn find_or_create_book_on_shelf(
 
 /// Find a chapter inside a book by exact name match, or create it.
 ///
-/// Reserved for Phase 3 of the identity book restructure (creating the
-/// `Agents`, `Subagent Conversations`, `Journal`, and `Journal Archive -
-/// {YEAR}` chapters). Phase 1 ships the helper but doesn't wire it in yet.
-#[allow(dead_code)]
+/// Used by `identity::create` to scaffold the `Agents`, `Subagent
+/// Conversations`, and `Journal` chapters, and by `remember_journal` to
+/// lazy-create `Journal Archive - {YEAR}` chapters during the year-rollover
+/// sweep. Match semantics: exact case-sensitive name match against
+/// `chapter.name`. Description is only used at create time.
 pub async fn find_or_create_chapter(
     client: &BookStackClient,
     index_db: &dyn IndexDb,

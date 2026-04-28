@@ -16,6 +16,8 @@ pub mod directory;
 pub mod envelope;
 pub mod frontmatter;
 pub mod identity;
+pub mod journal_archive;
+pub mod migrate;
 pub mod naming;
 pub mod provision;
 pub mod search;
@@ -200,6 +202,7 @@ async fn route(resource: &str, action: &str, ctx: &Context) -> Outcome {
         ("search", "read") => search::read(ctx).await,
         ("identity", a) => identity::handle(a, ctx).await,
         ("directory", "read") => directory::read(ctx).await,
+        ("migrate", a) => migrate::handle(a, ctx).await,
 
         _ => Outcome::error(ErrorCode::UnknownAction, format!("Unknown {resource}/{action}"), None),
     }

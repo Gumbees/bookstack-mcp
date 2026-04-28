@@ -637,6 +637,52 @@ impl BookStackClient {
         }))
     }
 
+    /// Find a page inside a chapter by exact (case-insensitive) name.
+    /// Returns the page row if found, or `None`. One `get_chapter` call.
+    /// Used by chapter-scoped collection resources (Phase 6 journal).
+    pub async fn find_page_in_chapter(
+        &self,
+        chapter_id: i64,
+        name: &str,
+    ) -> Result<Option<Value>, String> {
+        let chapter = self.get_chapter(chapter_id).await?;
+        let pages = chapter
+            .get("pages")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(pages.into_iter().find(|p| {
+            p.get("name")
+                .and_then(|n| n.as_str())
+                .map(|n| n.eq_ignore_ascii_case(name))
+                .unwrap_or(false)
+        }))
+    }
+
+    /// List pages inside a chapter, ordered by `updated_at` descending.
+    /// Returns up to `limit` pages. Used by chapter-scoped collections to
+    /// list recent entries.
+    pub async fn list_chapter_pages_by_updated(
+        &self,
+        chapter_id: i64,
+        limit: usize,
+    ) -> Result<Vec<Value>, String> {
+        let chapter = self.get_chapter(chapter_id).await?;
+        let mut pages = chapter
+            .get("pages")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        // Sort by updated_at descending (lexicographic on ISO-8601 == time order)
+        pages.sort_by(|a, b| {
+            let av = a.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
+            let bv = b.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
+            bv.cmp(av)
+        });
+        pages.truncate(limit);
+        Ok(pages)
+    }
+
     /// Find a chapter in a book by exact (case-insensitive) name. Returns
     /// the chapter row if found, or `None`. One `get_book` call.
     pub async fn find_chapter_in_book(

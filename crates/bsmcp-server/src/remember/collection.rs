@@ -12,10 +12,56 @@ use super::provision;
 use super::section;
 use super::{Context, Outcome};
 
-/// Book ID where a resource's pages live. Pages may be distributed across
-/// sub-chapters per `sub_chapter_for_key` (e.g., journals split into YYYY-MM
-/// monthly chapters).
-pub type CollectionParent = i64;
+/// Where a resource's pages live. Either a book (collage, shared_collage,
+/// user_journal, legacy journal) or a chapter (Phase 6 journal — pages live
+/// flat inside the per-identity Journal chapter, year-rollover sweep moves
+/// stale entries into `Journal Archive - {YEAR}` chapters scoped within the
+/// same Identity book).
+#[derive(Clone, Copy, Debug)]
+pub enum CollectionParent {
+    Book(i64),
+    Chapter(i64),
+}
+
+impl CollectionParent {
+    /// Returns the parent's book id when book-parented, `None` otherwise.
+    /// Used by code paths that only make sense for books — shelf-pin
+    /// reattachment, the search `{in_book:N}` filter, list/find walks.
+    pub fn book_id(&self) -> Option<i64> {
+        match self {
+            CollectionParent::Book(id) => Some(*id),
+            CollectionParent::Chapter(_) => None,
+        }
+    }
+
+    /// Find a page by exact-name match within this parent's scope. Books
+    /// walk every page in the book; chapters scope strictly to pages
+    /// inside that chapter.
+    pub async fn find_page_by_name(
+        &self,
+        client: &bsmcp_common::bookstack::BookStackClient,
+        name: &str,
+    ) -> Result<Option<i64>, String> {
+        let row = match self {
+            CollectionParent::Book(id) => client.find_page_in_book(*id, name).await?,
+            CollectionParent::Chapter(id) => client.find_page_in_chapter(*id, name).await?,
+        };
+        Ok(row.and_then(|p| p.get("id").and_then(|v| v.as_i64())))
+    }
+
+    /// List the most-recently-updated pages within this parent's scope,
+    /// up to `limit`. Used by the read-without-key list path and search.
+    pub async fn list_pages_by_updated(
+        &self,
+        client: &bsmcp_common::bookstack::BookStackClient,
+        limit: usize,
+    ) -> Result<Vec<Value>, String> {
+        match self {
+            CollectionParent::Book(id) => client.list_book_pages_by_updated(*id, limit).await,
+            CollectionParent::Chapter(id) => client.list_chapter_pages_by_updated(*id, limit).await,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum KeyKind {
@@ -200,14 +246,11 @@ async fn list_pages(
 ) -> Outcome {
     let limit = ctx.body_count("limit", 25, 200);
     let offset = ctx.body.get("offset").and_then(|v| v.as_i64()).unwrap_or(0).max(0) as usize;
-    // Pull (limit + offset) most-recently-updated pages from the book and
-    // skip to the requested offset. Goes through the BookStackClient helper
-    // so we get database `updated_at` ordering, not search-relevance.
-    match ctx
-        .client
-        .list_book_pages_by_updated(parent, limit + offset)
-        .await
-    {
+    // Pull (limit + offset) most-recently-updated pages from the parent
+    // (book or chapter, depending on the resource) and skip to the offset.
+    // Goes through `CollectionParent::list_pages_by_updated` so we get
+    // database `updated_at` ordering, not search-relevance.
+    match parent.list_pages_by_updated(&ctx.client, limit + offset).await {
         Ok(rows) => {
             let pages: Vec<Value> = rows
                 .into_iter()
@@ -235,19 +278,21 @@ async fn find_page_by_name(
     name: &str,
     ctx: &Context,
 ) -> Result<Option<i64>, String> {
-    // Goes through `get_book` + flatten — never `search` — so the book scope
-    // is honored. Exact-name match (case-insensitive) is done client-side.
-    match ctx.client.find_page_in_book(parent, name).await? {
-        Some(page) => Ok(page.get("id").and_then(|v| v.as_i64())),
-        None => Ok(None),
-    }
+    // Goes through `get_book`/`get_chapter` + flatten — never `search` — so
+    // the parent scope is honored. Exact-name match (case-insensitive) is
+    // done client-side.
+    parent.find_page_by_name(&ctx.client, name).await
 }
 
 /// Used only by `handle_search`, which prepends a positive keyword term —
 /// so the filter is honored. Listing/lookup paths must NOT use this; go
-/// through `list_book_pages_by_updated` / `find_page_in_book` instead.
-fn parent_filter(book_id: CollectionParent) -> String {
-    format!("{{in_book:{book_id}}}")
+/// through `CollectionParent::list_pages_by_updated` /
+/// `CollectionParent::find_page_by_name` instead.
+fn parent_filter(parent: CollectionParent) -> String {
+    match parent {
+        CollectionParent::Book(id) => format!("{{in_book:{id}}}"),
+        CollectionParent::Chapter(id) => format!("{{in_chapter:{id}}}"),
+    }
 }
 
 // --- WRITE ---
@@ -258,13 +303,14 @@ async fn handle_write(
     ctx: &Context,
 ) -> Outcome {
     // Self-healing shelf pin: if the resource is shelf-pinned (currently
-    // user_journal), reattach the parent book to the configured shelf on
-    // every write. Idempotent — `ensure_book_on_shelf` is a no-op when the
-    // book is already there. Runs before the page write so the new entry
-    // lands in a correctly-attached book.
+    // user_journal) AND the parent is a book, reattach it to the configured
+    // shelf on every write. Idempotent — `ensure_book_on_shelf` is a no-op
+    // when the book is already there. Chapter-parented resources don't have
+    // a shelf to pin themselves to (they live inside an Identity book that
+    // sits on the Hive shelf, locked separately).
     let globals = ctx.db.get_global_settings().await.unwrap_or_default();
-    if let Some(shelf_id) = resource.shelf_pin(&globals) {
-        provision::ensure_book_on_shelf(&ctx.client, parent, shelf_id).await;
+    if let (Some(shelf_id), Some(book_id)) = (resource.shelf_pin(&globals), parent.book_id()) {
+        provision::ensure_book_on_shelf(&ctx.client, book_id, shelf_id).await;
     }
 
     let body_text = match ctx.body_str("body") {
@@ -374,17 +420,27 @@ enum CreateTarget {
 
 async fn resolve_create_target(
     resource: &dyn CollectionResource,
-    book_id: CollectionParent,
+    parent: CollectionParent,
     key: Option<&str>,
     ctx: &Context,
 ) -> Result<CreateTarget, String> {
-    // If the resource splits by sub-chapter, find or create it.
-    let sub_chapter_name = key.and_then(|k| resource.sub_chapter_for_key(k));
-    if let Some(chapter_name) = sub_chapter_name {
-        let chapter_id = find_or_create_chapter(book_id, &chapter_name, ctx).await?;
-        Ok(CreateTarget::Chapter(chapter_id))
-    } else {
-        Ok(CreateTarget::Book(book_id))
+    match parent {
+        CollectionParent::Chapter(id) => {
+            // Chapter-parented resources land all writes directly in the
+            // chapter; sub-chapter splitting doesn't apply.
+            Ok(CreateTarget::Chapter(id))
+        }
+        CollectionParent::Book(book_id) => {
+            // Book-parented: if the resource splits by sub-chapter (e.g.
+            // user_journal's monthly chapters), find or create it.
+            let sub_chapter_name = key.and_then(|k| resource.sub_chapter_for_key(k));
+            if let Some(chapter_name) = sub_chapter_name {
+                let chapter_id = find_or_create_chapter(book_id, &chapter_name, ctx).await?;
+                Ok(CreateTarget::Chapter(chapter_id))
+            } else {
+                Ok(CreateTarget::Book(book_id))
+            }
+        }
     }
 }
 
@@ -424,8 +480,8 @@ async fn handle_append(
     ctx: &Context,
 ) -> Outcome {
     let globals = ctx.db.get_global_settings().await.unwrap_or_default();
-    if let Some(shelf_id) = resource.shelf_pin(&globals) {
-        provision::ensure_book_on_shelf(&ctx.client, parent, shelf_id).await;
+    if let (Some(shelf_id), Some(book_id)) = (resource.shelf_pin(&globals), parent.book_id()) {
+        provision::ensure_book_on_shelf(&ctx.client, book_id, shelf_id).await;
     }
 
     let body_text = match ctx.body_str("body") {
@@ -940,8 +996,15 @@ async fn handle_search(
     outcome
 }
 
-fn matches_parent(hit: &Value, book_id: CollectionParent) -> bool {
-    hit.get("book_id").and_then(|v| v.as_i64()) == Some(book_id)
+fn matches_parent(hit: &Value, parent: CollectionParent) -> bool {
+    match parent {
+        CollectionParent::Book(id) => {
+            hit.get("book_id").and_then(|v| v.as_i64()) == Some(id)
+        }
+        CollectionParent::Chapter(id) => {
+            hit.get("chapter_id").and_then(|v| v.as_i64()) == Some(id)
+        }
+    }
 }
 
 // --- DELETE (soft) ---
@@ -1038,14 +1101,14 @@ pub mod resources {
     pub struct Journal;
     impl CollectionResource for Journal {
         fn name(&self) -> &'static str { "journal" }
-        fn setting_field(&self) -> &'static str { "ai_hive_journal_book_id" }
+        fn setting_field(&self) -> &'static str { "ai_identity_journal_chapter_id" }
         fn parent(&self, s: &UserSettings) -> Option<CollectionParent> {
-            s.ai_hive_journal_book_id        }
-        fn key_kind(&self) -> KeyKind { KeyKind::Date }
-        fn sub_chapter_for_key(&self, key: &str) -> Option<String> {
-            // YYYY-MM-DD → YYYY-MM monthly chapter
-            if key.len() >= 7 { Some(key[..7].to_string()) } else { None }
+            // Phase 6: chapter-parented. Pages live flat inside the
+            // current-year Journal chapter; year-rollover sweep moves stale
+            // entries into 'Journal Archive - {YEAR}' chapters.
+            s.ai_identity_journal_chapter_id.map(CollectionParent::Chapter)
         }
+        fn key_kind(&self) -> KeyKind { KeyKind::Date }
     }
 
     pub struct Collage;
@@ -1053,7 +1116,8 @@ pub mod resources {
         fn name(&self) -> &'static str { "collage" }
         fn setting_field(&self) -> &'static str { "ai_collage_book_id" }
         fn parent(&self, s: &UserSettings) -> Option<CollectionParent> {
-            s.ai_collage_book_id        }
+            s.ai_collage_book_id.map(CollectionParent::Book)
+        }
         fn key_kind(&self) -> KeyKind { KeyKind::Slug }
     }
 
@@ -1062,7 +1126,8 @@ pub mod resources {
         fn name(&self) -> &'static str { "shared_collage" }
         fn setting_field(&self) -> &'static str { "ai_shared_collage_book_id" }
         fn parent(&self, s: &UserSettings) -> Option<CollectionParent> {
-            s.ai_shared_collage_book_id        }
+            s.ai_shared_collage_book_id.map(CollectionParent::Book)
+        }
         fn key_kind(&self) -> KeyKind { KeyKind::Slug }
     }
 
@@ -1071,7 +1136,8 @@ pub mod resources {
         fn name(&self) -> &'static str { "user_journal" }
         fn setting_field(&self) -> &'static str { "user_journal_book_id" }
         fn parent(&self, s: &UserSettings) -> Option<CollectionParent> {
-            s.user_journal_book_id        }
+            s.user_journal_book_id.map(CollectionParent::Book)
+        }
         fn key_kind(&self) -> KeyKind { KeyKind::Date }
         fn sub_chapter_for_key(&self, key: &str) -> Option<String> {
             if key.len() >= 7 { Some(key[..7].to_string()) } else { None }

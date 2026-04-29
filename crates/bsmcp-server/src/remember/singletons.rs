@@ -512,6 +512,40 @@ pub async fn write_config(ctx: &Context) -> Outcome {
         );
     }
 
+    // Resolve admin status up front so the all-admin-only-rejection path
+    // can short-circuit BEFORE any per-user save runs. Without this, a
+    // non-admin call carrying admin-only globals would either silently drop
+    // the fields or report success after persisting nothing visible. See #44.
+    //
+    // `is_admin()` only matters when the caller actually proposed
+    // `global_settings`; skip the BookStack roundtrip otherwise.
+    let global_field_names: Vec<String> = global_settings_arg
+        .as_ref()
+        .and_then(|v| v.as_object())
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    let is_admin = if global_settings_arg.is_some() {
+        ctx.client.is_admin().await.unwrap_or(false)
+    } else {
+        // Value is irrelevant when no global block was sent.
+        false
+    };
+
+    // Spec (issue #44): split the non-admin write into three buckets so the
+    // caller always gets a clear signal — see `decide_global_policy`.
+    let policy = decide_global_policy(GlobalPolicyInput {
+        is_admin,
+        has_user_settings: user_settings_arg.is_some(),
+        global_field_names: &global_field_names,
+    });
+    if matches!(policy, GlobalPolicy::RejectAllAdminOnly) {
+        return Outcome::error(
+            ErrorCode::PermissionDenied,
+            admin_only_rejection_message(&global_field_names),
+            Some("global_settings"),
+        );
+    }
+
     let mut warnings: Vec<super::envelope::RememberWarning> = Vec::new();
     let mut saved_user: Option<UserSettings> = None;
     let mut saved_globals: Option<GlobalSettings> = None;
@@ -543,7 +577,15 @@ pub async fn write_config(ctx: &Context) -> Outcome {
     }
 
     // --- global settings (admin-only, first-write-wins) ---
-    if let Some(raw) = global_settings_arg {
+    //
+    // Mixed-call path for non-admins: drop the admin-only block entirely,
+    // attach an `admin_only_fields_ignored` warning naming the requested
+    // fields, and continue. Per-user save above already succeeded.
+    if matches!(policy, GlobalPolicy::IgnoreWithWarning) {
+        warnings.push(admin_only_ignored_warning(&global_field_names));
+    }
+    if matches!(policy, GlobalPolicy::Allow) {
+        let raw = global_settings_arg.expect("Allow policy implies global block present");
         let proposed: GlobalSettings = match serde_json::from_value(raw) {
             Ok(g) => g,
             Err(e) => {
@@ -554,14 +596,6 @@ pub async fn write_config(ctx: &Context) -> Outcome {
                 );
             }
         };
-        let is_admin = ctx.client.is_admin().await.unwrap_or(false);
-        if !is_admin {
-            return Outcome::error(
-                ErrorCode::InvalidArgument,
-                "global_settings can only be written by BookStack admins",
-                Some("global_settings"),
-            );
-        }
 
         // Two policies merged in one pass:
         //   - Shelf IDs are STRUCTURAL: first-write-wins. Once set they're
@@ -642,6 +676,233 @@ pub async fn write_config(ctx: &Context) -> Outcome {
         outcome = outcome.with_warning(w);
     }
     outcome
+}
+
+/// Field names that exist on `GlobalSettings` and are admin-only writable.
+/// Used by the non-admin rejection path so the warning/error message names
+/// the requested fields back to the caller.
+///
+/// `set_by_token_hash` and `updated_at` are server-managed and never
+/// settable from a request, so they're omitted.
+const ADMIN_ONLY_GLOBAL_FIELDS: &[&str] = &[
+    "hive_shelf_id",
+    "user_journals_shelf_id",
+    "default_ai_identity_page_id",
+    "default_ai_identity_name",
+    "default_ai_identity_ouid",
+    "org_required_instructions_page_ids",
+    "org_ai_usage_policy_page_ids",
+    "org_identity_page_id",
+    "org_domains",
+];
+
+/// Filter a caller's `global_settings` keys down to recognized admin-only
+/// field names. Order-preserving so the warning message and `ignored_fields`
+/// list match the order the caller wrote them.
+fn classify_admin_only_fields(requested: &[String]) -> Vec<String> {
+    requested
+        .iter()
+        .filter(|name| ADMIN_ONLY_GLOBAL_FIELDS.contains(&name.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Build the `admin_only_fields_ignored` warning attached to mixed-call
+/// responses (per-user + admin-only globals) when the caller isn't admin.
+/// The shape matches issue #44's spec exactly so AI clients can switch on
+/// `code` and read `ignored_fields` directly.
+fn admin_only_ignored_warning(requested: &[String]) -> super::envelope::RememberWarning {
+    let ignored = classify_admin_only_fields(requested);
+    let names = ignored.join(", ");
+    let message = format!(
+        "Ignored admin-only global_settings fields: {names}. Your BookStack token \
+         doesn't have admin role; ask a BookStack admin to set these via /settings, \
+         or rotate your MCP token to one belonging to an admin user."
+    );
+    super::envelope::RememberWarning::new("admin_only_fields_ignored", message)
+        .with_details(json!({ "ignored_fields": ignored }))
+}
+
+/// Inputs for `decide_global_policy`. Pulled out into a struct so the test
+/// suite can build cases declaratively without juggling positional args.
+#[derive(Clone, Copy, Debug)]
+struct GlobalPolicyInput<'a> {
+    is_admin: bool,
+    has_user_settings: bool,
+    global_field_names: &'a [String],
+}
+
+/// What to do with the request's `global_settings` block. Three buckets,
+/// one per #44 acceptance criterion:
+///   - `Allow`: admin caller, run the existing merge logic.
+///   - `IgnoreWithWarning`: non-admin mixed call (per-user fields exist),
+///     drop the global block, attach the warning.
+///   - `RejectAllAdminOnly`: non-admin call with ONLY admin-only fields,
+///     no per-user save to fall back on; hard error.
+///   - `NoGlobals`: no `global_settings` block was sent at all,
+///     short-circuit straight to the per-user path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GlobalPolicy {
+    Allow,
+    IgnoreWithWarning,
+    RejectAllAdminOnly,
+    NoGlobals,
+}
+
+fn decide_global_policy(input: GlobalPolicyInput<'_>) -> GlobalPolicy {
+    if input.global_field_names.is_empty() {
+        return GlobalPolicy::NoGlobals;
+    }
+    if input.is_admin {
+        return GlobalPolicy::Allow;
+    }
+    // Non-admin from here on. Today every settable global_settings field is
+    // admin-only, so the choice collapses to: do we have any per-user save
+    // to attach the warning to, or is this an isolated globals call?
+    if input.has_user_settings {
+        GlobalPolicy::IgnoreWithWarning
+    } else {
+        GlobalPolicy::RejectAllAdminOnly
+    }
+}
+
+/// Message body for the all-admin-only permission_denied error path. Names
+/// the requested fields and points the caller at the same two remediation
+/// options as the warning so the AI can act on either signal identically.
+fn admin_only_rejection_message(requested: &[String]) -> String {
+    let ignored = classify_admin_only_fields(requested);
+    let names = if ignored.is_empty() {
+        "global_settings".to_string()
+    } else {
+        ignored.join(", ")
+    };
+    format!(
+        "Writing global_settings fields {{{names}}} requires admin authority on \
+         BookStack. Ask a BookStack admin to set these via /settings, or rotate \
+         your MCP token to one belonging to an admin user."
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    //! Pure-logic coverage for the #44 policy split — picks the right
+    //! branch (allow / ignore-with-warning / reject) given is_admin,
+    //! presence of per-user settings, and the field names the caller
+    //! sent. Async paths through `write_config` itself live behind a
+    //! BookStack client + db backend and are exercised by the
+    //! integration suite; this module only locks in the decision tree.
+    use super::*;
+
+    fn names(slice: &[&str]) -> Vec<String> {
+        slice.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn admin_call_passes_through() {
+        let fields = names(&["org_identity_page_id", "org_domains"]);
+        let policy = decide_global_policy(GlobalPolicyInput {
+            is_admin: true,
+            has_user_settings: false,
+            global_field_names: &fields,
+        });
+        assert_eq!(policy, GlobalPolicy::Allow);
+    }
+
+    #[test]
+    fn admin_call_with_per_user_also_allowed() {
+        // Admin with both blocks should still reach the merge path; no
+        // warning is attached because there's nothing to drop.
+        let fields = names(&["hive_shelf_id"]);
+        let policy = decide_global_policy(GlobalPolicyInput {
+            is_admin: true,
+            has_user_settings: true,
+            global_field_names: &fields,
+        });
+        assert_eq!(policy, GlobalPolicy::Allow);
+    }
+
+    #[test]
+    fn non_admin_mixed_call_ignores_with_warning() {
+        // Per the #44 spec acceptance: per-user fields persist, admin-only
+        // globals are dropped, and the response carries the warning.
+        let fields = names(&["org_identity_page_id"]);
+        let policy = decide_global_policy(GlobalPolicyInput {
+            is_admin: false,
+            has_user_settings: true,
+            global_field_names: &fields,
+        });
+        assert_eq!(policy, GlobalPolicy::IgnoreWithWarning);
+    }
+
+    #[test]
+    fn non_admin_all_admin_only_call_is_rejected() {
+        // Per the #44 spec acceptance: hard permission_denied because there's
+        // no per-user fallback to attach a warning to.
+        let fields = names(&["org_identity_page_id", "org_domains"]);
+        let policy = decide_global_policy(GlobalPolicyInput {
+            is_admin: false,
+            has_user_settings: false,
+            global_field_names: &fields,
+        });
+        assert_eq!(policy, GlobalPolicy::RejectAllAdminOnly);
+    }
+
+    #[test]
+    fn no_global_block_short_circuits() {
+        // Per-user-only writes never trigger the BookStack admin probe.
+        let policy = decide_global_policy(GlobalPolicyInput {
+            is_admin: false,
+            has_user_settings: true,
+            global_field_names: &[],
+        });
+        assert_eq!(policy, GlobalPolicy::NoGlobals);
+    }
+
+    #[test]
+    fn classify_admin_only_filters_unknown_fields() {
+        // Only fields on the admin-only allowlist are surfaced. Unknown
+        // names (e.g. caller typos) get dropped by the allowlist and don't
+        // confuse the warning message.
+        let requested = names(&["org_identity_page_id", "not_a_field", "hive_shelf_id"]);
+        let filtered = classify_admin_only_fields(&requested);
+        assert_eq!(filtered, names(&["org_identity_page_id", "hive_shelf_id"]));
+    }
+
+    #[test]
+    fn warning_carries_ignored_fields_at_top_level() {
+        // The #44 envelope spec puts `ignored_fields` directly on the
+        // warning object — clients shouldn't have to descend into a
+        // `details` sub-object to read it.
+        let requested = names(&["org_identity_page_id", "org_domains"]);
+        let w = admin_only_ignored_warning(&requested);
+        assert_eq!(w.code, "admin_only_fields_ignored");
+        let serialized = super::super::envelope::warning_to_json(&w);
+        assert_eq!(serialized["code"], "admin_only_fields_ignored");
+        assert!(serialized["message"].as_str().unwrap().contains("org_identity_page_id"));
+        let ignored = serialized["ignored_fields"].as_array().expect("ignored_fields array");
+        assert_eq!(ignored.len(), 2);
+        assert_eq!(ignored[0], "org_identity_page_id");
+        assert_eq!(ignored[1], "org_domains");
+    }
+
+    #[test]
+    fn rejection_message_names_requested_fields() {
+        let requested = names(&["org_identity_page_id", "org_domains"]);
+        let msg = admin_only_rejection_message(&requested);
+        assert!(msg.contains("org_identity_page_id"));
+        assert!(msg.contains("org_domains"));
+        assert!(msg.contains("admin"));
+    }
+
+    #[test]
+    fn rejection_message_falls_back_to_generic_label_when_all_unknown() {
+        // Defensive: if a caller somehow gets here with only unknown field
+        // names, the message still tells them what was rejected (the whole
+        // block) rather than rendering an empty `{}`.
+        let requested = names(&["totally_made_up"]);
+        let msg = admin_only_rejection_message(&requested);
+        assert!(msg.contains("global_settings"));
+    }
 }
 
 /// `remember_config action=dismiss_setup_nudge days=N` — snooze the briefing's

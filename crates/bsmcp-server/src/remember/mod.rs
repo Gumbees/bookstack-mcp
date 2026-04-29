@@ -123,6 +123,25 @@ pub async fn dispatch(
     if log_audit {
         let ouid = ctx.settings.ai_identity_ouid.clone();
         let user_id = ctx.settings.user_id.clone();
+        // The `error` text column doubles as an anomaly-notes field for
+        // succeeded-with-warnings writes (e.g. #44 admin-only field drops on
+        // remember_config write). Real errors win when both apply; warnings
+        // get JSON-serialized so a later `remember_audit action=read` can
+        // see exactly which fields were dropped without a schema migration.
+        let error_field = outcome.error_message().or_else(|| {
+            if outcome.warnings.is_empty() {
+                None
+            } else {
+                let payload = json!({
+                    "warnings": outcome
+                        .warnings
+                        .iter()
+                        .map(envelope::warning_to_json)
+                        .collect::<Vec<_>>()
+                });
+                Some(payload.to_string())
+            }
+        });
         let entry = AuditEntryInsert {
             token_id_hash,
             ai_identity_ouid: ouid,
@@ -132,7 +151,7 @@ pub async fn dispatch(
             target_page_id: outcome.target_page_id,
             target_key: outcome.target_key.clone(),
             success: outcome.is_ok(),
-            error: outcome.error_message(),
+            error: error_field,
             trace_id: Some(trace_id.clone()),
         };
         if let Err(e) = db.insert_audit_entry(&entry).await {

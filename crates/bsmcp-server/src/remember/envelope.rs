@@ -19,6 +19,7 @@ pub enum ErrorCode {
     BookStackError,
     NotFound,
     SemanticUnavailable,
+    PermissionDenied,
     InternalError,
 }
 
@@ -31,22 +32,55 @@ impl ErrorCode {
             Self::BookStackError => "bookstack_error",
             Self::NotFound => "not_found",
             Self::SemanticUnavailable => "semantic_unavailable",
+            Self::PermissionDenied => "permission_denied",
             Self::InternalError => "internal_error",
         }
     }
 }
 
 /// Soft warning attached to a successful response. Doesn't fail the call.
+///
+/// `details` carries warning-specific structured data (e.g.
+/// `ignored_fields` for `admin_only_fields_ignored`). Serialized inline at
+/// the top level of the warning JSON object so clients can read named
+/// fields directly without descending into a `details` sub-object.
 #[derive(Clone, Debug)]
 pub struct RememberWarning {
     pub code: String,
     pub message: String,
+    pub details: Option<Value>,
 }
 
 impl RememberWarning {
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self { code: code.into(), message: message.into() }
+        Self { code: code.into(), message: message.into(), details: None }
     }
+
+    /// Attach structured details. The details object's top-level fields are
+    /// merged into the serialized warning so callers see e.g.
+    /// `{ "code": "...", "message": "...", "ignored_fields": [...] }`.
+    pub fn with_details(mut self, details: Value) -> Self {
+        self.details = Some(details);
+        self
+    }
+}
+
+/// Serialize a warning to JSON. `details` (when present and an object) is
+/// merged at the top level so per-warning payload fields appear alongside
+/// `code`/`message` without an extra nesting layer.
+pub fn warning_to_json(w: &RememberWarning) -> Value {
+    let mut obj = json!({
+        "code": w.code,
+        "message": w.message,
+    });
+    if let Some(Value::Object(details)) = &w.details {
+        if let Value::Object(map) = &mut obj {
+            for (k, v) in details {
+                map.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    obj
 }
 
 pub fn build_meta(
@@ -67,10 +101,6 @@ pub fn build_meta(
             "ai_identity_ouid": settings.ai_identity_ouid,
             "user_id": settings.user_id,
         },
-        "warnings": warnings.iter().map(|w| json!({
-            "code": w.code,
-            "message": w.message,
-        })).collect::<Vec<_>>(),
         // Time block — surfaced on EVERY remember response (not just
         // briefing) so the AI always knows the current time in the user's
         // configured timezone without a separate roundtrip. Carries the
@@ -78,6 +108,13 @@ pub fn build_meta(
         // a fresh `client_timezone` on its next call.
         "time": build_time_block(settings, tz_just_pushed),
     });
+
+    // `warnings` is optional and omitted when empty so clients can use
+    // `meta.warnings` presence as the "anything to surface?" check without
+    // walking an always-empty array.
+    if !warnings.is_empty() {
+        meta["warnings"] = Value::Array(warnings.iter().map(warning_to_json).collect());
+    }
 
     // Compact setup-status pointer — surfaced on every response (not just
     // briefing) so the AI notices misconfiguration even when calling

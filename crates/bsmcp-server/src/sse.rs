@@ -46,6 +46,9 @@ pub struct AppState {
     pub summary_cache: crate::summary::SummaryCache,
     pub staging: crate::staging::StagingStore,
     pub settings_sessions: crate::settings_ui::SettingsSessionStore,
+    /// Per-`(token_hash, session_id)` briefing state — drives the full-vs-sticky
+    /// auto-injection of `meta.briefing` on every MCP tool response.
+    pub briefing_sessions: crate::session::SessionStore,
     /// Index db is always present (sqlite has full impl, postgres returns
     /// stub errors per #36). Webhook handler enqueues page:{id} index jobs
     /// here when BookStack page events arrive.
@@ -129,6 +132,7 @@ impl AppState {
             summary_cache,
             staging: crate::staging::new_staging_store(),
             settings_sessions: crate::settings_ui::new_settings_store(),
+            briefing_sessions: crate::session::new_store(),
             index_db,
         }
     }
@@ -418,11 +422,14 @@ pub async fn handle_message(
     };
 
     let semantic = state.semantic.as_deref();
+    let token_id_hash = bsmcp_common::settings::hash_token_id(&token_id);
     let remember_deps = mcp::RememberDeps {
         db: state.db.clone(),
         index_db: state.index_db.clone(),
         semantic: state.semantic.clone(),
+        session_store: state.briefing_sessions.clone(),
         token_id: token_id.clone(),
+        token_id_hash,
     };
     let response = mcp::handle_request(&request, &client, semantic, &state.summary_cache, &state.staging, &remember_deps).await;
 
@@ -500,11 +507,14 @@ pub async fn handle_streamable(
     }
 
     let semantic = state.semantic.as_deref();
+    let token_id_hash = bsmcp_common::settings::hash_token_id(&token_id);
     let remember_deps = mcp::RememberDeps {
         db: state.db.clone(),
         index_db: state.index_db.clone(),
         semantic: state.semantic.clone(),
+        session_store: state.briefing_sessions.clone(),
         token_id: token_id.clone(),
+        token_id_hash,
     };
     let response = mcp::handle_request(&request, &client, semantic, &state.summary_cache, &state.staging, &remember_deps).await;
 

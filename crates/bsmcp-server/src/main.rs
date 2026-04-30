@@ -1,9 +1,10 @@
+mod briefing;
 mod llm;
 mod mcp;
 mod migrate;
 mod oauth;
-mod remember;
 mod semantic;
+mod session;
 mod settings_ui;
 mod sse;
 mod staging;
@@ -14,7 +15,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{HeaderMap, HeaderName, Method, StatusCode};
 use axum::response::{Html, IntoResponse, Json};
 use axum::{Router, routing::get};
@@ -248,13 +249,13 @@ async fn main() {
     state.spawn_cleanup();
     state.spawn_backup();
     settings_ui::spawn_settings_cleanup(state.settings_sessions.clone());
+    session::spawn_cleanup(state.briefing_sessions.clone());
 
-    // BSMCP_REMEMBER_ENABLED gates the entire Hive memory surface — both
-    // the /remember/v1/* HTTP endpoint and the remember_* MCP tools. Default
-    // true (back-compat). Set to false to run bookstack-mcp purely as a
-    // BookStack proxy (e.g., when a separate frame application like Forager
-    // owns the memory layer).
-    let remember_enabled = env::var("BSMCP_REMEMBER_ENABLED")
+    // BSMCP_BRIEFING_ENABLED gates the briefing subsystem — both the
+    // /briefing/v1/read HTTP endpoint and the auto-injected meta.briefing
+    // on every MCP tool response. Default true. Set to false to run
+    // bookstack-mcp purely as a BookStack proxy.
+    let briefing_enabled = env::var("BSMCP_BRIEFING_ENABLED")
         .ok()
         .map(|v| {
             let v = v.trim().to_lowercase();
@@ -279,14 +280,14 @@ async fn main() {
             get(settings_ui::handle_settings_probe_get).post(settings_ui::handle_settings_probe_post),
         )
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }));
-    if remember_enabled {
+    if briefing_enabled {
         app = app.route(
-            "/remember/v1/{resource}/{action}",
-            axum::routing::post(handle_remember_http),
+            "/briefing/v1/read",
+            axum::routing::post(handle_briefing_http),
         );
-        eprintln!("Remember: HTTP endpoint active at POST /remember/v1/{{resource}}/{{action}}");
+        eprintln!("Briefing: HTTP endpoint active at POST /briefing/v1/read");
     } else {
-        eprintln!("Remember: DISABLED (set BSMCP_REMEMBER_ENABLED=true to enable)");
+        eprintln!("Briefing: DISABLED (set BSMCP_BRIEFING_ENABLED=true to enable)");
     }
     eprintln!("Settings: UI active at GET/POST /settings");
 
@@ -334,12 +335,11 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-/// HTTP handler for /remember/v1/{resource}/{action}. Resolves the caller's
-/// BookStack credentials via the same Bearer-token logic the MCP endpoints use,
-/// then dispatches into the `remember` module.
-async fn handle_remember_http(
+/// HTTP handler for `POST /briefing/v1/read`. Resolves the caller's BookStack
+/// credentials via the same Bearer-token logic the MCP endpoints use, then
+/// dispatches into the briefing builder.
+async fn handle_briefing_http(
     State(state): State<sse::AppState>,
-    Path((resource, action)): Path<(String, String)>,
     headers: HeaderMap,
     body: String,
 ) -> impl IntoResponse {
@@ -370,9 +370,7 @@ async fn handle_remember_http(
         state.http_client.clone(),
     );
 
-    let envelope = remember::dispatch(
-        &resource,
-        &action,
+    let envelope = briefing::read(
         body_value,
         &token_id,
         &client,
@@ -382,24 +380,7 @@ async fn handle_remember_http(
     )
     .await;
 
-    let status = if envelope.get("ok").and_then(|v| v.as_bool()) == Some(true) {
-        StatusCode::OK
-    } else {
-        // Map error code → HTTP status. Conservative: 400 for client errors, 500 for server.
-        envelope
-            .get("error")
-            .and_then(|e| e.get("code"))
-            .and_then(|c| c.as_str())
-            .map(|code| match code {
-                "settings_not_configured" | "invalid_argument" | "unknown_action" => StatusCode::BAD_REQUEST,
-                "not_found" => StatusCode::NOT_FOUND,
-                "semantic_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            })
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
-    };
-
-    (status, Json(envelope)).into_response()
+    (StatusCode::OK, Json(envelope)).into_response()
 }
 
 /// Webhook handler for BookStack page change events.

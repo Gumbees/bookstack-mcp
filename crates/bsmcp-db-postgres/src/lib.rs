@@ -42,6 +42,17 @@ fn decode_str_list(value: Option<String>) -> Vec<String> {
     }
 }
 
+fn encode_kb_scope(scope: Option<&bsmcp_common::settings::KbScope>) -> Option<String> {
+    scope.and_then(|s| serde_json::to_string(s).ok())
+}
+
+fn decode_kb_scope(value: Option<String>) -> Option<bsmcp_common::settings::KbScope> {
+    match value {
+        Some(s) if !s.is_empty() => serde_json::from_str(&s).ok(),
+        _ => None,
+    }
+}
+
 pub struct PostgresDb {
     pool: PgPool,
     encryption_key: Zeroizing<[u8; 32]>,
@@ -144,7 +155,14 @@ impl PostgresDb {
                 org_identity_page_id BIGINT,
                 org_domains TEXT,
                 set_by_token_hash TEXT,
-                updated_at BIGINT NOT NULL DEFAULT 0
+                updated_at BIGINT NOT NULL DEFAULT 0,
+                guide_page_id BIGINT,
+                policies_scope TEXT,
+                sops_scope TEXT,
+                best_practices_scope TEXT,
+                friendly_structure BOOLEAN NOT NULL DEFAULT TRUE,
+                full_content_in_briefing BOOLEAN NOT NULL DEFAULT FALSE,
+                strict_setup BOOLEAN NOT NULL DEFAULT FALSE
             )"
         )
         .execute(&pool)
@@ -152,9 +170,8 @@ impl PostgresDb {
         .map_err(|e| format!("Failed to create global_settings table: {e}"))?;
 
         // Migrations for older deployments — ADD COLUMN IF NOT EXISTS is supported in PG 9.6+.
-        // org_*_chapter_ids columns were briefly added during this PR's development and
-        // then dropped in favour of page-IDs-only — leaving any existing columns in place
-        // is harmless since we no longer read or write them.
+        // The default_ai_identity_* and other personal-memory columns are kept on disk
+        // but no longer read or written (v0.8.0 dropped that surface).
         for sql in [
             "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS default_ai_identity_page_id BIGINT",
             "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS default_ai_identity_name TEXT",
@@ -163,6 +180,14 @@ impl PostgresDb {
             "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS org_ai_usage_policy_page_ids TEXT",
             "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS org_identity_page_id BIGINT",
             "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS org_domains TEXT",
+            // v0.8.0 typed slots + org-wide booleans.
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS guide_page_id BIGINT",
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS policies_scope TEXT",
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS sops_scope TEXT",
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS best_practices_scope TEXT",
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS friendly_structure BOOLEAN NOT NULL DEFAULT TRUE",
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS full_content_in_briefing BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS strict_setup BOOLEAN NOT NULL DEFAULT FALSE",
         ] {
             sqlx::query(sql).execute(&pool).await.ok();
         }
@@ -541,11 +566,12 @@ impl DbBackend for PostgresDb {
     async fn get_global_settings(&self) -> Result<GlobalSettings, String> {
         let row = sqlx::query(
             "SELECT hive_shelf_id, user_journals_shelf_id,
-                    default_ai_identity_page_id, default_ai_identity_name, default_ai_identity_ouid,
                     org_required_instructions_page_ids,
                     org_ai_usage_policy_page_ids,
                     org_identity_page_id, org_domains,
-                    set_by_token_hash, updated_at
+                    set_by_token_hash, updated_at,
+                    guide_page_id, policies_scope, sops_scope, best_practices_scope,
+                    friendly_structure, full_content_in_briefing, strict_setup
              FROM global_settings WHERE id = 1"
         )
         .fetch_optional(&self.pool)
@@ -555,15 +581,19 @@ impl DbBackend for PostgresDb {
         Ok(row.map(|r| GlobalSettings {
             hive_shelf_id: r.get("hive_shelf_id"),
             user_journals_shelf_id: r.get("user_journals_shelf_id"),
-            default_ai_identity_page_id: r.get("default_ai_identity_page_id"),
-            default_ai_identity_name: r.get("default_ai_identity_name"),
-            default_ai_identity_ouid: r.get("default_ai_identity_ouid"),
             org_required_instructions_page_ids: decode_id_list(r.get("org_required_instructions_page_ids")),
             org_ai_usage_policy_page_ids: decode_id_list(r.get("org_ai_usage_policy_page_ids")),
             org_identity_page_id: r.get("org_identity_page_id"),
             org_domains: decode_str_list(r.get("org_domains")),
             set_by_token_hash: r.get("set_by_token_hash"),
             updated_at: r.get("updated_at"),
+            guide_page_id: r.get("guide_page_id"),
+            policies_scope: decode_kb_scope(r.get("policies_scope")),
+            sops_scope: decode_kb_scope(r.get("sops_scope")),
+            best_practices_scope: decode_kb_scope(r.get("best_practices_scope")),
+            friendly_structure: r.get("friendly_structure"),
+            full_content_in_briefing: r.get("full_content_in_briefing"),
+            strict_setup: r.get("strict_setup"),
         }).unwrap_or_default())
     }
 
@@ -585,28 +615,36 @@ impl DbBackend for PostgresDb {
             "UPDATE global_settings
              SET hive_shelf_id = $1,
                  user_journals_shelf_id = $2,
-                 default_ai_identity_page_id = $3,
-                 default_ai_identity_name = $4,
-                 default_ai_identity_ouid = $5,
-                 org_required_instructions_page_ids = $6,
-                 org_ai_usage_policy_page_ids = $7,
-                 org_identity_page_id = $8,
-                 org_domains = $9,
-                 set_by_token_hash = $10,
-                 updated_at = $11
+                 org_required_instructions_page_ids = $3,
+                 org_ai_usage_policy_page_ids = $4,
+                 org_identity_page_id = $5,
+                 org_domains = $6,
+                 set_by_token_hash = $7,
+                 updated_at = $8,
+                 guide_page_id = $9,
+                 policies_scope = $10,
+                 sops_scope = $11,
+                 best_practices_scope = $12,
+                 friendly_structure = $13,
+                 full_content_in_briefing = $14,
+                 strict_setup = $15
              WHERE id = 1"
         )
         .bind(settings.hive_shelf_id)
         .bind(settings.user_journals_shelf_id)
-        .bind(settings.default_ai_identity_page_id)
-        .bind(&settings.default_ai_identity_name)
-        .bind(&settings.default_ai_identity_ouid)
         .bind(encode_id_list(&settings.org_required_instructions_page_ids))
         .bind(encode_id_list(&settings.org_ai_usage_policy_page_ids))
         .bind(settings.org_identity_page_id)
         .bind(encode_str_list(&settings.org_domains))
         .bind(&final_setter)
         .bind(Self::now_secs())
+        .bind(settings.guide_page_id)
+        .bind(encode_kb_scope(settings.policies_scope.as_ref()))
+        .bind(encode_kb_scope(settings.sops_scope.as_ref()))
+        .bind(encode_kb_scope(settings.best_practices_scope.as_ref()))
+        .bind(settings.friendly_structure)
+        .bind(settings.full_content_in_briefing)
+        .bind(settings.strict_setup)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("save_global_settings: {e}"))?;

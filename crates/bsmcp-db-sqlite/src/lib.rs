@@ -79,7 +79,14 @@ impl SqliteDb {
                  org_identity_page_id INTEGER,
                  org_domains TEXT,
                  set_by_token_hash TEXT,
-                 updated_at INTEGER NOT NULL DEFAULT 0
+                 updated_at INTEGER NOT NULL DEFAULT 0,
+                 guide_page_id INTEGER,
+                 policies_scope TEXT,
+                 sops_scope TEXT,
+                 best_practices_scope TEXT,
+                 friendly_structure INTEGER NOT NULL DEFAULT 1,
+                 full_content_in_briefing INTEGER NOT NULL DEFAULT 0,
+                 strict_setup INTEGER NOT NULL DEFAULT 0
              );
              INSERT OR IGNORE INTO global_settings (id, updated_at) VALUES (1, 0);
              DROP TABLE IF EXISTS registrations;
@@ -197,6 +204,14 @@ impl SqliteDb {
             "ALTER TABLE global_settings ADD COLUMN org_ai_usage_policy_page_ids TEXT",
             "ALTER TABLE global_settings ADD COLUMN org_identity_page_id INTEGER",
             "ALTER TABLE global_settings ADD COLUMN org_domains TEXT",
+            // v0.8.0 typed slots + org-wide booleans.
+            "ALTER TABLE global_settings ADD COLUMN guide_page_id INTEGER",
+            "ALTER TABLE global_settings ADD COLUMN policies_scope TEXT",
+            "ALTER TABLE global_settings ADD COLUMN sops_scope TEXT",
+            "ALTER TABLE global_settings ADD COLUMN best_practices_scope TEXT",
+            "ALTER TABLE global_settings ADD COLUMN friendly_structure INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE global_settings ADD COLUMN full_content_in_briefing INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE global_settings ADD COLUMN strict_setup INTEGER NOT NULL DEFAULT 0",
         ] {
             conn.execute_batch(sql).ok();
         }
@@ -519,25 +534,30 @@ impl DbBackend for SqliteDb {
             let conn = conn.lock().unwrap();
             let row = conn.query_row(
                 "SELECT hive_shelf_id, user_journals_shelf_id,
-                        default_ai_identity_page_id, default_ai_identity_name, default_ai_identity_ouid,
                         org_required_instructions_page_ids,
                         org_ai_usage_policy_page_ids,
                         org_identity_page_id, org_domains,
-                        set_by_token_hash, updated_at
+                        set_by_token_hash, updated_at,
+                        guide_page_id, policies_scope, sops_scope, best_practices_scope,
+                        friendly_structure, full_content_in_briefing, strict_setup
                  FROM global_settings WHERE id = 1",
                 [],
                 |row| Ok(GlobalSettings {
                     hive_shelf_id: row.get::<_, Option<i64>>(0)?,
                     user_journals_shelf_id: row.get::<_, Option<i64>>(1)?,
-                    default_ai_identity_page_id: row.get::<_, Option<i64>>(2)?,
-                    default_ai_identity_name: row.get::<_, Option<String>>(3)?,
-                    default_ai_identity_ouid: row.get::<_, Option<String>>(4)?,
-                    org_required_instructions_page_ids: decode_id_list(row.get::<_, Option<String>>(5)?),
-                    org_ai_usage_policy_page_ids: decode_id_list(row.get::<_, Option<String>>(6)?),
-                    org_identity_page_id: row.get::<_, Option<i64>>(7)?,
-                    org_domains: decode_str_list(row.get::<_, Option<String>>(8)?),
-                    set_by_token_hash: row.get::<_, Option<String>>(9)?,
-                    updated_at: row.get::<_, i64>(10)?,
+                    org_required_instructions_page_ids: decode_id_list(row.get::<_, Option<String>>(2)?),
+                    org_ai_usage_policy_page_ids: decode_id_list(row.get::<_, Option<String>>(3)?),
+                    org_identity_page_id: row.get::<_, Option<i64>>(4)?,
+                    org_domains: decode_str_list(row.get::<_, Option<String>>(5)?),
+                    set_by_token_hash: row.get::<_, Option<String>>(6)?,
+                    updated_at: row.get::<_, i64>(7)?,
+                    guide_page_id: row.get::<_, Option<i64>>(8)?,
+                    policies_scope: decode_kb_scope(row.get::<_, Option<String>>(9)?),
+                    sops_scope: decode_kb_scope(row.get::<_, Option<String>>(10)?),
+                    best_practices_scope: decode_kb_scope(row.get::<_, Option<String>>(11)?),
+                    friendly_structure: row.get::<_, i64>(12)? != 0,
+                    full_content_in_briefing: row.get::<_, i64>(13)? != 0,
+                    strict_setup: row.get::<_, i64>(14)? != 0,
                 }),
             ).unwrap_or_default();
             Ok(row)
@@ -566,28 +586,36 @@ impl DbBackend for SqliteDb {
                 "UPDATE global_settings
                  SET hive_shelf_id = ?1,
                      user_journals_shelf_id = ?2,
-                     default_ai_identity_page_id = ?3,
-                     default_ai_identity_name = ?4,
-                     default_ai_identity_ouid = ?5,
-                     org_required_instructions_page_ids = ?6,
-                     org_ai_usage_policy_page_ids = ?7,
-                     org_identity_page_id = ?8,
-                     org_domains = ?9,
-                     set_by_token_hash = ?10,
-                     updated_at = ?11
+                     org_required_instructions_page_ids = ?3,
+                     org_ai_usage_policy_page_ids = ?4,
+                     org_identity_page_id = ?5,
+                     org_domains = ?6,
+                     set_by_token_hash = ?7,
+                     updated_at = ?8,
+                     guide_page_id = ?9,
+                     policies_scope = ?10,
+                     sops_scope = ?11,
+                     best_practices_scope = ?12,
+                     friendly_structure = ?13,
+                     full_content_in_briefing = ?14,
+                     strict_setup = ?15
                  WHERE id = 1",
                 params![
                     s.hive_shelf_id,
                     s.user_journals_shelf_id,
-                    s.default_ai_identity_page_id,
-                    s.default_ai_identity_name,
-                    s.default_ai_identity_ouid,
                     encode_id_list(&s.org_required_instructions_page_ids),
                     encode_id_list(&s.org_ai_usage_policy_page_ids),
                     s.org_identity_page_id,
                     encode_str_list(&s.org_domains),
                     final_setter,
                     SqliteDb::now_secs(),
+                    s.guide_page_id,
+                    encode_kb_scope(s.policies_scope.as_ref()),
+                    encode_kb_scope(s.sops_scope.as_ref()),
+                    encode_kb_scope(s.best_practices_scope.as_ref()),
+                    if s.friendly_structure { 1i64 } else { 0i64 },
+                    if s.full_content_in_briefing { 1i64 } else { 0i64 },
+                    if s.strict_setup { 1i64 } else { 0i64 },
                 ],
             ).map_err(|e| format!("save_global_settings: {e}"))?;
             Ok(())
@@ -1742,6 +1770,19 @@ fn decode_str_list(value: Option<String>) -> Vec<String> {
     match value {
         Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_default(),
         _ => Vec::new(),
+    }
+}
+
+/// Encode a KbScope as a JSON object string. Returns None when scope is
+/// None so the column round-trips as NULL.
+fn encode_kb_scope(scope: Option<&bsmcp_common::settings::KbScope>) -> Option<String> {
+    scope.and_then(|s| serde_json::to_string(s).ok())
+}
+
+fn decode_kb_scope(value: Option<String>) -> Option<bsmcp_common::settings::KbScope> {
+    match value {
+        Some(s) if !s.is_empty() => serde_json::from_str(&s).ok(),
+        _ => None,
     }
 }
 

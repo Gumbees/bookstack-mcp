@@ -22,7 +22,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use bsmcp_common::bookstack::BookStackClient;
-use bsmcp_common::db::{DbBackend, IndexDb};
+use bsmcp_common::db::DbBackend;
 use bsmcp_common::settings::{hash_token_id, UserSettings};
 
 use crate::semantic::SemanticState;
@@ -38,7 +38,6 @@ pub async fn read(
     token_id: &str,
     client: &BookStackClient,
     db: Arc<dyn DbBackend>,
-    index_db: Arc<dyn IndexDb>,
     semantic: Option<Arc<SemanticState>>,
 ) -> Value {
     let started = std::time::Instant::now();
@@ -88,10 +87,8 @@ pub async fn read(
 
     let ctx = Context {
         body,
-        trace_id: trace_id.clone(),
         client: client.clone(),
         db: db.clone(),
-        index_db,
         semantic,
         settings,
         token_id_hash,
@@ -117,13 +114,11 @@ pub async fn read(
 /// responses. `full` returns the entire briefing payload; `sticky` returns
 /// only the always-present bits (time, setup_status, warnings) so subsequent
 /// MCP tool calls in the same session don't re-pay the briefing's cost.
-#[allow(dead_code)]
 pub async fn build_meta_briefing(
     body: Value,
     token_id: &str,
     client: &BookStackClient,
     db: Arc<dyn DbBackend>,
-    index_db: Arc<dyn IndexDb>,
     semantic: Option<Arc<SemanticState>>,
     full: bool,
 ) -> Value {
@@ -147,10 +142,8 @@ pub async fn build_meta_briefing(
 
     let ctx = Context {
         body,
-        trace_id: uuid::Uuid::new_v4().to_string(),
         client: client.clone(),
         db,
-        index_db,
         semantic,
         settings,
         token_id_hash,
@@ -165,12 +158,8 @@ pub async fn build_meta_briefing(
 /// Per-call context passed to the briefing builder.
 pub struct Context {
     pub body: Value,
-    #[allow(dead_code)]
-    pub trace_id: String,
     pub client: BookStackClient,
     pub db: Arc<dyn DbBackend>,
-    #[allow(dead_code)]
-    pub index_db: Arc<dyn IndexDb>,
     pub semantic: Option<Arc<SemanticState>>,
     pub settings: UserSettings,
     pub token_id_hash: String,

@@ -375,7 +375,6 @@ async fn handle_briefing_http(
         &token_id,
         &client,
         state.db.clone(),
-        state.index_db.clone(),
         state.semantic.clone(),
     )
     .await;

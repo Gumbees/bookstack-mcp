@@ -23,7 +23,6 @@ pub const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Maximum sessions tracked in-memory. When the cap is hit, the cleanup loop
 /// evicts the oldest. Single-instance store; if we ever go multi-instance,
 /// move to Postgres.
-#[allow(dead_code)]
 const MAX_SESSIONS: usize = 10_000;
 
 #[derive(Clone, Debug)]
@@ -32,7 +31,10 @@ pub struct SessionEntry {
     #[allow(dead_code)]
     pub last_briefing_sent_at: Instant,
     /// Bumped when the AI calls `session_event action=compacted` to force
-    /// the next response to inject the full briefing again.
+    /// the next response to inject the full briefing again. Exposed for
+    /// future telemetry / debugging — the meta-injection path keys off
+    /// `needs_full_briefing` (which `mark_compacted` flips alongside the
+    /// version bump).
     #[allow(dead_code)]
     pub sticky_version: u64,
     /// True until the first response carrying meta.briefing has been sent
@@ -62,7 +64,6 @@ pub fn new_store() -> SessionStore {
 /// Compute the session key. Prefer the client-supplied session_id; fall back
 /// to a per-hour bucket per token so absent-id callers still get a coarse
 /// "first call this hour" notion.
-#[allow(dead_code)]
 pub fn session_key(token_hash: &str, session_id: Option<&str>) -> String {
     match session_id {
         Some(s) if !s.is_empty() => format!("{token_hash}:{s}"),
@@ -78,7 +79,6 @@ pub fn session_key(token_hash: &str, session_id: Option<&str>) -> String {
 
 /// Mark a session call. Returns true if this is the first call for the
 /// session (caller should inject full briefing) or false (sticky-only).
-#[allow(dead_code)]
 pub async fn record_call(store: &SessionStore, key: &str) -> bool {
     let mut sessions = store.write().await;
     if sessions.len() >= MAX_SESSIONS {
@@ -92,10 +92,12 @@ pub async fn record_call(store: &SessionStore, key: &str) -> bool {
     was_first
 }
 
-/// Reset a session so the next call gets a fresh full briefing.
-/// Called by the `session_event` MCP tool on `action=compacted` or `reset`.
-#[allow(dead_code)]
-pub async fn reset_session(store: &SessionStore, key: &str) {
+/// Reset a session so the next call gets a fresh full briefing. Called by
+/// the `session_event` MCP tool on `action=compacted`, and by the `briefing`
+/// tool itself (calling `briefing` resets the session so the next response
+/// carries full content again — useful after the AI gets compacted by its
+/// harness).
+pub async fn mark_compacted(store: &SessionStore, key: &str) {
     let mut sessions = store.write().await;
     let entry = sessions.entry(key.to_string()).or_insert_with(SessionEntry::new);
     entry.needs_full_briefing = true;

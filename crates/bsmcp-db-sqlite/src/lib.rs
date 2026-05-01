@@ -194,6 +194,25 @@ impl SqliteDb {
             conn.execute_batch(sql).ok();
         }
 
+        // v0.8.0 cleanup migrations. SQLite 3.35+ supports `DROP COLUMN`;
+        // older builds will silently no-op via `.ok()` and leave the orphan
+        // column on disk — same end state as before this block existed.
+        // Idempotent on rerun: the second invocation hits "no such column"
+        // and is also swallowed.
+        for sql in [
+            // remember_audit + indexes — fully retired in v0.8.0; no consumers.
+            "DROP INDEX IF EXISTS idx_audit_user_time",
+            "DROP INDEX IF EXISTS idx_audit_resource_time",
+            "DROP TABLE IF EXISTS remember_audit",
+            // default_ai_identity_* — orphaned when the personal-memory
+            // layer moved to memberberry.ai. Drop, don't preserve.
+            "ALTER TABLE global_settings DROP COLUMN default_ai_identity_page_id",
+            "ALTER TABLE global_settings DROP COLUMN default_ai_identity_name",
+            "ALTER TABLE global_settings DROP COLUMN default_ai_identity_ouid",
+        ] {
+            conn.execute_batch(sql).ok();
+        }
+
         let hash = sha2::Sha256::digest(encryption_key.as_bytes());
         let mut key = Zeroizing::new([0u8; 32]);
         key.copy_from_slice(&hash);

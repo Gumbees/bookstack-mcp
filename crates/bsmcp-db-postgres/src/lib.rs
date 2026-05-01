@@ -159,6 +159,19 @@ impl PostgresDb {
             sqlx::query(sql).execute(&pool).await.ok();
         }
 
+        // v0.8.0 cleanup migrations — fully idempotent via IF EXISTS.
+        for sql in [
+            // remember_audit + indexes — fully retired in v0.8.0; no consumers.
+            "DROP TABLE IF EXISTS remember_audit CASCADE",
+            // default_ai_identity_* — orphaned when the personal-memory
+            // layer moved to memberberry.ai. Drop, don't preserve.
+            "ALTER TABLE global_settings DROP COLUMN IF EXISTS default_ai_identity_page_id",
+            "ALTER TABLE global_settings DROP COLUMN IF EXISTS default_ai_identity_name",
+            "ALTER TABLE global_settings DROP COLUMN IF EXISTS default_ai_identity_ouid",
+        ] {
+            sqlx::query(sql).execute(&pool).await.ok();
+        }
+
         sqlx::query("INSERT INTO global_settings (id, updated_at) VALUES (1, 0) ON CONFLICT (id) DO NOTHING")
             .execute(&pool).await.ok();
 

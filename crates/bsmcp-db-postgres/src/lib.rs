@@ -118,38 +118,10 @@ impl PostgresDb {
         .map_err(|e| format!("Failed to create user_settings table: {e}"))?;
 
         sqlx::query(
-            "CREATE TABLE IF NOT EXISTS remember_audit (
-                id BIGSERIAL PRIMARY KEY,
-                token_id_hash TEXT NOT NULL,
-                ai_identity_ouid TEXT,
-                user_id TEXT,
-                resource TEXT NOT NULL,
-                action TEXT NOT NULL,
-                target_page_id BIGINT,
-                target_key TEXT,
-                success BOOLEAN NOT NULL,
-                error TEXT,
-                trace_id TEXT,
-                occurred_at BIGINT NOT NULL
-            )"
-        )
-        .execute(&pool)
-        .await
-        .map_err(|e| format!("Failed to create remember_audit table: {e}"))?;
-
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_user_time ON remember_audit(token_id_hash, occurred_at DESC)")
-            .execute(&pool).await.ok();
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_resource_time ON remember_audit(resource, occurred_at DESC)")
-            .execute(&pool).await.ok();
-
-        sqlx::query(
             "CREATE TABLE IF NOT EXISTS global_settings (
                 id INT PRIMARY KEY CHECK (id = 1),
                 hive_shelf_id BIGINT,
                 user_journals_shelf_id BIGINT,
-                default_ai_identity_page_id BIGINT,
-                default_ai_identity_name TEXT,
-                default_ai_identity_ouid TEXT,
                 org_required_instructions_page_ids TEXT,
                 org_ai_usage_policy_page_ids TEXT,
                 org_identity_page_id BIGINT,
@@ -170,12 +142,7 @@ impl PostgresDb {
         .map_err(|e| format!("Failed to create global_settings table: {e}"))?;
 
         // Migrations for older deployments — ADD COLUMN IF NOT EXISTS is supported in PG 9.6+.
-        // The default_ai_identity_* and other personal-memory columns are kept on disk
-        // but no longer read or written (v0.8.0 dropped that surface).
         for sql in [
-            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS default_ai_identity_page_id BIGINT",
-            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS default_ai_identity_name TEXT",
-            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS default_ai_identity_ouid TEXT",
             "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS org_required_instructions_page_ids TEXT",
             "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS org_ai_usage_policy_page_ids TEXT",
             "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS org_identity_page_id BIGINT",
@@ -538,31 +505,6 @@ impl DbBackend for PostgresDb {
         Ok(())
     }
 
-    async fn insert_audit_entry(&self, entry: &AuditEntryInsert) -> Result<i64, String> {
-        let row = sqlx::query(
-            "INSERT INTO remember_audit
-                (token_id_hash, ai_identity_ouid, user_id, resource, action,
-                 target_page_id, target_key, success, error, trace_id, occurred_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-             RETURNING id"
-        )
-        .bind(&entry.token_id_hash)
-        .bind(&entry.ai_identity_ouid)
-        .bind(&entry.user_id)
-        .bind(&entry.resource)
-        .bind(&entry.action)
-        .bind(entry.target_page_id)
-        .bind(&entry.target_key)
-        .bind(entry.success)
-        .bind(&entry.error)
-        .bind(&entry.trace_id)
-        .bind(Self::now_secs())
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| format!("insert_audit_entry: {e}"))?;
-        Ok(row.get("id"))
-    }
-
     async fn get_global_settings(&self) -> Result<GlobalSettings, String> {
         let row = sqlx::query(
             "SELECT hive_shelf_id, user_journals_shelf_id,
@@ -651,44 +593,6 @@ impl DbBackend for PostgresDb {
         Ok(())
     }
 
-    async fn list_audit_entries(
-        &self,
-        token_id_hash: &str,
-        limit: i64,
-        offset: i64,
-        since_unix: Option<i64>,
-    ) -> Result<Vec<AuditEntry>, String> {
-        let rows = sqlx::query(
-            "SELECT id, token_id_hash, ai_identity_ouid, user_id, resource, action,
-                    target_page_id, target_key, success, error, trace_id, occurred_at
-             FROM remember_audit
-             WHERE token_id_hash = $1 AND occurred_at >= $2
-             ORDER BY occurred_at DESC
-             LIMIT $3 OFFSET $4"
-        )
-        .bind(token_id_hash)
-        .bind(since_unix.unwrap_or(0))
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| format!("list_audit_entries: {e}"))?;
-
-        Ok(rows.iter().map(|r| AuditEntry {
-            id: r.get("id"),
-            token_id_hash: r.get("token_id_hash"),
-            ai_identity_ouid: r.get("ai_identity_ouid"),
-            user_id: r.get("user_id"),
-            resource: r.get("resource"),
-            action: r.get("action"),
-            target_page_id: r.get("target_page_id"),
-            target_key: r.get("target_key"),
-            success: r.get("success"),
-            error: r.get("error"),
-            trace_id: r.get("trace_id"),
-            occurred_at: r.get("occurred_at"),
-        }).collect())
-    }
 }
 
 #[async_trait]

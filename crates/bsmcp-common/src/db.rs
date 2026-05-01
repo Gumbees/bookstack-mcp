@@ -43,21 +43,6 @@ pub trait DbBackend: Send + Sync + 'static {
     /// Upsert user settings for `token_id_hash`. Replaces the entire row.
     async fn save_user_settings(&self, token_id_hash: &str, settings: &UserSettings) -> Result<(), String>;
 
-    // --- Remember audit log ---
-
-    /// Insert one audit entry. Failures are logged but do not propagate (audit
-    /// logging is best-effort; never blocks the user-facing call).
-    async fn insert_audit_entry(&self, entry: &AuditEntryInsert) -> Result<i64, String>;
-
-    /// List audit entries for one user, newest first, paginated.
-    async fn list_audit_entries(
-        &self,
-        token_id_hash: &str,
-        limit: i64,
-        offset: i64,
-        since_unix: Option<i64>,
-    ) -> Result<Vec<AuditEntry>, String>;
-
     // --- Global settings (server-instance-wide) ---
 
     /// Load the singleton global settings row. Returns defaults if never set.

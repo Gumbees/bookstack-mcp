@@ -87,6 +87,7 @@ pub async fn read(
 
     let ctx = Context {
         body,
+        trace_id: trace_id.clone(),
         client: client.clone(),
         db: db.clone(),
         semantic,
@@ -142,6 +143,7 @@ pub async fn build_meta_briefing(
 
     let ctx = Context {
         body,
+        trace_id: uuid::Uuid::new_v4().to_string(),
         client: client.clone(),
         db,
         semantic,
@@ -158,6 +160,10 @@ pub async fn build_meta_briefing(
 /// Per-call context passed to the briefing builder.
 pub struct Context {
     pub body: Value,
+    /// UUID assigned when the briefing was invoked. Threaded into eprintln!
+    /// log lines so a failed fetch in the builder can be correlated back to
+    /// the originating request.
+    pub trace_id: String,
     pub client: BookStackClient,
     pub db: Arc<dyn DbBackend>,
     pub semantic: Option<Arc<SemanticState>>,

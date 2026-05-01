@@ -10,6 +10,7 @@
 //! shared by all users on the same BookStack instance.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Per-user settings.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -65,6 +66,12 @@ pub struct UserSettings {
     /// nudge is snoozed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_nudge_dismissed_until: Option<i64>,
+
+    /// v0.7.x leftover keys captured on deserialize. Skipped on serialize so
+    /// they're dropped from disk on next save. Surfaced in the briefing's
+    /// setup_warnings so the user knows their old data is no longer pointed at.
+    #[serde(default, flatten, skip_serializing)]
+    pub extras: std::collections::HashMap<String, Value>,
 }
 
 impl UserSettings {

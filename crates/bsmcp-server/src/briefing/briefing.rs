@@ -2,15 +2,62 @@
 //!
 //! Returns: time, system_prompt_additions (guide, org_identity,
 //! org_instructions, org_policy, user-supplied pages, owned-domains
-//! synthetic block), KB semantic matches against the user prompt,
-//! setup_nudge (when settings incomplete), and a thin config echo.
+//! synthetic block, kb_scopes pointers), KB semantic matches against the user
+//! prompt, setup_nudge (when settings incomplete), setup_warnings (resolution
+//! failures + v0.7.x migration leftovers), and a thin config echo.
+//!
+//! Behavior toggles read from `GlobalSettings`:
+//! - `full_content_in_briefing` — when true, fetch full markdown for Page-typed
+//!   `system_prompt_additions` entries (incl. resolved kb_scopes that point at
+//!   a Page). When false (default), entries carry id/name/summary/url only.
+//!   Shelf/Book scopes never include body content (potentially huge).
+//! - `friendly_structure` — when false, drop prose summary/hint fields from
+//!   the JSON shape. When true (default), keep human-readable headings/labels.
+//! - `strict_setup` — when true and setup is incomplete, the response carries
+//!   `setup_required: true` at the top level. The actual error-envelope gating
+//!   on tool-call paths lives in `mcp.rs` (Agent E's scope). The
+//!   `setup_complete` heuristic here is intentionally minimal:
+//!   `globals.org_identity_page_id.is_some() && settings.user_id.is_some()`.
 
 use serde_json::{json, Value};
 
 use bsmcp_common::bookstack::BookStackClient;
+use bsmcp_common::settings::{GlobalSettings, KbScope, UserSettings};
 
 use super::{frontmatter, Context};
 use crate::semantic::trim_match;
+
+/// v0.7.x personal-memory keys removed in v0.8.0. If any of these appear in
+/// `UserSettings.extras` (the serde-flatten capture), surface a one-shot
+/// migration warning in the briefing and clean them off disk on the same call.
+const LEGACY_USER_SETTINGS_KEYS: &[&str] = &[
+    "ai_hive_journal_book_id",
+    "ai_collage_book_id",
+    "ai_shared_collage_book_id",
+    "ai_identity_page_id",
+    "ai_identity_book_id",
+    "ai_identity_name",
+    "ai_identity_ouid",
+    "ai_hive_shelf_id",
+    "ai_identity_agents_chapter_id",
+    "ai_identity_journal_chapter_id",
+    "user_journal_book_id",
+    "user_identity_page_id",
+    "user_identity_book_id",
+    "user_journal_agent_page_id",
+    "recent_journal_count",
+    "recent_collage_count",
+    "active_collage_count",
+    "semantic_against_journal",
+    "semantic_against_collage",
+    "semantic_against_shared_collage",
+    "semantic_against_user_journal",
+    "use_follow_up_remember_agent",
+];
+
+/// Hard cap on the "summary" snippet returned for pages when
+/// `full_content_in_briefing` is false and BookStack didn't supply a description.
+const SUMMARY_CHAR_LIMIT: usize = 500;
 
 /// `kb_semantic_matches` chunk-trim (tighter than the `semantic_search` MCP tool
 /// because the briefing fires once per session at start).
@@ -26,6 +73,49 @@ const SEMANTIC_MATCHES_HINT: &str =
 pub async fn read(ctx: &Context) -> Value {
     let user_prompt = ctx.body_str("user_prompt").unwrap_or_default();
     let globals = ctx.db.get_global_settings().await.unwrap_or_default();
+    let friendly = globals.friendly_structure;
+    let full_content = globals.full_content_in_briefing;
+
+    let mut setup_warnings: Vec<Value> = Vec::new();
+
+    // v0.7.x migration warning + one-shot cleanup. We only care about extras
+    // matching the known legacy key list — anything else stays in extras as a
+    // pass-through (caller's problem, not a v0.7.x leftover).
+    let stale_pairs: Vec<(String, Value)> = ctx
+        .settings
+        .extras
+        .iter()
+        .filter(|(k, _)| LEGACY_USER_SETTINGS_KEYS.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    if !stale_pairs.is_empty() {
+        let stale_keys: Vec<String> = stale_pairs.iter().map(|(k, _)| k.clone()).collect();
+        let stale_values: serde_json::Map<String, Value> =
+            stale_pairs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        setup_warnings.push(json!({
+            "kind": "v0_8_0_migration",
+            "message": "Detected v0.7.x personal-memory pointers in your settings. \
+                        They no longer apply (memory moved to memberberry.ai). \
+                        The associated BookStack pages are still in your instance \
+                        but no longer auto-loaded by the briefing.",
+            "stale_keys": stale_keys,
+            "stale_values": Value::Object(stale_values),
+        }));
+        // Clean off disk. UserSettings serializes without `extras` (skip_serializing),
+        // so saving the same object is the wipe. Subsequent reads emit no warning.
+        // We use the parsed settings (without extras) — `save_user_settings` takes
+        // the typed struct, so the legacy keys can't accidentally round-trip.
+        if let Err(e) = ctx
+            .db
+            .save_user_settings(&ctx.token_id_hash, &ctx.settings)
+            .await
+        {
+            eprintln!(
+                "Briefing: failed to clean v0.7.x extras (trace_id={}): {e}",
+                ctx.trace_id
+            );
+        }
+    }
 
     let bookstack_user_id = ctx.settings.bookstack_user_id;
     let token_id_hash = ctx.token_id_hash.clone();
@@ -70,16 +160,22 @@ pub async fn read(ctx: &Context) -> Value {
         &ctx.client,
         &ctx.settings.system_prompt_page_ids,
         "user",
+        full_content,
+        friendly,
     );
     let org_instructions_fut = fetch_pages_with_source(
         &ctx.client,
         &globals.org_required_instructions_page_ids,
         "org_instructions",
+        full_content,
+        friendly,
     );
     let org_policy_fut = fetch_pages_with_source(
         &ctx.client,
         &globals.org_ai_usage_policy_page_ids,
         "org_policy",
+        full_content,
+        friendly,
     );
     let org_identity_page_ids: Vec<i64> = globals
         .org_identity_page_id
@@ -89,41 +185,73 @@ pub async fn read(ctx: &Context) -> Value {
         &ctx.client,
         &org_identity_page_ids,
         "org_identity",
+        full_content,
+        friendly,
     );
     let guide_page_ids: Vec<i64> = globals
         .guide_page_id
         .map(|id| vec![id])
         .unwrap_or_default();
-    let guide_fut = fetch_pages_with_source(&ctx.client, &guide_page_ids, "guide");
+    let guide_fut = fetch_pages_with_source(
+        &ctx.client,
+        &guide_page_ids,
+        "guide",
+        full_content,
+        friendly,
+    );
 
-    let (kb_matches, user_pages, org_instructions, org_policy, org_identity, guide_pages) = tokio::join!(
+    // Typed scope slots — one entry per configured slot. Each entry resolves
+    // its name + url; failures bubble up as setup_warnings instead of hard
+    // erroring. For Page scopes we honor full_content_in_briefing; for
+    // Shelf/Book we never include body content (could be enormous).
+    let scopes_fut = resolve_kb_scopes(&ctx.client, &globals, full_content, friendly);
+
+    let (kb_matches, user_pages, org_instructions, org_policy, org_identity, guide_pages, scope_results) = tokio::join!(
         semantic_fut,
         user_pages_fut,
         org_instructions_fut,
         org_policy_fut,
         org_identity_fut,
         guide_fut,
+        scopes_fut,
     );
 
+    let (scope_entries, scope_warnings) = scope_results;
+    setup_warnings.extend(scope_warnings);
+
     let mut system_prompt: Vec<Value> = Vec::with_capacity(
-        user_pages.len() + org_instructions.len() + org_policy.len() + org_identity.len() + guide_pages.len() + 1,
+        user_pages.len()
+            + org_instructions.len()
+            + org_policy.len()
+            + org_identity.len()
+            + guide_pages.len()
+            + scope_entries.len()
+            + 1,
     );
     system_prompt.extend(guide_pages);
     system_prompt.extend(org_identity);
+    system_prompt.extend(scope_entries);
     system_prompt.extend(user_pages);
     system_prompt.extend(org_instructions);
     system_prompt.extend(org_policy);
 
-    // Domains block — merged user + org domains.
+    // Domains block — merged user + org domains. In terse (`friendly=false`)
+    // mode we emit just the domain list; the prose wrapper is friendly-only.
     let merged_domains = merge_domains(&ctx.settings.domains, &globals.org_domains);
     if !merged_domains.is_empty() {
-        system_prompt.push(json!({
-            "page_id": 0,
-            "name": "Owned domains",
-            "markdown": format_domains_block(&merged_domains),
-            "url": Value::Null,
-            "source": "domains",
-        }));
+        let mut entry = serde_json::Map::new();
+        entry.insert("page_id".to_string(), json!(0));
+        entry.insert("source".to_string(), json!("domains"));
+        entry.insert("url".to_string(), Value::Null);
+        entry.insert("domains".to_string(), json!(merged_domains));
+        if friendly {
+            entry.insert("name".to_string(), json!("Owned domains"));
+            entry.insert(
+                "markdown".to_string(),
+                json!(format_domains_block(&merged_domains)),
+            );
+        }
+        system_prompt.push(Value::Object(entry));
     }
 
     // Setup nudge — show until everything's configured AND not snoozed.
@@ -154,19 +282,48 @@ pub async fn read(ctx: &Context) -> Value {
         None
     };
 
-    json!({
-        "setup_nudge": setup_nudge,
-        "kb_semantic_matches": kb_matches,
-        "semantic_matches_hint": SEMANTIC_MATCHES_HINT,
-        "system_prompt_additions": system_prompt,
-        "time": super::envelope::build_time_block(&ctx.settings, false),
-        "config": {
+    // strict_setup gating. We only flip `setup_required` when the strict
+    // boolean is on AND setup is incomplete. The actual error-envelope
+    // gating on tool-call paths is Agent E's wiring in mcp.rs; this field
+    // is the signal Agent E will read.
+    let setup_complete = setup_complete(&ctx.settings, &globals);
+    let setup_required = globals.strict_setup && !setup_complete;
+
+    let mut payload = serde_json::Map::new();
+    payload.insert("setup_required".to_string(), json!(setup_required));
+    payload.insert("setup_nudge".to_string(), json!(setup_nudge));
+    payload.insert("setup_warnings".to_string(), json!(setup_warnings));
+    payload.insert("kb_semantic_matches".to_string(), json!(kb_matches));
+    if friendly {
+        payload.insert(
+            "semantic_matches_hint".to_string(),
+            json!(SEMANTIC_MATCHES_HINT),
+        );
+    }
+    payload.insert("system_prompt_additions".to_string(), json!(system_prompt));
+    payload.insert(
+        "time".to_string(),
+        super::envelope::build_time_block(&ctx.settings, false),
+    );
+    payload.insert(
+        "config".to_string(),
+        json!({
             "label": ctx.settings.label,
             "role": ctx.settings.role,
             "friendly_structure": globals.friendly_structure,
             "full_content_in_briefing": globals.full_content_in_briefing,
-        },
-    })
+            "strict_setup": globals.strict_setup,
+        }),
+    );
+
+    Value::Object(payload)
+}
+
+/// Minimal heuristic for "setup is done." Documented in the module-level
+/// comment. Used only by the `setup_required` flag — Agent E will wire the
+/// actual error-envelope gating on tool calls in `mcp.rs`.
+fn setup_complete(s: &UserSettings, g: &GlobalSettings) -> bool {
+    g.org_identity_page_id.is_some() && s.user_id.is_some()
 }
 
 fn build_semantic_query(user_prompt: &str, ctx: &Context) -> String {
@@ -189,6 +346,8 @@ async fn fetch_pages_with_source(
     client: &BookStackClient,
     page_ids: &[i64],
     source: &'static str,
+    full_content: bool,
+    friendly: bool,
 ) -> Vec<Value> {
     if page_ids.is_empty() {
         return Vec::new();
@@ -205,14 +364,7 @@ async fn fetch_pages_with_source(
         let Ok((id, result)) = h.await else { continue; };
         match result {
             Ok(page) => {
-                let raw = page.get("markdown").and_then(|v| v.as_str()).unwrap_or("");
-                out.push(json!({
-                    "page_id": id,
-                    "name": page.get("name").cloned().unwrap_or(Value::Null),
-                    "markdown": frontmatter::strip(raw),
-                    "url": page.get("url").cloned().unwrap_or(Value::Null),
-                    "source": source,
-                }));
+                out.push(build_page_entry(id, &page, source, full_content, friendly));
             }
             Err(e) => {
                 eprintln!("Briefing: {source} page {id} fetch failed: {e}");
@@ -220,6 +372,232 @@ async fn fetch_pages_with_source(
         }
     }
     out
+}
+
+/// Build a single page entry for `system_prompt_additions`. Honors
+/// `full_content_in_briefing` (markdown body vs summary) and
+/// `friendly_structure` (suppress prose-y fields when off).
+fn build_page_entry(
+    id: i64,
+    page: &Value,
+    source: &'static str,
+    full_content: bool,
+    friendly: bool,
+) -> Value {
+    let raw = page.get("markdown").and_then(|v| v.as_str()).unwrap_or("");
+    let stripped = frontmatter::strip(raw);
+    let mut entry = serde_json::Map::new();
+    entry.insert("page_id".to_string(), json!(id));
+    entry.insert(
+        "name".to_string(),
+        page.get("name").cloned().unwrap_or(Value::Null),
+    );
+    entry.insert(
+        "url".to_string(),
+        page.get("url").cloned().unwrap_or(Value::Null),
+    );
+    entry.insert("source".to_string(), json!(source));
+    if full_content {
+        entry.insert("markdown".to_string(), json!(stripped));
+    } else {
+        let description = page
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let summary = description.unwrap_or_else(|| truncate_summary(stripped));
+        if friendly || !summary.is_empty() {
+            entry.insert("summary".to_string(), json!(summary));
+        }
+    }
+    Value::Object(entry)
+}
+
+fn truncate_summary(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.chars().count() <= SUMMARY_CHAR_LIMIT {
+        return trimmed.to_string();
+    }
+    let mut out: String = trimmed.chars().take(SUMMARY_CHAR_LIMIT).collect();
+    out.push('…');
+    out
+}
+
+/// Resolve the three typed scope slots on `GlobalSettings` into
+/// `system_prompt_additions` entries. Returns `(entries, warnings)`. Warnings
+/// surface configured IDs that no longer resolve in BookStack.
+async fn resolve_kb_scopes(
+    client: &BookStackClient,
+    globals: &GlobalSettings,
+    full_content: bool,
+    friendly: bool,
+) -> (Vec<Value>, Vec<Value>) {
+    let mut slots: Vec<(&'static str, &'static str, &'static str, &KbScope)> = Vec::new();
+    if let Some(s) = &globals.policies_scope {
+        slots.push((
+            "policy_scope",
+            "policies_scope",
+            "Look here when asked about org policy, compliance, or required behavior.",
+            s,
+        ));
+    }
+    if let Some(s) = &globals.sops_scope {
+        slots.push((
+            "sop_scope",
+            "sops_scope",
+            "Look here when asked how to perform a routine operational task.",
+            s,
+        ));
+    }
+    if let Some(s) = &globals.best_practices_scope {
+        slots.push((
+            "best_practice_scope",
+            "best_practices_scope",
+            "Look here when asked for recommended approaches or design guidance.",
+            s,
+        ));
+    }
+
+    let mut entries = Vec::new();
+    let mut warnings = Vec::new();
+    for (kind, slot_name, hint, scope) in slots {
+        match resolve_one_scope(client, scope, full_content, friendly).await {
+            Ok(mut entry) => {
+                entry.insert("kind".to_string(), json!(kind));
+                entry.insert("source".to_string(), json!("kb_scope"));
+                if friendly {
+                    entry.insert("hint".to_string(), json!(hint));
+                }
+                entries.push(Value::Object(entry));
+            }
+            Err(e) => {
+                warnings.push(json!({
+                    "kind": "scope_unresolved",
+                    "slot": slot_name,
+                    "scope_type": scope_type_str(scope),
+                    "id": scope.id(),
+                    "message": format!("Configured {slot_name} could not be resolved: {e}"),
+                }));
+            }
+        }
+    }
+    (entries, warnings)
+}
+
+fn scope_type_str(s: &KbScope) -> &'static str {
+    match s {
+        KbScope::Shelf(_) => "shelf",
+        KbScope::Book(_) => "book",
+        KbScope::Page(_) => "page",
+    }
+}
+
+/// Resolve one `KbScope` against BookStack. Page scopes optionally include
+/// body markdown (if `full_content` is true). Shelf/Book scopes never include
+/// body content — they list referenced books/chapters via the BookStack API
+/// response's `contents` array (when present) so the AI knows what's inside.
+async fn resolve_one_scope(
+    client: &BookStackClient,
+    scope: &KbScope,
+    full_content: bool,
+    friendly: bool,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let mut entry = serde_json::Map::new();
+    entry.insert("scope_type".to_string(), json!(scope_type_str(scope)));
+    entry.insert("id".to_string(), json!(scope.id()));
+    match scope {
+        KbScope::Shelf(id) => {
+            let s = client.get_shelf(*id).await?;
+            entry.insert(
+                "name".to_string(),
+                s.get("name").cloned().unwrap_or(Value::Null),
+            );
+            entry.insert(
+                "url".to_string(),
+                s.get("url").cloned().unwrap_or(Value::Null),
+            );
+            if friendly {
+                if let Some(desc) = s.get("description").and_then(|v| v.as_str()) {
+                    let trimmed = desc.trim();
+                    if !trimmed.is_empty() {
+                        entry.insert("summary".to_string(), json!(trimmed));
+                    }
+                }
+            }
+            if let Some(books) = s.get("books").and_then(|v| v.as_array()) {
+                let listing: Vec<Value> = books
+                    .iter()
+                    .map(|b| {
+                        json!({
+                            "id": b.get("id").cloned().unwrap_or(Value::Null),
+                            "name": b.get("name").cloned().unwrap_or(Value::Null),
+                        })
+                    })
+                    .collect();
+                entry.insert("books".to_string(), json!(listing));
+            }
+        }
+        KbScope::Book(id) => {
+            let b = client.get_book(*id).await?;
+            entry.insert(
+                "name".to_string(),
+                b.get("name").cloned().unwrap_or(Value::Null),
+            );
+            entry.insert(
+                "url".to_string(),
+                b.get("url").cloned().unwrap_or(Value::Null),
+            );
+            if friendly {
+                if let Some(desc) = b.get("description").and_then(|v| v.as_str()) {
+                    let trimmed = desc.trim();
+                    if !trimmed.is_empty() {
+                        entry.insert("summary".to_string(), json!(trimmed));
+                    }
+                }
+            }
+            if let Some(contents) = b.get("contents").and_then(|v| v.as_array()) {
+                let listing: Vec<Value> = contents
+                    .iter()
+                    .map(|c| {
+                        json!({
+                            "id": c.get("id").cloned().unwrap_or(Value::Null),
+                            "type": c.get("type").cloned().unwrap_or(Value::Null),
+                            "name": c.get("name").cloned().unwrap_or(Value::Null),
+                        })
+                    })
+                    .collect();
+                entry.insert("contents".to_string(), json!(listing));
+            }
+        }
+        KbScope::Page(id) => {
+            let p = client.get_page(*id).await?;
+            entry.insert(
+                "name".to_string(),
+                p.get("name").cloned().unwrap_or(Value::Null),
+            );
+            entry.insert(
+                "url".to_string(),
+                p.get("url").cloned().unwrap_or(Value::Null),
+            );
+            entry.insert("page_id".to_string(), json!(id));
+            let raw = p.get("markdown").and_then(|v| v.as_str()).unwrap_or("");
+            let stripped = frontmatter::strip(raw);
+            if full_content {
+                entry.insert("markdown".to_string(), json!(stripped));
+            } else {
+                let description = p
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                let summary = description.unwrap_or_else(|| truncate_summary(stripped));
+                if friendly || !summary.is_empty() {
+                    entry.insert("summary".to_string(), json!(summary));
+                }
+            }
+        }
+    }
+    Ok(entry)
 }
 
 fn pending_user_fields(s: &bsmcp_common::settings::UserSettings) -> Vec<Value> {

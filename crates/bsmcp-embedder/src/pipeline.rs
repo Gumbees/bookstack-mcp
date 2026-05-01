@@ -228,7 +228,6 @@ async fn build_shelf_lookup(client: &BookStackClient) -> HashMap<i64, String> {
 
 /// Result of a pipeline run, including any per-page failures.
 pub struct PipelineResult {
-    pub total_pages: usize,
     pub succeeded: usize,
     pub failed_pages: Vec<(i64, String)>,
     /// True if the pipeline aborted early due to too many consecutive failures.
@@ -263,7 +262,6 @@ pub async fn run_pipeline(
                 eprintln!("Pipeline: ACL reconcile complete — {processed} ok, {failed} failed");
                 db.update_job_progress(job_id, processed as i64, (processed + failed) as i64).await?;
                 return Ok(PipelineResult {
-                    total_pages: processed + failed,
                     succeeded: processed,
                     failed_pages: Vec::new(),
                     aborted: false,
@@ -392,7 +390,6 @@ pub async fn run_pipeline(
     }
 
     Ok(PipelineResult {
-        total_pages,
         succeeded,
         failed_pages,
         aborted,

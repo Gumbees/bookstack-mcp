@@ -27,9 +27,6 @@ use bsmcp_common::settings::{hash_token_id, UserSettings};
 
 use crate::semantic::SemanticState;
 
-#[allow(unused_imports)]
-pub use envelope::{build_meta, build_time_block, ErrorCode, TIMEZONE_REFRESH_SECS};
-
 /// Build the briefing JSON envelope for one request. Loads user settings,
 /// applies any client-pushed timezone, runs the briefing builder, and wraps
 /// the result in the standard `{ok, data, meta}` shape.

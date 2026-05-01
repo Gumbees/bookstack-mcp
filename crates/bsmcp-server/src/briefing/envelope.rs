@@ -9,25 +9,6 @@ use bsmcp_common::settings::{GlobalSettings, UserSettings};
 /// for refresh. 4h covers DST transitions and most travel within a session.
 pub const TIMEZONE_REFRESH_SECS: i64 = 4 * 60 * 60;
 
-#[derive(Clone, Copy, Debug)]
-#[allow(dead_code)]
-pub enum ErrorCode {
-    InvalidArgument,
-    NotFound,
-    InternalError,
-}
-
-impl ErrorCode {
-    #[allow(dead_code)]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::InvalidArgument => "invalid_argument",
-            Self::NotFound => "not_found",
-            Self::InternalError => "internal_error",
-        }
-    }
-}
-
 /// Build the `meta` block for a `/briefing/v1/read` response. For the meta
 /// block injected onto every MCP tool response, see `crate::briefing::build_meta_briefing`.
 pub fn build_meta(

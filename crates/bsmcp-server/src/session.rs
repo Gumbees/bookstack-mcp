@@ -5,11 +5,12 @@
 //! every MCP tool response can decide between full content (first call) and
 //! sticky-only (subsequent calls).
 //!
-//! Streamable HTTP is stateless, so the session_id comes from the client.
-//! When absent, fall back to a per-hour bucket keyed by token_hash so the
-//! user gets full briefing roughly once per hour instead of once per
-//! conversation. The compaction tool (`session_event`) lets the AI signal
-//! "I just compacted" so the next request is treated as a first call.
+//! `session_id` comes from the `Mcp-Session-Id` header (Streamable HTTP) or
+//! the `?sessionId=` query param (SSE 2024-11-05). When the client doesn't
+//! send one — e.g. a non-spec-compliant caller — we fall back to a stable
+//! `{token_hash}:no-session` key. That gives them one full briefing on first
+//! contact and sticky-only thereafter. To reset, the AI calls `briefing` or
+//! `session_event action=compacted`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -62,18 +63,14 @@ pub fn new_store() -> SessionStore {
 }
 
 /// Compute the session key. Prefer the client-supplied session_id; fall back
-/// to a per-hour bucket per token so absent-id callers still get a coarse
-/// "first call this hour" notion.
+/// to a stable `no-session` slot per token. The no-session slot collapses
+/// every absent-id call from one token into a single entry — first call gets
+/// full briefing, sticky-only thereafter until the AI explicitly resets via
+/// `briefing` or `session_event`.
 pub fn session_key(token_hash: &str, session_id: Option<&str>) -> String {
     match session_id {
         Some(s) if !s.is_empty() => format!("{token_hash}:{s}"),
-        _ => {
-            let hour = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() / 3600)
-                .unwrap_or(0);
-            format!("{token_hash}:bucket-{hour}")
-        }
+        _ => format!("{token_hash}:no-session"),
     }
 }
 
@@ -105,7 +102,9 @@ pub async fn mark_compacted(store: &SessionStore, key: &str) {
 }
 
 /// Spawn the periodic cleanup task. Once per minute evicts entries older
-/// than `SESSION_TTL`.
+/// than `SESSION_TTL` and trims to `MAX_SESSIONS` if the cap was crossed
+/// without any intervening write (defense-in-depth — `record_call` already
+/// enforces the cap on insert).
 pub fn spawn_cleanup(store: SessionStore) {
     tokio::spawn(async move {
         loop {
@@ -113,6 +112,18 @@ pub fn spawn_cleanup(store: SessionStore) {
             let cutoff = Instant::now() - SESSION_TTL;
             let mut sessions = store.write().await;
             sessions.retain(|_, e| e.first_call_seen_at > cutoff);
+            if sessions.len() > MAX_SESSIONS {
+                // Evict oldest first until we're back under cap.
+                let overflow = sessions.len() - MAX_SESSIONS;
+                let mut by_age: Vec<(String, Instant)> = sessions
+                    .iter()
+                    .map(|(k, e)| (k.clone(), e.first_call_seen_at))
+                    .collect();
+                by_age.sort_by_key(|(_, t)| *t);
+                for (k, _) in by_age.into_iter().take(overflow) {
+                    sessions.remove(&k);
+                }
+            }
         }
     });
 }

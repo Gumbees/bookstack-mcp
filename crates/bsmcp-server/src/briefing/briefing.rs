@@ -27,33 +27,54 @@ use bsmcp_common::settings::{GlobalSettings, KbScope, UserSettings};
 use super::{frontmatter, Context};
 use crate::semantic::trim_match;
 
-/// v0.7.x personal-memory keys removed in v0.8.0. If any of these appear in
-/// `UserSettings.extras` (the serde-flatten capture), surface a one-shot
-/// migration warning in the briefing and clean them off disk on the same call.
-const LEGACY_USER_SETTINGS_KEYS: &[&str] = &[
-    "ai_hive_journal_book_id",
-    "ai_collage_book_id",
-    "ai_shared_collage_book_id",
-    "ai_identity_page_id",
-    "ai_identity_book_id",
-    "ai_identity_name",
-    "ai_identity_ouid",
-    "ai_hive_shelf_id",
-    "ai_identity_agents_chapter_id",
-    "ai_identity_journal_chapter_id",
-    "user_journal_book_id",
-    "user_identity_page_id",
-    "user_identity_book_id",
-    "user_journal_agent_page_id",
-    "recent_journal_count",
-    "recent_collage_count",
-    "active_collage_count",
-    "semantic_against_journal",
-    "semantic_against_collage",
-    "semantic_against_shared_collage",
-    "semantic_against_user_journal",
-    "use_follow_up_remember_agent",
+/// v0.7.x personal-memory keys removed in v0.8.0. Each entry maps the JSON
+/// field to the BookStack entity kind it pointed at (or `None` for non-ID
+/// fields like counters and booleans). If any appear in `UserSettings.extras`
+/// (the serde-flatten capture), surface a one-shot migration warning with
+/// BookStack metadata for the addressable entries, then clean them off disk.
+const LEGACY_USER_SETTINGS_KEYS: &[(&str, Option<LegacyKind>)] = &[
+    ("ai_hive_journal_book_id", Some(LegacyKind::Book)),
+    ("ai_collage_book_id", Some(LegacyKind::Book)),
+    ("ai_shared_collage_book_id", Some(LegacyKind::Book)),
+    ("ai_identity_page_id", Some(LegacyKind::Page)),
+    ("ai_identity_book_id", Some(LegacyKind::Book)),
+    ("ai_identity_name", None),
+    ("ai_identity_ouid", None),
+    ("ai_hive_shelf_id", Some(LegacyKind::Shelf)),
+    ("ai_identity_agents_chapter_id", Some(LegacyKind::Chapter)),
+    ("ai_identity_journal_chapter_id", Some(LegacyKind::Chapter)),
+    ("user_journal_book_id", Some(LegacyKind::Book)),
+    ("user_identity_page_id", Some(LegacyKind::Page)),
+    ("user_identity_book_id", Some(LegacyKind::Book)),
+    ("user_journal_agent_page_id", Some(LegacyKind::Page)),
+    ("recent_journal_count", None),
+    ("recent_collage_count", None),
+    ("active_collage_count", None),
+    ("semantic_against_journal", None),
+    ("semantic_against_collage", None),
+    ("semantic_against_shared_collage", None),
+    ("semantic_against_user_journal", None),
+    ("use_follow_up_remember_agent", None),
 ];
+
+#[derive(Clone, Copy)]
+enum LegacyKind {
+    Shelf,
+    Book,
+    Chapter,
+    Page,
+}
+
+impl LegacyKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Shelf => "shelf",
+            Self::Book => "book",
+            Self::Chapter => "chapter",
+            Self::Page => "page",
+        }
+    }
+}
 
 /// Hard cap on the "summary" snippet returned for pages when
 /// `full_content_in_briefing` is false and BookStack didn't supply a description.
@@ -81,25 +102,36 @@ pub async fn read(ctx: &Context) -> Value {
     // v0.7.x migration warning + one-shot cleanup. We only care about extras
     // matching the known legacy key list — anything else stays in extras as a
     // pass-through (caller's problem, not a v0.7.x leftover).
-    let stale_pairs: Vec<(String, Value)> = ctx
+    let stale_pairs: Vec<(String, Value, Option<LegacyKind>)> = ctx
         .settings
         .extras
         .iter()
-        .filter(|(k, _)| LEGACY_USER_SETTINGS_KEYS.contains(&k.as_str()))
-        .map(|(k, v)| (k.clone(), v.clone()))
+        .filter_map(|(k, v)| {
+            LEGACY_USER_SETTINGS_KEYS
+                .iter()
+                .find(|(name, _)| *name == k.as_str())
+                .map(|(_, kind)| (k.clone(), v.clone(), *kind))
+        })
         .collect();
     if !stale_pairs.is_empty() {
-        let stale_keys: Vec<String> = stale_pairs.iter().map(|(k, _)| k.clone()).collect();
-        let stale_values: serde_json::Map<String, Value> =
-            stale_pairs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let stale_keys: Vec<String> =
+            stale_pairs.iter().map(|(k, _, _)| k.clone()).collect();
+        let stale_values: serde_json::Map<String, Value> = stale_pairs
+            .iter()
+            .map(|(k, v, _)| (k.clone(), v.clone()))
+            .collect();
+        let stale_entities = resolve_legacy_entities(&stale_pairs, &ctx.client).await;
         setup_warnings.push(json!({
             "kind": "v0_8_0_migration",
             "message": "Detected v0.7.x personal-memory pointers in your settings. \
                         They no longer apply (memory moved to memberberry.ai). \
                         The associated BookStack pages are still in your instance \
-                        but no longer auto-loaded by the briefing.",
+                        but no longer auto-loaded by the briefing — see \
+                        `stale_entities` for names and URLs so you can find them \
+                        if you want to migrate them yourself.",
             "stale_keys": stale_keys,
             "stale_values": Value::Object(stale_values),
+            "stale_entities": stale_entities,
         }));
         // Clean off disk. UserSettings serializes without `extras` (skip_serializing),
         // so saving the same object is the wipe. Subsequent reads emit no warning.
@@ -324,6 +356,58 @@ pub async fn read(ctx: &Context) -> Value {
 /// actual error-envelope gating on tool calls in `mcp.rs`.
 fn setup_complete(s: &UserSettings, g: &GlobalSettings) -> bool {
     g.org_identity_page_id.is_some() && s.user_id.is_some()
+}
+
+/// Resolve every numeric-ID legacy key against BookStack so the migration
+/// warning carries actionable names + URLs. Failures (deleted pages, ACL
+/// blocks) become entries with `resolved: false`. Non-ID keys are skipped
+/// entirely — they have nothing to look up.
+async fn resolve_legacy_entities(
+    pairs: &[(String, Value, Option<LegacyKind>)],
+    client: &BookStackClient,
+) -> Vec<Value> {
+    let mut out = Vec::new();
+    for (key, value, kind) in pairs {
+        let Some(kind) = kind else { continue };
+        let Some(id) = value.as_i64() else { continue };
+        let fetched = match kind {
+            LegacyKind::Shelf => client.get_shelf(id).await,
+            LegacyKind::Book => client.get_book(id).await,
+            LegacyKind::Chapter => client.get_chapter(id).await,
+            LegacyKind::Page => client.get_page(id).await,
+        };
+        match fetched {
+            Ok(entity) => {
+                let name = entity
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(unnamed)")
+                    .to_string();
+                let url = entity
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                out.push(json!({
+                    "key": key,
+                    "kind": kind.as_str(),
+                    "id": id,
+                    "name": name,
+                    "url": url,
+                    "resolved": true,
+                }));
+            }
+            Err(e) => {
+                out.push(json!({
+                    "key": key,
+                    "kind": kind.as_str(),
+                    "id": id,
+                    "resolved": false,
+                    "error": e,
+                }));
+            }
+        }
+    }
+    out
 }
 
 fn build_semantic_query(user_prompt: &str, ctx: &Context) -> String {

@@ -166,7 +166,7 @@ Single-row table holding instance-wide pointers used by the briefing builder, se
 
 Writes are admin-only (BookStack admin probed via `/api/users` access in the settings handler).
 
-## Implemented Tools (62 + 1 briefing)
+## Implemented Tools (56 + 3 semantic + 3 briefing = 62)
 
 - **search_content** - Full-text search with BookStack query operators
 - **semantic_search** - Natural language vector search (when semantic enabled)

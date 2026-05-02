@@ -422,7 +422,7 @@ button {{ margin-top: 1.5em; padding: 0.6em 1.2em; font-size: 1em; cursor: point
   <h2>Org-wide (admin-only)</h2>
   <p class="help">Non-admin saves silently drop the global fields below.</p>
   <label>guide_page_id <input type="number" name="guide_page_id" value="{guide_page_id}"></label>
-  <p class="help">Page describing how to use this BookStack. AIs fetch it via <code>get_guide</code>.</p>
+  <p class="help">Page describing how to use this BookStack. Auto-included in every briefing's system_prompt_additions when set.</p>
   <label>org_identity_page_id <input type="number" name="org_identity_page_id" value="{org_identity_page_id}"></label>
   <p class="help">Page describing the organization. Pulled into every briefing.</p>
   {policies}

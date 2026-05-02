@@ -67,10 +67,13 @@ pub struct UserSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_nudge_dismissed_until: Option<i64>,
 
-    /// v0.7.x leftover keys captured on deserialize. Skipped on serialize so
-    /// they're dropped from disk on next save. Surfaced in the briefing's
-    /// setup_warnings so the user knows their old data is no longer pointed at.
-    #[serde(default, flatten, skip_serializing)]
+    /// v0.7.x leftover keys captured on deserialize. Round-trips through
+    /// saves until the briefing builder explicitly clears them — that way an
+    /// unrelated save path (oauth auto-populate, settings UI, dismiss tool)
+    /// can't silently nuke the user's legacy data before the migration
+    /// warning has fired. The briefing's migration handler clears this field
+    /// after surfacing the warning, on the same call.
+    #[serde(default, flatten)]
     pub extras: std::collections::HashMap<String, Value>,
 }
 
@@ -119,9 +122,9 @@ impl KbScope {
 pub struct GlobalSettings {
     // --- Typed setup slots ---
 
-    /// Page describing how to use this BookStack with this MCP server. AIs
-    /// fetch it on demand via the `get_guide` MCP tool. Surfaced in the
-    /// briefing's `system_prompt_additions` so the AI knows it exists.
+    /// Page describing how to use this BookStack with this MCP server. When
+    /// configured, the briefing auto-includes its full markdown in
+    /// `system_prompt_additions` so the AI sees it on every session start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guide_page_id: Option<i64>,
 

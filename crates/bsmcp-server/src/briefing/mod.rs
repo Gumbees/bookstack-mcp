@@ -110,7 +110,7 @@ pub async fn read(
 
 /// Build just the `meta.briefing` block for injection into other tool
 /// responses. `full` returns the entire briefing payload; `sticky` returns
-/// only the always-present bits (time, setup_status, warnings) so subsequent
+/// only the always-present bits (time, setup_nudge, warnings) so subsequent
 /// MCP tool calls in the same session don't re-pay the briefing's cost.
 pub async fn build_meta_briefing(
     body: Value,
@@ -130,7 +130,7 @@ pub async fn build_meta_briefing(
     let globals = db.get_global_settings().await.unwrap_or_default();
 
     if !full {
-        // Sticky: time + setup_status + nothing else
+        // Sticky: time + setup_nudge + nothing else
         return json!({
             "time": envelope::build_time_block(&settings, false),
             "setup_summary": envelope::sticky_setup_summary(&settings, &globals),

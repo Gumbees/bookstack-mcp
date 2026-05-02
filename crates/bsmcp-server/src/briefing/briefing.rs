@@ -133,13 +133,16 @@ pub async fn read(ctx: &Context) -> Value {
             "stale_values": Value::Object(stale_values),
             "stale_entities": stale_entities,
         }));
-        // Clean off disk. UserSettings serializes without `extras` (skip_serializing),
-        // so saving the same object is the wipe. Subsequent reads emit no warning.
-        // We use the parsed settings (without extras) — `save_user_settings` takes
-        // the typed struct, so the legacy keys can't accidentally round-trip.
+        // Clean off disk. UserSettings now serializes `extras` through saves
+        // (so unrelated save paths don't silently nuke legacy data before the
+        // user is notified), so we explicitly clear it here on the same call
+        // that surfaced the warning. Subsequent reads find an empty extras
+        // map and emit no warning.
+        let mut cleaned = ctx.settings.clone();
+        cleaned.extras.clear();
         if let Err(e) = ctx
             .db
-            .save_user_settings(&ctx.token_id_hash, &ctx.settings)
+            .save_user_settings(&ctx.token_id_hash, &cleaned)
             .await
         {
             eprintln!(
@@ -351,11 +354,12 @@ pub async fn read(ctx: &Context) -> Value {
     Value::Object(payload)
 }
 
-/// Minimal heuristic for "setup is done." Documented in the module-level
-/// comment. Used only by the `setup_required` flag — Agent E will wire the
-/// actual error-envelope gating on tool calls in `mcp.rs`.
+/// "Setup is done" = no pending user or global fields. Mirrors the same
+/// definition used by `pending_user_fields` / `pending_global_fields` so the
+/// `setup_required` flag (gated by `globals.strict_setup`) and the
+/// `setup_nudge` block agree on what "done" means.
 fn setup_complete(s: &UserSettings, g: &GlobalSettings) -> bool {
-    g.org_identity_page_id.is_some() && s.user_id.is_some()
+    pending_user_fields(s).is_empty() && pending_global_fields(g).is_empty()
 }
 
 /// Resolve every numeric-ID legacy key against BookStack so the migration
@@ -712,7 +716,7 @@ fn pending_global_fields(g: &bsmcp_common::settings::GlobalSettings) -> Vec<Valu
     if g.guide_page_id.is_none() {
         out.push(json!({
             "field": "guide_page_id",
-            "why": "Org-configured guide page describing how to use this BookStack. AIs call `get_guide` to fetch it on demand. Admin-only.",
+            "why": "Org-configured guide page describing how to use this BookStack. Auto-included in every briefing's system_prompt_additions when set. Admin-only.",
             "admin_only": true,
         }));
     }

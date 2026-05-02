@@ -1444,7 +1444,7 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool, su
          the full briefing again.\n\n\
          If `setup_nudge` is present, the user's Hive isn't fully configured. The settings \
          live behind the `/settings` browser UI (token-gated) — point the user there and walk \
-         them through the pending fields. Use `search_content` + the briefing's `setup_status` \
+         them through the pending fields. Use `search_content` + the briefing's `setup_nudge` \
          block to help them locate existing structure. Per-user fields can be set by any \
          authenticated user; global fields (org_identity, guide_page, scopes) require a \
          BookStack admin. If the user wants the warnings to stop temporarily, call \
@@ -2050,7 +2050,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
                 "properties": {
                     "user_prompt": { "type": "string", "description": "First user message — drives semantic prioritization" },
                     "client_timezone": { "type": "string", "description": "Optional IANA timezone (e.g. \"America/New_York\"). Cached server-side." },
-                    "session_id": { "type": "string", "description": "Optional client-supplied session id; falls back to per-hour bucket." }
+                    "session_id": { "type": "string", "description": "Optional client-supplied session id. Normally taken from the Mcp-Session-Id header; pass it here for clients that can't set the header." }
                 }
             }),
         }));

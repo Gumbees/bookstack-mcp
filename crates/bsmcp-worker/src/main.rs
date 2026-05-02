@@ -32,7 +32,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bsmcp_common::config::DbBackendType;
-use bsmcp_common::db::{DbBackend, IndexDb};
+use bsmcp_common::db::{DbBackend, IndexDb, SemanticDb};
 
 #[tokio::main]
 async fn main() {
@@ -64,14 +64,22 @@ async fn main() {
     // Select database backend — must point at the SAME database the server
     // uses so the index_jobs queue is shared.
     let backend_type = DbBackendType::from_env();
-    let (db, index_db): (Arc<dyn DbBackend>, Arc<dyn IndexDb>) = match backend_type {
+    let (db, index_db, semantic_db): (
+        Arc<dyn DbBackend>,
+        Arc<dyn IndexDb>,
+        Arc<dyn SemanticDb>,
+    ) = match backend_type {
         DbBackendType::Sqlite => {
             let db_path = env::var("BSMCP_DB_PATH")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("/data/bookstack-mcp.db"));
             eprintln!("Database: SQLite ({})", db_path.display());
             let db = Arc::new(bsmcp_db_sqlite::SqliteDb::open(&db_path, &encryption_key));
-            (db.clone() as Arc<dyn DbBackend>, db as Arc<dyn IndexDb>)
+            (
+                db.clone() as Arc<dyn DbBackend>,
+                db.clone() as Arc<dyn IndexDb>,
+                db as Arc<dyn SemanticDb>,
+            )
         }
         DbBackendType::Postgres => {
             let database_url = env::var("BSMCP_DATABASE_URL")
@@ -82,7 +90,11 @@ async fn main() {
                     .await
                     .expect("Failed to connect to PostgreSQL"),
             );
-            (db.clone() as Arc<dyn DbBackend>, db as Arc<dyn IndexDb>)
+            (
+                db.clone() as Arc<dyn DbBackend>,
+                db.clone() as Arc<dyn IndexDb>,
+                db as Arc<dyn SemanticDb>,
+            )
         }
     };
 
@@ -102,7 +114,7 @@ async fn main() {
     );
 
     let worker = bsmcp_worker::IndexWorker::new(bs_client, db, index_db);
-    let handle = worker.spawn(delta_interval);
+    let handle = worker.spawn(delta_interval, Some(semantic_db));
 
     // Block on the worker indefinitely. Crashes inside the spawned task
     // surface as a JoinError here so the container exits and the

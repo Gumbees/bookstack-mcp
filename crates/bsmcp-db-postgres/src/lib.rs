@@ -260,9 +260,19 @@ impl PostgresDb {
                 finished_at BIGINT,
                 progress BIGINT NOT NULL DEFAULT 0,
                 total BIGINT NOT NULL DEFAULT 0,
-                error TEXT
+                error TEXT,
+                resolved_status TEXT,
+                prev_status TEXT,
+                resolved_at BIGINT,
+                retry_of BIGINT
             )",
             "CREATE INDEX IF NOT EXISTS idx_index_jobs_pending ON index_jobs(status) WHERE status = 'pending'",
+            "ALTER TABLE index_jobs ADD COLUMN IF NOT EXISTS resolved_status TEXT",
+            "ALTER TABLE index_jobs ADD COLUMN IF NOT EXISTS prev_status TEXT",
+            "ALTER TABLE index_jobs ADD COLUMN IF NOT EXISTS resolved_at BIGINT",
+            "ALTER TABLE index_jobs ADD COLUMN IF NOT EXISTS retry_of BIGINT",
+            "UPDATE index_jobs SET status = 'failed' \
+             WHERE status = 'error' AND resolved_status IS NULL",
             // Singleton bookkeeping for the indexer (last_full_walk_at,
             // last_delta_walk_at, etc.).
             "CREATE TABLE IF NOT EXISTS index_meta (
@@ -646,7 +656,11 @@ impl SemanticDb for PostgresDb {
                 started_at BIGINT,
                 finished_at BIGINT,
                 error TEXT,
-                worker_id TEXT
+                worker_id TEXT,
+                resolved_status TEXT,
+                prev_status TEXT,
+                resolved_at BIGINT,
+                retry_of BIGINT
             )",
         ];
         for sql in statements {
@@ -665,6 +679,20 @@ impl SemanticDb for PostgresDb {
         // Migration: add worker_id column if missing (existing databases)
         sqlx::query("ALTER TABLE embed_jobs ADD COLUMN IF NOT EXISTS worker_id TEXT")
             .execute(&self.pool).await.ok();
+
+        // Issue #54 — job lifecycle columns.
+        for sql in [
+            "ALTER TABLE embed_jobs ADD COLUMN IF NOT EXISTS resolved_status TEXT",
+            "ALTER TABLE embed_jobs ADD COLUMN IF NOT EXISTS prev_status TEXT",
+            "ALTER TABLE embed_jobs ADD COLUMN IF NOT EXISTS resolved_at BIGINT",
+            "ALTER TABLE embed_jobs ADD COLUMN IF NOT EXISTS retry_of BIGINT",
+            // Migrate v0.7.x rows that used 'error' as the failed sentinel.
+            // resolved_status stays NULL so the reconciler picks them up.
+            "UPDATE embed_jobs SET status = 'failed' \
+             WHERE status = 'error' AND resolved_status IS NULL",
+        ] {
+            sqlx::query(sql).execute(&self.pool).await.ok();
+        }
 
         // Metadata key-value store (v0.5.0+)
         sqlx::query("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
@@ -1000,8 +1028,15 @@ impl SemanticDb for PostgresDb {
         let mut tx = self.pool.begin().await
             .map_err(|e| format!("create_embed_job transaction failed: {e}"))?;
 
+        // Dedup: pending/running collapse onto the existing job. Failed jobs
+        // not yet touched by the reconciler also count as active so a webhook
+        // firing mid-retry-window doesn't double-enqueue.
         let existing = sqlx::query(
-            "SELECT id FROM embed_jobs WHERE scope = $1 AND status IN ('pending', 'running') ORDER BY id DESC LIMIT 1 FOR UPDATE"
+            "SELECT id FROM embed_jobs \
+             WHERE scope = $1 \
+               AND (status IN ('pending', 'running') \
+                    OR (status = 'failed' AND resolved_status IS NULL)) \
+             ORDER BY id DESC LIMIT 1 FOR UPDATE"
         )
         .bind(scope)
         .fetch_optional(&mut *tx)
@@ -1029,12 +1064,14 @@ impl SemanticDb for PostgresDb {
     async fn claim_next_job(&self, worker_id: &str) -> Result<Option<EmbedJob>, String> {
         // FOR UPDATE SKIP LOCKED enables concurrent embedder workers
         let row = sqlx::query(
-            "UPDATE embed_jobs SET status = 'running', started_at = $1, worker_id = $2
-             WHERE id = (
-                SELECT id FROM embed_jobs WHERE status = 'pending'
-                ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED
-             )
-             RETURNING id, scope, status, total_pages, done_pages, started_at, finished_at, error, worker_id"
+            &format!(
+                "UPDATE embed_jobs SET status = 'running', started_at = $1, worker_id = $2 \
+                 WHERE id = ( \
+                    SELECT id FROM embed_jobs WHERE status = 'pending' \
+                    ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED \
+                 ) \
+                 RETURNING {EMBED_JOB_COLS}"
+            )
         )
         .bind(Self::now_secs())
         .bind(worker_id)
@@ -1042,83 +1079,42 @@ impl SemanticDb for PostgresDb {
         .await
         .map_err(|e| format!("claim_next_job failed: {e}"))?;
 
-        Ok(row.map(|r| EmbedJob {
-            id: r.get("id"),
-            scope: r.get("scope"),
-            status: r.get("status"),
-            total_pages: r.get("total_pages"),
-            done_pages: r.get("done_pages"),
-            started_at: r.get("started_at"),
-            finished_at: r.get("finished_at"),
-            error: r.get("error"),
-            worker_id: r.get("worker_id"),
-        }))
+        Ok(row.map(embed_job_from_row))
     }
 
     async fn recover_worker_jobs(&self, worker_id: &str) -> Result<usize, String> {
-        // Mark duplicate-scope orphans as superseded (keep only the newest per scope)
-        let superseded = sqlx::query(
-            "UPDATE embed_jobs SET status = 'error', finished_at = $1, error = 'superseded'
-             WHERE status = 'running' AND (worker_id = $2 OR worker_id IS NULL)
-               AND EXISTS (
-                   SELECT 1 FROM embed_jobs e2
-                   WHERE e2.scope = embed_jobs.scope AND e2.id > embed_jobs.id
-                     AND e2.status = 'running' AND (e2.worker_id = $2 OR e2.worker_id IS NULL)
-               )"
+        // Process restart: jobs left running by this worker (or orphans
+        // pre-0.3.1) flip to failed-open. resolved_status stays NULL so the
+        // reconciler picks them up.
+        let failed = sqlx::query(
+            "UPDATE embed_jobs \
+             SET status = 'failed', finished_at = $1, error = 'worker_restart' \
+             WHERE status = 'running' AND (worker_id = $2 OR worker_id IS NULL)"
         )
         .bind(Self::now_secs())
         .bind(worker_id)
         .execute(&self.pool)
         .await
-        .map_err(|e| format!("recover_worker_jobs (supersede) failed: {e}"))?
+        .map_err(|e| format!("recover_worker_jobs failed: {e}"))?
         .rows_affected() as usize;
 
-        // Reset remaining jobs owned by this worker or orphaned from pre-0.3.1
-        let reset = sqlx::query(
-            "UPDATE embed_jobs SET status = 'pending', started_at = NULL, worker_id = NULL
-             WHERE status = 'running' AND (worker_id = $1 OR worker_id IS NULL)"
-        )
-        .bind(worker_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("recover_worker_jobs (reset) failed: {e}"))?
-        .rows_affected() as usize;
-
-        Ok(superseded + reset)
+        Ok(failed)
     }
 
     async fn expire_stale_jobs(&self, stale_secs: i64) -> Result<usize, String> {
         let cutoff = Self::now_secs() - stale_secs;
-
-        // Supersede stale jobs that have a newer job with the same scope
-        let superseded = sqlx::query(
-            "UPDATE embed_jobs SET status = 'error', finished_at = $1, error = 'superseded'
-             WHERE status = 'running' AND started_at < $2
-               AND EXISTS (
-                   SELECT 1 FROM embed_jobs e2
-                   WHERE e2.scope = embed_jobs.scope AND e2.id > embed_jobs.id
-                     AND e2.status IN ('pending', 'running')
-               )"
+        let failed = sqlx::query(
+            "UPDATE embed_jobs \
+             SET status = 'failed', finished_at = $1, error = 'timeout' \
+             WHERE status = 'running' AND started_at < $2"
         )
         .bind(Self::now_secs())
         .bind(cutoff)
         .execute(&self.pool)
         .await
-        .map_err(|e| format!("expire_stale_jobs (supersede) failed: {e}"))?
+        .map_err(|e| format!("expire_stale_jobs failed: {e}"))?
         .rows_affected() as usize;
-
-        // Reset remaining stale jobs (no newer sibling) back to pending
-        let reset = sqlx::query(
-            "UPDATE embed_jobs SET status = 'pending', started_at = NULL
-             WHERE status = 'running' AND started_at < $1"
-        )
-        .bind(cutoff)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("expire_stale_jobs (reset) failed: {e}"))?
-        .rows_affected() as usize;
-
-        Ok(superseded + reset)
+        Ok(failed)
     }
 
     async fn update_job_progress(&self, job_id: i64, done: i64, total: i64) -> Result<(), String> {
@@ -1131,38 +1127,51 @@ impl SemanticDb for PostgresDb {
     }
 
     async fn complete_job(&self, job_id: i64, error: Option<&str>) -> Result<(), String> {
-        let status = if error.is_some() { "error" } else { "completed" };
-        sqlx::query("UPDATE embed_jobs SET status = $1, finished_at = $2, error = $3 WHERE id = $4")
-            .bind(status)
-            .bind(Self::now_secs())
-            .bind(error)
+        let now = Self::now_secs();
+        if let Some(reason) = error {
+            // Failed-open: resolved_status stays NULL until the reconciler
+            // closes us with superseded/retried/gave_up. Status guard makes
+            // this idempotent — if the user cancelled the job mid-flight,
+            // the cancel wins and this is a no-op.
+            sqlx::query(
+                "UPDATE embed_jobs \
+                 SET status = 'failed', finished_at = $1, error = $2 \
+                 WHERE id = $3 AND status IN ('pending', 'running')"
+            )
+            .bind(now)
+            .bind(reason)
             .bind(job_id)
             .execute(&self.pool)
             .await
             .map_err(|e| format!("complete_job failed: {e}"))?;
+        } else {
+            // Status guard: a cancel that arrived after the pipeline's last
+            // should_stop_embed_job poll but before this write must not be
+            // silently overwritten back to 'succeeded'.
+            sqlx::query(
+                "UPDATE embed_jobs \
+                 SET status = 'succeeded', finished_at = $1, \
+                     resolved_status = 'succeeded', resolved_at = $1, error = NULL \
+                 WHERE id = $2 AND status IN ('pending', 'running')"
+            )
+            .bind(now)
+            .bind(job_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("complete_job failed: {e}"))?;
+        }
         Ok(())
     }
 
     async fn get_latest_job(&self) -> Result<Option<EmbedJob>, String> {
         let row = sqlx::query(
-            "SELECT id, scope, status, total_pages, done_pages, started_at, finished_at, error, worker_id
-             FROM embed_jobs ORDER BY id DESC LIMIT 1"
+            &format!("SELECT {EMBED_JOB_COLS} FROM embed_jobs ORDER BY id DESC LIMIT 1")
         )
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| format!("get_latest_job failed: {e}"))?;
 
-        Ok(row.map(|r| EmbedJob {
-            id: r.get("id"),
-            scope: r.get("scope"),
-            status: r.get("status"),
-            total_pages: r.get("total_pages"),
-            done_pages: r.get("done_pages"),
-            started_at: r.get("started_at"),
-            finished_at: r.get("finished_at"),
-            error: r.get("error"),
-            worker_id: r.get("worker_id"),
-        }))
+        Ok(row.map(embed_job_from_row))
     }
 
     async fn get_stats(&self) -> Result<EmbedStats, String> {
@@ -1181,31 +1190,191 @@ impl SemanticDb for PostgresDb {
     }
 
     async fn list_jobs(&self, recent: usize) -> Result<Vec<EmbedJob>, String> {
-        // All active jobs (pending/running) + most recent completed/failed
         let rows = sqlx::query(
             &format!(
-                "(SELECT id, scope, status, total_pages, done_pages, started_at, finished_at, error, worker_id
-                 FROM embed_jobs WHERE status IN ('pending', 'running') ORDER BY id ASC)
-                UNION ALL
-                (SELECT id, scope, status, total_pages, done_pages, started_at, finished_at, error, worker_id
-                 FROM embed_jobs WHERE status NOT IN ('pending', 'running') ORDER BY id DESC LIMIT {recent})"
+                "(SELECT {EMBED_JOB_COLS} FROM embed_jobs \
+                  WHERE status IN ('pending', 'running', 'failed') ORDER BY id ASC) \
+                 UNION ALL \
+                 (SELECT {EMBED_JOB_COLS} FROM embed_jobs \
+                  WHERE status NOT IN ('pending', 'running', 'failed') \
+                  ORDER BY id DESC LIMIT {recent})"
             )
         )
         .fetch_all(&self.pool)
         .await
         .map_err(|e| format!("list_jobs failed: {e}"))?;
 
-        Ok(rows.iter().map(|r| EmbedJob {
-            id: r.get("id"),
-            scope: r.get("scope"),
-            status: r.get("status"),
-            total_pages: r.get("total_pages"),
-            done_pages: r.get("done_pages"),
-            started_at: r.get("started_at"),
-            finished_at: r.get("finished_at"),
-            error: r.get("error"),
-            worker_id: r.get("worker_id"),
-        }).collect())
+        Ok(rows.into_iter().map(embed_job_from_row).collect())
+    }
+
+    async fn cancel_embed_job(&self, job_id: i64) -> Result<(), String> {
+        let now = Self::now_secs();
+        sqlx::query(
+            "UPDATE embed_jobs \
+             SET status = 'cancelled', resolved_status = 'cancelled', \
+                 resolved_at = $1, finished_at = $1 \
+             WHERE id = $2 AND status IN ('pending', 'running')"
+        )
+        .bind(now)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("cancel_embed_job: {e}"))?;
+        Ok(())
+    }
+
+    async fn should_stop_embed_job(&self, job_id: i64) -> Result<bool, String> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT status FROM embed_jobs WHERE id = $1"
+        )
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("should_stop_embed_job: {e}"))?;
+        Ok(matches!(row.as_ref().map(|r| r.0.as_str()), Some(s) if s != "running"))
+    }
+
+    async fn fail_embed_job(&self, job_id: i64, reason: &str) -> Result<(), String> {
+        let now = Self::now_secs();
+        sqlx::query(
+            "UPDATE embed_jobs \
+             SET status = 'failed', finished_at = $1, error = $2 \
+             WHERE id = $3 AND status IN ('pending', 'running')"
+        )
+        .bind(now)
+        .bind(reason)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("fail_embed_job: {e}"))?;
+        Ok(())
+    }
+
+    async fn list_failed_open_embed_jobs(&self) -> Result<Vec<EmbedJob>, String> {
+        let rows = sqlx::query(
+            &format!(
+                "SELECT {EMBED_JOB_COLS} FROM embed_jobs \
+                 WHERE status = 'failed' ORDER BY id ASC"
+            )
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_failed_open_embed_jobs: {e}"))?;
+        Ok(rows.into_iter().map(embed_job_from_row).collect())
+    }
+
+    async fn has_successor_embed_job(&self, scope: &str, excluded_id: i64) -> Result<bool, String> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1::BIGINT FROM embed_jobs \
+             WHERE scope = $1 AND id > $2 \
+               AND status IN ('pending','running','succeeded','cancelled','closed') \
+             LIMIT 1"
+        )
+        .bind(scope)
+        .bind(excluded_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("has_successor_embed_job: {e}"))?;
+        Ok(row.is_some())
+    }
+
+    async fn embed_job_retry_chain_len(&self, job_id: i64) -> Result<usize, String> {
+        let mut len = 1usize;
+        let mut current = job_id;
+        for _ in 0..1024 {
+            let parent: Option<(Option<i64>,)> = sqlx::query_as(
+                "SELECT retry_of FROM embed_jobs WHERE id = $1"
+            )
+            .bind(current)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| format!("embed_job_retry_chain_len: {e}"))?;
+            match parent.and_then(|(p,)| p) {
+                Some(p) => {
+                    len += 1;
+                    current = p;
+                }
+                None => break,
+            }
+        }
+        Ok(len)
+    }
+
+    async fn close_embed_job(
+        &self,
+        job_id: i64,
+        resolved_status: Option<&str>,
+    ) -> Result<(), String> {
+        if let Some(rs) = resolved_status {
+            sqlx::query(
+                "UPDATE embed_jobs \
+                 SET prev_status = status, status = 'closed', resolved_status = $1 \
+                 WHERE id = $2 AND status != 'closed'"
+            )
+            .bind(rs)
+            .bind(job_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("close_embed_job: {e}"))?;
+        } else {
+            sqlx::query(
+                "UPDATE embed_jobs \
+                 SET prev_status = status, status = 'closed' \
+                 WHERE id = $1 AND status != 'closed'"
+            )
+            .bind(job_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("close_embed_job: {e}"))?;
+        }
+        Ok(())
+    }
+
+    async fn create_retry_embed_job(&self, scope: &str, retry_of: i64) -> Result<i64, String> {
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO embed_jobs (scope, status, retry_of) VALUES ($1, 'pending', $2) RETURNING id"
+        )
+        .bind(scope)
+        .bind(retry_of)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| format!("create_retry_embed_job: {e}"))?;
+        Ok(row.0)
+    }
+
+    async fn list_archivable_embed_jobs(
+        &self,
+        older_than_secs: i64,
+    ) -> Result<Vec<i64>, String> {
+        let cutoff = Self::now_secs() - older_than_secs;
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT id FROM embed_jobs \
+             WHERE status IN ('succeeded', 'cancelled') AND resolved_at IS NOT NULL \
+               AND resolved_at <= $1 \
+             ORDER BY id ASC"
+        )
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_archivable_embed_jobs: {e}"))?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    async fn list_running_embed_jobs_started_before(
+        &self,
+        started_before_secs: i64,
+    ) -> Result<Vec<EmbedJob>, String> {
+        let rows = sqlx::query(
+            &format!(
+                "SELECT {EMBED_JOB_COLS} FROM embed_jobs \
+                 WHERE status = 'running' AND started_at IS NOT NULL AND started_at < $1"
+            )
+        )
+        .bind(started_before_secs)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_running_embed_jobs_started_before: {e}"))?;
+        Ok(rows.into_iter().map(embed_job_from_row).collect())
     }
 
     async fn vector_search(
@@ -1998,18 +2167,20 @@ impl IndexDb for PostgresDb {
         kind: &str,
         triggered_by: &str,
     ) -> Result<(i64, bool), String> {
-        // Dedup on scope (mirrors create_embed_job): if a pending or running
-        // job exists for the same scope, return that one. Wrapped in a
-        // transaction so the check + insert is atomic.
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| format!("create_index_job tx: {e}"))?;
 
+        // Dedup: pending/running collapse onto the existing job. Failed jobs
+        // not yet touched by the reconciler also count as active so a webhook
+        // firing mid-retry-window doesn't double-enqueue.
         let existing = sqlx::query(
             "SELECT id FROM index_jobs
-             WHERE scope = $1 AND status IN ('pending', 'running')
+             WHERE scope = $1
+               AND (status IN ('pending', 'running')
+                    OR (status = 'failed' AND resolved_status IS NULL))
              ORDER BY id DESC LIMIT 1
              FOR UPDATE",
         )
@@ -2043,13 +2214,14 @@ impl IndexDb for PostgresDb {
         // FOR UPDATE SKIP LOCKED enables multiple worker processes to run
         // safely against the same database without claiming the same job.
         let row = sqlx::query(
-            "UPDATE index_jobs SET status = 'running', started_at = $1
-             WHERE id = (
-                 SELECT id FROM index_jobs WHERE status = 'pending'
-                 ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED
-             )
-             RETURNING id, scope, kind, status, triggered_by, started_at,
-                       finished_at, progress, total, error",
+            &format!(
+                "UPDATE index_jobs SET status = 'running', started_at = $1 \
+                 WHERE id = ( \
+                     SELECT id FROM index_jobs WHERE status = 'pending' \
+                     ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED \
+                 ) \
+                 RETURNING {INDEX_JOB_COLS}"
+            )
         )
         .bind(Self::now_secs())
         .fetch_optional(&self.pool)
@@ -2079,26 +2251,46 @@ impl IndexDb for PostgresDb {
         job_id: i64,
         error: Option<&str>,
     ) -> Result<(), String> {
-        let status = if error.is_some() { "failed" } else { "completed" };
-        sqlx::query(
-            "UPDATE index_jobs SET status = $1, finished_at = $2, error = $3 WHERE id = $4",
-        )
-        .bind(status)
-        .bind(Self::now_secs())
-        .bind(error)
-        .bind(job_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("complete_index_job: {e}"))?;
+        let now = Self::now_secs();
+        if let Some(reason) = error {
+            // Status guard makes this idempotent — a cancel that landed
+            // between the worker's last should_stop_index_job poll and this
+            // write must not be silently overwritten.
+            sqlx::query(
+                "UPDATE index_jobs \
+                 SET status = 'failed', finished_at = $1, error = $2 \
+                 WHERE id = $3 AND status IN ('pending', 'running')",
+            )
+            .bind(now)
+            .bind(reason)
+            .bind(job_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("complete_index_job: {e}"))?;
+        } else {
+            // Same guard on the success branch — a cancel-then-success race
+            // must leave the row in 'cancelled', not flip it back.
+            sqlx::query(
+                "UPDATE index_jobs \
+                 SET status = 'succeeded', finished_at = $1, \
+                     resolved_status = 'succeeded', resolved_at = $1, error = NULL \
+                 WHERE id = $2 AND status IN ('pending', 'running')",
+            )
+            .bind(now)
+            .bind(job_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("complete_index_job: {e}"))?;
+        }
         Ok(())
     }
 
     async fn list_pending_index_jobs(&self, limit: i64) -> Result<Vec<IndexJob>, String> {
         let rows = sqlx::query(
-            "SELECT id, scope, kind, status, triggered_by, started_at, finished_at,
-                    progress, total, error
-             FROM index_jobs WHERE status = 'pending'
-             ORDER BY id ASC LIMIT $1",
+            &format!(
+                "SELECT {INDEX_JOB_COLS} FROM index_jobs \
+                 WHERE status = 'pending' ORDER BY id ASC LIMIT $1"
+            )
         )
         .bind(limit)
         .fetch_all(&self.pool)
@@ -2109,14 +2301,206 @@ impl IndexDb for PostgresDb {
 
     async fn get_latest_index_job(&self) -> Result<Option<IndexJob>, String> {
         let row = sqlx::query(
-            "SELECT id, scope, kind, status, triggered_by, started_at, finished_at,
-                    progress, total, error
-             FROM index_jobs ORDER BY id DESC LIMIT 1",
+            &format!("SELECT {INDEX_JOB_COLS} FROM index_jobs ORDER BY id DESC LIMIT 1")
         )
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| format!("get_latest_index_job: {e}"))?;
         Ok(row.map(index_job_from_row))
+    }
+
+    async fn cancel_index_job(&self, job_id: i64) -> Result<(), String> {
+        let now = Self::now_secs();
+        sqlx::query(
+            "UPDATE index_jobs \
+             SET status = 'cancelled', resolved_status = 'cancelled', \
+                 resolved_at = $1, finished_at = $1 \
+             WHERE id = $2 AND status IN ('pending', 'running')"
+        )
+        .bind(now)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("cancel_index_job: {e}"))?;
+        Ok(())
+    }
+
+    async fn should_stop_index_job(&self, job_id: i64) -> Result<bool, String> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT status FROM index_jobs WHERE id = $1"
+        )
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("should_stop_index_job: {e}"))?;
+        Ok(matches!(row.as_ref().map(|r| r.0.as_str()), Some(s) if s != "running"))
+    }
+
+    async fn fail_index_job(&self, job_id: i64, reason: &str) -> Result<(), String> {
+        let now = Self::now_secs();
+        sqlx::query(
+            "UPDATE index_jobs \
+             SET status = 'failed', finished_at = $1, error = $2 \
+             WHERE id = $3 AND status IN ('pending', 'running')"
+        )
+        .bind(now)
+        .bind(reason)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("fail_index_job: {e}"))?;
+        Ok(())
+    }
+
+    async fn list_failed_open_index_jobs(&self) -> Result<Vec<IndexJob>, String> {
+        let rows = sqlx::query(
+            &format!(
+                "SELECT {INDEX_JOB_COLS} FROM index_jobs \
+                 WHERE status = 'failed' ORDER BY id ASC"
+            )
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_failed_open_index_jobs: {e}"))?;
+        Ok(rows.into_iter().map(index_job_from_row).collect())
+    }
+
+    async fn has_successor_index_job(&self, scope: &str, excluded_id: i64) -> Result<bool, String> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1::BIGINT FROM index_jobs \
+             WHERE scope = $1 AND id > $2 \
+               AND status IN ('pending','running','succeeded','cancelled','closed') \
+             LIMIT 1"
+        )
+        .bind(scope)
+        .bind(excluded_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("has_successor_index_job: {e}"))?;
+        Ok(row.is_some())
+    }
+
+    async fn index_job_retry_chain_len(&self, job_id: i64) -> Result<usize, String> {
+        let mut len = 1usize;
+        let mut current = job_id;
+        for _ in 0..1024 {
+            let parent: Option<(Option<i64>,)> = sqlx::query_as(
+                "SELECT retry_of FROM index_jobs WHERE id = $1"
+            )
+            .bind(current)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| format!("index_job_retry_chain_len: {e}"))?;
+            match parent.and_then(|(p,)| p) {
+                Some(p) => {
+                    len += 1;
+                    current = p;
+                }
+                None => break,
+            }
+        }
+        Ok(len)
+    }
+
+    async fn close_index_job(
+        &self,
+        job_id: i64,
+        resolved_status: Option<&str>,
+    ) -> Result<(), String> {
+        if let Some(rs) = resolved_status {
+            sqlx::query(
+                "UPDATE index_jobs \
+                 SET prev_status = status, status = 'closed', resolved_status = $1 \
+                 WHERE id = $2 AND status != 'closed'"
+            )
+            .bind(rs)
+            .bind(job_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("close_index_job: {e}"))?;
+        } else {
+            sqlx::query(
+                "UPDATE index_jobs \
+                 SET prev_status = status, status = 'closed' \
+                 WHERE id = $1 AND status != 'closed'"
+            )
+            .bind(job_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("close_index_job: {e}"))?;
+        }
+        Ok(())
+    }
+
+    async fn create_retry_index_job(
+        &self,
+        scope: &str,
+        kind: &str,
+        retry_of: i64,
+    ) -> Result<i64, String> {
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO index_jobs (scope, kind, status, triggered_by, retry_of) \
+             VALUES ($1, $2, 'pending', 'reconciler', $3) RETURNING id"
+        )
+        .bind(scope)
+        .bind(kind)
+        .bind(retry_of)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| format!("create_retry_index_job: {e}"))?;
+        Ok(row.0)
+    }
+
+    async fn list_archivable_index_jobs(
+        &self,
+        older_than_secs: i64,
+    ) -> Result<Vec<i64>, String> {
+        let cutoff = Self::now_secs() - older_than_secs;
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT id FROM index_jobs \
+             WHERE status IN ('succeeded', 'cancelled') AND resolved_at IS NOT NULL \
+               AND resolved_at <= $1 \
+             ORDER BY id ASC"
+        )
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_archivable_index_jobs: {e}"))?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    async fn list_running_index_jobs_started_before(
+        &self,
+        started_before_secs: i64,
+    ) -> Result<Vec<IndexJob>, String> {
+        let rows = sqlx::query(
+            &format!(
+                "SELECT {INDEX_JOB_COLS} FROM index_jobs \
+                 WHERE status = 'running' AND started_at IS NOT NULL AND started_at < $1"
+            )
+        )
+        .bind(started_before_secs)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_running_index_jobs_started_before: {e}"))?;
+        Ok(rows.into_iter().map(index_job_from_row).collect())
+    }
+
+    async fn list_index_jobs(&self, recent: usize) -> Result<Vec<IndexJob>, String> {
+        let rows = sqlx::query(
+            &format!(
+                "(SELECT {INDEX_JOB_COLS} FROM index_jobs \
+                  WHERE status IN ('pending', 'running', 'failed') ORDER BY id ASC) \
+                 UNION ALL \
+                 (SELECT {INDEX_JOB_COLS} FROM index_jobs \
+                  WHERE status NOT IN ('pending', 'running', 'failed') \
+                  ORDER BY id DESC LIMIT {recent})"
+            )
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_index_jobs: {e}"))?;
+        Ok(rows.into_iter().map(index_job_from_row).collect())
     }
 
     // --- Index meta ---
@@ -2212,5 +2596,35 @@ fn index_job_from_row(r: sqlx::postgres::PgRow) -> IndexJob {
         progress: r.get("progress"),
         total: r.get("total"),
         error: r.get("error"),
+        resolved_status: r.get("resolved_status"),
+        prev_status: r.get("prev_status"),
+        resolved_at: r.get("resolved_at"),
+        retry_of: r.get("retry_of"),
     }
 }
+
+const INDEX_JOB_COLS: &str =
+    "id, scope, kind, status, triggered_by, started_at, finished_at, progress, total, error, \
+     resolved_status, prev_status, resolved_at, retry_of";
+
+fn embed_job_from_row(r: sqlx::postgres::PgRow) -> EmbedJob {
+    EmbedJob {
+        id: r.get("id"),
+        scope: r.get("scope"),
+        status: r.get("status"),
+        total_pages: r.get("total_pages"),
+        done_pages: r.get("done_pages"),
+        started_at: r.get("started_at"),
+        finished_at: r.get("finished_at"),
+        error: r.get("error"),
+        worker_id: r.get("worker_id"),
+        resolved_status: r.get("resolved_status"),
+        prev_status: r.get("prev_status"),
+        resolved_at: r.get("resolved_at"),
+        retry_of: r.get("retry_of"),
+    }
+}
+
+const EMBED_JOB_COLS: &str =
+    "id, scope, status, total_pages, done_pages, started_at, finished_at, error, worker_id, \
+     resolved_status, prev_status, resolved_at, retry_of";

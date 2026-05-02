@@ -331,10 +331,14 @@ async fn job_queue_worker(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(32);
-    let job_timeout: i64 = env::var("BSMCP_EMBED_JOB_TIMEOUT")
+    // BSMCP_JOB_TIMEOUT_SECS supersedes the legacy BSMCP_EMBED_JOB_TIMEOUT.
+    // The new var matches the worker + reconciler naming so all three share
+    // one knob; the legacy env stays as a fallback for existing deployments.
+    let job_timeout: i64 = env::var("BSMCP_JOB_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(14400); // 4 hours default
+        .or_else(|| env::var("BSMCP_EMBED_JOB_TIMEOUT").ok().and_then(|v| v.parse().ok()))
+        .unwrap_or(3600);
     let failure_threshold: usize = env::var("BSMCP_EMBED_FAILURE_THRESHOLD")
         .ok()
         .and_then(|v| v.parse().ok())

@@ -10,6 +10,7 @@
 //! the MCP server still respects the per-process budget.
 
 use std::env;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -71,6 +72,11 @@ impl RateLimiter {
         }
     }
 
+    /// Adjust the local cap based on `X-RateLimit-Limit` advertised by
+    /// BookStack. The cap is **monotonically non-increasing** for the life
+    /// of the process — once we've seen a tighter limit we stay at that
+    /// floor even if BookStack later advertises a higher one. To widen the
+    /// cap after BookStack relaxes its throttle, restart the process.
     pub fn observe_limit(&self, headers: &reqwest::header::HeaderMap) {
         let Some(value) = headers.get("X-RateLimit-Limit") else {
             return;
@@ -96,6 +102,34 @@ impl RateLimiter {
             }
         }
     }
+}
+
+/// Counter used to ensure successive jitter calls within the same process
+/// can't return the same value when invoked back-to-back on different
+/// callers (embedder + worker) — paired with wall-clock nanos this gives
+/// us enough entropy to desync stampedes without pulling in `rand`.
+static JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Return a uniform jitter in `[0, max_ms)` milliseconds. Uses
+/// wall-clock nanoseconds + a process-local counter for entropy — no
+/// external RNG dependency. Good enough to desync two workers that share
+/// a `Retry-After=N` value.
+pub fn jitter(max_ms: u64) -> Duration {
+    if max_ms == 0 {
+        return Duration::from_millis(0);
+    }
+    let counter = JITTER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    // Mix nanos and counter so two calls in the same nanosecond still
+    // diverge. The exact distribution doesn't matter — we just need
+    // non-trivially different sleeps per caller.
+    let mixed = nanos
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15) // golden-ratio multiplier
+        .wrapping_add(counter.wrapping_mul(0xBF58_476D_1CE4_E5B9));
+    Duration::from_millis(mixed % max_ms)
 }
 
 fn refill(inner: &mut Inner) {
@@ -208,5 +242,33 @@ mod tests {
         // accidentally parse a date.
         assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), None);
         assert_eq!(parse_retry_after("not-a-number"), None);
+    }
+
+    #[test]
+    fn jitter_within_bound() {
+        for _ in 0..100 {
+            let j = jitter(500);
+            assert!(j < Duration::from_millis(500), "jitter {:?} not < 500ms", j);
+        }
+    }
+
+    #[test]
+    fn jitter_zero_returns_zero() {
+        assert_eq!(jitter(0), Duration::from_millis(0));
+    }
+
+    #[test]
+    fn jitter_desyncs_concurrent_callers() {
+        // Two back-to-back callers with the same Retry-After value should
+        // not sleep for the exact same duration — that's the whole point.
+        // Sample a batch and assert at least two distinct values appear.
+        let mut samples = std::collections::HashSet::new();
+        for _ in 0..32 {
+            samples.insert(jitter(500).as_millis());
+        }
+        assert!(
+            samples.len() > 1,
+            "jitter degenerated to a constant — embedder + worker would still stampede"
+        );
     }
 }

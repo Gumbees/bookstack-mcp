@@ -1237,17 +1237,22 @@ impl SemanticDb for SqliteDb {
             if error.is_some() {
                 // Failed-open: resolved_status stays NULL until the
                 // reconciler closes us with superseded/retried/gave_up.
+                // Status guard makes this idempotent — if the user cancelled
+                // the job mid-flight, the cancel wins and this is a no-op.
                 conn.execute(
                     "UPDATE embed_jobs SET status = 'failed', finished_at = ?1, error = ?2 \
-                     WHERE id = ?3",
+                     WHERE id = ?3 AND status IN ('pending', 'running')",
                     params![now, error, job_id],
                 ).ok();
             } else {
+                // Status guard: a cancel that arrived after the pipeline's
+                // last should_stop_embed_job poll but before this write must
+                // not be silently overwritten back to 'succeeded'.
                 conn.execute(
                     "UPDATE embed_jobs SET status = 'succeeded', finished_at = ?1, \
                                           resolved_status = 'succeeded', resolved_at = ?1, \
                                           error = NULL \
-                     WHERE id = ?2",
+                     WHERE id = ?2 AND status IN ('pending', 'running')",
                     params![now, job_id],
                 ).ok();
             }
@@ -2461,18 +2466,23 @@ impl IndexDb for SqliteDb {
             let conn = conn.lock().unwrap();
             let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
             if error.is_some() {
+                // Status guard makes this idempotent — a cancel that landed
+                // between the worker's last should_stop_index_job poll and
+                // this write must not be silently overwritten.
                 conn.execute(
                     "UPDATE index_jobs \
                      SET status = 'failed', finished_at = ?1, error = ?2 \
-                     WHERE id = ?3",
+                     WHERE id = ?3 AND status IN ('pending', 'running')",
                     params![now, error, job_id],
                 ).map_err(|e| format!("complete_index_job: {e}"))?;
             } else {
+                // Same guard on the success branch — a cancel-then-success
+                // race must leave the row in 'cancelled', not flip it back.
                 conn.execute(
                     "UPDATE index_jobs \
                      SET status = 'succeeded', finished_at = ?1, \
                          resolved_status = 'succeeded', resolved_at = ?1, error = NULL \
-                     WHERE id = ?2",
+                     WHERE id = ?2 AND status IN ('pending', 'running')",
                     params![now, job_id],
                 ).map_err(|e| format!("complete_index_job: {e}"))?;
             }
@@ -3051,5 +3061,97 @@ mod lifecycle_tests {
         // Cancel → should_stop returns true.
         IndexDb::cancel_index_job(&db, j).await.unwrap();
         assert!(IndexDb::should_stop_index_job(&db, j).await.unwrap());
+    }
+
+    // Cancel race: pipeline finishes its current page after a cancel landed
+    // but before the next should_stop poll. complete_job must not flip
+    // 'cancelled' back to 'succeeded' (or 'failed' on the error branch).
+    #[tokio::test]
+    async fn complete_job_does_not_overwrite_cancelled() {
+        let db = temp_db();
+        db.init_semantic_tables().await.unwrap();
+
+        let (job_id, _) = SemanticDb::create_embed_job(&db, "page:1").await.unwrap();
+        // Claim → running.
+        let claimed = SemanticDb::claim_next_job(&db, "worker-x").await.unwrap().unwrap();
+        assert_eq!(claimed.id, job_id);
+        // User cancels mid-flight.
+        SemanticDb::cancel_embed_job(&db, job_id).await.unwrap();
+        // Pipeline finishes its in-flight page and tries to mark complete.
+        SemanticDb::complete_job(&db, job_id, None).await.unwrap();
+
+        let job = SemanticDb::list_jobs(&db, 5)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|j| j.id == job_id)
+            .expect("job should still exist");
+        assert_eq!(job.status, "cancelled");
+        assert_eq!(job.resolved_status.as_deref(), Some("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn complete_job_failure_does_not_overwrite_cancelled() {
+        let db = temp_db();
+        db.init_semantic_tables().await.unwrap();
+
+        let (job_id, _) = SemanticDb::create_embed_job(&db, "page:2").await.unwrap();
+        SemanticDb::claim_next_job(&db, "worker-x").await.unwrap().unwrap();
+        SemanticDb::cancel_embed_job(&db, job_id).await.unwrap();
+        // Pipeline's in-flight page errored — but the job has already been
+        // cancelled, so the failure must not flip it back.
+        SemanticDb::complete_job(&db, job_id, Some("boom")).await.unwrap();
+
+        let job = SemanticDb::list_jobs(&db, 5)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|j| j.id == job_id)
+            .expect("job should still exist");
+        assert_eq!(job.status, "cancelled");
+        assert_eq!(job.resolved_status.as_deref(), Some("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn complete_index_job_does_not_overwrite_cancelled() {
+        let db = temp_db();
+
+        let (job_id, _) = IndexDb::create_index_job(&db, "page:3", "both", "test")
+            .await
+            .unwrap();
+        let claimed = IndexDb::claim_next_index_job(&db).await.unwrap().unwrap();
+        assert_eq!(claimed.id, job_id);
+        IndexDb::cancel_index_job(&db, job_id).await.unwrap();
+        IndexDb::complete_index_job(&db, job_id, None).await.unwrap();
+
+        let job = IndexDb::list_index_jobs(&db, 5)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|j| j.id == job_id)
+            .expect("job should still exist");
+        assert_eq!(job.status, "cancelled");
+        assert_eq!(job.resolved_status.as_deref(), Some("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn complete_index_job_failure_does_not_overwrite_cancelled() {
+        let db = temp_db();
+
+        let (job_id, _) = IndexDb::create_index_job(&db, "page:4", "both", "test")
+            .await
+            .unwrap();
+        IndexDb::claim_next_index_job(&db).await.unwrap().unwrap();
+        IndexDb::cancel_index_job(&db, job_id).await.unwrap();
+        IndexDb::complete_index_job(&db, job_id, Some("boom")).await.unwrap();
+
+        let job = IndexDb::list_index_jobs(&db, 5)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|j| j.id == job_id)
+            .expect("job should still exist");
+        assert_eq!(job.status, "cancelled");
+        assert_eq!(job.resolved_status.as_deref(), Some("cancelled"));
     }
 }

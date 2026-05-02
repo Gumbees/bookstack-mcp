@@ -301,6 +301,11 @@ impl IndexWorker {
         }
         let mut total_pages = 0usize;
         for shelf_id in shelves {
+            // Per-shelf/book/chapter/page status check. This (and every
+            // other should_stop_index_job call in walk_*) is a `WHERE id = ?`
+            // PK lookup — cheap (microseconds on either backend) and
+            // intentional, so a user-issued cancel takes effect at the
+            // next yield point rather than waiting for the whole walk.
             if matches!(self.index_db.should_stop_index_job(job_id).await, Ok(true)) {
                 eprintln!("IndexWorker: job {job_id} stopped — bailing out of walk_all");
                 return Ok(());

@@ -1130,11 +1130,13 @@ impl SemanticDb for PostgresDb {
         let now = Self::now_secs();
         if let Some(reason) = error {
             // Failed-open: resolved_status stays NULL until the reconciler
-            // closes us with superseded/retried/gave_up.
+            // closes us with superseded/retried/gave_up. Status guard makes
+            // this idempotent — if the user cancelled the job mid-flight,
+            // the cancel wins and this is a no-op.
             sqlx::query(
                 "UPDATE embed_jobs \
                  SET status = 'failed', finished_at = $1, error = $2 \
-                 WHERE id = $3"
+                 WHERE id = $3 AND status IN ('pending', 'running')"
             )
             .bind(now)
             .bind(reason)
@@ -1143,11 +1145,14 @@ impl SemanticDb for PostgresDb {
             .await
             .map_err(|e| format!("complete_job failed: {e}"))?;
         } else {
+            // Status guard: a cancel that arrived after the pipeline's last
+            // should_stop_embed_job poll but before this write must not be
+            // silently overwritten back to 'succeeded'.
             sqlx::query(
                 "UPDATE embed_jobs \
                  SET status = 'succeeded', finished_at = $1, \
                      resolved_status = 'succeeded', resolved_at = $1, error = NULL \
-                 WHERE id = $2"
+                 WHERE id = $2 AND status IN ('pending', 'running')"
             )
             .bind(now)
             .bind(job_id)
@@ -2248,10 +2253,13 @@ impl IndexDb for PostgresDb {
     ) -> Result<(), String> {
         let now = Self::now_secs();
         if let Some(reason) = error {
+            // Status guard makes this idempotent — a cancel that landed
+            // between the worker's last should_stop_index_job poll and this
+            // write must not be silently overwritten.
             sqlx::query(
                 "UPDATE index_jobs \
                  SET status = 'failed', finished_at = $1, error = $2 \
-                 WHERE id = $3",
+                 WHERE id = $3 AND status IN ('pending', 'running')",
             )
             .bind(now)
             .bind(reason)
@@ -2260,11 +2268,13 @@ impl IndexDb for PostgresDb {
             .await
             .map_err(|e| format!("complete_index_job: {e}"))?;
         } else {
+            // Same guard on the success branch — a cancel-then-success race
+            // must leave the row in 'cancelled', not flip it back.
             sqlx::query(
                 "UPDATE index_jobs \
                  SET status = 'succeeded', finished_at = $1, \
                      resolved_status = 'succeeded', resolved_at = $1, error = NULL \
-                 WHERE id = $2",
+                 WHERE id = $2 AND status IN ('pending', 'running')",
             )
             .bind(now)
             .bind(job_id)

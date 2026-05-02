@@ -351,6 +351,10 @@ pub async fn run_pipeline(
     let mut aborted = false;
 
     for (i, page_id) in all_page_ids.iter().enumerate() {
+        // Per-page status check. This is a `WHERE id = ?` PK lookup —
+        // cheap (microseconds on either backend) and intentional. We pay
+        // it on every page so a user-issued cancel takes effect within
+        // one page rather than waiting for the whole walk to finish.
         if matches!(db.should_stop_embed_job(job_id).await, Ok(true)) {
             eprintln!("Pipeline: job {job_id} flipped out of running — aborting at page {i}");
             aborted = true;

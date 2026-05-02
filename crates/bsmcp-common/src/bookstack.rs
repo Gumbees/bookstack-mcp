@@ -308,12 +308,19 @@ impl BookStackClient {
                 "Request failed".to_string()
             })?;
             if resp.status().as_u16() == 429 {
-                let delay = resp
+                // Jitter both the parsed Retry-After and the exponential
+                // fallback. When the embedder + worker share a token they
+                // would otherwise wake on the same millisecond after a
+                // synchronized Retry-After=N and stampede BookStack right
+                // back into 429. 0–500ms uniform jitter is enough to
+                // desync them without meaningfully extending the retry.
+                let base = resp
                     .headers()
                     .get("Retry-After")
                     .and_then(|v| v.to_str().ok())
                     .and_then(rate_limit::parse_retry_after)
                     .unwrap_or_else(|| Duration::from_millis(500 * 2u64.pow(attempt)));
+                let delay = base + rate_limit::jitter(500);
                 if attempt + 1 == Self::RETRY_429_MAX_ATTEMPTS {
                     let status = resp.status();
                     let body = Self::read_error_body(resp).await;

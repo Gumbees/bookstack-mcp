@@ -107,6 +107,62 @@ pub trait SemanticDb: Send + Sync + 'static {
     /// List all pending/running jobs, plus the most recent completed/failed jobs (up to `recent`).
     async fn list_jobs(&self, recent: usize) -> Result<Vec<EmbedJob>, String>;
 
+    // --- Job lifecycle (issue #54) ---
+
+    /// Cancel a job. Idempotent: pending/running flip to `cancelled`; jobs
+    /// already in a resolved or closed state are left alone. Running workers
+    /// observe via `should_stop_embed_job`.
+    async fn cancel_embed_job(&self, job_id: i64) -> Result<(), String>;
+
+    /// True when the job is no longer `running` — running pipelines poll this
+    /// at yield points to short-circuit on cancel/timeout/external failure.
+    async fn should_stop_embed_job(&self, job_id: i64) -> Result<bool, String>;
+
+    /// Mark a job as failed (hard timeout or systemic error). Sets
+    /// `status='failed'`, `resolved_status='failed'`, `resolved_at=now`.
+    /// Reconciler decides whether to retry, supersede, or give up.
+    async fn fail_embed_job(&self, job_id: i64, reason: &str) -> Result<(), String>;
+
+    /// Reconciler input: failed jobs that haven't been closed yet.
+    async fn list_failed_open_embed_jobs(&self) -> Result<Vec<EmbedJob>, String>;
+
+    /// Reconciler input: any same-scope job with `id > excluded_id` whose
+    /// status is in pending/running/succeeded/cancelled/closed. Used to
+    /// detect supersedence — a newer job for the same scope already exists.
+    async fn has_successor_embed_job(&self, scope: &str, excluded_id: i64) -> Result<bool, String>;
+
+    /// Walk `retry_of` back to the chain root and return the chain length
+    /// (1 = original, 2 = first retry, ...).
+    async fn embed_job_retry_chain_len(&self, job_id: i64) -> Result<usize, String>;
+
+    /// Close a job (`status='closed'`, `prev_status=status`). When
+    /// `resolved_status` is `Some`, overwrite the existing resolved_status;
+    /// when `None`, preserve whatever's there (archiver path for
+    /// succeeded/cancelled).
+    async fn close_embed_job(
+        &self,
+        job_id: i64,
+        resolved_status: Option<&str>,
+    ) -> Result<(), String>;
+
+    /// Insert a fresh pending job that records `retry_of` as its
+    /// predecessor. Returns the new job id.
+    async fn create_retry_embed_job(&self, scope: &str, retry_of: i64) -> Result<i64, String>;
+
+    /// Archiver input: ids of succeeded/cancelled jobs whose
+    /// `resolved_at` is older than `older_than_secs` and which haven't
+    /// already been closed.
+    async fn list_archivable_embed_jobs(&self, older_than_secs: i64)
+        -> Result<Vec<i64>, String>;
+
+    /// List currently-running jobs whose `started_at` is older than
+    /// `started_before_secs` (unix epoch). Background timeout watcher
+    /// uses this to fail hung jobs.
+    async fn list_running_embed_jobs_started_before(
+        &self,
+        started_before_secs: i64,
+    ) -> Result<Vec<EmbedJob>, String>;
+
     // --- Vector search ---
 
     /// Backend-specific vector search. SQLite: brute-force cosine scan. Postgres: pgvector HNSW.
@@ -313,6 +369,33 @@ pub trait IndexDb: Send + Sync + 'static {
     ) -> Result<(), String>;
     async fn list_pending_index_jobs(&self, limit: i64) -> Result<Vec<IndexJob>, String>;
     async fn get_latest_index_job(&self) -> Result<Option<IndexJob>, String>;
+
+    // --- Job lifecycle (issue #54) ---
+
+    async fn cancel_index_job(&self, job_id: i64) -> Result<(), String>;
+    async fn should_stop_index_job(&self, job_id: i64) -> Result<bool, String>;
+    async fn fail_index_job(&self, job_id: i64, reason: &str) -> Result<(), String>;
+    async fn list_failed_open_index_jobs(&self) -> Result<Vec<IndexJob>, String>;
+    async fn has_successor_index_job(&self, scope: &str, excluded_id: i64) -> Result<bool, String>;
+    async fn index_job_retry_chain_len(&self, job_id: i64) -> Result<usize, String>;
+    async fn close_index_job(
+        &self,
+        job_id: i64,
+        resolved_status: Option<&str>,
+    ) -> Result<(), String>;
+    async fn create_retry_index_job(
+        &self,
+        scope: &str,
+        kind: &str,
+        retry_of: i64,
+    ) -> Result<i64, String>;
+    async fn list_archivable_index_jobs(&self, older_than_secs: i64) -> Result<Vec<i64>, String>;
+    async fn list_running_index_jobs_started_before(
+        &self,
+        started_before_secs: i64,
+    ) -> Result<Vec<IndexJob>, String>;
+    /// List the set of pending/running/failed-open jobs for status-page rendering.
+    async fn list_index_jobs(&self, recent: usize) -> Result<Vec<IndexJob>, String>;
 
     // --- Index meta (singleton key-value) ---
 

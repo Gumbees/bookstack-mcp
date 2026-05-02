@@ -351,6 +351,12 @@ pub async fn run_pipeline(
     let mut aborted = false;
 
     for (i, page_id) in all_page_ids.iter().enumerate() {
+        if matches!(db.should_stop_embed_job(job_id).await, Ok(true)) {
+            eprintln!("Pipeline: job {job_id} flipped out of running — aborting at page {i}");
+            aborted = true;
+            db.update_job_progress(job_id, i as i64, total_pages as i64).await?;
+            break;
+        }
         match embed_single_page(db, embedder, client, *page_id, force, &shelf_lookup, role_ctx.as_ref()).await {
             Ok(()) => {
                 succeeded += 1;

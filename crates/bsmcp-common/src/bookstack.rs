@@ -1,8 +1,11 @@
 use reqwest::Client;
 use serde_json::Value;
 use std::net::IpAddr;
+use std::time::Duration;
 use url::Url;
 use zeroize::Zeroize;
+
+use crate::rate_limit::{self, RateLimiter};
 
 /// Maximum size for file content fetched from URLs (50MB).
 const MAX_FILE_CONTENT_SIZE: usize = 50 * 1024 * 1024;
@@ -199,6 +202,7 @@ pub struct BookStackClient {
     base_url: String,
     token_id: String,
     token_secret: String,
+    rate_limiter: RateLimiter,
 }
 
 impl Drop for BookStackClient {
@@ -215,6 +219,7 @@ impl BookStackClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             token_id: token_id.to_string(),
             token_secret: token_secret.to_string(),
+            rate_limiter: rate_limit::shared(),
         }
     }
 
@@ -286,45 +291,85 @@ impl BookStackClient {
         String::from_utf8_lossy(&buf).into_owned()
     }
 
+    /// Cap on 429 retries before surfacing the error to the caller.
+    const RETRY_429_MAX_ATTEMPTS: u32 = 4;
+
+    async fn send_with_retry(
+        &self,
+        builder: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, String> {
+        for attempt in 0..Self::RETRY_429_MAX_ATTEMPTS {
+            self.rate_limiter.acquire().await;
+            let req = builder
+                .try_clone()
+                .ok_or_else(|| "non-cloneable request".to_string())?;
+            let resp = req.send().await.map_err(|e| {
+                eprintln!("BookStack request error: {e}");
+                "Request failed".to_string()
+            })?;
+            if resp.status().as_u16() == 429 {
+                let delay = resp
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(rate_limit::parse_retry_after)
+                    .unwrap_or_else(|| Duration::from_millis(500 * 2u64.pow(attempt)));
+                if attempt + 1 == Self::RETRY_429_MAX_ATTEMPTS {
+                    let status = resp.status();
+                    let body = Self::read_error_body(resp).await;
+                    eprintln!("BookStack 429 retry budget exhausted: {body}");
+                    return Err(format!("BookStack API error: {status}"));
+                }
+                eprintln!(
+                    "BookStack 429 retry {}/{} after {:?}",
+                    attempt + 1,
+                    Self::RETRY_429_MAX_ATTEMPTS - 1,
+                    delay
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            self.rate_limiter.observe_limit(resp.headers());
+            return Ok(resp);
+        }
+        Err("BookStack API error: 429".to_string())
+    }
+
     async fn get(&self, path: &str, query: &[(&str, &str)]) -> Result<Value, String> {
-        let resp = self.client
+        let builder = self
+            .client
             .get(format!("{}/api/{}", self.base_url, path))
             .header("Authorization", self.auth_header())
-            .query(query)
-            .send()
-            .await
-            .map_err(|e| { eprintln!("BookStack request error: {e}"); "Request failed".to_string() })?;
-
+            .query(query);
+        let resp = self.send_with_retry(builder).await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = Self::read_error_body(resp).await;
             eprintln!("BookStack API error {status}: {body}");
             return Err(format!("BookStack API error: {status}"));
         }
-
         Self::read_json(resp).await
     }
 
     async fn post(&self, path: &str, body: &Value) -> Result<Value, String> {
-        let resp = self.client
+        let builder = self
+            .client
             .post(format!("{}/api/{}", self.base_url, path))
             .header("Authorization", self.auth_header())
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| { eprintln!("BookStack request error: {e}"); "Request failed".to_string() })?;
-
+            .json(body);
+        let resp = self.send_with_retry(builder).await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = Self::read_error_body(resp).await;
             eprintln!("BookStack API error {status}: {body}");
             return Err(format!("BookStack API error: {status}"));
         }
-
         Self::read_json(resp).await
     }
 
     async fn post_multipart(&self, path: &str, form: reqwest::multipart::Form) -> Result<Value, String> {
+        // Multipart bodies stream and aren't `try_clone`-safe; skip retry.
+        self.rate_limiter.acquire().await;
         let resp = self.client
             .post(format!("{}/api/{}", self.base_url, path))
             .header("Authorization", self.auth_header())
@@ -332,6 +377,7 @@ impl BookStackClient {
             .send()
             .await
             .map_err(|e| { eprintln!("BookStack request error: {e}"); "Request failed".to_string() })?;
+        self.rate_limiter.observe_limit(resp.headers());
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -344,57 +390,48 @@ impl BookStackClient {
     }
 
     async fn put(&self, path: &str, body: &Value) -> Result<Value, String> {
-        let resp = self.client
+        let builder = self
+            .client
             .put(format!("{}/api/{}", self.base_url, path))
             .header("Authorization", self.auth_header())
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| { eprintln!("BookStack request error: {e}"); "Request failed".to_string() })?;
-
+            .json(body);
+        let resp = self.send_with_retry(builder).await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = Self::read_error_body(resp).await;
             eprintln!("BookStack API error {status}: {body}");
             return Err(format!("BookStack API error: {status}"));
         }
-
         Self::read_json(resp).await
     }
 
     async fn get_text(&self, path: &str) -> Result<String, String> {
-        let resp = self.client
+        let builder = self
+            .client
             .get(format!("{}/api/{}", self.base_url, path))
-            .header("Authorization", self.auth_header())
-            .send()
-            .await
-            .map_err(|e| { eprintln!("BookStack request error: {e}"); "Request failed".to_string() })?;
-
+            .header("Authorization", self.auth_header());
+        let resp = self.send_with_retry(builder).await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = Self::read_error_body(resp).await;
             eprintln!("BookStack API error {status}: {body}");
             return Err(format!("BookStack API error: {status}"));
         }
-
         Self::read_text(resp).await
     }
 
     async fn delete(&self, path: &str) -> Result<(), String> {
-        let resp = self.client
+        let builder = self
+            .client
             .delete(format!("{}/api/{}", self.base_url, path))
-            .header("Authorization", self.auth_header())
-            .send()
-            .await
-            .map_err(|e| { eprintln!("BookStack request error: {e}"); "Request failed".to_string() })?;
-
+            .header("Authorization", self.auth_header());
+        let resp = self.send_with_retry(builder).await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = Self::read_error_body(resp).await;
             eprintln!("BookStack API error {status}: {body}");
             return Err(format!("BookStack API error: {status}"));
         }
-
         Ok(())
     }
 
@@ -447,12 +484,11 @@ impl BookStackClient {
     /// Uses GET /api/pages/{id} which correctly evaluates entity permissions.
     /// Returns true on 200, false on 403/404 or any error.
     pub async fn can_access_page(&self, page_id: i64) -> bool {
-        let resp = self.client
+        let builder = self
+            .client
             .get(format!("{}/api/pages/{page_id}", self.base_url))
-            .header("Authorization", self.auth_header())
-            .send()
-            .await;
-        match resp {
+            .header("Authorization", self.auth_header());
+        match self.send_with_retry(builder).await {
             Ok(r) => r.status().is_success(),
             Err(_) => false,
         }

@@ -60,6 +60,10 @@ pub struct EmbedJob {
     pub finished_at: Option<i64>,
     pub error: Option<String>,
     pub worker_id: Option<String>,
+    pub resolved_status: Option<String>,
+    pub prev_status: Option<String>,
+    pub resolved_at: Option<i64>,
+    pub retry_of: Option<i64>,
 }
 
 #[derive(Clone, Debug)]

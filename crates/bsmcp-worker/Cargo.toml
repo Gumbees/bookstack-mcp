@@ -12,6 +12,9 @@ reqwest = { version = "0.12", features = ["json"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+
 [[bin]]
 name = "bsmcp-worker"
 path = "src/main.rs"

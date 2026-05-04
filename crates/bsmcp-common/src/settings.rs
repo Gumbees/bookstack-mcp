@@ -436,6 +436,46 @@ fn default_true() -> bool {
     true
 }
 
+/// Memory-protocol / "non-CRUD" MCP tool names that ship default-OFF on
+/// fresh installs. Existing admins keep whatever they've configured.
+///
+/// Why default-off: an unconfigured fresh server has no
+/// `bookstack_user_id`, no `user_journals_shelf_id`, and no per-user
+/// journaling toggle. Most of these tools error or no-op until
+/// configured. Hiding them by default keeps the first-time tool list
+/// short (KB CRUD + semantic) and lets users opt in via the
+/// `/setup/user` per-tool overrides or admin's `/settings` after
+/// reading the help text there.
+///
+/// Seeded into `GlobalSettings.tool_defaults` exactly once, at first
+/// server startup — the seed step keys on `tool_defaults IS NULL` and
+/// `set_by_token_hash IS NULL` so admins who clear it (or have already
+/// touched it) don't get the seed re-applied.
+pub const MEMORY_PROTOCOL_TOOL_NAMES: &[&str] = &[
+    "briefing",
+    "user",
+    "config",
+    "directory",
+    "identity",
+    "journal",
+    "migrate",
+    "reminders",
+    "events",
+    "sessions",
+    "session_event",
+    "dismiss_setup_nudge",
+];
+
+/// Build the seed map for `GlobalSettings.tool_defaults` on a fresh
+/// install. Every entry is `false` → tools default-off. Backend `open`
+/// paths apply this map only when no admin has touched the row yet.
+pub fn memory_protocol_tool_defaults_seed() -> std::collections::HashMap<String, bool> {
+    MEMORY_PROTOCOL_TOOL_NAMES
+        .iter()
+        .map(|n| ((*n).to_string(), false))
+        .collect()
+}
+
 /// Decide whether a tool is enabled for a given (user, global) settings pair.
 ///
 /// Resolution order:

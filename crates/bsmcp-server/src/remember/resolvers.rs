@@ -436,6 +436,211 @@ pub async fn resolve_journal_page(
 const JOURNAL_CHAPTER_DESCRIPTION: &str =
     "Monthly journal entries — one daily page per session-day, append-only";
 
+/// Description stamped on the user's `Reminders` chapter at create time.
+const REMINDERS_CHAPTER_DESCRIPTION: &str =
+    "Rolling task list — monthly pages with open/done sections. Written by the `reminders` MCP tool.";
+
+/// Description stamped on the user's `Events` chapter at create time.
+const EVENTS_CHAPTER_DESCRIPTION: &str =
+    "Future-scheduled calendar items — monthly pages, written by the `events` MCP tool.";
+
+/// Find-or-create the singleton `Reminders` chapter inside the user's
+/// per-user Journal book. Single chapter; monthly pages live inside it.
+pub async fn resolve_reminders_chapter(
+    book_id: i64,
+    client: &BookStackClient,
+) -> Result<i64, ResolverError> {
+    find_or_create_chapter(client, book_id, "Reminders", REMINDERS_CHAPTER_DESCRIPTION).await
+}
+
+/// Find-or-create the `{YYYY-MM}-Reminders` monthly page inside the
+/// reminders chapter. Returns `(page_id, was_created)`. On create the
+/// body is the empty-page seed (Open + Done section headers); the
+/// reminders handlers read+modify+write the markdown wholesale.
+pub async fn resolve_reminders_monthly_page(
+    chapter_id: i64,
+    year: i32,
+    month: u32,
+    client: &BookStackClient,
+) -> Result<(i64, bool), ResolverError> {
+    let page_name = reminders_monthly_page_name(year, month);
+    if let Some(existing) = client
+        .find_page_in_chapter(chapter_id, &page_name)
+        .await
+        .map_err(ResolverError::BookstackError)?
+    {
+        let id = existing
+            .get("id")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| ResolverError::BookstackError("page missing id".to_string()))?;
+        return Ok((id, false));
+    }
+    let page = client
+        .create_page(&serde_json::json!({
+            "chapter_id": chapter_id,
+            "name": page_name,
+            "markdown": reminders_seed(),
+        }))
+        .await
+        .map_err(ResolverError::BookstackError)?;
+    let id = page
+        .get("id")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| ResolverError::BookstackError("create_page: missing id in response".to_string()))?;
+    Ok((id, true))
+}
+
+/// Render `{YYYY-MM}-Reminders`. Pure helper.
+pub fn reminders_monthly_page_name(year: i32, month: u32) -> String {
+    format!("{year:04}-{month:02}-Reminders")
+}
+
+/// Empty-page seed for a fresh `{YYYY-MM}-Reminders` page. Establishes
+/// the section headers the `reminders` tool's create/complete handlers
+/// rely on for placement.
+pub fn reminders_seed() -> String {
+    "## 🟢 Open\n\n## ✅ Done\n".to_string()
+}
+
+/// Find-or-create the singleton `Events` chapter inside the user's
+/// per-user Journal book.
+pub async fn resolve_events_chapter(
+    book_id: i64,
+    client: &BookStackClient,
+) -> Result<i64, ResolverError> {
+    find_or_create_chapter(client, book_id, "Events", EVENTS_CHAPTER_DESCRIPTION).await
+}
+
+/// Find-or-create the `{YYYY-MM}-Events` monthly page inside the events
+/// chapter. Returns `(page_id, was_created)`.
+pub async fn resolve_events_monthly_page(
+    chapter_id: i64,
+    year: i32,
+    month: u32,
+    client: &BookStackClient,
+) -> Result<(i64, bool), ResolverError> {
+    let page_name = events_monthly_page_name(year, month);
+    if let Some(existing) = client
+        .find_page_in_chapter(chapter_id, &page_name)
+        .await
+        .map_err(ResolverError::BookstackError)?
+    {
+        let id = existing
+            .get("id")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| ResolverError::BookstackError("page missing id".to_string()))?;
+        return Ok((id, false));
+    }
+    let page = client
+        .create_page(&serde_json::json!({
+            "chapter_id": chapter_id,
+            "name": page_name,
+            "markdown": events_seed(),
+        }))
+        .await
+        .map_err(ResolverError::BookstackError)?;
+    let id = page
+        .get("id")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| ResolverError::BookstackError("create_page: missing id in response".to_string()))?;
+    Ok((id, true))
+}
+
+/// Render `{YYYY-MM}-Events`. Pure helper.
+pub fn events_monthly_page_name(year: i32, month: u32) -> String {
+    format!("{year:04}-{month:02}-Events")
+}
+
+/// Empty-page seed for a fresh `{YYYY-MM}-Events` page. One section,
+/// since events don't have a distinct lifecycle state — they're just
+/// scheduled or cancelled (cancelled = removed).
+pub fn events_seed() -> String {
+    "## 📅 Scheduled\n".to_string()
+}
+
+/// Description stamped on per-agent `Sessions: {agent_name}` chapters
+/// at create time.
+const SESSIONS_CHAPTER_DESCRIPTION: &str =
+    "AI session captures (forager / Claude Code / external clients) — page-per-session, append-only blocks";
+
+/// Find-or-create the `Sessions: {agent_name}` chapter inside the
+/// user's per-user Journal book. Mirrors the `AI Identity:` chapter
+/// pattern.
+pub async fn resolve_sessions_chapter(
+    book_id: i64,
+    agent_name: &str,
+    client: &BookStackClient,
+) -> Result<i64, ResolverError> {
+    let chapter_name = sessions_chapter_name(agent_name);
+    find_or_create_chapter(client, book_id, &chapter_name, SESSIONS_CHAPTER_DESCRIPTION).await
+}
+
+/// Render the chapter name `Sessions: {agent_name}`. Pure helper so
+/// tests can assert the formatting.
+pub fn sessions_chapter_name(agent_name: &str) -> String {
+    format!("Sessions: {agent_name}")
+}
+
+/// Render a session page name. Used on first append for the session.
+/// Format: `{YYYY-MM-DD}-{title-slug}` when a title is supplied,
+/// `{YYYY-MM-DD}-{session_id_short}` otherwise.
+pub fn session_page_name(date: chrono::NaiveDate, title: Option<&str>, session_id: &str) -> String {
+    let date_part = format!(
+        "{:04}-{:02}-{:02}",
+        date.year(),
+        date.month(),
+        date.day()
+    );
+    let suffix = match title {
+        Some(t) if !t.trim().is_empty() => slugify_natural_key(t),
+        _ => session_id_short(session_id),
+    };
+    format!("{date_part}-{suffix}")
+}
+
+/// Take the first 8 ASCII alphanumeric characters of a session_id for
+/// use in a page name when no title is supplied. Stable + readable.
+fn session_id_short(session_id: &str) -> String {
+    let s: String = session_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect();
+    if s.is_empty() {
+        "session".to_string()
+    } else {
+        s
+    }
+}
+
+/// Slugify free-form text into a stable natural-key. Used by reminders
+/// + events when the caller doesn't supply one explicitly. Lowercase,
+/// non-alphanumeric → dash, collapse runs, trim, cap to 40 chars.
+pub fn slugify_natural_key(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut prev_dash = true;
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    let trimmed: &str = out.trim_matches('-');
+    let mut s: String = trimmed.chars().take(40).collect();
+    while s.ends_with('-') {
+        s.pop();
+    }
+    if s.is_empty() {
+        // Fallback so the bullet always carries a parseable key.
+        "untitled".to_string()
+    } else {
+        s
+    }
+}
+
 /// Render the chapter name `{YYYY-MM}-{name}`. Pure helper so tests can
 /// assert the formatting without hitting BookStack.
 pub fn journal_chapter_name(year: i32, month: u32, name: &str) -> String {

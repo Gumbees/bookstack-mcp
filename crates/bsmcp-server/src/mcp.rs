@@ -2558,6 +2558,121 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             }),
         ));
         tools.push(tool(
+            "reminders",
+            "Simple labeled task list living on monthly pages inside the user's per-user Journal book. Layout: singleton `Reminders` chapter, monthly pages `{YYYY-MM}-Reminders` with `## 🟢 Open` and `## ✅ Done` sections. Bullet shape `- [ ] {priority_emoji?} {created} — {action} _[{label}: {natural_key}]_`. Four actions: `create` (appends a bullet under Open; auto-slugifies `natural_key` from text if absent; returns the assembled `reminder_id` = `{label}:{natural_key}`), `list` (filterable by `owner` + `status`), `complete` (flips `[ ]` → `[x]`, stamps ` · done {ts}`, moves bullet to Done section), `delete` (removes the bullet). Cross-month operations are out of scope — complete/delete look at the current month's page.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["create", "list", "complete", "delete"],
+                        "description": "Operation to perform"
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Required for `create`. The reminder body, rendered after the timestamp. e.g. 'rotate the CF AI Gateway token'."
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Required for `create`. Owner — `user` or a normalized agent name (lowercase ASCII alphanumerics + dashes/underscores; whitespace -> dash). Becomes the first half of the `reminder_id`."
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": ["today", "this-week", "whenever"],
+                        "description": "Optional for `create`. Maps to a priority emoji in the bullet (🔥 / ⚡ / 🌱). Omit for no emoji."
+                    },
+                    "natural_key": {
+                        "type": "string",
+                        "description": "Optional for `create`. Stable slug used as the `reminder_id` second half. Auto-derived from `text` when absent."
+                    },
+                    "owner": {
+                        "type": "string",
+                        "description": "Optional filter for `list`. Pass `user` or an agent name to limit results to that label."
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["open", "done", "all"],
+                        "description": "Optional filter for `list`. Defaults to `all`."
+                    },
+                    "reminder_id": {
+                        "type": "string",
+                        "description": "Required for `complete` and `delete`. Format `{label}:{natural_key}` — exactly what `create` returned."
+                    }
+                },
+                "required": ["action"]
+            }),
+        ));
+        tools.push(tool(
+            "events",
+            "Future-scheduled calendar items living on monthly pages inside the user's per-user Journal book. Layout: singleton `Events` chapter, monthly pages `{YYYY-MM}-Events` (page month matches the event's scheduled month, not the creation month), single section `## 📅 Scheduled`. Bullet shape `- {scheduled_at} — {title} _[{label}: {natural_key}]_` (no checkbox — events are scheduled or cancelled, and cancellation removes the bullet). Three actions: `create` (auto-routes to the right monthly page based on `scheduled_at`), `list` (current month, optional `label` filter), `cancel` (removes bullet from current month's page). Cross-month list/cancel is out of scope.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["create", "list", "cancel"],
+                        "description": "Operation to perform"
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Required for `create`. Free-form event title."
+                    },
+                    "scheduled_at": {
+                        "type": "string",
+                        "description": "Required for `create`. Accepts `YYYY-MM-DD`, `YYYY-MM-DD HH:MM`, `YYYY-MM-DD HH:MM TZ`, or RFC 3339. Bare date/time without TZ assumes the user's saved timezone (default UTC)."
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Optional for `create` (defaults to `user`) and `list` (filter). `user` or a normalized agent name."
+                    },
+                    "natural_key": {
+                        "type": "string",
+                        "description": "Optional for `create`. Stable slug used as the `event_id` second half. Auto-derived from `title` when absent."
+                    },
+                    "event_id": {
+                        "type": "string",
+                        "description": "Required for `cancel`. Format `{label}:{natural_key}` — exactly what `create` returned."
+                    }
+                },
+                "required": ["action"]
+            }),
+        ));
+        tools.push(tool(
+            "sessions",
+            "Capture AI sessions (forager, Claude Code hooks, external clients) into the user's per-user Journal book. Layout: per-agent chapter `Sessions: {agent_name}`; one page per session named `{YYYY-MM-DD}-{title|session_id_short}`; each `append` adds a new `## Block N — {ts}` markdown block to the bottom of that page. The `sessions` DB table indexes session_id → page_id so resume flows don't re-walk BookStack. Three actions: `append` (creates page on first call, appends blocks on resume; gated on `journaling_enabled = true`), `list` (paged by `last_appended_at DESC`, optional `agent_name` filter), `read` (returns the full transcript markdown). Search is deferred to Phase 6's precision_search. The same flow is reachable via HTTP for non-MCP clients (forager): `POST /sessions/v1/append`, `GET /sessions/v1/list`, `GET /sessions/v1/{session_id}`.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["append", "list", "read"],
+                        "description": "Operation to perform"
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Required for `append` and `read`. Opaque, caller-chosen (UUID, ULID, etc.). The first append for a given session_id creates the page; subsequent appends resume on the same page."
+                    },
+                    "agent_name": {
+                        "type": "string",
+                        "description": "Required for `append`. Optional filter for `list`. Free-form name; normalized to lowercase ASCII alphanumerics + dashes/underscores (whitespace -> dash)."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Required for `append`. Markdown body of the new block. Appended below any prior blocks on the same session page."
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Optional for `append` (only honored on first call for a session). Used in the page name when present, else page falls back to `{date}-{session_id_short}`."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Optional for `list`. Defaults to 50, clamped 1..=500."
+                    }
+                },
+                "required": ["action"]
+            }),
+        ));
+        tools.push(tool(
             "session_event",
             "Signal a session-level event. Currently supported: `action: 'compacted'` resets the briefing-injection state so the next tool response includes the full briefing again. Useful after the AI gets compacted by its harness and loses context.",
             json!({
@@ -2605,6 +2720,9 @@ fn remember_resource(tool_name: &str) -> Option<&'static str> {
         "identity" => Some("identity"),
         "journal" => Some("journal"),
         "migrate" => Some("migrate"),
+        "reminders" => Some("reminders"),
+        "events" => Some("events"),
+        "sessions" => Some("sessions"),
         _ => None,
     }
 }

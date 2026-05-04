@@ -34,10 +34,13 @@ pub mod briefing;
 pub mod config;
 pub mod directory;
 pub mod envelope;
+pub mod events;
 pub mod identity;
 pub mod journal;
 pub mod migrate;
+pub mod reminders;
 pub mod resolvers;
+pub mod sessions;
 pub mod user;
 
 use std::sync::Arc;
@@ -162,6 +165,16 @@ async fn route(resource: &str, action: &str, ctx: &Context) -> DispatchResult {
         ("migrate", "list_sources") => migrate::list_sources(ctx).await,
         ("migrate", "plan") => migrate::plan(ctx).await,
         ("migrate", "execute") => migrate::execute(ctx).await,
+        ("reminders", "create") => reminders::create(ctx).await,
+        ("reminders", "list") => reminders::list(ctx).await,
+        ("reminders", "complete") => reminders::complete(ctx).await,
+        ("reminders", "delete") => reminders::delete(ctx).await,
+        ("events", "create") => events::create(ctx).await,
+        ("events", "list") => events::list(ctx).await,
+        ("events", "cancel") => events::cancel(ctx).await,
+        ("sessions", "append") => sessions::append(ctx).await,
+        ("sessions", "list") => sessions::list(ctx).await,
+        ("sessions", "read") => sessions::read(ctx).await,
         (r, _) if !known_resource(r) => Err((
             ErrorCode::UnknownResource,
             format!("Unknown resource: {r}"),
@@ -176,7 +189,16 @@ async fn route(resource: &str, action: &str, ctx: &Context) -> DispatchResult {
 fn known_resource(resource: &str) -> bool {
     matches!(
         resource,
-        "briefing" | "user" | "config" | "directory" | "identity" | "journal" | "migrate"
+        "briefing"
+            | "user"
+            | "config"
+            | "directory"
+            | "identity"
+            | "journal"
+            | "migrate"
+            | "reminders"
+            | "events"
+            | "sessions"
     )
 }
 
@@ -219,6 +241,9 @@ mod tests {
         assert!(known_resource("identity"));
         assert!(known_resource("journal"));
         assert!(known_resource("migrate"));
+        assert!(known_resource("reminders"));
+        assert!(known_resource("events"));
+        assert!(known_resource("sessions"));
     }
 
     #[test]

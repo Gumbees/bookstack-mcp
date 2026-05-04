@@ -6,6 +6,28 @@ use crate::index::*;
 use crate::settings::{GlobalSettings, UserSettings, DEFAULT_ACCOUNT_LABEL};
 use crate::types::*;
 
+/// One row per AI session captured to BookStack via the `sessions`
+/// MCP tool / HTTP surface (`POST /sessions/v1/append`).
+///
+/// Sessions live as plain BookStack pages inside chapter
+/// `Sessions: {agent_name}` in the user's per-user Journal book; this
+/// row is the lookup index — `session_id` → page id, plus enough
+/// metadata to render the wizard / list call without re-walking
+/// BookStack.
+#[derive(Clone, Debug)]
+pub struct SessionRow {
+    pub session_id: String,
+    pub token_id_hash: String,
+    pub agent_name: String,
+    pub bookstack_page_id: i64,
+    pub chapter_id: i64,
+    pub book_id: i64,
+    pub started_at: i64,
+    pub last_appended_at: i64,
+    pub block_count: i64,
+    pub title: Option<String>,
+}
+
 /// Maps a BookStack API token hash to its stable identity.
 ///
 /// One token's hash is one binding; rotating the token issues a new
@@ -139,6 +161,33 @@ pub trait DbBackend: Send + Sync + 'static {
     /// a binding (via [`Self::set_token_binding`]) before saving.
     async fn save_user_settings(&self, token_id_hash: &str, settings: &UserSettings)
         -> Result<(), String>;
+
+    // --- Sessions (Phase 2.8 — forager / Claude Code session capture) ---
+    //
+    // One row per captured session. The session's actual transcript
+    // lives on a BookStack page inside chapter `Sessions: {agent_name}`
+    // in the user's per-user Journal book; this row is the index.
+    // `session_id` is opaque (forager picks it).
+
+    /// Look up a session by its `session_id`. `Ok(None)` when the row
+    /// doesn't exist (the caller is expected to create one via
+    /// `upsert_session` after find-or-create-ing the BookStack page).
+    async fn get_session(&self, session_id: &str) -> Result<Option<SessionRow>, String>;
+
+    /// Upsert a session row. Replaces the entire row keyed by
+    /// `session_id`; callers should preserve `started_at` and bump
+    /// `last_appended_at` + `block_count` on each append.
+    async fn upsert_session(&self, row: &SessionRow) -> Result<(), String>;
+
+    /// List sessions for a user (all if `agent_name` is None) ordered
+    /// by `last_appended_at DESC`. Used by `sessions list` and
+    /// `GET /sessions/v1/list`.
+    async fn list_sessions(
+        &self,
+        token_id_hash: &str,
+        agent_name: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<SessionRow>, String>;
 
     // --- Global settings (server-instance-wide) ---
 

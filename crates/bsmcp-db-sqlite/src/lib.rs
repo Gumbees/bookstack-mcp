@@ -1993,6 +1993,30 @@ impl IndexDb for SqliteDb {
         }).await.map_err(|e| format!("Task failed: {e}"))?
     }
 
+    async fn list_indexed_shelves(&self) -> Result<Vec<IndexedShelf>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT shelf_id, name, slug, shelf_kind, indexed_at, deleted
+                 FROM bookstack_shelves WHERE deleted = 0
+                 ORDER BY name"
+            ).map_err(|e| format!("list_indexed_shelves prepare: {e}"))?;
+            let rows = stmt.query_map([], |r| {
+                let kind_str: String = r.get(3)?;
+                Ok(IndexedShelf {
+                    shelf_id: r.get(0)?,
+                    name: r.get(1)?,
+                    slug: r.get(2)?,
+                    shelf_kind: kind_str.parse().unwrap_or(ShelfKind::Unclassified),
+                    indexed_at: r.get(4)?,
+                    deleted: r.get::<_, i64>(5)? != 0,
+                })
+            }).map_err(|e| format!("list_indexed_shelves query: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("list_indexed_shelves collect: {e}"))
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
     // --- Books ---
 
     async fn upsert_indexed_book(&self, book: &IndexedBook) -> Result<(), String> {
@@ -2108,6 +2132,32 @@ impl IndexDb for SqliteDb {
                 params![book_id],
             ).map_err(|e| format!("soft_delete_indexed_book: {e}"))?;
             Ok(())
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn list_indexed_orphan_books(&self) -> Result<Vec<IndexedBook>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT book_id, name, slug, shelf_id, identity_ouid, book_kind, indexed_at, deleted
+                 FROM bookstack_books WHERE shelf_id IS NULL AND deleted = 0
+                 ORDER BY name"
+            ).map_err(|e| format!("list_indexed_orphan_books prepare: {e}"))?;
+            let rows = stmt.query_map([], |r| {
+                let kind_str: String = r.get(5)?;
+                Ok(IndexedBook {
+                    book_id: r.get(0)?,
+                    name: r.get(1)?,
+                    slug: r.get(2)?,
+                    shelf_id: r.get(3)?,
+                    identity_ouid: r.get(4)?,
+                    book_kind: kind_str.parse().unwrap_or(BookKind::Unclassified),
+                    indexed_at: r.get(6)?,
+                    deleted: r.get::<_, i64>(7)? != 0,
+                })
+            }).map_err(|e| format!("list_indexed_orphan_books query: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("list_indexed_orphan_books collect: {e}"))
         }).await.map_err(|e| format!("Task failed: {e}"))?
     }
 

@@ -1808,6 +1808,31 @@ impl IndexDb for PostgresDb {
         Ok(())
     }
 
+    async fn list_indexed_shelves(&self) -> Result<Vec<IndexedShelf>, String> {
+        let rows = sqlx::query(
+            "SELECT shelf_id, name, slug, shelf_kind, indexed_at, deleted
+             FROM bookstack_shelves WHERE deleted = FALSE
+             ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_indexed_shelves: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let kind_str: String = r.get("shelf_kind");
+                IndexedShelf {
+                    shelf_id: r.get("shelf_id"),
+                    name: r.get("name"),
+                    slug: r.get("slug"),
+                    shelf_kind: kind_str.parse().unwrap_or(ShelfKind::Unclassified),
+                    indexed_at: r.get("indexed_at"),
+                    deleted: r.get("deleted"),
+                }
+            })
+            .collect())
+    }
+
     // --- Books ---
 
     async fn upsert_indexed_book(&self, book: &IndexedBook) -> Result<(), String> {
@@ -1886,6 +1911,18 @@ impl IndexDb for PostgresDb {
             .await
             .map_err(|e| format!("soft_delete_indexed_book: {e}"))?;
         Ok(())
+    }
+
+    async fn list_indexed_orphan_books(&self) -> Result<Vec<IndexedBook>, String> {
+        let rows = sqlx::query(
+            "SELECT book_id, name, slug, shelf_id, identity_ouid, book_kind, indexed_at, deleted
+             FROM bookstack_books WHERE shelf_id IS NULL AND deleted = FALSE
+             ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_indexed_orphan_books: {e}"))?;
+        Ok(rows.into_iter().map(book_from_row).collect())
     }
 
     // --- Chapters ---

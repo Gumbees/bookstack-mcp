@@ -9,6 +9,7 @@ use pulldown_cmark::{html, Options, Parser};
 use bsmcp_common::bookstack::{self, BookStackClient, ContentType, ExportFormat};
 use bsmcp_common::db::DbBackend;
 use crate::briefing;
+use crate::directory::DirectoryService;
 use crate::semantic::{trim_match, SemanticState};
 use crate::session::{self, SessionStore};
 
@@ -20,9 +21,10 @@ const PROTOCOL_VERSION: &str = "2025-03-26";
 pub struct BriefingDeps {
     pub db: Arc<dyn DbBackend>,
     pub semantic: Option<Arc<SemanticState>>,
-    /// Drives the `meta.briefing` auto-injection: tracks per-`(token_hash,
-    /// session_id)` state so the first tool call in a session gets the full
-    /// briefing payload and subsequent calls get sticky-only.
+    /// Drives the per-session meta-injection: first call in a session gets
+    /// the full briefing under `meta.briefing_pending`, every call gets the
+    /// directory snapshot or its `{version, hash}` pointer under
+    /// `meta.directory`.
     pub session_store: SessionStore,
     pub token_id: String,
     /// Token-hash for session-store lookups (avoids redundant SHA-256 work
@@ -30,10 +32,14 @@ pub struct BriefingDeps {
     pub token_id_hash: String,
     /// Optional client-supplied session id. Streamable HTTP carries it in
     /// the `Mcp-Session-Id` header; SSE carries it as the `?sessionId=`
-    /// query param. When absent, `session_key` falls back to a per-hour
-    /// bucket per token so the user still gets a coarse "first call this
-    /// hour" notion.
+    /// query param. When absent, `session_key` falls back to a stable
+    /// `no-session` slot per token so the user still gets a single coarse
+    /// session.
     pub session_id: Option<String>,
+    /// Directory cache. Sourced from `AppState`; passed through every
+    /// remember dispatch + auto-attached to every MCP response's
+    /// `meta.directory`.
+    pub directory: Arc<DirectoryService>,
 }
 
 pub async fn handle_request(
@@ -75,12 +81,23 @@ pub async fn handle_request(
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
+
+            // Decide pre-tool whether to attach `meta.briefing_pending`. The
+            // session record_call flip happens BEFORE execute_tool so that
+            // an explicit `remember_briefing` call in the same JSON-RPC
+            // request won't double-set the flag (mark_compacted resets it).
+            let attach_briefing_pending = name != "remember_briefing"
+                && briefing_enabled()
+                && {
+                    let key = session::session_key(
+                        &deps.token_id_hash,
+                        deps.session_id.as_deref(),
+                    );
+                    session::record_call(&deps.session_store, &key).await
+                };
+
             let result = execute_tool(name, &args, client, semantic, staging, deps).await;
 
-            // Build the tool-result object first so we can decorate it with
-            // `meta.briefing`. The meta-injection runs for every tool except
-            // `remember_briefing` itself (where the response IS the briefing —
-            // duplicating it under meta would be wasteful).
             let mut tool_result = match result {
                 Ok(text) => json!({
                     "content": [{ "type": "text", "text": text }],
@@ -91,30 +108,20 @@ pub async fn handle_request(
                 }),
             };
 
-            if name != "remember_briefing" && briefing_enabled() {
-                // Calling `remember_briefing` explicitly resets the session via task 5;
-                // for every other tool, record_call decides full-vs-sticky.
-                let key = session::session_key(&deps.token_id_hash, deps.session_id.as_deref());
-                let was_first = session::record_call(&deps.session_store, &key).await;
-                let body_for_briefing = build_briefing_meta_body(&args, id);
-                let meta_briefing = briefing::build_meta_briefing(
-                    body_for_briefing,
-                    &deps.token_id,
-                    client,
-                    deps.db.clone(),
-                    deps.semantic.clone(),
-                    was_first,
-                )
-                .await;
-
-                if let Value::Object(ref mut m) = tool_result {
-                    let meta_entry = m
-                        .entry("meta".to_string())
-                        .or_insert_with(|| json!({}));
-                    if let Value::Object(ref mut meta) = meta_entry {
-                        meta.insert("briefing".to_string(), meta_briefing);
-                    }
-                }
+            // Build the per-response meta envelope: always-present time +
+            // directory pointer/full + first-call briefing_pending. Time
+            // and directory ride on every response (cheap); briefing_pending
+            // only on the first non-briefing call per session.
+            let meta = build_response_meta(
+                &args,
+                id,
+                attach_briefing_pending,
+                client,
+                deps,
+            )
+            .await;
+            if let Value::Object(ref mut m) = tool_result {
+                m.insert("meta".to_string(), meta);
             }
 
             Some(json_rpc_result(id, tool_result))
@@ -139,6 +146,117 @@ fn build_briefing_meta_body(args: &Value, request_id: Option<&Value>) -> Value {
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     body["trace_id"] = json!(trace_id);
     body
+}
+
+/// Build the `meta` block decorating every MCP `tools/call` response.
+///
+/// Always present:
+/// - `time` — `{ iso, tz, unix }` in the user's timezone (UTC if unset).
+/// - `directory` — full snapshot if the session hasn't seen the current
+///   `version` yet, otherwise a `{version, hash, built_at, shape: "pointer"}`
+///   stub the AI can ignore.
+///
+/// First non-briefing tool call per session also gets:
+/// - `briefing_pending` — `{message, briefing}` where `briefing` is the
+///   complete briefing payload. After this attaches once, the session flag
+///   flips and subsequent calls skip it.
+async fn build_response_meta(
+    args: &Value,
+    request_id: Option<&Value>,
+    attach_briefing_pending: bool,
+    client: &BookStackClient,
+    deps: &BriefingDeps,
+) -> Value {
+    let settings = deps
+        .db
+        .get_user_settings(&deps.token_id_hash)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+
+    let mut meta = json!({
+        "time": build_response_time_block(&settings),
+        "directory": build_response_directory_block(deps).await,
+    });
+
+    if attach_briefing_pending {
+        let body = build_briefing_meta_body(args, request_id);
+        let briefing_payload = briefing::build_meta_briefing(
+            body,
+            &deps.token_id,
+            client,
+            deps.db.clone(),
+            deps.semantic.clone(),
+            true,
+        )
+        .await;
+        meta["briefing_pending"] = json!({
+            "message": "You didn't run your briefing yet, here it is..",
+            "briefing": briefing_payload,
+        });
+    }
+
+    meta
+}
+
+/// Compact time block: ISO-8601 with explicit offset, IANA tz name, unix
+/// seconds. Distinct from `briefing::envelope::build_time_block` (which
+/// emits a verbose, multi-field block tuned for the briefing payload).
+fn build_response_time_block(settings: &bsmcp_common::settings::UserSettings) -> Value {
+    let now = chrono::Utc::now();
+    let unix = now.timestamp();
+    let (iso, tz_name) = match settings
+        .timezone
+        .as_deref()
+        .and_then(|s| s.parse::<chrono_tz::Tz>().ok())
+    {
+        Some(tz) => {
+            let local = now.with_timezone(&tz);
+            (
+                local.format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
+                tz.name().to_string(),
+            )
+        }
+        None => (now.format("%Y-%m-%dT%H:%M:%S+00:00").to_string(), "UTC".to_string()),
+    };
+    json!({ "iso": iso, "tz": tz_name, "unix": unix })
+}
+
+/// Directory pointer-or-full block. Bumps the session's
+/// `last_directory_version` when attaching the full snapshot so the next
+/// call gets the cheap pointer.
+async fn build_response_directory_block(deps: &BriefingDeps) -> Value {
+    let snapshot = deps.directory.current().await;
+    let key = session::session_key(&deps.token_id_hash, deps.session_id.as_deref());
+    let needs_full = session::take_directory_version(
+        &deps.session_store,
+        &key,
+        snapshot.version,
+    )
+    .await;
+    if needs_full {
+        // Full attach. Returning the snapshot verbatim — the receiving AI
+        // pulls `version` and `content_hash` from it.
+        serde_json::to_value(&*snapshot).unwrap_or_else(|_| {
+            json!({
+                "version": snapshot.version,
+                "content_hash": snapshot.content_hash,
+                "built_at": snapshot.built_at,
+                "shape": "error_serializing",
+            })
+        })
+    } else {
+        // Pointer. Includes built_at so the AI can tell how stale the
+        // cache the server is holding is, without paying for the full
+        // tree. (See sub-PR 2.2 report for the rationale.)
+        json!({
+            "version": snapshot.version,
+            "hash": snapshot.content_hash,
+            "built_at": snapshot.built_at,
+            "shape": "pointer",
+        })
+    }
 }
 
 fn json_rpc_result(id: Option<&Value>, result: Value) -> Value {
@@ -184,14 +302,20 @@ async fn execute_tool(
         if let Value::Object(ref mut map) = body {
             map.remove("action");
         }
-        // Calling `remember_briefing` explicitly resets the session for the
-        // next response — useful after the AI gets compacted by its harness.
+        // Mark the session as having received its briefing in-band so the
+        // next non-briefing tool call doesn't re-emit it under
+        // `meta.briefing_pending`. The post-compaction reset (which sets
+        // `needs_full_briefing = true` again) lives in the
+        // `session_event action=compacted` tool, NOT here — calling
+        // remember_briefing manually means "I want it now", not "I just lost
+        // context".
+        //
         // Honor the tool's own `session_id` arg if present (lets a client
-        // without HTTP-header session_id support still get sticky-vs-full
-        // behavior); otherwise fall back to the transport-layer id.
+        // without HTTP-header session_id support still drive its session
+        // state explicitly); otherwise fall back to the transport-layer id.
         let effective_sid = arg_session_id.as_deref().or(deps.session_id.as_deref());
         let key = session::session_key(&deps.token_id_hash, effective_sid);
-        session::mark_compacted(&deps.session_store, &key).await;
+        session::mark_briefing_delivered(&deps.session_store, &key).await;
 
         let envelope = briefing::read(
             body,
@@ -204,9 +328,11 @@ async fn execute_tool(
         return Ok(serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| envelope.to_string()));
     }
 
-    // `remember_user` / `remember_config` route through the
-    // `/remember/v1/{resource}/{action}` dispatcher. Each tool takes an
-    // `action` string + a `body` object of resource-specific fields.
+    // `remember_user` / `remember_config` / `remember_directory` route
+    // through the `/remember/v1/{resource}/{action}` dispatcher. The MCP
+    // arg shape is FLAT: `action` plus the resource-specific fields at the
+    // top level. We pull `action` out and re-collect everything else into
+    // the `body` map the dispatcher expects.
     if let Some(resource) = remember_resource(name) {
         if !briefing_enabled() {
             return Err(format!(
@@ -214,10 +340,7 @@ async fn execute_tool(
             ));
         }
         let action = arg_str(args, "action")?;
-        let body = args
-            .get("body")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
+        let body = flatten_remember_args(args);
         let envelope = crate::remember::dispatch(
             resource,
             &action,
@@ -226,6 +349,7 @@ async fn execute_tool(
             client,
             deps.db.clone(),
             deps.semantic.clone(),
+            Some(deps.directory.clone()),
         )
         .await;
         return Ok(serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| envelope.to_string()));
@@ -2085,7 +2209,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
         }));
         tools.push(tool(
             "remember_user",
-            "Read or write the per-user UserSettings row. `action: 'read'` returns the current settings (no secrets). `action: 'write'` accepts `body.patch` (JSON object) and merges it into existing settings — keys not provided are preserved. Use this to set label, role, user_id, bookstack_user_id, domains, system_prompt_page_ids, timezone, semantic_against_full_kb.",
+            "Read or write the per-user UserSettings row. `action: 'read'` returns the current settings (no secrets). `action: 'write'` requires a `patch` object alongside `action` and merges it into existing settings — keys not provided are preserved. Use this to set label, role, user_id, bookstack_user_id, domains, system_prompt_page_ids, timezone, semantic_against_full_kb.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2094,9 +2218,9 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
                         "enum": ["read", "write"],
                         "description": "Operation to perform"
                     },
-                    "body": {
+                    "patch": {
                         "type": "object",
-                        "description": "Action-specific payload. For `write`, must contain `patch: {field: value, ...}`."
+                        "description": "For `write`: the {field: value, ...} object to merge into UserSettings."
                     }
                 },
                 "required": ["action"]
@@ -2104,7 +2228,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
         ));
         tools.push(tool(
             "remember_config",
-            "Read or write the per-user config_extras K/V store, or dismiss the briefing's setup_nudge. `action: 'read'` returns the current config. `action: 'write'` accepts `body.config: {key: value, ...}` (string values, pass null to delete a key) and merges into existing extras. `action: 'dismiss_setup_nudge'` accepts `body.days: int` (1..=365) and snoozes the briefing nudge.",
+            "Read or write the per-user config_extras K/V store, or dismiss the briefing's setup_nudge. `action: 'read'` returns the current config. `action: 'write'` accepts a top-level `config: {key: value, ...}` (string values, pass null to delete a key) and merges into existing extras. `action: 'dismiss_setup_nudge'` accepts a top-level `days: int` (1..=365) and snoozes the briefing nudge.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2113,9 +2237,30 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
                         "enum": ["read", "write", "dismiss_setup_nudge"],
                         "description": "Operation to perform"
                     },
-                    "body": {
+                    "config": {
                         "type": "object",
-                        "description": "Action-specific payload. For `write`: `{config: {key: value, ...}}`. For `dismiss_setup_nudge`: `{days: int}`."
+                        "description": "For `write`: the {key: value, ...} object to merge into config_extras."
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "For `dismiss_setup_nudge`: how many days to suppress the nudge (1..=365).",
+                        "minimum": 1,
+                        "maximum": 365
+                    }
+                },
+                "required": ["action"]
+            }),
+        ));
+        tools.push(tool(
+            "remember_directory",
+            "Return the in-memory directory tree (shelves -> books -> chapters -> pages, plus orphan books) with names, slugs, ids, and page updated_at timestamps. Built from the index DB, refreshed automatically on BookStack webhook events. The same snapshot auto-attaches to every MCP tool response under `meta.directory` (full first call per session, then a `{version, hash}` pointer); call this tool to force a re-pull.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["read"],
+                        "description": "Only `read` is supported."
                     }
                 },
                 "required": ["action"]
@@ -2165,8 +2310,29 @@ fn remember_resource(tool_name: &str) -> Option<&'static str> {
     match tool_name {
         "remember_user" => Some("user"),
         "remember_config" => Some("config"),
+        "remember_directory" => Some("directory"),
         _ => None,
     }
+}
+
+/// Flatten the MCP `remember_*` tool arguments into the body map the
+/// dispatcher expects. The MCP arg shape is `{action, key1, key2, ...}`
+/// (flat, easier for AI to call); the dispatcher's body map is just the
+/// resource-specific fields without the `action` envelope. So we drop
+/// `action` and re-wrap. Non-object args (shouldn't happen — `args` always
+/// arrives as an object) collapse to an empty body.
+fn flatten_remember_args(args: &Value) -> Value {
+    let Some(map) = args.as_object() else {
+        return json!({});
+    };
+    let mut body = serde_json::Map::with_capacity(map.len());
+    for (k, v) in map {
+        if k == "action" {
+            continue;
+        }
+        body.insert(k.clone(), v.clone());
+    }
+    Value::Object(body)
 }
 
 /// Whether the briefing surface is enabled. Reads BSMCP_BRIEFING_ENABLED;

@@ -6,18 +6,19 @@
 //! split is being undone — `remember_*` endpoints are coming back into
 //! bookstack-mcp with a smaller, opinionated surface.
 //!
-//! Resources shipped in this sub-PR:
-//!   - `briefing` — thin wrapper over the existing briefing builder
-//!   - `user`     — read/write the per-user `UserSettings` row
-//!   - `config`   — read/write per-user `config_extras` + dismiss_setup_nudge
+//! Resources shipped through sub-PR 2.2:
+//!   - `briefing`  — thin wrapper over the existing briefing builder
+//!   - `user`      — read/write the per-user `UserSettings` row
+//!   - `config`    — read/write per-user `config_extras` + dismiss_setup_nudge
+//!   - `directory` — serve the in-memory `DirectoryService` snapshot
 //!
-//! Resources arriving in later sub-PRs: directory, user_journal,
-//! agent_journal, migrate.
+//! Resources arriving in later sub-PRs: user_journal, agent_journal, migrate.
 //!
 //! Every handler returns the standard `{ok, data, meta, error}` envelope.
 
 pub mod briefing;
 pub mod config;
+pub mod directory;
 pub mod envelope;
 pub mod user;
 
@@ -29,11 +30,17 @@ use bsmcp_common::bookstack::BookStackClient;
 use bsmcp_common::db::DbBackend;
 use bsmcp_common::settings::{hash_token_id, UserSettings};
 
+use crate::directory::DirectoryService;
 use crate::semantic::SemanticState;
 
 use envelope::{error_envelope, ErrorCode};
 
 /// Dispatch a `/remember/v1/{resource}/{action}` call. Returns the JSON envelope.
+///
+/// `directory_service` is `Option` so HTTP and MCP entrypoints that don't yet
+/// thread it through still compile during the cutover. The `directory`
+/// resource returns `internal_error` if it's `None`.
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch(
     resource: &str,
     action: &str,
@@ -42,6 +49,7 @@ pub async fn dispatch(
     client: &BookStackClient,
     db: Arc<dyn DbBackend>,
     semantic: Option<Arc<SemanticState>>,
+    directory_service: Option<Arc<DirectoryService>>,
 ) -> Value {
     let started = std::time::Instant::now();
     let trace_id = body
@@ -93,6 +101,7 @@ pub async fn dispatch(
         client: client.clone(),
         db: db.clone(),
         semantic,
+        directory: directory_service,
         settings,
         token_id: token_id.to_string(),
         token_id_hash,
@@ -127,6 +136,7 @@ async fn route(resource: &str, action: &str, ctx: &Context) -> DispatchResult {
         ("config", "read") => config::read(ctx).await,
         ("config", "write") => config::write(ctx).await,
         ("config", "dismiss_setup_nudge") => config::dismiss_setup_nudge(ctx).await,
+        ("directory", "read") => directory::read(ctx).await,
         (r, _) if !known_resource(r) => Err((
             ErrorCode::UnknownResource,
             format!("Unknown resource: {r}"),
@@ -139,7 +149,7 @@ async fn route(resource: &str, action: &str, ctx: &Context) -> DispatchResult {
 }
 
 fn known_resource(resource: &str) -> bool {
-    matches!(resource, "briefing" | "user" | "config")
+    matches!(resource, "briefing" | "user" | "config" | "directory")
 }
 
 /// Per-call context passed to every handler.
@@ -148,6 +158,10 @@ pub struct Context {
     pub client: BookStackClient,
     pub db: Arc<dyn DbBackend>,
     pub semantic: Option<Arc<SemanticState>>,
+    /// Cached directory tree, populated by `crate::directory`. Optional
+    /// because not every dispatch entrypoint has wired it yet — handlers
+    /// that need it return an explicit InternalError when it's None.
+    pub directory: Option<Arc<DirectoryService>>,
     pub settings: UserSettings,
     /// Raw BookStack token id for the calling user. Required by
     /// `briefing::read`, which hashes it internally for settings lookup.
@@ -173,12 +187,13 @@ mod tests {
         assert!(known_resource("briefing"));
         assert!(known_resource("user"));
         assert!(known_resource("config"));
+        assert!(known_resource("directory"));
     }
 
     #[test]
     fn known_resource_rejects_unshipped() {
-        assert!(!known_resource("directory"));
         assert!(!known_resource("user_journal"));
+        assert!(!known_resource("agent_journal"));
         assert!(!known_resource("nonsense"));
         assert!(!known_resource(""));
     }

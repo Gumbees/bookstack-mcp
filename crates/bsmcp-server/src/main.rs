@@ -1,4 +1,5 @@
 mod briefing;
+mod directory;
 mod llm;
 mod mcp;
 mod migrate;
@@ -435,6 +436,7 @@ async fn handle_remember_http(
         &client,
         state.db.clone(),
         state.semantic.clone(),
+        Some(state.directory.clone()),
     )
     .await;
 
@@ -488,7 +490,57 @@ async fn handle_webhook(
         eprintln!("IndexWorker: webhook enqueue failed (non-fatal): {e}");
     }
 
+    // Directory cache invalidation: any tree-affecting event swaps in a
+    // fresh snapshot in the background. Sits at the routing layer (not the
+    // semantic layer) because the directory is independent of semantic
+    // search and ships even when semantic is disabled.
+    maybe_invalidate_directory(&payload, &state);
+
     StatusCode::ACCEPTED.into_response()
+}
+
+/// Trigger a directory rebuild when the webhook payload describes a
+/// tree-affecting change. The tree changes on shelf / book / chapter / page
+/// create / update / delete / restore / move events. We can't tell from the
+/// payload whether a `page_update` was a name change vs a content edit, so
+/// we err on the side of invalidating — the rebuild is cheap (DB row reads,
+/// no BookStack API calls).
+fn maybe_invalidate_directory(payload: &serde_json::Value, state: &sse::AppState) {
+    let event = payload
+        .get("event")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let affects_tree = matches!(
+        event,
+        // Pages
+        "page_create"
+            | "page_update"
+            | "page_delete"
+            | "page_restore"
+            | "page_move"
+            // Chapters
+            | "chapter_create"
+            | "chapter_update"
+            | "chapter_delete"
+            | "chapter_restore"
+            | "chapter_move"
+            // Books
+            | "book_create"
+            | "book_update"
+            | "book_delete"
+            | "book_restore"
+            | "book_sort"
+            | "book_create_from_chapter"
+            // Shelves (BookStack uses `bookshelf_*` event names)
+            | "bookshelf_create"
+            | "bookshelf_update"
+            | "bookshelf_delete"
+            | "bookshelf_restore"
+            | "bookshelf_create_from_book"
+    );
+    if affects_tree {
+        state.directory.invalidate();
+    }
 }
 
 /// Mirror the event-dispatch logic in semantic::handle_webhook for the

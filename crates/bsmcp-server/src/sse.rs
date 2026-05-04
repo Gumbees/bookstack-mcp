@@ -53,6 +53,12 @@ pub struct AppState {
     /// stub errors per #36). Webhook handler enqueues page:{id} index jobs
     /// here when BookStack page events arrive.
     pub index_db: Arc<dyn bsmcp_common::db::IndexDb>,
+    /// In-memory directory tree cache. Built from `index_db` rows; webhook
+    /// handler invalidates on any tree-affecting BookStack event. Served by
+    /// the `remember/directory read` endpoint and auto-attached to every
+    /// MCP tool response's `meta.directory` (full first time per session,
+    /// `{version, hash}` pointer thereafter).
+    pub directory: Arc<crate::directory::DirectoryService>,
 }
 
 pub(crate) struct RateLimit {
@@ -115,6 +121,7 @@ impl AppState {
             .timeout(Duration::from_secs(60))
             .build()
             .expect("Failed to build HTTP client");
+        let directory = crate::directory::DirectoryService::new(index_db.clone());
         Self {
             bookstack_url: bookstack_url.trim_end_matches('/').to_string(),
             http_client,
@@ -134,6 +141,7 @@ impl AppState {
             settings_sessions: crate::settings_ui::new_settings_store(),
             briefing_sessions: crate::session::new_store(),
             index_db,
+            directory,
         }
     }
 
@@ -431,6 +439,7 @@ pub async fn handle_message(
         token_id_hash,
         // SSE 2024-11-05: the session_id IS the `?sessionId=` query param.
         session_id: Some(session_id.clone()),
+        directory: state.directory.clone(),
     };
     let response = mcp::handle_request(&request, &client, semantic, &state.summary_cache, &state.staging, &briefing_deps).await;
 
@@ -528,6 +537,7 @@ pub async fn handle_streamable(
         token_id: token_id.clone(),
         token_id_hash,
         session_id: incoming_session_id.clone(),
+        directory: state.directory.clone(),
     };
     let response = mcp::handle_request(&request, &client, semantic, &state.summary_cache, &state.staging, &briefing_deps).await;
 

@@ -275,6 +275,9 @@ pub trait IndexDb: Send + Sync + 'static {
 
     async fn upsert_indexed_shelf(&self, shelf: &IndexedShelf) -> Result<(), String>;
     async fn get_indexed_shelf(&self, shelf_id: i64) -> Result<Option<IndexedShelf>, String>;
+    /// All non-deleted shelves, sorted by name. Used by the directory cache
+    /// (sub-PR 2.2) to walk the full tree without reading global config.
+    async fn list_indexed_shelves(&self) -> Result<Vec<IndexedShelf>, String>;
     async fn soft_delete_indexed_shelf(&self, shelf_id: i64) -> Result<(), String>;
 
     // --- Books ---
@@ -286,6 +289,10 @@ pub trait IndexDb: Send + Sync + 'static {
         &self,
         identity_ouid: &str,
     ) -> Result<Vec<IndexedBook>, String>;
+    /// All non-deleted books with NULL shelf_id, sorted by name. Used by the
+    /// directory cache to surface books that aren't on any shelf so they
+    /// don't disappear from the tree.
+    async fn list_indexed_orphan_books(&self) -> Result<Vec<IndexedBook>, String>;
     async fn soft_delete_indexed_book(&self, book_id: i64) -> Result<(), String>;
 
     // --- Chapters ---

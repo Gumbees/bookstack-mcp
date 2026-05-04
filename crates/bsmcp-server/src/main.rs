@@ -1,10 +1,14 @@
+mod briefing;
+mod directory;
 mod llm;
 mod mcp;
 mod migrate;
 mod oauth;
 mod remember;
 mod semantic;
+mod session;
 mod settings_ui;
+mod setup_ui;
 mod sse;
 mod staging;
 mod summary;
@@ -15,8 +19,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{HeaderMap, HeaderName, Method, StatusCode};
-use axum::response::{Html, IntoResponse, Json};
+use axum::http::{HeaderMap, HeaderName, Method, StatusCode, header};
+use axum::response::{Html, IntoResponse, Json, Redirect};
 use axum::{Router, routing::get};
 use serde_json::json;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -248,13 +252,13 @@ async fn main() {
     state.spawn_cleanup();
     state.spawn_backup();
     settings_ui::spawn_settings_cleanup(state.settings_sessions.clone());
+    session::spawn_cleanup(state.briefing_sessions.clone());
 
-    // BSMCP_REMEMBER_ENABLED gates the entire Hive memory surface — both
-    // the /remember/v1/* HTTP endpoint and the remember_* MCP tools. Default
-    // true (back-compat). Set to false to run bookstack-mcp purely as a
-    // BookStack proxy (e.g., when a separate frame application like Forager
-    // owns the memory layer).
-    let remember_enabled = env::var("BSMCP_REMEMBER_ENABLED")
+    // BSMCP_BRIEFING_ENABLED gates the briefing subsystem — both the
+    // /briefing/v1/read HTTP endpoint and the auto-injected meta.briefing
+    // on every MCP tool response. Default true. Set to false to run
+    // bookstack-mcp purely as a BookStack proxy.
+    let briefing_enabled = env::var("BSMCP_BRIEFING_ENABLED")
         .ok()
         .map(|v| {
             let v = v.trim().to_lowercase();
@@ -278,17 +282,43 @@ async fn main() {
             "/settings/probe",
             get(settings_ui::handle_settings_probe_get).post(settings_ui::handle_settings_probe_post),
         )
+        .route(
+            "/setup/user",
+            get(setup_ui::handle_setup_user_get).post(setup_ui::handle_setup_user_post),
+        )
+        .route(
+            "/setup/user/migrate/preview",
+            axum::routing::post(setup_ui::handle_setup_user_migrate_preview),
+        )
+        .route(
+            "/setup/admin",
+            get(setup_ui::handle_setup_admin_get).post(setup_ui::handle_setup_admin_post),
+        )
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }));
-    if remember_enabled {
+    if briefing_enabled {
+        app = app.route(
+            "/briefing/v1/read",
+            axum::routing::post(handle_briefing_http),
+        );
         app = app.route(
             "/remember/v1/{resource}/{action}",
             axum::routing::post(handle_remember_http),
         );
+        eprintln!("Briefing: HTTP endpoint active at POST /briefing/v1/read");
         eprintln!("Remember: HTTP endpoint active at POST /remember/v1/{{resource}}/{{action}}");
     } else {
-        eprintln!("Remember: DISABLED (set BSMCP_REMEMBER_ENABLED=true to enable)");
+        eprintln!("Briefing: DISABLED (set BSMCP_BRIEFING_ENABLED=true to enable)");
     }
     eprintln!("Settings: UI active at GET/POST /settings");
+    if mcp::onboarding_enabled() {
+        eprintln!("Onboarding: user wizard active at GET/POST /setup/user");
+        eprintln!("Onboarding: admin wizard active at GET/POST /setup/admin");
+        if setup_ui::force_admin_setup_env() {
+            eprintln!("Onboarding: BSMCP_FORCE_ADMIN_SETUP=1 — admin nudge re-armed regardless of stored flag");
+        }
+    } else {
+        eprintln!("Onboarding: DISABLED (set BSMCP_ONBOARDING_ENABLED=true to enable)");
+    }
 
     // Staging upload endpoint for file uploads (50MB limit)
     app = app.route(
@@ -302,9 +332,12 @@ async fn main() {
     if state.semantic.is_some() {
         app = app
             .route("/webhooks/bookstack", axum::routing::post(handle_webhook))
-            .route("/status", get(handle_status));
+            .route("/status", get(handle_status))
+            .route("/jobs/embed/{id}/cancel", axum::routing::post(handle_cancel_embed_job))
+            .route("/jobs/index/{id}/cancel", axum::routing::post(handle_cancel_index_job));
         eprintln!("Semantic: webhook endpoint active at POST /webhooks/bookstack");
         eprintln!("Semantic: status page at GET /status (auth-gated — Bearer token or settings cookie)");
+        eprintln!("Semantic: cancel endpoints at POST /jobs/{{embed,index}}/:id/cancel");
     }
 
     let app = app
@@ -334,9 +367,56 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-/// HTTP handler for /remember/v1/{resource}/{action}. Resolves the caller's
-/// BookStack credentials via the same Bearer-token logic the MCP endpoints use,
-/// then dispatches into the `remember` module.
+/// HTTP handler for `POST /briefing/v1/read`. Resolves the caller's BookStack
+/// credentials via the same Bearer-token logic the MCP endpoints use, then
+/// dispatches into the briefing builder.
+async fn handle_briefing_http(
+    State(state): State<sse::AppState>,
+    headers: HeaderMap,
+    body: String,
+) -> impl IntoResponse {
+    let (token_id, token_secret) = match sse::resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+
+    let body_value: serde_json::Value = if body.is_empty() {
+        serde_json::Value::Object(Default::default())
+    } else {
+        match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"ok": false, "error": {"code": "invalid_argument", "message": "request body must be JSON"}})),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    let client = bsmcp_common::bookstack::BookStackClient::new(
+        &state.bookstack_url,
+        &token_id,
+        &token_secret,
+        state.http_client.clone(),
+    );
+
+    let envelope = briefing::read(
+        body_value,
+        &token_id,
+        &client,
+        state.db.clone(),
+        state.semantic.clone(),
+    )
+    .await;
+
+    (StatusCode::OK, Json(envelope)).into_response()
+}
+
+/// HTTP handler for `POST /remember/v1/{resource}/{action}`. Same auth +
+/// body parsing as `handle_briefing_http`; routes through
+/// `crate::remember::dispatch`.
 async fn handle_remember_http(
     State(state): State<sse::AppState>,
     Path((resource, action)): Path<(String, String)>,
@@ -377,29 +457,12 @@ async fn handle_remember_http(
         &token_id,
         &client,
         state.db.clone(),
-        state.index_db.clone(),
         state.semantic.clone(),
+        Some(state.directory.clone()),
     )
     .await;
 
-    let status = if envelope.get("ok").and_then(|v| v.as_bool()) == Some(true) {
-        StatusCode::OK
-    } else {
-        // Map error code → HTTP status. Conservative: 400 for client errors, 500 for server.
-        envelope
-            .get("error")
-            .and_then(|e| e.get("code"))
-            .and_then(|c| c.as_str())
-            .map(|code| match code {
-                "settings_not_configured" | "invalid_argument" | "unknown_action" => StatusCode::BAD_REQUEST,
-                "not_found" => StatusCode::NOT_FOUND,
-                "semantic_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            })
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
-    };
-
-    (status, Json(envelope)).into_response()
+    (StatusCode::OK, Json(envelope)).into_response()
 }
 
 /// Webhook handler for BookStack page change events.
@@ -449,7 +512,57 @@ async fn handle_webhook(
         eprintln!("IndexWorker: webhook enqueue failed (non-fatal): {e}");
     }
 
+    // Directory cache invalidation: any tree-affecting event swaps in a
+    // fresh snapshot in the background. Sits at the routing layer (not the
+    // semantic layer) because the directory is independent of semantic
+    // search and ships even when semantic is disabled.
+    maybe_invalidate_directory(&payload, &state);
+
     StatusCode::ACCEPTED.into_response()
+}
+
+/// Trigger a directory rebuild when the webhook payload describes a
+/// tree-affecting change. The tree changes on shelf / book / chapter / page
+/// create / update / delete / restore / move events. We can't tell from the
+/// payload whether a `page_update` was a name change vs a content edit, so
+/// we err on the side of invalidating — the rebuild is cheap (DB row reads,
+/// no BookStack API calls).
+fn maybe_invalidate_directory(payload: &serde_json::Value, state: &sse::AppState) {
+    let event = payload
+        .get("event")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let affects_tree = matches!(
+        event,
+        // Pages
+        "page_create"
+            | "page_update"
+            | "page_delete"
+            | "page_restore"
+            | "page_move"
+            // Chapters
+            | "chapter_create"
+            | "chapter_update"
+            | "chapter_delete"
+            | "chapter_restore"
+            | "chapter_move"
+            // Books
+            | "book_create"
+            | "book_update"
+            | "book_delete"
+            | "book_restore"
+            | "book_sort"
+            | "book_create_from_chapter"
+            // Shelves (BookStack uses `bookshelf_*` event names)
+            | "bookshelf_create"
+            | "bookshelf_update"
+            | "bookshelf_delete"
+            | "bookshelf_restore"
+            | "bookshelf_create_from_book"
+    );
+    if affects_tree {
+        state.directory.invalidate();
+    }
 }
 
 /// Mirror the event-dispatch logic in semantic::handle_webhook for the
@@ -562,9 +675,11 @@ fn format_timestamp(ts: Option<i64>) -> String {
 fn badge_class(status: &str) -> &str {
     match status {
         "running" => "running",
-        "completed" => "completed",
+        "succeeded" | "completed" => "succeeded",
         "failed" => "failed",
         "pending" => "pending",
+        "cancelled" => "cancelled",
+        "closed" => "closed",
         _ => "none",
     }
 }
@@ -572,10 +687,216 @@ fn badge_class(status: &str) -> &str {
 fn bar_color(status: &str) -> &str {
     match status {
         "running" => "#3b82f6",
-        "completed" => "#22c55e",
+        "succeeded" | "completed" => "#22c55e",
         "failed" => "#ef4444",
+        "cancelled" => "#a78bfa",
+        "closed" => "#64748b",
         _ => "#6b7280",
     }
+}
+
+fn job_is_terminal(status: &str) -> bool {
+    !matches!(status, "pending" | "running")
+}
+
+fn render_status_label(status: &str, resolved: Option<&str>) -> String {
+    if status == "closed" {
+        match resolved {
+            Some(r) => format!("closed ({})", html_escape(r)),
+            None => "closed".to_string(),
+        }
+    } else {
+        html_escape(status)
+    }
+}
+
+fn render_embed_job_row(job: &bsmcp_common::types::EmbedJob) -> String {
+    let pct = if job.total_pages > 0 {
+        (job.done_pages as f64 / job.total_pages as f64) * 100.0
+    } else {
+        0.0
+    };
+    let color = bar_color(&job.status);
+    let badge = badge_class(&job.status);
+    let scope = html_escape(&job.scope);
+    let started = format_timestamp(job.started_at);
+    let finished = format_timestamp(job.finished_at);
+    let resolved_at = format_timestamp(job.resolved_at);
+    let label = render_status_label(&job.status, job.resolved_status.as_deref());
+    let progress_html = if job.status == "running" || job.status == "succeeded" || job.status == "completed" || job.status == "failed" {
+        format!(
+            r#"
+      <div class="bar-bg bar-sm">
+        <div class="bar-fill" style="width: {pct:.1}%; background: {color};">{done}/{total}</div>
+      </div>"#,
+            done = job.done_pages,
+            total = job.total_pages,
+        )
+    } else {
+        String::new()
+    };
+    let cancel_btn = if !job_is_terminal(&job.status) {
+        format!(
+            r#"<form class="cancel-form" method="post" action="/jobs/embed/{id}/cancel"><button class="cancel-btn" type="submit">Cancel</button></form>"#,
+            id = job.id,
+        )
+    } else {
+        String::new()
+    };
+    let retry_badge = match job.retry_of {
+        Some(p) => format!(r#"<span class="retry-of">↻ retry of #{p}</span>"#),
+        None => String::new(),
+    };
+    let resolved_tag = match job.resolved_status.as_deref() {
+        Some(rs) if job.status != "closed" => format!(r#"<span class="resolved-tag">resolved: {}</span>"#, html_escape(rs)),
+        _ => String::new(),
+    };
+    let resolved_meta = if job.resolved_at.is_some() {
+        format!("<span>Resolved: {resolved_at}</span>")
+    } else {
+        String::new()
+    };
+    let error_html = match &job.error {
+        Some(e) => format!(r#"<div class="error">Error: {}</div>"#, html_escape(e)),
+        None => String::new(),
+    };
+    let row_class = if job.status == "closed" { "job-row closed-row" } else { "job-row" };
+    let finished_span = if job.finished_at.is_some() {
+        format!("<span>Finished: {finished}</span>")
+    } else {
+        String::new()
+    };
+    format!(
+        r#"
+    <div class="{row_class}">
+      <div class="job-header">
+        <span class="status-badge {badge}">{label}</span>{resolved_tag}
+        <span class="job-scope">{scope}</span>{retry_badge}
+        <span class="job-id">#{id}</span>{cancel_btn}
+      </div>{progress_html}
+      <div class="job-meta">
+        <span>Started: {started}</span>
+        {finished_span}
+        {resolved_meta}
+      </div>{error_html}
+    </div>"#,
+        id = job.id,
+    )
+}
+
+fn render_index_job_row(job: &bsmcp_common::index::IndexJob) -> String {
+    let pct = if job.total > 0 {
+        (job.progress as f64 / job.total as f64) * 100.0
+    } else {
+        0.0
+    };
+    let color = bar_color(&job.status);
+    let badge = badge_class(&job.status);
+    let scope = html_escape(&job.scope);
+    let started = format_timestamp(job.started_at);
+    let finished = format_timestamp(job.finished_at);
+    let resolved_at = format_timestamp(job.resolved_at);
+    let label = render_status_label(&job.status, job.resolved_status.as_deref());
+    let progress_html = if job.status == "running" || job.status == "succeeded" || job.status == "completed" || job.status == "failed" {
+        format!(
+            r#"
+      <div class="bar-bg bar-sm">
+        <div class="bar-fill" style="width: {pct:.1}%; background: {color};">{done}/{total}</div>
+      </div>"#,
+            done = job.progress,
+            total = job.total,
+        )
+    } else {
+        String::new()
+    };
+    let cancel_btn = if !job_is_terminal(&job.status) {
+        format!(
+            r#"<form class="cancel-form" method="post" action="/jobs/index/{id}/cancel"><button class="cancel-btn" type="submit">Cancel</button></form>"#,
+            id = job.id,
+        )
+    } else {
+        String::new()
+    };
+    let retry_badge = match job.retry_of {
+        Some(p) => format!(r#"<span class="retry-of">↻ retry of #{p}</span>"#),
+        None => String::new(),
+    };
+    let resolved_tag = match job.resolved_status.as_deref() {
+        Some(rs) if job.status != "closed" => format!(r#"<span class="resolved-tag">resolved: {}</span>"#, html_escape(rs)),
+        _ => String::new(),
+    };
+    let resolved_meta = if job.resolved_at.is_some() {
+        format!("<span>Resolved: {resolved_at}</span>")
+    } else {
+        String::new()
+    };
+    let error_html = match &job.error {
+        Some(e) => format!(r#"<div class="error">Error: {}</div>"#, html_escape(e)),
+        None => String::new(),
+    };
+    let row_class = if job.status == "closed" { "job-row closed-row" } else { "job-row" };
+    let finished_span = if job.finished_at.is_some() {
+        format!("<span>Finished: {finished}</span>")
+    } else {
+        String::new()
+    };
+    format!(
+        r#"
+    <div class="{row_class}">
+      <div class="job-header">
+        <span class="status-badge {badge}">{label}</span>{resolved_tag}
+        <span class="job-scope">{scope}</span>{retry_badge}
+        <span class="job-id">#{id}</span>{cancel_btn}
+      </div>{progress_html}
+      <div class="job-meta">
+        <span>Kind: {kind}</span>
+        <span>Started: {started}</span>
+        {finished_span}
+        {resolved_meta}
+      </div>{error_html}
+    </div>"#,
+        id = job.id,
+        kind = html_escape(&job.kind),
+    )
+}
+
+async fn handle_cancel_embed_job(
+    State(state): State<sse::AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let bearer_ok = sse::resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await.is_ok();
+    let cookie_ok = settings_ui::has_valid_session(&headers, &state.settings_sessions).await;
+    if !bearer_ok && !cookie_ok {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    let semantic = match &state.semantic {
+        Some(s) => s,
+        None => return StatusCode::NOT_FOUND.into_response(),
+    };
+    if let Err(e) = semantic.cancel_embed_job(id).await {
+        eprintln!("cancel_embed_job({id}) failed: {e}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel failed: {e}")).into_response();
+    }
+    Redirect::to("/status").into_response()
+}
+
+async fn handle_cancel_index_job(
+    State(state): State<sse::AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let bearer_ok = sse::resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await.is_ok();
+    let cookie_ok = settings_ui::has_valid_session(&headers, &state.settings_sessions).await;
+    if !bearer_ok && !cookie_ok {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    if let Err(e) = state.index_db.cancel_index_job(id).await {
+        eprintln!("cancel_index_job({id}) failed: {e}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel failed: {e}")).into_response();
+    }
+    let _ = header::CONTENT_TYPE;
+    Redirect::to("/status").into_response()
 }
 
 async fn handle_status(
@@ -605,11 +926,13 @@ async fn handle_status(
     };
 
     let jobs = semantic.list_jobs(10).await.unwrap_or_default();
+    let index_jobs = state.index_db.list_index_jobs(10).await.unwrap_or_default();
 
     let total_pages = stats["total_indexed_pages"].as_i64().unwrap_or(0);
     let total_chunks = stats["total_chunks"].as_i64().unwrap_or(0);
 
-    let has_active = jobs.iter().any(|j| j.status == "running" || j.status == "pending");
+    let has_active = jobs.iter().any(|j| j.status == "running" || j.status == "pending")
+        || index_jobs.iter().any(|j| j.status == "running" || j.status == "pending");
     let auto_refresh = if has_active {
         r#"<meta http-equiv="refresh" content="5">"#
     } else {
@@ -619,60 +942,25 @@ async fn handle_status(
     // Build job rows
     let mut job_rows = String::new();
     for job in &jobs {
-        let pct = if job.total_pages > 0 {
-            (job.done_pages as f64 / job.total_pages as f64) * 100.0
-        } else {
-            0.0
-        };
-        let color = bar_color(&job.status);
-        let badge = badge_class(&job.status);
-        let scope = html_escape(&job.scope);
-        let started = format_timestamp(job.started_at);
-        let finished = format_timestamp(job.finished_at);
-        let error_html = match &job.error {
-            Some(e) => format!(r#"<div class="error">Error: {}</div>"#, html_escape(e)),
-            None => String::new(),
-        };
-        let progress_html = if job.status == "running" || job.status == "completed" || job.status == "failed" {
-            format!(r#"
-      <div class="bar-bg bar-sm">
-        <div class="bar-fill" style="width: {pct:.1}%; background: {color};">{done}/{total}</div>
-      </div>"#,
-                done = job.done_pages,
-                total = job.total_pages,
-            )
-        } else {
-            String::new()
-        };
-
-        job_rows.push_str(&format!(r#"
-    <div class="job-row">
-      <div class="job-header">
-        <span class="status-badge {badge}">{status}</span>
-        <span class="job-scope">{scope}</span>
-        <span class="job-id">#{id}</span>
-      </div>{progress_html}
-      <div class="job-meta">
-        <span>Started: {started}</span>
-        {finished_span}
-      </div>{error_html}
-    </div>"#,
-            status = html_escape(&job.status),
-            id = job.id,
-            finished_span = if job.finished_at.is_some() {
-                format!("<span>Finished: {finished}</span>")
-            } else {
-                String::new()
-            },
-        ));
+        job_rows.push_str(&render_embed_job_row(job));
     }
 
     if jobs.is_empty() {
-        job_rows = r#"<div class="job-row"><span style="color:#64748b">No jobs found</span></div>"#.to_string();
+        job_rows = r#"<div class="job-row"><span style="color:#64748b">No embed jobs found</span></div>"#.to_string();
     }
 
-    let pending_count = jobs.iter().filter(|j| j.status == "pending").count();
-    let running_count = jobs.iter().filter(|j| j.status == "running").count();
+    let mut index_job_rows = String::new();
+    for job in &index_jobs {
+        index_job_rows.push_str(&render_index_job_row(job));
+    }
+    if index_jobs.is_empty() {
+        index_job_rows = r#"<div class="job-row"><span style="color:#64748b">No index jobs found</span></div>"#.to_string();
+    }
+
+    let pending_count = jobs.iter().filter(|j| j.status == "pending").count()
+        + index_jobs.iter().filter(|j| j.status == "pending").count();
+    let running_count = jobs.iter().filter(|j| j.status == "running").count()
+        + index_jobs.iter().filter(|j| j.status == "running").count();
     let queue_summary = if pending_count > 0 || running_count > 0 {
         format!("{running_count} running, {pending_count} pending")
     } else {
@@ -700,11 +988,20 @@ async fn handle_status(
   .bar-fill {{ height: 100%%; border-radius: 9999px; transition: width 0.5s ease; display: flex; align-items: center; justify-content: center; font-size: 0.7rem; font-weight: 600; min-width: 2.5rem; color: #fff; }}
   .status-badge {{ display: inline-block; padding: 0.125rem 0.5rem; border-radius: 9999px; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; }}
   .running {{ background: #1e3a5f; color: #60a5fa; }}
+  .succeeded {{ background: #14532d; color: #4ade80; }}
   .completed {{ background: #14532d; color: #4ade80; }}
   .failed {{ background: #450a0a; color: #f87171; }}
   .pending {{ background: #3f3f46; color: #a1a1aa; }}
+  .cancelled {{ background: #2e1065; color: #c4b5fd; }}
+  .closed {{ background: #1e293b; color: #94a3b8; }}
   .none {{ background: #27272a; color: #71717a; }}
   .error {{ color: #f87171; font-size: 0.8rem; margin-top: 0.25rem; }}
+  .retry-of {{ background: #1e293b; color: #fbbf24; padding: 0.125rem 0.5rem; border-radius: 9999px; font-size: 0.65rem; }}
+  .resolved-tag {{ color: #94a3b8; font-size: 0.75rem; margin-left: 0.25rem; }}
+  .cancel-form {{ display: inline; margin-left: 0.5rem; }}
+  .cancel-btn {{ background: transparent; color: #94a3b8; border: 1px solid #475569; border-radius: 0.25rem; padding: 0.05rem 0.4rem; font-size: 0.7rem; cursor: pointer; }}
+  .cancel-btn:hover {{ background: #450a0a; color: #f87171; border-color: #f87171; }}
+  .closed-row {{ opacity: 0.55; }}
   .job-row {{ padding: 0.75rem 0; border-bottom: 1px solid #334155; }}
   .job-row:last-child {{ border-bottom: none; }}
   .job-header {{ display: flex; align-items: center; gap: 0.5rem; }}
@@ -731,8 +1028,12 @@ async fn handle_status(
     </div>
   </div>
   <div class="card">
-    <h2>Job Queue</h2>
+    <h2>Embed Job Queue</h2>
     {job_rows}
+  </div>
+  <div class="card">
+    <h2>Index Job Queue</h2>
+    {index_job_rows}
   </div>
   <div class="footer">Auto-refreshes every 5s while jobs are active</div>
 </div>

@@ -228,7 +228,6 @@ async fn build_shelf_lookup(client: &BookStackClient) -> HashMap<i64, String> {
 
 /// Result of a pipeline run, including any per-page failures.
 pub struct PipelineResult {
-    pub total_pages: usize,
     pub succeeded: usize,
     pub failed_pages: Vec<(i64, String)>,
     /// True if the pipeline aborted early due to too many consecutive failures.
@@ -263,7 +262,6 @@ pub async fn run_pipeline(
                 eprintln!("Pipeline: ACL reconcile complete — {processed} ok, {failed} failed");
                 db.update_job_progress(job_id, processed as i64, (processed + failed) as i64).await?;
                 return Ok(PipelineResult {
-                    total_pages: processed + failed,
                     succeeded: processed,
                     failed_pages: Vec::new(),
                     aborted: false,
@@ -353,6 +351,16 @@ pub async fn run_pipeline(
     let mut aborted = false;
 
     for (i, page_id) in all_page_ids.iter().enumerate() {
+        // Per-page status check. This is a `WHERE id = ?` PK lookup —
+        // cheap (microseconds on either backend) and intentional. We pay
+        // it on every page so a user-issued cancel takes effect within
+        // one page rather than waiting for the whole walk to finish.
+        if matches!(db.should_stop_embed_job(job_id).await, Ok(true)) {
+            eprintln!("Pipeline: job {job_id} flipped out of running — aborting at page {i}");
+            aborted = true;
+            db.update_job_progress(job_id, i as i64, total_pages as i64).await?;
+            break;
+        }
         match embed_single_page(db, embedder, client, *page_id, force, &shelf_lookup, role_ctx.as_ref()).await {
             Ok(()) => {
                 succeeded += 1;
@@ -392,7 +400,6 @@ pub async fn run_pipeline(
     }
 
     Ok(PipelineResult {
-        total_pages,
         succeeded,
         failed_pages,
         aborted,

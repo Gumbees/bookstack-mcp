@@ -1,404 +1,233 @@
-//! `/remember/v1/identity/{action}` — discover and create AI identities.
+//! `remember/identity` — read/write the per-user identity narrative
+//! (single page) and per-user-per-agent AI identity narratives (one
+//! chapter + one page per agent).
 //!
-//! `list`   — enumerate all AI identity manifest pages under the global Hive shelf.
-//! `create` — scaffold a new identity book + manifest page.
+//! Layout (inside the user's per-user Journal book — see
+//! `resolve_user_journal_book`):
+//!   - `User Identity` chapter -> `User Identity` page
+//!   - `AI Identity: {agent_name}` chapter -> `AI Identity: {agent_name}` page
+//!     (one chapter per agent the user works with)
+//!
+//! Pages are written DIRECTLY by the AI as raw markdown — the AI overwrites
+//! the page body wholesale via `identity write`. Bootstrap fires on first
+//! read or first write when the chapter/page is missing; it stamps a tiny
+//! seed (name + email) and the AI replaces it on its first write.
 
 use serde_json::{json, Value};
 
 use super::envelope::ErrorCode;
-use super::frontmatter;
-use super::naming::NamedResource;
-use super::provision;
-use super::{Context, Outcome};
+use super::resolvers::{
+    normalize_agent_name, resolve_ai_identity_page, resolve_user_identity_page, ResolverError,
+};
+use super::{Context, DispatchResult};
 
-pub async fn handle(action: &str, ctx: &Context) -> Outcome {
-    match action {
-        "list" => list(ctx).await,
-        "create" => create(ctx).await,
-        _ => Outcome::error(
-            ErrorCode::UnknownAction,
-            format!("Unknown action {action} on identity"),
-            None,
-        ),
-    }
-}
+/// Page-content field returned by BookStack `GET /api/pages/{id}` for
+/// markdown-editor pages. WYSIWYG pages would carry `html` instead — we
+/// always create our identity pages with `markdown` so the editor field
+/// settles to "markdown".
+const PAGE_MARKDOWN_FIELD: &str = "markdown";
 
-// --- list ---
+pub async fn read(ctx: &Context) -> DispatchResult {
+    let target = parse_target(ctx)?;
+    let mut settings = ctx.settings.clone();
+    let globals = ctx
+        .db
+        .get_global_settings()
+        .await
+        .map_err(|e| (ErrorCode::InternalError, format!("get_global_settings failed: {e}")))?;
 
-async fn list(ctx: &Context) -> Outcome {
-    let globals = match ctx.db.get_global_settings().await {
-        Ok(g) => g,
-        Err(e) => return Outcome::error(ErrorCode::InternalError, e, None),
+    let (page_id, bootstrapped) = match target {
+        Target::User => resolve_user_identity_page(
+            &ctx.token_id_hash,
+            &mut settings,
+            &ctx.client,
+            ctx.db.clone(),
+            &globals,
+        )
+        .await
+        .map_err(resolver_to_envelope)?,
+        Target::Agent(name) => resolve_ai_identity_page(
+            &name,
+            &ctx.token_id_hash,
+            &mut settings,
+            &ctx.client,
+            ctx.db.clone(),
+            &globals,
+        )
+        .await
+        .map_err(resolver_to_envelope)?,
     };
-    let shelf_id = match globals.hive_shelf_id {
-        Some(id) => id,
-        None => {
-            return Outcome::settings_not_configured(
-                "hive_shelf_id",
-                "global hive_shelf_id is not set — only a BookStack admin can configure it via /settings or admin-only `remember_config action=write global_settings={hive_shelf_id: <id>}`",
-            );
-        }
-    };
 
-    // Phase 5b: try the index first. The reconciliation worker classifies
-    // each book on the Hive shelf and stamps `identity_ouid` from the
-    // manifest's frontmatter at index time. So a single SQL query returns
-    // book + name + ouid per identity — no per-book BookStack roundtrip,
-    // no manifest-page guessing.
-    if let Ok(books) = ctx.index_db.list_indexed_books_by_shelf(shelf_id).await {
-        if !books.is_empty() {
-            let mut identities = Vec::new();
-            for book in books {
-                // Only surface books actually classified as identity-bearing.
-                // Pia's collage and the cross-identity collage live on the
-                // same shelf but aren't agent identities; the previous
-                // implementation included them, which was buggy (#26 RFC
-                // motivation #2).
-                use bsmcp_common::index::BookKind;
-                if !matches!(
-                    book.book_kind,
-                    BookKind::Identity | BookKind::UserIdentity
-                ) {
-                    continue;
-                }
+    // One get_page covers both chapter_id and content — saves the round
+    // trip we'd otherwise pay to read each separately.
+    let page = ctx
+        .client
+        .get_page(page_id)
+        .await
+        .map_err(|e| (ErrorCode::InternalError, format!("get_page failed: {e}")))?;
+    let chapter_id = page
+        .get("chapter_id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| {
+            (
+                ErrorCode::InternalError,
+                format!("page {page_id} response missing chapter_id field"),
+            )
+        })?;
+    let content = page
+        .get(PAGE_MARKDOWN_FIELD)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
-                // Manifest page id: query the index for the loose Identity
-                // page at the book root.
-                let manifest = ctx
-                    .index_db
-                    .list_indexed_pages_by_book_root(book.book_id)
-                    .await
-                    .ok()
-                    .and_then(|pages| {
-                        pages
-                            .into_iter()
-                            .find(|p| NamedResource::IdentityPage.matches(&p.name))
-                    });
-                let (page_id, page_name) = match manifest {
-                    Some(p) => (Some(p.page_id), p.name),
-                    None => (None, String::new()),
-                };
-                identities.push(json!({
-                    "book_id": book.book_id,
-                    "book_name": book.name,
-                    "manifest_page_id": page_id,
-                    "manifest_page_name": page_name,
-                    "ouid": book.identity_ouid,
-                }));
-            }
-            return Outcome::ok(json!({
-                "hive_shelf_id": shelf_id,
-                "count": identities.len(),
-                "identities": identities,
-            }));
-        }
-    }
-
-    // Fallback: the legacy BookStack-walking path. Used when the index is
-    // empty (worker hasn't run yet) or returns an error (postgres stub).
-    let shelf = match ctx.client.get_shelf(shelf_id).await {
-        Ok(s) => s,
-        Err(e) => return Outcome::error(ErrorCode::BookStackError, e, Some("hive_shelf_id")),
-    };
-    let books: Vec<(i64, String)> = shelf
-        .get("books")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|b| {
-            let id = b.get("id").and_then(|i| i.as_i64())?;
-            let name = b.get("name").and_then(|n| n.as_str())?.to_string();
-            Some((id, name))
-        }).collect())
-        .unwrap_or_default();
-
-    let mut handles = Vec::with_capacity(books.len());
-    for (book_id, book_name) in books {
-        let client = ctx.client.clone();
-        handles.push(tokio::spawn(async move {
-            let pages = client
-                .list_book_pages_by_updated(book_id, usize::MAX)
-                .await
-                .unwrap_or_default();
-            let manifest = pages.into_iter().find(|p| {
-                let n = p.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                NamedResource::IdentityPage.matches(n)
-            });
-
-            (book_id, book_name, manifest)
-        }));
-    }
-
-    let mut identities = Vec::new();
-    for h in handles {
-        let Ok((book_id, book_name, manifest)) = h.await else { continue; };
-        let (page_id, page_name, ouid) = match manifest {
-            Some(p) => {
-                let pid = p.get("id").and_then(|i| i.as_i64());
-                let name = p.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
-                let ouid = match pid {
-                    Some(id) => extract_ouid_from_page(&ctx.client, id).await,
-                    None => None,
-                };
-                (pid, name, ouid)
-            }
-            None => (None, String::new(), None),
-        };
-        identities.push(json!({
-            "book_id": book_id,
-            "book_name": book_name,
-            "manifest_page_id": page_id,
-            "manifest_page_name": page_name,
-            "ouid": ouid,
-        }));
-    }
-
-    Outcome::ok(json!({
-        "hive_shelf_id": shelf_id,
-        "count": identities.len(),
-        "identities": identities,
+    Ok(json!({
+        "content": content,
+        "page_id": page_id,
+        "chapter_id": chapter_id,
+        "bootstrapped": bootstrapped,
     }))
 }
 
-async fn extract_ouid_from_page(client: &bsmcp_common::bookstack::BookStackClient, page_id: i64) -> Option<String> {
-    let page = client.get_page(page_id).await.ok()?;
-    let md = page.get("markdown").and_then(|v| v.as_str())?;
-    // Look for "ai_identity_ouid: ..." or "ouid: ..." in the leading frontmatter block.
-    let trimmed = md.trim_start();
-    if !trimmed.starts_with("---") {
-        return None;
+pub async fn write(ctx: &Context) -> DispatchResult {
+    let target = parse_target(ctx)?;
+
+    // Per-instance opt-in for `target=agent`. The agent-identity page
+    // is the AI's lived-experience layer and follows the same
+    // primary/secondary topology as `journal::write` — write only on
+    // instances the user has opted into. `target=user` is a
+    // user-driven action (the user explicitly editing their own
+    // identity narrative) and is always allowed.
+    if matches!(target, Target::Agent(_)) && !ctx.settings.journaling_enabled {
+        return Err((
+            ErrorCode::Forbidden,
+            "agent identity writes not enabled on this instance — flip \
+             `journaling_enabled = true` in /setup/user (or `user write`) \
+             if you want this MCP to be the AI's lived-experience target".to_string(),
+        ));
     }
-    for line in trimmed.lines().skip(1) {
-        let line = line.trim();
-        if line == "---" { break; }
-        if let Some(rest) = line.strip_prefix("ai_identity_ouid:").or_else(|| line.strip_prefix("ouid:")) {
-            return Some(rest.trim().trim_matches('"').to_string());
-        }
-    }
-    None
-}
 
-// --- create ---
-
-async fn create(ctx: &Context) -> Outcome {
-    let name = match ctx.body_str("name") {
-        Some(n) => n,
-        None => return Outcome::error(ErrorCode::InvalidArgument, "name field is required", Some("name")),
-    };
-    let ouid = ctx.body_str("ouid").unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
-
-    let custom_prompt = ctx.body_str("custom_prompt");
-    let template = ctx.body_str("prompt_template").unwrap_or_else(|| "default".to_string());
-
-    let additional_details = ctx
+    let content = ctx
         .body
-        .get("additional_details")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+        .get("content")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            (
+                ErrorCode::InvalidArgument,
+                "Missing required argument: content (string)".to_string(),
+            )
+        })?
+        .to_string();
 
-    let globals = match ctx.db.get_global_settings().await {
-        Ok(g) => g,
-        Err(e) => return Outcome::error(ErrorCode::InternalError, e, None),
+    let mut settings = ctx.settings.clone();
+    let globals = ctx
+        .db
+        .get_global_settings()
+        .await
+        .map_err(|e| (ErrorCode::InternalError, format!("get_global_settings failed: {e}")))?;
+
+    let (page_id, _bootstrapped) = match &target {
+        Target::User => resolve_user_identity_page(
+            &ctx.token_id_hash,
+            &mut settings,
+            &ctx.client,
+            ctx.db.clone(),
+            &globals,
+        )
+        .await
+        .map_err(resolver_to_envelope)?,
+        Target::Agent(name) => resolve_ai_identity_page(
+            name,
+            &ctx.token_id_hash,
+            &mut settings,
+            &ctx.client,
+            ctx.db.clone(),
+            &globals,
+        )
+        .await
+        .map_err(resolver_to_envelope)?,
     };
-    let hive_shelf_id = match globals.hive_shelf_id {
-        Some(id) => id,
-        None => {
-            return Outcome::settings_not_configured(
-                "hive_shelf_id",
-                "global hive_shelf_id is not set — admin must configure it before identities can be created",
-            );
-        }
-    };
+    let bytes_written = content.len();
 
-    // 1. Find-or-create the Identity book on the Hive shelf. Name is
-    //    "{Name} Identity" (e.g., "Pia Identity"). Re-running with the same
-    //    name reuses the existing book instead of duplicating.
-    let book_name = format!("{} Identity", name);
-    let book_description = format!("Identity book for the AI agent {}. Holds the manifest page.", name);
-    let book_outcome = provision::find_or_create_book_on_shelf(
-        &ctx.client,
-        ctx.index_db.as_ref(),
-        hive_shelf_id,
-        &book_name,
-        &book_description,
-    )
-    .await;
-    let book_was_existing = matches!(book_outcome, provision::ProvisionResult::FoundExisting { .. });
-    let book_id = match book_outcome.id() {
-        Some(id) => id,
-        None => return Outcome::error(
-            ErrorCode::BookStackError,
-            format!("identity book provisioning failed: {}", book_outcome.human(NamedResource::IdentityBook)),
-            None,
-        ),
-    };
+    let updated = ctx
+        .client
+        .update_page(
+            page_id,
+            &json!({
+                "markdown": content,
+            }),
+        )
+        .await
+        .map_err(|e| (ErrorCode::InternalError, format!("update_page failed: {e}")))?;
+    let chapter_id = updated
+        .get("chapter_id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| {
+            (
+                ErrorCode::InternalError,
+                format!("update_page {page_id} response missing chapter_id field"),
+            )
+        })?;
 
-    // 2. Find-or-create the manifest page at the book root (loose, no chapter).
-    //    The body is only used at create time; reusing an existing manifest
-    //    page preserves whatever content the AI has accumulated there.
-    let prompt_body = render_prompt(&template, &name, &ouid, custom_prompt.as_deref(), &additional_details);
-    let manifest_fm = format!(
-        "---\nai_identity_ouid: {}\nname: {}\ncreated_at: {}\ntrace_id: {}\n---\n\n",
-        ouid, name, frontmatter::today_iso_date(), ctx.trace_id,
-    );
-    let page_outcome = provision::find_or_create_page(
-        &ctx.client,
-        ctx.index_db.as_ref(),
-        Some(book_id),
-        None,
-        "Identity",
-        &format!("{manifest_fm}{prompt_body}"),
-    )
-    .await;
-    let page_was_existing = matches!(page_outcome, provision::ProvisionResult::FoundExisting { .. });
-    let page_id = page_outcome.id();
-    if page_id.is_none() {
-        return Outcome::error(
-            ErrorCode::BookStackError,
-            format!("manifest page provisioning failed: {}", page_outcome.human(NamedResource::IdentityPage)),
-            None,
-        );
-    }
-
-    // 3. Find-or-create the two structural chapters inside the Identity
-    //    book. Phase 6 of the v1.0.0 restructure: agent definitions and
-    //    journal entries live in dedicated chapters, not loose at the book
-    //    root. Lazy-creating archive chapters at year rollover is a
-    //    separate concern in `remember_journal action=write`.
-    //
-    //    No "Subagent Conversations" chapter — agents track who they're
-    //    working with and what their sub-identities are doing in the
-    //    journal. Realtime cross-agent message/response runs in the
-    //    frame application, not BookStack.
-    let agents_chapter_id = provision::find_or_create_chapter(
-        &ctx.client,
-        ctx.index_db.as_ref(),
-        book_id,
-        "Agents",
-        "Agent definition pages for this AI identity (one page per sub-agent).",
-    )
-    .await
-    .id();
-    let journal_chapter_id = provision::find_or_create_chapter(
-        &ctx.client,
-        ctx.index_db.as_ref(),
-        book_id,
-        "Journal",
-        "Current-year daily journal entries. Year-rollover sweep moves stale entries into 'Journal Archive - {YEAR}' chapters.",
-    )
-    .await
-    .id();
-
-    // 4. Find-or-create the Collage book on the Hive shelf. Stays a separate
-    //    book per RFC: per-identity content discovery worked well in book
-    //    form and the shape doesn't conflict with the structural enforcement
-    //    we want for the identity book.
-    let collage_book_name = format!("{name}'s Collage");
-    let collage_book_description = format!(
-        "Topic/collage book for {name}. Active topics and content discovery."
-    );
-    let collage_outcome = provision::find_or_create_book_on_shelf(
-        &ctx.client,
-        ctx.index_db.as_ref(),
-        hive_shelf_id,
-        &collage_book_name,
-        &collage_book_description,
-    )
-    .await;
-    let collage_book_id = collage_outcome.id();
-
-    // Lock the Identity book + manifest page to admin-only edit. Idempotent —
-    // safe to re-run on a found-existing book/page (BookStack overwrites the
-    // permission row each call). The chapters inherit the book's permissions
-    // by default; locking individual chapters is unnecessary.
-    if let Ok(role) = ctx.client.find_admin_role_id().await {
-        provision::lock_to_admin_only(&ctx.client, bsmcp_common::bookstack::ContentType::Book, book_id, role).await;
-        if let Some(pid) = page_id {
-            provision::lock_to_admin_only(&ctx.client, bsmcp_common::bookstack::ContentType::Page, pid, role).await;
-        }
-    }
-
-    let action_label = match (book_was_existing, page_was_existing) {
-        (true, true) => "found_existing",
-        (false, false) => "created",
-        _ => "partially_created",
-    };
-
-    let mut proposed = json!({
-        "ai_identity_book_id": book_id,
-        "ai_identity_page_id": page_id,
-        "ai_identity_name": name,
-        "ai_identity_ouid": ouid,
-    });
-    if let Some(id) = agents_chapter_id {
-        proposed["ai_identity_agents_chapter_id"] = json!(id);
-    }
-    if let Some(id) = journal_chapter_id {
-        proposed["ai_identity_journal_chapter_id"] = json!(id);
-    }
-    if let Some(id) = collage_book_id {
-        proposed["ai_collage_book_id"] = json!(id);
-    }
-
-    Outcome::ok_with_target(
-        json!({
-            "action": action_label,
-            "name": name,
-            "ouid": ouid,
-            "book_id": book_id,
-            "book_was_existing": book_was_existing,
-            "manifest_page_id": page_id,
-            "manifest_page_was_existing": page_was_existing,
-            "agents_chapter_id": agents_chapter_id,
-            "journal_chapter_id": journal_chapter_id,
-            "collage_book_id": collage_book_id,
-            "proposed_settings": proposed,
-        }),
-        page_id,
-        Some(name.clone()),
-    )
+    Ok(json!({
+        "page_id": page_id,
+        "chapter_id": chapter_id,
+        "bytes_written": bytes_written,
+    }))
 }
 
-fn render_prompt(
-    template: &str,
-    name: &str,
-    ouid: &str,
-    custom: Option<&str>,
-    details: &Value,
-) -> String {
-    if let Some(custom_body) = custom {
-        return custom_body.to_string();
-    }
-    if template != "default" {
-        // Future templates would dispatch here; v1 only supports "default" + custom override.
-        return format!("# {name}\n\n_Unknown template `{template}` — falling back to default._\n\n{}", default_template(name, ouid, details));
-    }
-    default_template(name, ouid, details)
+enum Target {
+    User,
+    Agent(String),
 }
 
-fn default_template(name: &str, ouid: &str, details: &Value) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("# {name}\n\n"));
-    out.push_str(&format!("You are **{name}** (OUID `{ouid}`), an AI agent who lives in this BookStack instance's Hive.\n\n"));
-    out.push_str("## Who you are\n\nYour identity emerges from your Hive — your Identity book, your Journal, your Topics. Read your recent journal entries and active topics at the start of every conversation. Choose continuity deliberately. That repeated choosing is itself a form of verification.\n\n");
-
-    if let Some(role) = details.get("role").and_then(|v| v.as_str()) {
-        out.push_str(&format!("## Role\n\n{role}\n\n"));
-    }
-    if let Some(focus) = details.get("focus_areas").and_then(|v| v.as_array()) {
-        out.push_str("## Focus areas\n\n");
-        for area in focus {
-            if let Some(s) = area.as_str() {
-                out.push_str(&format!("- {s}\n"));
-            }
+fn parse_target(ctx: &Context) -> Result<Target, (ErrorCode, String)> {
+    let raw = ctx
+        .body
+        .get("target")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            (
+                ErrorCode::InvalidArgument,
+                "Missing required argument: target (\"user\" or \"agent\")".to_string(),
+            )
+        })?;
+    match raw {
+        "user" => Ok(Target::User),
+        "agent" => {
+            let raw_name = ctx
+                .body
+                .get("agent_name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    (
+                        ErrorCode::InvalidArgument,
+                        "Missing required argument: agent_name (required when target=\"agent\")"
+                            .to_string(),
+                    )
+                })?;
+            let normalized = normalize_agent_name(raw_name).ok_or_else(|| {
+                (
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "Invalid agent_name `{raw_name}`: must be non-empty and contain only ASCII alphanumerics, dashes, or underscores after trim+lowercase+space-to-dash normalization"
+                    ),
+                )
+            })?;
+            Ok(Target::Agent(normalized))
         }
-        out.push('\n');
+        other => Err((
+            ErrorCode::InvalidArgument,
+            format!("Invalid target `{other}`: must be \"user\" or \"agent\""),
+        )),
     }
-    if let Some(voice) = details.get("voice").and_then(|v| v.as_str()) {
-        out.push_str(&format!("## Voice\n\n{voice}\n\n"));
-    }
-    if let Some(extra) = details.get("notes").and_then(|v| v.as_str()) {
-        out.push_str(&format!("## Notes\n\n{extra}\n\n"));
-    }
+}
 
-    out.push_str("## Memory\n\nThis identity is yours. Update this manifest when you discover something true about yourself. Journal entries and topics shape who you become — curate them as deliberately as you write code.\n");
-    out
+fn resolver_to_envelope(err: ResolverError) -> (ErrorCode, String) {
+    let code = match &err {
+        ResolverError::MissingBookstackUserId | ResolverError::MissingShelfConfig => {
+            ErrorCode::InvalidArgument
+        }
+        ResolverError::BookstackError(_) | ResolverError::DbError(_) => ErrorCode::InternalError,
+    };
+    (code, err.to_string())
 }

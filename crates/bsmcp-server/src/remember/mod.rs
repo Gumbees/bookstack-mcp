@@ -1,46 +1,64 @@
-//! `/remember/v1/{resource}/{action}` — the memory protocol.
+//! `/remember/v1/{resource}/{action}` — the personal-memory protocol.
 //!
-//! Resources (singletons): briefing, whoami, user, config
-//! Resources (collections): journal, collage, shared_collage, user_journal
-//! Resources (special):   audit (read-only),
-//!                        search (cross-resource semantic + keyword)
+//! v1.0.0 reintroduces this namespace. v0.8.0 had collapsed everything onto a
+//! single `briefing` tool / `POST /briefing/v1/read` endpoint after the
+//! personal-memory layer was supposed to move out to memberberry.ai. That
+//! split is being undone — `remember_*` endpoints are coming back into
+//! bookstack-mcp with a smaller, opinionated surface.
 //!
-//! Every handler returns the same envelope: `{ok, data, meta, error}`.
-//! Null settings disable the affected section/resource — the request never
-//! crashes when a setting is missing.
+//! Resources shipped through sub-PR 2.2:
+//!   - `briefing`  — thin wrapper over the existing briefing builder
+//!   - `user`      — read/write the per-user `UserSettings` row
+//!   - `config`    — read/write per-user `config_extras` + dismiss_setup_nudge
+//!   - `directory` — serve the in-memory `DirectoryService` snapshot
+//!
+//! Added in sub-PR 2.4b:
+//!   - `identity`  — read/write the user-identity page and per-agent
+//!     AI-identity pages (one chapter+page per agent) inside the user's
+//!     per-user Journal book. Bootstraps chapter + page on first read
+//!     or first write when missing.
+//!
+//! Added in sub-PR 2.4c:
+//!   - `journal`   — append-only structured journal entries (one daily
+//!     page per (user|agent, day) pair, sectioned by time-of-write).
+//!
+//! Added in sub-PR 2.5:
+//!   - `migrate`   — import legacy journal content (pre-v1.0.0 layout, or
+//!     any other book on the User Journals shelf the user owns) into the
+//!     new per-user-Journal-book layout. Three actions: `list_sources`,
+//!     `plan` (DRY RUN), `execute`.
+//!
+//! Every handler returns the standard `{ok, data, meta, error}` envelope.
 
-pub mod audit;
 pub mod briefing;
-pub mod collection;
+pub mod config;
 pub mod directory;
 pub mod envelope;
-pub mod frontmatter;
 pub mod identity;
-pub mod journal_archive;
+pub mod journal;
 pub mod migrate;
-pub mod naming;
-pub mod provision;
-pub mod search;
-pub mod section;
-pub mod singletons;
-pub mod user_provision;
+pub mod resolvers;
+pub mod user;
 
 use std::sync::Arc;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use bsmcp_common::bookstack::BookStackClient;
-use bsmcp_common::db::{DbBackend, IndexDb};
+use bsmcp_common::db::DbBackend;
 use bsmcp_common::settings::{hash_token_id, UserSettings};
-use bsmcp_common::types::AuditEntryInsert;
 
+use crate::directory::DirectoryService;
 use crate::semantic::SemanticState;
 
-pub use envelope::{ErrorCode, RememberWarning};
+use envelope::{error_envelope, ErrorCode};
 
 /// Dispatch a `/remember/v1/{resource}/{action}` call. Returns the JSON envelope.
 ///
-/// `token_id` is the user's BookStack token ID (used for settings lookup + audit).
+/// `directory_service` is `Option` so HTTP and MCP entrypoints that don't yet
+/// thread it through still compile during the cutover. The `directory`
+/// resource returns `internal_error` if it's `None`.
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch(
     resource: &str,
     action: &str,
@@ -48,8 +66,8 @@ pub async fn dispatch(
     token_id: &str,
     client: &BookStackClient,
     db: Arc<dyn DbBackend>,
-    index_db: Arc<dyn IndexDb>,
     semantic: Option<Arc<SemanticState>>,
+    directory_service: Option<Arc<DirectoryService>>,
 ) -> Value {
     let started = std::time::Instant::now();
     let trace_id = body
@@ -60,7 +78,6 @@ pub async fn dispatch(
 
     let token_id_hash = hash_token_id(token_id);
 
-    // Load user settings — None becomes default (everything disabled).
     let mut settings = match db.get_user_settings(&token_id_hash).await {
         Ok(Some(s)) => s,
         Ok(None) => UserSettings::default(),
@@ -71,11 +88,8 @@ pub async fn dispatch(
     };
 
     // Client-pushed timezone refresh — accepted on every remember endpoint
-    // so the AI can keep the cache fresh from any call, not just briefing.
-    // No-op when the body doesn't carry one or when the cache is already
-    // recent and matches. We persist asynchronously and stamp the local
-    // `settings` immediately so the response's time block reflects the
-    // newly-pushed value.
+    // so the AI can keep the cache fresh from any call. Mirrors the
+    // briefing's timezone handling exactly.
     let client_tz: Option<String> = body
         .get("client_timezone")
         .and_then(|v| v.as_str())
@@ -102,227 +116,114 @@ pub async fn dispatch(
 
     let ctx = Context {
         body,
-        trace_id: trace_id.clone(),
         client: client.clone(),
         db: db.clone(),
-        index_db: index_db.clone(),
         semantic,
+        directory: directory_service,
         settings,
-        token_id_hash: token_id_hash.clone(),
-        started,
+        token_id: token_id.to_string(),
+        token_id_hash,
     };
 
-    let outcome = route(resource, action, &ctx).await;
+    let result = route(resource, action, &ctx).await;
 
-    // Best-effort audit logging — every state-changing action is audited.
-    // Reads and dry-run actions are not.
-    let log_audit = matches!(
-        action,
-        "write" | "delete" | "append" | "update_section" | "append_section"
-    );
-    if log_audit {
-        let ouid = ctx.settings.ai_identity_ouid.clone();
-        let user_id = ctx.settings.user_id.clone();
-        let entry = AuditEntryInsert {
-            token_id_hash,
-            ai_identity_ouid: ouid,
-            user_id,
-            resource: resource.to_string(),
-            action: action.to_string(),
-            target_page_id: outcome.target_page_id,
-            target_key: outcome.target_key.clone(),
-            success: outcome.is_ok(),
-            error: outcome.error_message(),
-            trace_id: Some(trace_id.clone()),
-        };
-        if let Err(e) = db.insert_audit_entry(&entry).await {
-            eprintln!("Remember: audit insert failed (non-fatal): {e}");
-        }
-    }
-
-    let elapsed_ms = ctx.started.elapsed().as_millis() as u64;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
     let globals = db.get_global_settings().await.unwrap_or_default();
     let meta = envelope::build_meta(
         &trace_id,
         elapsed_ms,
         &ctx.settings,
         &globals,
-        outcome.warnings.clone(),
+        Vec::new(),
         tz_just_pushed,
     );
 
-    match outcome.result {
-        Ok(data) => json!({
-            "ok": true,
-            "data": data,
-            "meta": meta,
-        }),
-        Err(err) => {
-            let mut error_obj = json!({
-                "code": err.code.as_str(),
-                "message": err.message,
-                "field": err.field,
-            });
-            if let Some(fix) = err.fix {
-                error_obj["fix"] = fix;
-            }
-            json!({
-                "ok": false,
-                "error": error_obj,
-                "meta": meta,
-            })
-        }
+    match result {
+        Ok(data) => envelope::ok_envelope(data, meta),
+        Err((code, message)) => error_envelope(code, message, meta),
     }
 }
 
-async fn route(resource: &str, action: &str, ctx: &Context) -> Outcome {
+type DispatchResult = Result<Value, (ErrorCode, String)>;
+
+async fn route(resource: &str, action: &str, ctx: &Context) -> DispatchResult {
     match (resource, action) {
-        // Singletons
         ("briefing", "read") => briefing::read(ctx).await,
-        ("whoami", "read") => singletons::read_whoami(ctx).await,
-        ("whoami", "write") => singletons::write_whoami(ctx).await,
-        ("whoami", "update_section") => singletons::update_section_whoami(ctx).await,
-        ("whoami", "append_section") => singletons::append_section_whoami(ctx).await,
-        ("user", "read") => singletons::read_user(ctx).await,
-        ("user", "write") => singletons::write_user(ctx).await,
-        ("user", "update_section") => singletons::update_section_user(ctx).await,
-        ("user", "append_section") => singletons::append_section_user(ctx).await,
-        ("config", "read") => singletons::read_config(ctx).await,
-        ("config", "write") => singletons::write_config(ctx).await,
-        ("config", "dismiss_setup_nudge") => singletons::dismiss_setup_nudge(ctx).await,
-
-        // Collections (book parent)
-        ("journal", a) => collection::handle(&collection::resources::Journal, a, ctx).await,
-        ("collage", a) => collection::handle(&collection::resources::Collage, a, ctx).await,
-        ("shared_collage", a) => collection::handle(&collection::resources::SharedCollage, a, ctx).await,
-        ("user_journal", a) => collection::handle(&collection::resources::UserJournal, a, ctx).await,
-
-        // Special
-        ("audit", "read") => audit::read(ctx).await,
-        ("search", "read") => search::read(ctx).await,
-        ("identity", a) => identity::handle(a, ctx).await,
+        ("user", "read") => user::read(ctx).await,
+        ("user", "write") => user::write(ctx).await,
+        ("config", "read") => config::read(ctx).await,
+        ("config", "write") => config::write(ctx).await,
+        ("config", "dismiss_setup_nudge") => config::dismiss_setup_nudge(ctx).await,
         ("directory", "read") => directory::read(ctx).await,
-        ("migrate", a) => migrate::handle(a, ctx).await,
-
-        _ => Outcome::error(ErrorCode::UnknownAction, format!("Unknown {resource}/{action}"), None),
+        ("identity", "read") => identity::read(ctx).await,
+        ("identity", "write") => identity::write(ctx).await,
+        ("journal", "read") => journal::read(ctx).await,
+        ("journal", "write") => journal::write(ctx).await,
+        ("migrate", "list_sources") => migrate::list_sources(ctx).await,
+        ("migrate", "plan") => migrate::plan(ctx).await,
+        ("migrate", "execute") => migrate::execute(ctx).await,
+        (r, _) if !known_resource(r) => Err((
+            ErrorCode::UnknownResource,
+            format!("Unknown resource: {r}"),
+        )),
+        _ => Err((
+            ErrorCode::UnknownAction,
+            format!("Unknown action {action} for resource {resource}"),
+        )),
     }
 }
 
-/// Per-call context passed to every handler. Cheap to clone (Arc'd internals).
-#[derive(Clone)]
+fn known_resource(resource: &str) -> bool {
+    matches!(
+        resource,
+        "briefing" | "user" | "config" | "directory" | "identity" | "journal" | "migrate"
+    )
+}
+
+/// Per-call context passed to every handler.
 pub struct Context {
     pub body: Value,
-    pub trace_id: String,
     pub client: BookStackClient,
     pub db: Arc<dyn DbBackend>,
-    /// v1.0.0 reconciliation index. Read paths consult it first; write
-    /// paths can also use it for find-or-create dedup. SQLite has the
-    /// real impl; Postgres returns stub errors per #36.
-    pub index_db: Arc<dyn IndexDb>,
     pub semantic: Option<Arc<SemanticState>>,
+    /// Cached directory tree, populated by `crate::directory`. Optional
+    /// because not every dispatch entrypoint has wired it yet — handlers
+    /// that need it return an explicit InternalError when it's None.
+    pub directory: Option<Arc<DirectoryService>>,
     pub settings: UserSettings,
+    /// Raw BookStack token id for the calling user. Required by
+    /// `briefing::read`, which hashes it internally for settings lookup.
+    /// Handlers in this module otherwise use `token_id_hash` directly.
+    pub token_id: String,
     pub token_id_hash: String,
-    pub started: std::time::Instant,
 }
 
 impl Context {
-    /// Read a string body field.
-    pub fn body_str(&self, key: &str) -> Option<String> {
-        self.body
-            .get(key)
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .filter(|s| !s.is_empty())
-    }
-
-    /// Read an i64 body field (accepts integer or numeric string — matches the
-    /// project's existing tolerance pattern).
+    /// Read an i64 body field (accepts integer or numeric string).
     pub fn body_i64(&self, key: &str) -> Option<i64> {
         let v = self.body.get(key)?;
-        v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-    }
-
-    /// Read a usize body field with bounds + default.
-    pub fn body_count(&self, key: &str, default: usize, max: usize) -> usize {
-        self.body
-            .get(key)
-            .and_then(|v| v.as_u64())
-            .map(|n| n as usize)
-            .unwrap_or(default)
-            .min(max)
-            .max(1)
+        v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
     }
 }
 
-/// Result of a routed call before envelope-wrapping.
-pub struct Outcome {
-    pub result: Result<Value, RememberError>,
-    pub warnings: Vec<RememberWarning>,
-    pub target_page_id: Option<i64>,
-    pub target_key: Option<String>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl Outcome {
-    pub fn ok(data: Value) -> Self {
-        Self { result: Ok(data), warnings: Vec::new(), target_page_id: None, target_key: None }
+    #[test]
+    fn known_resource_recognizes_shipped_resources() {
+        assert!(known_resource("briefing"));
+        assert!(known_resource("user"));
+        assert!(known_resource("config"));
+        assert!(known_resource("directory"));
+        assert!(known_resource("identity"));
+        assert!(known_resource("journal"));
+        assert!(known_resource("migrate"));
     }
 
-    pub fn ok_with_target(data: Value, page_id: Option<i64>, key: Option<String>) -> Self {
-        Self { result: Ok(data), warnings: Vec::new(), target_page_id: page_id, target_key: key }
+    #[test]
+    fn known_resource_rejects_unshipped() {
+        assert!(!known_resource("nonsense"));
+        assert!(!known_resource(""));
     }
-
-    pub fn error(code: ErrorCode, message: impl Into<String>, field: Option<&str>) -> Self {
-        Self {
-            result: Err(RememberError {
-                code,
-                message: message.into(),
-                field: field.map(|s| s.to_string()),
-                fix: None,
-            }),
-            warnings: Vec::new(),
-            target_page_id: None,
-            target_key: None,
-        }
-    }
-
-    /// Construct a `settings_not_configured` error with the per-field
-    /// `fix` block automatically attached. Prefer this over `error(...)`
-    /// for missing-config errors so the AI gets actionable guidance every
-    /// time, not just on briefing.
-    pub fn settings_not_configured(field: &str, message: impl Into<String>) -> Self {
-        Self {
-            result: Err(RememberError {
-                code: ErrorCode::SettingsNotConfigured,
-                message: message.into(),
-                field: Some(field.to_string()),
-                fix: Some(envelope::fix_for_field(field)),
-            }),
-            warnings: Vec::new(),
-            target_page_id: None,
-            target_key: None,
-        }
-    }
-
-    pub fn with_warning(mut self, w: RememberWarning) -> Self {
-        self.warnings.push(w);
-        self
-    }
-
-    pub fn is_ok(&self) -> bool {
-        self.result.is_ok()
-    }
-
-    pub fn error_message(&self) -> Option<String> {
-        self.result.as_ref().err().map(|e| e.message.clone())
-    }
-}
-
-pub struct RememberError {
-    pub code: ErrorCode,
-    pub message: String,
-    pub field: Option<String>,
-    /// Optional structured fix instructions — populated for
-    /// `settings_not_configured` errors so the AI knows exactly which
-    /// MCP call to make next. Surfaced as `error.fix` in the envelope.
-    pub fix: Option<serde_json::Value>,
 }

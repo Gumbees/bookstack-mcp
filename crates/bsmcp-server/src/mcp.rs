@@ -8,19 +8,39 @@ use pulldown_cmark::{html, Options, Parser};
 
 use bsmcp_common::bookstack::{self, BookStackClient, ContentType, ExportFormat};
 use bsmcp_common::db::DbBackend;
-use crate::remember;
+use bsmcp_common::settings::is_tool_enabled;
+use crate::briefing;
+use crate::directory::DirectoryService;
 use crate::semantic::{trim_match, SemanticState};
+use crate::session::{self, SessionStore};
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
 
-/// Dependencies the `remember_*` tools need beyond the BookStack client.
-/// Bundled into one struct to keep `handle_request` / `execute_tool` signatures
-/// from sprouting more positional args.
-pub struct RememberDeps {
+/// Dependencies the `briefing` and other server-tier tools need beyond the
+/// BookStack client. Bundled into one struct to keep `handle_request` /
+/// `execute_tool` signatures from sprouting more positional args.
+pub struct BriefingDeps {
     pub db: Arc<dyn DbBackend>,
-    pub index_db: Arc<dyn bsmcp_common::db::IndexDb>,
     pub semantic: Option<Arc<SemanticState>>,
+    /// Drives the per-session meta-injection: first call in a session gets
+    /// the full briefing under `meta.briefing_pending`, every call gets the
+    /// directory snapshot or its `{version, hash}` pointer under
+    /// `meta.directory`.
+    pub session_store: SessionStore,
     pub token_id: String,
+    /// Token-hash for session-store lookups (avoids redundant SHA-256 work
+    /// on the meta-injection hot path).
+    pub token_id_hash: String,
+    /// Optional client-supplied session id. Streamable HTTP carries it in
+    /// the `Mcp-Session-Id` header; SSE carries it as the `?sessionId=`
+    /// query param. When absent, `session_key` falls back to a stable
+    /// `no-session` slot per token so the user still gets a single coarse
+    /// session.
+    pub session_id: Option<String>,
+    /// Directory cache. Sourced from `AppState`; passed through every
+    /// remember dispatch + auto-attached to every MCP response's
+    /// `meta.directory`.
+    pub directory: Arc<DirectoryService>,
 }
 
 pub async fn handle_request(
@@ -29,7 +49,7 @@ pub async fn handle_request(
     semantic: Option<&SemanticState>,
     summary_cache: &crate::summary::SummaryCache,
     staging: &crate::staging::StagingStore,
-    remember_deps: &RememberDeps,
+    deps: &BriefingDeps,
 ) -> Option<Value> {
     let id = request.get("id");
 
@@ -58,22 +78,296 @@ pub async fn handle_request(
             })))
         }
         "notifications/initialized" => None,
-        "tools/list" => Some(json_rpc_result(id, json!({ "tools": tool_definitions(semantic.is_some()) }))),
+        "tools/list" => {
+            // Filter the tool list by per-user + global enable/disable
+            // settings. Both lookups are cheap (one row each, server-side
+            // only) and the filter is best-effort: if either lookup
+            // errors out we fall back to the unfiltered list rather than
+            // hand the client an empty or partial response.
+            //
+            // The token_id_hash is always present in BriefingDeps for
+            // authenticated transports — sse.rs and the streamable
+            // handler both populate it. There's no anonymous tools/list
+            // entry point in this server today; if one is added later,
+            // it should call `tool_definitions(...)` directly without the
+            // filter.
+            let user_settings = deps
+                .db
+                .get_user_settings(&deps.token_id_hash)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let global_settings = deps
+                .db
+                .get_global_settings()
+                .await
+                .unwrap_or_default();
+            let tools = filter_tools_by_enabled(
+                tool_definitions(semantic.is_some()),
+                &user_settings,
+                &global_settings,
+            );
+            Some(json_rpc_result(id, json!({ "tools": tools })))
+        }
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let result = execute_tool(name, &args, client, semantic, staging, remember_deps).await;
-            match result {
-                Ok(text) => Some(json_rpc_result(id, json!({
+
+            // Decide pre-tool whether to attach `meta.briefing_pending`. The
+            // session record_call flip happens BEFORE execute_tool so that
+            // an explicit `briefing` call in the same JSON-RPC
+            // request won't double-set the flag (mark_compacted resets it).
+            //
+            // Phase 2.4d: also short-circuit when the `briefing` tool itself
+            // is disabled for this caller (per-user override or admin
+            // default). User opted out — skip the work. Deliberately don't
+            // record_call in that branch so that re-enabling briefing later
+            // restores the first-call full-injection behavior.
+            let briefing_tool_enabled = {
+                let user_settings = deps
+                    .db
+                    .get_user_settings(&deps.token_id_hash)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let global_settings = deps
+                    .db
+                    .get_global_settings()
+                    .await
+                    .unwrap_or_default();
+                is_tool_enabled("briefing", &user_settings, &global_settings)
+            };
+            let attach_briefing_pending = name != "briefing"
+                && briefing_enabled()
+                && briefing_tool_enabled
+                && {
+                    let key = session::session_key(
+                        &deps.token_id_hash,
+                        deps.session_id.as_deref(),
+                    );
+                    session::record_call(&deps.session_store, &key).await
+                };
+
+            let result = execute_tool(name, &args, client, semantic, staging, deps).await;
+
+            let mut tool_result = match result {
+                Ok(text) => json!({
                     "content": [{ "type": "text", "text": text }],
-                }))),
-                Err(e) => Some(json_rpc_result(id, json!({
+                }),
+                Err(e) => json!({
                     "content": [{ "type": "text", "text": format!("Error: {e}") }],
                     "isError": true,
-                }))),
+                }),
+            };
+
+            // Build the per-response meta envelope: always-present time +
+            // directory pointer/full + first-call briefing_pending. Time
+            // and directory ride on every response (cheap); briefing_pending
+            // only on the first non-briefing call per session.
+            let meta = build_response_meta(
+                &args,
+                id,
+                attach_briefing_pending,
+                client,
+                deps,
+            )
+            .await;
+            if let Value::Object(ref mut m) = tool_result {
+                m.insert("meta".to_string(), meta);
             }
+
+            Some(json_rpc_result(id, tool_result))
         }
         _ => Some(json_rpc_error(id, -32601, "Method not found")),
+    }
+}
+
+/// Build the minimal body passed to `briefing::build_meta_briefing` for the
+/// auto-injection path. Forwards `client_timezone` if the caller happened to
+/// thread one through (so timezone refresh keeps working from any tool, not
+/// just the explicit `briefing` call) and a `trace_id` derived from the
+/// JSON-RPC request id — and nothing else; the full tool-call args would
+/// just bloat the briefing call.
+fn build_briefing_meta_body(args: &Value, request_id: Option<&Value>) -> Value {
+    let mut body = json!({});
+    if let Some(tz) = args.get("client_timezone").and_then(|v| v.as_str()) {
+        body["client_timezone"] = json!(tz);
+    }
+    let trace_id = request_id
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    body["trace_id"] = json!(trace_id);
+    body
+}
+
+/// Build the `meta` block decorating every MCP `tools/call` response.
+///
+/// Always present:
+/// - `time` — `{ iso, tz, unix }` in the user's timezone (UTC if unset).
+/// - `directory` — full snapshot if the session hasn't seen the current
+///   `version` yet, otherwise a `{version, hash, built_at, shape: "pointer"}`
+///   stub the AI can ignore.
+///
+/// First non-briefing tool call per session also gets:
+/// - `briefing_pending` — `{message, briefing}` where `briefing` is the
+///   complete briefing payload. After this attaches once, the session flag
+///   flips and subsequent calls skip it.
+///
+/// Until the user completes the `/setup/user` wizard, every call also gets:
+/// - `onboarding_pending` — `{message, url}`. Unlike `briefing_pending`
+///   this is NOT one-shot: it rides on every response until
+///   `UserSettings.setup_complete` flips. Gated by `BSMCP_ONBOARDING_ENABLED`
+///   (default on); see `is_onboarding_visible`.
+///
+/// For BookStack admins on a freshly-installed instance, every call also
+/// gets:
+/// - `admin_onboarding_pending` — `{message, url}`. Same shape as
+///   `onboarding_pending` but pointed at `/setup/admin`. "Run once"
+///   semantics — the first admin to submit the wizard flips the org-wide
+///   `GlobalSettings.admin_setup_complete` flag and the nudge stops for
+///   every admin. `BSMCP_FORCE_ADMIN_SETUP=1` env override re-arms the
+///   nudge for ops recovery without touching the DB.
+async fn build_response_meta(
+    args: &Value,
+    request_id: Option<&Value>,
+    attach_briefing_pending: bool,
+    client: &BookStackClient,
+    deps: &BriefingDeps,
+) -> Value {
+    let mut settings = deps
+        .db
+        .get_user_settings(&deps.token_id_hash)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+
+    let mut meta = json!({
+        "time": build_response_time_block(&settings),
+        "directory": build_response_directory_block(deps).await,
+    });
+
+    if attach_briefing_pending {
+        let body = build_briefing_meta_body(args, request_id);
+        let briefing_payload = briefing::build_meta_briefing(
+            body,
+            &deps.token_id,
+            client,
+            deps.db.clone(),
+            deps.semantic.clone(),
+            true,
+        )
+        .await;
+        meta["briefing_pending"] = json!({
+            "message": "You didn't run your briefing yet, here it is..",
+            "briefing": briefing_payload,
+        });
+    }
+
+    if is_onboarding_visible(onboarding_enabled(), settings.setup_complete) {
+        meta["onboarding_pending"] = build_onboarding_pending_meta();
+    }
+
+    // Admin onboarding nudge. Independent from the per-user `setup_complete`
+    // gate above: a single agent who is both a first-time user AND a
+    // BookStack admin can see BOTH `onboarding_pending` and
+    // `admin_onboarding_pending` on the same response (different keys, no
+    // conflict).
+    //
+    // The admin-status check has to do real work (refresh the cache when
+    // stale, hit BookStack's `/api/users/{id}` endpoint). To stay fast on
+    // the hot path we:
+    //   1. Skip entirely when env or global flag already says "no".
+    //   2. Use the user's existing cached bit via `resolve_is_admin_cached`.
+    //      That helper refreshes opportunistically when stale — the brief
+    //      asks for a "background" refresh, but the cache TTL is 24h so
+    //      paying one BookStack round-trip per day per user is acceptable
+    //      and keeps the implementation synchronous and deterministic.
+    //   3. If admin status can't be determined (no bookstack_user_id, or
+    //      the BookStack call errored with no stale cache to fall back
+    //      on), `resolve_is_admin_cached` returns None — we treat that as
+    //      "not admin" so non-admins never get nagged.
+    let global_settings = deps.db.get_global_settings().await.unwrap_or_default();
+    let force_override = crate::setup_ui::force_admin_setup_env();
+    let effective_complete = crate::setup_ui::effective_admin_setup_complete(
+        global_settings.admin_setup_complete,
+        force_override,
+    );
+    if onboarding_enabled() && !effective_complete {
+        let user_is_admin = crate::setup_ui::resolve_is_admin_cached(
+            &deps.token_id_hash,
+            &mut settings,
+            client,
+            deps.db.clone(),
+        )
+        .await
+        .unwrap_or(false);
+        if crate::setup_ui::is_admin_onboarding_visible(true, false, user_is_admin) {
+            meta["admin_onboarding_pending"] = build_admin_onboarding_pending_meta();
+        }
+    }
+
+    meta
+}
+
+/// Compact time block: ISO-8601 with explicit offset, IANA tz name, unix
+/// seconds. Distinct from `briefing::envelope::build_time_block` (which
+/// emits a verbose, multi-field block tuned for the briefing payload).
+fn build_response_time_block(settings: &bsmcp_common::settings::UserSettings) -> Value {
+    let now = chrono::Utc::now();
+    let unix = now.timestamp();
+    let (iso, tz_name) = match settings
+        .timezone
+        .as_deref()
+        .and_then(|s| s.parse::<chrono_tz::Tz>().ok())
+    {
+        Some(tz) => {
+            let local = now.with_timezone(&tz);
+            (
+                local.format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
+                tz.name().to_string(),
+            )
+        }
+        None => (now.format("%Y-%m-%dT%H:%M:%S+00:00").to_string(), "UTC".to_string()),
+    };
+    json!({ "iso": iso, "tz": tz_name, "unix": unix })
+}
+
+/// Directory pointer-or-full block. Bumps the session's
+/// `last_directory_version` when attaching the full snapshot so the next
+/// call gets the cheap pointer.
+async fn build_response_directory_block(deps: &BriefingDeps) -> Value {
+    let snapshot = deps.directory.current().await;
+    let key = session::session_key(&deps.token_id_hash, deps.session_id.as_deref());
+    let needs_full = session::take_directory_version(
+        &deps.session_store,
+        &key,
+        snapshot.version,
+    )
+    .await;
+    if needs_full {
+        // Full attach. Returning the snapshot verbatim — the receiving AI
+        // pulls `version` and `content_hash` from it.
+        serde_json::to_value(&*snapshot).unwrap_or_else(|_| {
+            json!({
+                "version": snapshot.version,
+                "content_hash": snapshot.content_hash,
+                "built_at": snapshot.built_at,
+                "shape": "error_serializing",
+            })
+        })
+    } else {
+        // Pointer. Includes built_at so the AI can tell how stale the
+        // cache the server is holding is, without paying for the full
+        // tree. (See sub-PR 2.2 report for the rationale.)
+        json!({
+            "version": snapshot.version,
+            "hash": snapshot.content_hash,
+            "built_at": snapshot.built_at,
+            "shape": "pointer",
+        })
     }
 }
 
@@ -99,34 +393,100 @@ async fn execute_tool(
     client: &BookStackClient,
     semantic: Option<&SemanticState>,
     staging: &crate::staging::StagingStore,
-    remember_deps: &RememberDeps,
+    deps: &BriefingDeps,
 ) -> Result<String, String> {
-    // Remember tools share one dispatch path: tool name = "remember_{resource}",
-    // action carried as an arg. Keeps the MCP tool count manageable.
-    if let Some(resource) = name.strip_prefix("remember_") {
-        if !remember_enabled() {
-            // Defensive: a stale client could have cached the tool list
-            // before BSMCP_REMEMBER_ENABLED was set to false. Reject
-            // explicitly so the caller knows it's not a "tool not found"
-            // case but a deliberate disable.
+    // Per-user + global tool enable/disable guard. Defense-in-depth:
+    // tools/list already filters disabled tools out of the catalog, but a
+    // determined client could still issue a call by name. Refuse cleanly
+    // with a structured `tool_disabled` error rather than silently running
+    // the work.
+    //
+    // Lookups are best-effort: if either fails we default to enabled
+    // (matches the helper's "absent = on" semantics) — same posture the
+    // `tools/list` filter takes when the DB is unhappy.
+    let user_settings = deps
+        .db
+        .get_user_settings(&deps.token_id_hash)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let global_settings = deps
+        .db
+        .get_global_settings()
+        .await
+        .unwrap_or_default();
+    if !is_tool_enabled(name, &user_settings, &global_settings) {
+        return Err(tool_disabled_error(name));
+    }
+
+    // `briefing` is the top-level entry into the briefing subsystem
+    // (besides auto-injection on every other tool's response meta). The
+    // memory-protocol tools (`briefing` / `user` / `config` / `directory`
+    // / `identity`) are first-class primitives — no `remember_` prefix.
+    if name == "briefing" {
+        if !briefing_enabled() {
             return Err(
-                "Hive memory disabled (BSMCP_REMEMBER_ENABLED=false on this server)".to_string(),
+                "briefing disabled (BSMCP_BRIEFING_ENABLED=false on this server)".to_string(),
             );
         }
-        let action = arg_str_default(args, "action", "read");
         let mut body = args.clone();
+        let arg_session_id = body
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty());
         if let Value::Object(ref mut map) = body {
             map.remove("action");
         }
-        let envelope = remember::dispatch(
+        // Mark the session as having received its briefing in-band so the
+        // next non-briefing tool call doesn't re-emit it under
+        // `meta.briefing_pending`. The post-compaction reset (which sets
+        // `needs_full_briefing = true` again) lives in the
+        // `session_event action=compacted` tool, NOT here — calling
+        // briefing manually means "I want it now", not "I just lost
+        // context".
+        //
+        // Honor the tool's own `session_id` arg if present (lets a client
+        // without HTTP-header session_id support still drive its session
+        // state explicitly); otherwise fall back to the transport-layer id.
+        let effective_sid = arg_session_id.as_deref().or(deps.session_id.as_deref());
+        let key = session::session_key(&deps.token_id_hash, effective_sid);
+        session::mark_briefing_delivered(&deps.session_store, &key).await;
+
+        let envelope = briefing::read(
+            body,
+            &deps.token_id,
+            client,
+            deps.db.clone(),
+            deps.semantic.clone(),
+        )
+        .await;
+        return Ok(serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| envelope.to_string()));
+    }
+
+    // `user` / `config` / `directory` / `identity` route through the
+    // `/remember/v1/{resource}/{action}` dispatcher. The MCP arg shape is
+    // FLAT: `action` plus the resource-specific fields at the top level.
+    // We pull `action` out and re-collect everything else into the `body`
+    // map the dispatcher expects.
+    if let Some(resource) = remember_resource(name) {
+        if !briefing_enabled() {
+            return Err(format!(
+                "{name} disabled (BSMCP_BRIEFING_ENABLED=false on this server)"
+            ));
+        }
+        let action = arg_str(args, "action")?;
+        let body = flatten_remember_args(args);
+        let envelope = crate::remember::dispatch(
             resource,
             &action,
             body,
-            &remember_deps.token_id,
+            &deps.token_id,
             client,
-            remember_deps.db.clone(),
-            remember_deps.index_db.clone(),
-            remember_deps.semantic.clone(),
+            deps.db.clone(),
+            deps.semantic.clone(),
+            Some(deps.directory.clone()),
         )
         .await;
         return Ok(serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| envelope.to_string()));
@@ -791,6 +1151,69 @@ async fn execute_tool(
             format_json(&client.get_role(id).await?)
         }
 
+        // Session — let the AI signal session-level events (compaction, etc.)
+        "session_event" => {
+            if !briefing_enabled() {
+                return Err(
+                    "session_event is unavailable when the briefing surface is disabled \
+                     (BSMCP_BRIEFING_ENABLED=false on this server)"
+                        .to_string(),
+                );
+            }
+            let action = arg_str(args, "action")?;
+            match action.as_str() {
+                "compacted" => {
+                    let key = session::session_key(&deps.token_id_hash, deps.session_id.as_deref());
+                    session::mark_compacted(&deps.session_store, &key).await;
+                    format_json(&json!({
+                        "ok": true,
+                        "action": "compacted",
+                        "note": "Next tool response will inject the full briefing again.",
+                    }))
+                }
+                other => Err(format!(
+                    "Unknown session_event action: {other}. Supported: compacted"
+                )),
+            }
+        }
+
+        // Dismiss the briefing setup_nudge for N days
+        "dismiss_setup_nudge" => {
+            if !briefing_enabled() {
+                return Err(
+                    "dismiss_setup_nudge is unavailable when the briefing surface is disabled \
+                     (BSMCP_BRIEFING_ENABLED=false on this server)"
+                        .to_string(),
+                );
+            }
+            let days = arg_i64_required(args, "days")?.clamp(1, 365);
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let dismissed_until = now_unix + days * 86400;
+            let mut settings = deps
+                .db
+                .get_user_settings(&deps.token_id_hash)
+                .await
+                .map_err(|e| format!("get_user_settings failed: {e}"))?
+                .unwrap_or_default();
+            settings.settings_nudge_dismissed_until = Some(dismissed_until);
+            deps.db
+                .save_user_settings(&deps.token_id_hash, &settings)
+                .await
+                .map_err(|e| format!("save_user_settings failed: {e}"))?;
+            let until_human = chrono::DateTime::<chrono::Utc>::from_timestamp(dismissed_until, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                .unwrap_or_else(|| dismissed_until.to_string());
+            format_json(&json!({
+                "ok": true,
+                "dismissed_until": dismissed_until,
+                "until_human": until_human,
+                "days": days,
+            }))
+        }
+
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -1297,19 +1720,25 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool, su
 
     let mut instructions = String::new();
 
-    // Hive memory flow — surface this FIRST so it lands before any other guidance.
+    // Briefing flow — surface this FIRST so it lands before any other guidance.
     instructions.push_str(
-        "It's a best practice to always use remember/briefing at the beginning of any session. \
-         The briefing returns the agent's identity manifest, recent journal entries, active topics, \
-         org-required instructions and AI usage policy, and semantic matches against the user's \
-         first message — one structured pull instead of many tool calls. \
-         Call the `remember_briefing` MCP tool (or POST /remember/v1/briefing/read) with the user's \
-         opening message as `user_prompt`.\n\n\
-         If the briefing response includes a `setup_nudge` field, the user hasn't configured their \
-         Hive yet. Walk them through the `suggested_workflow` in that nudge — use search_content + \
-         remember_directory to discover existing structure, propose moves with move_book_to_shelf / \
-         move_chapter / move_page, and lock in the IDs with `remember_config action=write`. The \
-         user can snooze the reminder via `remember_config action=dismiss_setup_nudge days=N`.\n\n"
+        "Call the `briefing` tool at session start with the user's opening message as \
+         `user_prompt`. It returns time, system_prompt_additions (guide page, org_identity, \
+         org_required_instructions, org_ai_usage_policy, user-supplied pages, owned-domains), \
+         kb_semantic_matches against the prompt, and a `setup_nudge` block when settings are \
+         incomplete. Equivalent to POST /briefing/v1/read or POST /remember/v1/briefing/read.\n\n\
+         The briefing payload is also auto-injected as `meta.briefing` on every other tool \
+         response — full content on the first call per session, sticky-only (time + setup \
+         summary) thereafter. After your harness compacts you and you lose context, call \
+         `session_event { action: \"compacted\" }` to force the next tool response to carry \
+         the full briefing again.\n\n\
+         If `setup_nudge` is present, the user's Hive isn't fully configured. The settings \
+         live behind the `/settings` browser UI (token-gated) — point the user there and walk \
+         them through the pending fields. Use `search_content` + the briefing's `setup_nudge` \
+         block to help them locate existing structure. Per-user fields can be set by any \
+         authenticated user; global fields (org_identity, guide_page, scopes) require a \
+         BookStack admin. If the user wants the warnings to stop temporarily, call \
+         `dismiss_setup_nudge { days: N }` (1..=365).\n\n"
     );
 
     if !instance_name.is_empty() {
@@ -1517,6 +1946,58 @@ async fn build_structure(client: &BookStackClient) -> Option<String> {
 }
 
 // --- Tool definitions ---
+
+/// All tool names this server can advertise — the union of every tool
+/// `tool_definitions` would emit with semantic search enabled. Single
+/// source of truth for the settings UI's per-tool toggle list (Phase 2.4d)
+/// and any future code that needs to enumerate the catalog. Order matches
+/// `tool_definitions(true)` so the UI lays toggles out the same way the
+/// MCP `tools/list` reply does.
+pub fn all_tool_names() -> Vec<String> {
+    tool_definitions(true)
+        .into_iter()
+        .filter_map(|t| t.get("name").and_then(|v| v.as_str()).map(String::from))
+        .collect()
+}
+
+/// Filter a `tool_definitions(...)` Vec down to the tools enabled for the
+/// given (user, global) settings pair. Used by the MCP `tools/list`
+/// handler so the catalog the AI sees matches what `execute_tool` will
+/// actually run. Tools without a `name` field are kept (defensive — the
+/// shape only ever omits `name` if `tool_definitions` itself is broken).
+fn filter_tools_by_enabled(
+    tools: Vec<Value>,
+    user: &bsmcp_common::settings::UserSettings,
+    global: &bsmcp_common::settings::GlobalSettings,
+) -> Vec<Value> {
+    tools
+        .into_iter()
+        .filter(|t| {
+            t.get("name")
+                .and_then(|v| v.as_str())
+                .map(|n| is_tool_enabled(n, user, global))
+                .unwrap_or(true)
+        })
+        .collect()
+}
+
+/// Render the structured error returned by `execute_tool` when a tool is
+/// disabled. Matches the brief's contract — JSON-encoded so the upstream
+/// `Err -> "Error: {e}"` envelope still surfaces an inspectable shape to
+/// the client.
+fn tool_disabled_error(name: &str) -> String {
+    let payload = json!({
+        "error": {
+            "code": "tool_disabled",
+            "message": format!(
+                "Tool '{name}' is disabled in your settings or by the admin"
+            ),
+        }
+    });
+    serde_json::to_string(&payload).unwrap_or_else(|_| {
+        format!("tool_disabled: '{name}' is disabled in your settings or by the admin")
+    })
+}
 
 pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
     let mut tools = vec![
@@ -1897,23 +2378,261 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             })));
     }
 
-    // Remember protocol tools — one per resource. The `action` arg picks the
-    // operation (read | write | search | delete depending on resource).
-    // All return the same JSON envelope: { ok, data, meta, error }.
-    // Gated by BSMCP_REMEMBER_ENABLED (default true). When false, the
-    // server runs as a plain BookStack proxy with no Hive memory surface.
-    if remember_enabled() {
-        add_remember_tools(&mut tools);
+    // Briefing tool — the only top-level briefing entry point. The briefing
+    // payload also auto-injects into `meta.briefing` on every other tool's
+    // response (full content first call per session, sticky bits thereafter).
+    // `session_event` and `dismiss_setup_nudge` ride alongside it — they only
+    // make sense when the briefing surface is enabled.
+    if briefing_enabled() {
+        tools.push(json!({
+            "name": "briefing",
+            "description": "Reconstitution shell — returns time, system_prompt_additions (guide page, org_identity, org_required_instructions, org_ai_usage_policy, user system_prompt_page_ids, owned-domains synthetic block), kb_semantic_matches against the user_prompt, setup_nudge when settings are incomplete, and a thin config echo. Auto-injected into meta.briefing on every MCP tool response (full content first call, sticky bits thereafter); call this tool explicitly after compaction to reset to first-call form.",
+            "inputSchema": json!({
+                "type": "object",
+                "properties": {
+                    "user_prompt": { "type": "string", "description": "First user message — drives semantic prioritization" },
+                    "client_timezone": { "type": "string", "description": "Optional IANA timezone (e.g. \"America/New_York\"). Cached server-side." },
+                    "session_id": { "type": "string", "description": "Optional client-supplied session id. Normally taken from the Mcp-Session-Id header; pass it here for clients that can't set the header." }
+                }
+            }),
+        }));
+        tools.push(tool(
+            "user",
+            "Read or write the per-user UserSettings row. `action: 'read'` returns the current settings (no secrets). `action: 'write'` requires a `patch` object alongside `action` and merges it into existing settings — keys not provided are preserved. Use this to set label, role, user_id, bookstack_user_id, domains, system_prompt_page_ids, timezone, semantic_against_full_kb.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["read", "write"],
+                        "description": "Operation to perform"
+                    },
+                    "patch": {
+                        "type": "object",
+                        "description": "For `write`: the {field: value, ...} object to merge into UserSettings."
+                    }
+                },
+                "required": ["action"]
+            }),
+        ));
+        tools.push(tool(
+            "config",
+            "Read or write the per-user config_extras K/V store, or dismiss the briefing's setup_nudge. `action: 'read'` returns the current config. `action: 'write'` accepts a top-level `config: {key: value, ...}` (string values, pass null to delete a key) and merges into existing extras. `action: 'dismiss_setup_nudge'` accepts a top-level `days: int` (1..=365) and snoozes the briefing nudge.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["read", "write", "dismiss_setup_nudge"],
+                        "description": "Operation to perform"
+                    },
+                    "config": {
+                        "type": "object",
+                        "description": "For `write`: the {key: value, ...} object to merge into config_extras."
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "For `dismiss_setup_nudge`: how many days to suppress the nudge (1..=365).",
+                        "minimum": 1,
+                        "maximum": 365
+                    }
+                },
+                "required": ["action"]
+            }),
+        ));
+        tools.push(tool(
+            "directory",
+            "Return the in-memory directory tree (shelves -> books -> chapters -> pages, plus orphan books) with names, slugs, ids, and page updated_at timestamps. Built from the index DB, refreshed automatically on BookStack webhook events. The same snapshot auto-attaches to every MCP tool response under `meta.directory` (full first call per session, then a `{version, hash}` pointer); call this tool to force a re-pull.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["read"],
+                        "description": "Only `read` is supported."
+                    }
+                },
+                "required": ["action"]
+            }),
+        ));
+        tools.push(tool(
+            "identity",
+            "Read or write the user-identity narrative or a per-agent AI-identity narrative. Layout: a single `User Identity` chapter+page (target='user') and one `AI Identity: {agent_name}` chapter+page per agent (target='agent'), all inside the user's per-user Journal book. Pages are raw markdown the AI writes wholesale — no append-only, no time-stamped sections. Bootstrap fires on first read or first write when the chapter/page is missing; the seed contains name+email frontmatter and a 'replace this content' marker the AI overwrites on its first `write`. Returns `{content, page_id, chapter_id, bootstrapped}` on read; `{page_id, chapter_id, bytes_written}` on write. `agent_name` is normalized to lowercase ASCII alphanumerics + dashes/underscores; whitespace becomes a dash.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["read", "write"],
+                        "description": "Operation to perform"
+                    },
+                    "target": {
+                        "type": "string",
+                        "enum": ["user", "agent"],
+                        "description": "Whose identity to read/write. `user` = the human's identity narrative (one per user). `agent` = the named AI agent's identity (one per (user, agent_name) pair)."
+                    },
+                    "agent_name": {
+                        "type": "string",
+                        "description": "Required when target='agent'. Free-form name; normalized to lowercase ASCII alphanumerics + dashes/underscores (whitespace -> dash). Rejected if normalization yields empty or contains other characters."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Required when action='write'. Raw markdown body — overwrites the page wholesale. Do NOT include the page title as an H1; BookStack renders the page name as an H1 automatically."
+                    }
+                },
+                "required": ["action", "target"]
+            }),
+        ));
+        tools.push(tool(
+            "journal",
+            "Append-only structured journal entries on the user's per-user Journal book. Layout: monthly chapter `{YYYY-MM}-{name}` containing daily page `{YYYY-MM-DD}-{name}`, where `name` is the user's first name (entry_type='user') or the normalized agent name (entry_type='agent'). `action: 'write'` appends a `## YYYY-MM-DD HH:MM:SS TZ` section to the daily page (creates chapter+page on demand if missing). `action: 'read'` returns the daily page's full markdown body, defaulting to today in user TZ; pass `date: 'YYYY-MM-DD'` to read a specific day. Read is passive: missing pages return `{exists: false, content: null}` instead of bootstrapping. `agent_name` normalization matches the identity tool: lowercase ASCII alphanumerics + dashes/underscores; whitespace becomes a dash.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["read", "write"],
+                        "description": "Operation to perform"
+                    },
+                    "entry_type": {
+                        "type": "string",
+                        "enum": ["user", "agent"],
+                        "description": "Whose journal to read/write. `user` = the human's daily journal. `agent` = the named AI agent's daily journal."
+                    },
+                    "agent_name": {
+                        "type": "string",
+                        "description": "Required when entry_type='agent'. Free-form name; normalized to lowercase ASCII alphanumerics + dashes/underscores (whitespace -> dash)."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Required when action='write'. Markdown body for the new section. Appended below any prior sections on the same daily page — never overwrites."
+                    },
+                    "date": {
+                        "type": "string",
+                        "description": "Optional for action='read'. Format YYYY-MM-DD. Defaults to today in the user's timezone."
+                    }
+                },
+                "required": ["action", "entry_type"]
+            }),
+        ));
+        tools.push(tool(
+            "migrate",
+            "Import legacy journal content into the v1.0.0 per-user-Journal-book layout. Three actions: \
+             `list_sources` (returns the books on the User Journals shelf the calling user can see, with `owned` and `page_count`), \
+             `plan` (DRY RUN — walks the source `book_id`, parses each page name for `YYYY-MM-DD` (with H1 fallback), and returns the projected target chapter+page names per the v1.0.0 layout), \
+             `execute` (imports the chosen pages — for each source page, fetches its markdown body and appends a single `## Imported from {source_name} — {original_updated_at}` section to the per-day target page; one block per source page, content verbatim). \
+             `entry_type='user'` imports under the user's first name; `entry_type='agent'` imports under the normalized `agent_name`. The optional `pages` array on `execute` lets you pick a subset of source page IDs from the plan; omit it to import every dated page in the source book. Page-name date parsing tolerates `YYYY-MM-DD`, `YYYY-MM-DD-anything`, `YYYY-MM-DD anything`, `YYYY-MM-DD_anything`. Anything not matched is reported in `undated_pages` for the wizard to handle.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list_sources", "plan", "execute"],
+                        "description": "Operation to perform"
+                    },
+                    "book_id": {
+                        "type": "integer",
+                        "description": "Source book to walk. Required for `plan` and `execute`."
+                    },
+                    "entry_type": {
+                        "type": "string",
+                        "enum": ["user", "agent"],
+                        "description": "Whose journal layout to import into. Required for `plan` and `execute`. `user` = first-name chapters; `agent` = normalized-agent-name chapters."
+                    },
+                    "agent_name": {
+                        "type": "string",
+                        "description": "Required when entry_type='agent'. Normalized like the journal/identity tools (lowercase ASCII alphanumerics + dashes/underscores; whitespace -> dash)."
+                    },
+                    "pages": {
+                        "type": "array",
+                        "items": { "type": "integer" },
+                        "description": "Optional for `execute`. Subset of source `source_page_id` values from the `plan` response. Defaults to every dated page (plus any with a `page_date_overrides` entry) when omitted; an explicit empty array is a safe no-op."
+                    },
+                    "page_date_overrides": {
+                        "type": "object",
+                        "description": "Optional for `execute`. Object mapping `\"<source_page_id>\"` (string keys) to `\"YYYY-MM-DD\"`. Used to give undated pages a date the user picked manually. Override wins over both name-prefix and H1 fallback.",
+                        "additionalProperties": { "type": "string" }
+                    }
+                },
+                "required": ["action"]
+            }),
+        ));
+        tools.push(tool(
+            "session_event",
+            "Signal a session-level event. Currently supported: `action: 'compacted'` resets the briefing-injection state so the next tool response includes the full briefing again. Useful after the AI gets compacted by its harness and loses context.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["compacted"],
+                        "description": "Event kind. Only 'compacted' is supported today."
+                    }
+                },
+                "required": ["action"]
+            }),
+        ));
+        tools.push(tool(
+            "dismiss_setup_nudge",
+            "Dismiss the briefing's setup_nudge for N days (1..=365). Useful when the user knows the configuration warnings and wants quiet sessions. Reappears automatically after N days.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "days": {
+                        "type": "integer",
+                        "description": "How many days to suppress the setup_nudge. Clamped to 1..=365.",
+                        "minimum": 1,
+                        "maximum": 365
+                    }
+                },
+                "required": ["days"]
+            }),
+        ));
     }
 
     tools
 }
 
-/// Whether the Hive memory surface is enabled. Reads BSMCP_REMEMBER_ENABLED;
-/// defaults true. Same parsing as the HTTP-route gate in main.rs so the
-/// MCP and HTTP surfaces flip together.
-fn remember_enabled() -> bool {
-    std::env::var("BSMCP_REMEMBER_ENABLED")
+/// Map an MCP tool name to its `/remember/v1/{resource}` resource, if any.
+/// Returns `None` for tools that aren't memory-protocol dispatchers (or for
+/// `briefing`, which is handled separately so it can run the
+/// session-compaction reset before delegating).
+fn remember_resource(tool_name: &str) -> Option<&'static str> {
+    match tool_name {
+        "user" => Some("user"),
+        "config" => Some("config"),
+        "directory" => Some("directory"),
+        "identity" => Some("identity"),
+        "journal" => Some("journal"),
+        "migrate" => Some("migrate"),
+        _ => None,
+    }
+}
+
+/// Flatten the MCP memory-protocol tool arguments into the body map the
+/// dispatcher expects. The MCP arg shape is `{action, key1, key2, ...}`
+/// (flat, easier for AI to call); the dispatcher's body map is just the
+/// resource-specific fields without the `action` envelope. So we drop
+/// `action` and re-wrap. Non-object args (shouldn't happen — `args` always
+/// arrives as an object) collapse to an empty body.
+fn flatten_remember_args(args: &Value) -> Value {
+    let Some(map) = args.as_object() else {
+        return json!({});
+    };
+    let mut body = serde_json::Map::with_capacity(map.len());
+    for (k, v) in map {
+        if k == "action" {
+            continue;
+        }
+        body.insert(k.clone(), v.clone());
+    }
+    Value::Object(body)
+}
+
+/// Whether the briefing surface is enabled. Reads BSMCP_BRIEFING_ENABLED;
+/// defaults true.
+fn briefing_enabled() -> bool {
+    std::env::var("BSMCP_BRIEFING_ENABLED")
         .ok()
         .map(|v| {
             let v = v.trim().to_lowercase();
@@ -1922,205 +2641,81 @@ fn remember_enabled() -> bool {
         .unwrap_or(true)
 }
 
-fn add_remember_tools(tools: &mut Vec<Value>) {
-    fn remember_tool(resource: &str, description: &str, actions: &[&str], extra_props: Value) -> Value {
-        let mut props = json!({
-            "action": {
-                "type": "string",
-                "enum": actions,
-                "description": "Operation to perform on this resource",
-                "default": actions.first().copied().unwrap_or("read"),
-            },
-            // client_timezone is accepted by EVERY remember endpoint, not
-            // just briefing. The server caches it in user_settings and
-            // refreshes whenever the cache is stale (>4h) or the value
-            // changes. Pass it whenever `meta.time.timezone_refresh_due`
-            // was true on a previous response.
-            "client_timezone": {
-                "type": "string",
-                "description": "Optional IANA timezone (e.g. \"America/New_York\"). Cached server-side; refresh when `meta.time.timezone_refresh_due` is true. Detect via your client's local time API.",
-            },
-        });
-        if let Value::Object(extra) = extra_props {
-            if let Value::Object(ref mut p) = props {
-                for (k, v) in extra { p.insert(k, v); }
+/// Whether the user-onboarding flow is enabled (Phase 2.4e). Reads
+/// `BSMCP_ONBOARDING_ENABLED`; defaults true. When off:
+/// - `meta.onboarding_pending` is never injected.
+/// - `GET/POST /setup/user` return 404.
+///
+/// Boolean parse: `false`/`0`/`no`/`off` (case-insensitive) = off; any
+/// other value (including absent) = on. Mirrors `briefing_enabled` so
+/// operators get one consistent toggle shape across the surface.
+pub fn onboarding_enabled() -> bool {
+    parse_onboarding_env(std::env::var("BSMCP_ONBOARDING_ENABLED").ok().as_deref())
+}
+
+/// Pure parse of the `BSMCP_ONBOARDING_ENABLED` env var. Extracted so the
+/// env-parse cases are testable without touching process env. `None`
+/// (absent) → true; "false"/"0"/"no"/"off" (any case, trimmed) → false;
+/// everything else → true.
+pub fn parse_onboarding_env(raw: Option<&str>) -> bool {
+    match raw {
+        None => true,
+        Some(s) => {
+            let v = s.trim().to_lowercase();
+            !(v == "false" || v == "0" || v == "no" || v == "off")
+        }
+    }
+}
+
+/// Decide whether `meta.onboarding_pending` should ride along on this
+/// MCP response. Pure helper — no I/O. The injection happens iff:
+/// - the env flag is on (operator hasn't disabled the surface), and
+/// - the user hasn't yet completed the onboarding wizard.
+///
+/// See `build_response_meta` for the corresponding write side.
+pub fn is_onboarding_visible(env_enabled: bool, setup_complete: bool) -> bool {
+    env_enabled && !setup_complete
+}
+
+/// Build the `meta.onboarding_pending` payload. Public-domain-aware:
+/// returns the absolute URL when `BSMCP_PUBLIC_DOMAIN` is set, otherwise
+/// a relative `/setup/user` path so the AI can still render a clickable
+/// link inside its own UI.
+pub fn build_onboarding_pending_meta() -> Value {
+    let url = onboarding_url("/setup/user");
+    json!({
+        "message": "Welcome to bookstack-mcp. Please complete user setup.",
+        "url": url,
+    })
+}
+
+/// Build the `meta.admin_onboarding_pending` payload. Same domain /
+/// relative-fallback rules as `build_onboarding_pending_meta` but points
+/// at `/setup/admin` and uses the admin-flavored message string.
+pub fn build_admin_onboarding_pending_meta() -> Value {
+    let url = onboarding_url("/setup/admin");
+    json!({
+        "message": "First-time admin setup pending. Please complete org configuration.",
+        "url": url,
+    })
+}
+
+/// Shared URL builder: resolves `BSMCP_PUBLIC_DOMAIN` to an absolute
+/// `https://{domain}{path}` when set + non-empty, else returns the path
+/// itself so the AI still has a clickable in-app link. Trailing slashes
+/// on the env value are collapsed.
+fn onboarding_url(path: &str) -> String {
+    match std::env::var("BSMCP_PUBLIC_DOMAIN") {
+        Ok(d) => {
+            let d = d.trim().trim_end_matches('/');
+            if d.is_empty() {
+                path.to_string()
+            } else {
+                format!("https://{d}{path}")
             }
         }
-        // Every remember_* tool ends with the same setup pointer so the AI
-        // knows what to do when a call returns settings_not_configured.
-        // The pointer is identical across tools intentionally — repeating it
-        // beats hoping the AI noticed it once on a different tool.
-        let full_description = format!(
-            "{description}\n\nSETUP: All remember_* tools require user/global settings. \
-             If this returns `settings_not_configured`, the response includes a \
-             structured `error.fix` block with the exact MCP call to make. \
-             Run `remember_briefing action=read` first — its `setup_nudge` enumerates \
-             every pending field and `meta.setup_incomplete` flags partial config on \
-             every response. \
-             TIME: every response carries `meta.time` with now_unix/now_utc/now_local/now_human \
-             and `timezone_refresh_due`. Pass `client_timezone` on any call to refresh."
-        );
-        tool(
-            &format!("remember_{resource}"),
-            &full_description,
-            json!({ "type": "object", "properties": props }),
-        )
+        Err(_) => path.to_string(),
     }
-
-    let common_collection_props = json!({
-        "id": { "type": ["integer", "string"], "description": "BookStack page ID (for read/write/delete by id)" },
-        "key": { "type": "string", "description": "Natural key (date YYYY-MM-DD for journals, slug for topics, lowercase name for subagents)" },
-        "body": { "type": "string", "description": "Markdown body for write/append/update_section/append_section" },
-        "section": { "type": "string", "description": "H2 heading text for update_section / append_section. Match is exact (whitespace-trimmed). If the section doesn't exist it gets appended." },
-        "timestamp": { "type": "boolean", "description": "When true on action=append, prefix the appended chunk with a `## HH:MM TZ` heading using the user's local timezone — useful for multi-append-per-day journal entries.", "default": false },
-        "query": { "type": "string", "description": "Search query for action=search" },
-        "limit": { "type": "integer", "default": 25 },
-        "offset": { "type": "integer", "default": 0 },
-        "reason": { "type": "string", "description": "Optional reason for delete (recorded in tombstone)" },
-        "trace_id": { "type": "string", "description": "Optional correlation ID for the audit log" },
-    });
-
-    // Singletons
-    tools.push(remember_tool(
-        "briefing",
-        "Reconstitution dossier — one structured pull replacing the multi-call AI bootstrap. Returns identity manifest, user identity, recent journals, active topics, semantic matches against the user_prompt, and config metadata. The full setup_nudge surfaces here when settings are incomplete.",
-        &["read"],
-        json!({
-            "user_prompt": { "type": "string", "description": "First user message — drives semantic prioritization" },
-            "recent_journal_count": { "type": "integer", "description": "Override the configured recent_journal_count" },
-            "active_collage_count": { "type": "integer", "description": "Override the configured active_collage_count" },
-        }),
-    ));
-
-    tools.push(remember_tool(
-        "whoami",
-        "AI agent identity. read returns the manifest page + subagent list + book/chapter pointers. \
-         write replaces the manifest page body (frontmatter auto-stamped) — destructive. \
-         update_section replaces just the named H2 section's body, preserving every other section. \
-         append_section appends to the named section's body (creates the section if missing). \
-         Prefer update_section / append_section over write for incremental edits — write is full-replace and rarely what you want.",
-        &["read", "write", "update_section", "append_section"],
-        json!({
-            "body": { "type": "string", "description": "New manifest markdown for write, OR section content for update_section/append_section" },
-            "section": { "type": "string", "description": "H2 heading text for update_section / append_section. Match is exact (whitespace-trimmed). If the section doesn't exist it gets appended." },
-        }),
-    ));
-
-    tools.push(remember_tool(
-        "user",
-        "Human user identity. read auto-provisions missing structure (per-user Identity book on the user-journals shelf, Identity page, Agent: {user_id}-journal-agent page, journal book) when `user_id` is set, returning what was created in `auto_provisioned`. \
-         write replaces the user identity page body — destructive. \
-         update_section replaces just the named H2 section, preserving every other section. \
-         append_section appends to the named section's body (creates the section if missing). \
-         IMPORTANT: as you work with the user, learn what they care about, how they prefer to collaborate, and update the identity page to reflect that — the briefing surfaces a refresh reminder after 30 days of inactivity. Prefer update_section / append_section over write for incremental edits.",
-        &["read", "write", "update_section", "append_section"],
-        json!({
-            "body": { "type": "string", "description": "New user identity markdown for write, OR section content for update_section/append_section" },
-            "section": { "type": "string", "description": "H2 heading text for update_section / append_section. Match is exact (whitespace-trimmed). If the section doesn't exist it gets appended." },
-        }),
-    ));
-
-    tools.push(remember_tool(
-        "config",
-        "Per-user settings AND (admin-only) global shelves. read returns both `{settings, global_settings}`. write accepts `settings` (per-user — any user) and/or `global_settings` (admin-only, server-side first-write-wins for shelf and org_identity_page IDs; org_domains and org-default identity are tunable). \
-         Per-user fields the AI typically maintains: `domains` (list of strings — owned domains for ours/external classification), `bookstack_user_id` (numeric BookStack user id, enables ACL-filtered semantic search), `user_id` (stable identifier, drives auto-provisioning naming), plus the ai_*/user_* book/page IDs. \
-         Admin-only globals: `hive_shelf_id`, `user_journals_shelf_id`, `org_identity_page_id` (first-write-wins), `org_domains` (replaces on write), and the org-default identity fields. \
-         dismiss_setup_nudge snoozes the briefing's setup reminder for `days` days (default 7, max 365).",
-        &["read", "write", "dismiss_setup_nudge"],
-        json!({
-            "settings": { "type": "object", "description": "Full UserSettings object for per-user write" },
-            "global_settings": { "type": "object", "description": "GlobalSettings object (admin-only). Only null fields are written; set fields are preserved (except org_domains which replaces)." },
-            "days": { "type": "integer", "description": "For dismiss_setup_nudge: how many days to snooze (default 7, max 365)" },
-        }),
-    ));
-
-    // Collections
-    tools.push(remember_tool(
-        "journal",
-        "AI agent's daily journal entries (book of pages, monthly chapters auto-managed). Key = date YYYY-MM-DD; defaults to today on write if omitted.",
-        &["read", "write", "append", "update_section", "append_section", "search", "delete"],
-        common_collection_props.clone(),
-    ));
-
-    tools.push(remember_tool(
-        "collage",
-        "AI agent's active topics. Key = topic slug. Pages live directly in the configured Topics book.",
-        &["read", "write", "append", "update_section", "append_section", "search", "delete"],
-        common_collection_props.clone(),
-    ));
-
-    tools.push(remember_tool(
-        "shared_collage",
-        "Cross-agent shared topics. Same shape as collage but a different parent book.",
-        &["read", "write", "append", "update_section", "append_section", "search", "delete"],
-        common_collection_props.clone(),
-    ));
-
-    tools.push(remember_tool(
-        "user_journal",
-        "Human user's journal (when configured by the user). Key = date YYYY-MM-DD with monthly chapters auto-managed.",
-        &["read", "write", "append", "update_section", "append_section", "search", "delete"],
-        common_collection_props.clone(),
-    ));
-
-    // Audit (read only)
-    tools.push(remember_tool(
-        "audit",
-        "Read the server-side audit log of every /remember write performed by this user. Always scoped to the calling user.",
-        &["read"],
-        json!({
-            "limit": { "type": "integer", "default": 50 },
-            "offset": { "type": "integer", "default": 0 },
-            "since_unix": { "type": "integer", "description": "Only return entries with occurred_at >= this unix timestamp" },
-        }),
-    ));
-
-    // Cross-resource search
-    tools.push(remember_tool(
-        "search",
-        "Cross-resource semantic + keyword search across multiple Hive scopes (journal, collage, shared_collage, user_journal) in one call. Returns results partitioned by scope.",
-        &["read"],
-        json!({
-            "query": { "type": "string", "description": "Search query (required)" },
-            "scopes": { "type": "array", "items": { "type": "string" }, "description": "Resource names to include (e.g., ['journal','collage']). Defaults to all configured." },
-            "limit": { "type": "integer", "default": 10, "description": "Per-scope result cap" },
-        }),
-    ));
-
-    // Identity discovery + creation
-    tools.push(remember_tool(
-        "identity",
-        "List or create AI identities under the global Hive shelf. action=list enumerates existing identities (book + manifest page + OUID per agent). action=create scaffolds a new Identity book + manifest page from a prompt template.",
-        &["list", "create"],
-        json!({
-            "name": { "type": "string", "description": "Display name for the new agent (e.g., 'Pia')" },
-            "ouid": { "type": "string", "description": "Optional stable OUID; a UUID is generated if omitted" },
-            "prompt_template": { "type": "string", "default": "default", "description": "Template name for the manifest body. Currently 'default' is the only built-in." },
-            "custom_prompt": { "type": "string", "description": "Override the template entirely with this markdown" },
-            "additional_details": {
-                "type": "object",
-                "description": "Free-form details merged into the default template (role, focus_areas, voice, notes, etc.)",
-            },
-        }),
-    ));
-
-    // Directory (cross-shelf discovery)
-    tools.push(remember_tool(
-        "directory",
-        "Discover globally-shared resources by kind. action=read with kind='identities' lists books on the Hive shelf; kind='user_journals' lists books on the User Journals shelf. The calling user's BookStack permissions filter what is visible.",
-        &["read"],
-        json!({
-            "kind": { "type": "string", "enum": ["identities", "user_journals"], "description": "Which global shelf to enumerate" },
-        }),
-    ));
-
-    // Migrate (Phase 7 v1.0.0 chapter restructure)
-    tools.push(remember_tool(
-        "migrate",
-        "Migrate an AI identity from the legacy book layout to the v1.0.0 chapter structure. action=plan dry-runs and returns the proposed steps. action=apply executes the plan: scaffolds Agents/Journal chapters, moves loose Agent: pages into the Agents chapter, moves legacy journal book pages into the Journal chapter, runs the year-rollover sweep, and clears the legacy ai_hive_journal_book_id pointer. Idempotent — safe to re-run after partial failures. action=status returns a per-check breakdown of whether the identity is fully migrated.",
-        &["plan", "apply", "status"],
-        json!({}),
-    ));
 }
 
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {
@@ -2175,4 +2770,228 @@ fn update_schema(id_name: &str, fields: &[&str]) -> Value {
         "properties": props,
         "required": [id_name]
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bsmcp_common::settings::{GlobalSettings, UserSettings};
+
+    fn names_of(tools: &[Value]) -> Vec<String> {
+        tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|v| v.as_str()).map(String::from))
+            .collect()
+    }
+
+    #[test]
+    fn all_tool_names_matches_definitions() {
+        let names = all_tool_names();
+        let from_defs = names_of(&tool_definitions(true));
+        assert_eq!(names, from_defs, "all_tool_names diverged from tool_definitions");
+        assert!(names.contains(&"search_content".to_string()));
+        assert!(names.contains(&"briefing".to_string()));
+        assert!(!names.is_empty());
+    }
+
+    #[test]
+    fn filter_keeps_everything_when_settings_empty() {
+        let tools = tool_definitions(false);
+        let user = UserSettings::default();
+        let global = GlobalSettings::default();
+        let filtered = filter_tools_by_enabled(tools.clone(), &user, &global);
+        assert_eq!(names_of(&tools), names_of(&filtered));
+    }
+
+    #[test]
+    fn filter_drops_globally_disabled_tools() {
+        let tools = tool_definitions(false);
+        let user = UserSettings::default();
+        let mut global = GlobalSettings::default();
+        global.tool_defaults.insert("search_content".to_string(), false);
+        let filtered = filter_tools_by_enabled(tools, &user, &global);
+        let names = names_of(&filtered);
+        assert!(!names.contains(&"search_content".to_string()));
+        // Other tools survive.
+        assert!(names.contains(&"list_books".to_string()));
+    }
+
+    #[test]
+    fn filter_user_override_on_keeps_globally_disabled_tool() {
+        let tools = tool_definitions(false);
+        let mut user = UserSettings::default();
+        user.tool_overrides.insert("search_content".to_string(), true);
+        let mut global = GlobalSettings::default();
+        global.tool_defaults.insert("search_content".to_string(), false);
+        let filtered = filter_tools_by_enabled(tools, &user, &global);
+        let names = names_of(&filtered);
+        assert!(
+            names.contains(&"search_content".to_string()),
+            "user override should override global"
+        );
+    }
+
+    #[test]
+    fn filter_user_override_off_drops_default_on_tool() {
+        let tools = tool_definitions(false);
+        let mut user = UserSettings::default();
+        user.tool_overrides.insert("list_books".to_string(), false);
+        let global = GlobalSettings::default();
+        let filtered = filter_tools_by_enabled(tools, &user, &global);
+        let names = names_of(&filtered);
+        assert!(
+            !names.contains(&"list_books".to_string()),
+            "user opt-out should suppress the tool"
+        );
+    }
+
+    #[test]
+    fn tool_disabled_error_is_structured_json_with_code() {
+        let s = tool_disabled_error("journal");
+        let v: Value = serde_json::from_str(&s).expect("valid JSON");
+        assert_eq!(
+            v["error"]["code"].as_str(),
+            Some("tool_disabled"),
+            "expected tool_disabled code, got {v}"
+        );
+        assert!(
+            v["error"]["message"].as_str().unwrap_or("").contains("journal"),
+            "message should mention the tool name"
+        );
+    }
+
+    // --- Onboarding (Phase 2.4e) ---
+
+    #[test]
+    fn parse_onboarding_env_absent_defaults_on() {
+        assert!(parse_onboarding_env(None));
+    }
+
+    #[test]
+    fn parse_onboarding_env_truthy_values() {
+        for v in ["1", "yes", "true", "on", "TRUE", "  yes  ", "anything"] {
+            assert!(
+                parse_onboarding_env(Some(v)),
+                "expected {v:?} to parse as on"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_onboarding_env_falsy_values() {
+        for v in ["0", "no", "false", "off", "FALSE", "  Off  "] {
+            assert!(
+                !parse_onboarding_env(Some(v)),
+                "expected {v:?} to parse as off"
+            );
+        }
+    }
+
+    #[test]
+    fn is_onboarding_visible_matrix() {
+        // env on + setup not complete → visible
+        assert!(is_onboarding_visible(true, false));
+        // env on + setup complete → hidden (user finished the wizard)
+        assert!(!is_onboarding_visible(true, true));
+        // env off + setup not complete → hidden (operator killed the surface)
+        assert!(!is_onboarding_visible(false, false));
+        // env off + setup complete → hidden (both reasons)
+        assert!(!is_onboarding_visible(false, true));
+    }
+
+    /// Composition test mirroring the conditional in `build_response_meta`:
+    /// the same is-visible predicate the meta builder uses gates whether
+    /// the payload appears at all. This keeps the helper + the call-site
+    /// in lock-step without standing up the full async dependency graph
+    /// (db, client, semantic, session_store) just to assert the field's
+    /// presence.
+    #[test]
+    fn meta_onboarding_pending_shape_matches_visibility_helper() {
+        // Visible: env on + setup not complete → field present, full shape.
+        let visible = is_onboarding_visible(true, false);
+        assert!(visible);
+        let payload = build_onboarding_pending_meta();
+        assert!(payload.get("message").is_some(), "message field present");
+        assert!(payload.get("url").is_some(), "url field present");
+
+        // Hidden: setup complete → meta builder skips the injection entirely
+        // (no payload built). We assert at the predicate level since the
+        // payload itself is unconditional (it's the *visibility* that gates).
+        assert!(!is_onboarding_visible(true, true));
+        assert!(!is_onboarding_visible(false, false));
+        assert!(!is_onboarding_visible(false, true));
+    }
+
+    /// All env-touching `BSMCP_PUBLIC_DOMAIN` cases live in one test so
+    /// `cargo test` doesn't race them against each other when running the
+    /// in-process tests in parallel. We capture+restore the ambient value
+    /// at the boundaries so we don't pollute the test binary's env across
+    /// modules. Covers BOTH `build_onboarding_pending_meta` (user) and
+    /// `build_admin_onboarding_pending_meta` (admin) so any divergence
+    /// between the two URL paths surfaces here.
+    #[test]
+    fn build_onboarding_pending_meta_url_cases() {
+        let prev = std::env::var("BSMCP_PUBLIC_DOMAIN").ok();
+
+        // 1. Domain set → absolute https URL.
+        std::env::set_var("BSMCP_PUBLIC_DOMAIN", "mcp.example.com");
+        let payload = build_onboarding_pending_meta();
+        assert_eq!(
+            payload["url"].as_str(),
+            Some("https://mcp.example.com/setup/user")
+        );
+        assert!(payload["message"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("Welcome"));
+        // Admin variant.
+        let admin_payload = build_admin_onboarding_pending_meta();
+        assert_eq!(
+            admin_payload["url"].as_str(),
+            Some("https://mcp.example.com/setup/admin")
+        );
+        assert!(admin_payload["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("admin setup"));
+
+        // 2. Trailing slash collapsed.
+        std::env::set_var("BSMCP_PUBLIC_DOMAIN", "mcp.example.com/");
+        assert_eq!(
+            build_onboarding_pending_meta()["url"].as_str(),
+            Some("https://mcp.example.com/setup/user")
+        );
+        assert_eq!(
+            build_admin_onboarding_pending_meta()["url"].as_str(),
+            Some("https://mcp.example.com/setup/admin")
+        );
+
+        // 3. Blank/whitespace → relative fallback.
+        std::env::set_var("BSMCP_PUBLIC_DOMAIN", "   ");
+        assert_eq!(
+            build_onboarding_pending_meta()["url"].as_str(),
+            Some("/setup/user")
+        );
+        assert_eq!(
+            build_admin_onboarding_pending_meta()["url"].as_str(),
+            Some("/setup/admin")
+        );
+
+        // 4. Unset → relative fallback.
+        std::env::remove_var("BSMCP_PUBLIC_DOMAIN");
+        assert_eq!(
+            build_onboarding_pending_meta()["url"].as_str(),
+            Some("/setup/user")
+        );
+        assert_eq!(
+            build_admin_onboarding_pending_meta()["url"].as_str(),
+            Some("/setup/admin")
+        );
+
+        // Restore.
+        match prev {
+            Some(v) => std::env::set_var("BSMCP_PUBLIC_DOMAIN", v),
+            None => std::env::remove_var("BSMCP_PUBLIC_DOMAIN"),
+        }
+    }
 }

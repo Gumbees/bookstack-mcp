@@ -12,9 +12,9 @@ use sqlx::{PgPool, Row};
 use zeroize::Zeroizing;
 
 use bsmcp_common::config::{access_token_ttl, refresh_token_ttl};
-use bsmcp_common::db::{DbBackend, IndexDb, SemanticDb};
+use bsmcp_common::db::{stable_id_for, DbBackend, IndexDb, SemanticDb, TokenBinding};
 use bsmcp_common::index::*;
-use bsmcp_common::settings::{GlobalSettings, UserSettings};
+use bsmcp_common::settings::{GlobalSettings, UserSettings, DEFAULT_ACCOUNT_LABEL};
 use bsmcp_common::types::*;
 
 const BASE64: base64::engine::general_purpose::GeneralPurpose =
@@ -39,6 +39,31 @@ fn decode_str_list(value: Option<String>) -> Vec<String> {
     match value {
         Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_default(),
         _ => Vec::new(),
+    }
+}
+
+fn encode_kb_scope(scope: Option<&bsmcp_common::settings::KbScope>) -> Option<String> {
+    scope.and_then(|s| serde_json::to_string(s).ok())
+}
+
+fn decode_kb_scope(value: Option<String>) -> Option<bsmcp_common::settings::KbScope> {
+    match value {
+        Some(s) if !s.is_empty() => serde_json::from_str(&s).ok(),
+        _ => None,
+    }
+}
+
+/// Encode a HashMap<String, bool> as a JSON object string. Returns None
+/// when the map is empty so the column round-trips as NULL — matches the
+/// `org_domains` / `policies_scope` pattern.
+fn encode_bool_map(map: &std::collections::HashMap<String, bool>) -> Option<String> {
+    if map.is_empty() { None } else { serde_json::to_string(map).ok() }
+}
+
+fn decode_bool_map(value: Option<String>) -> std::collections::HashMap<String, bool> {
+    match value {
+        Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_default(),
+        _ => std::collections::HashMap::new(),
     }
 }
 
@@ -97,7 +122,7 @@ impl PostgresDb {
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS user_settings (
-                token_id_hash TEXT PRIMARY KEY,
+                stable_id TEXT PRIMARY KEY,
                 settings_json TEXT NOT NULL,
                 updated_at BIGINT NOT NULL
             )"
@@ -106,45 +131,51 @@ impl PostgresDb {
         .await
         .map_err(|e| format!("Failed to create user_settings table: {e}"))?;
 
+        // token_bindings: token_id_hash -> stable identity. The
+        // user_settings row lives at the bound stable_id, so when a
+        // BookStack API token rotates the user attaches the new token's
+        // binding to the same stable_id via /setup/user and keeps every
+        // saved setting.
         sqlx::query(
-            "CREATE TABLE IF NOT EXISTS remember_audit (
-                id BIGSERIAL PRIMARY KEY,
-                token_id_hash TEXT NOT NULL,
-                ai_identity_ouid TEXT,
-                user_id TEXT,
-                resource TEXT NOT NULL,
-                action TEXT NOT NULL,
-                target_page_id BIGINT,
-                target_key TEXT,
-                success BOOLEAN NOT NULL,
-                error TEXT,
-                trace_id TEXT,
-                occurred_at BIGINT NOT NULL
+            "CREATE TABLE IF NOT EXISTS token_bindings (
+                token_id_hash TEXT PRIMARY KEY,
+                bookstack_user_id BIGINT NOT NULL,
+                account_label TEXT NOT NULL DEFAULT 'default',
+                created_at BIGINT NOT NULL
             )"
         )
         .execute(&pool)
         .await
-        .map_err(|e| format!("Failed to create remember_audit table: {e}"))?;
+        .map_err(|e| format!("Failed to create token_bindings table: {e}"))?;
 
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_user_time ON remember_audit(token_id_hash, occurred_at DESC)")
-            .execute(&pool).await.ok();
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_resource_time ON remember_audit(resource, occurred_at DESC)")
-            .execute(&pool).await.ok();
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_token_bindings_user
+             ON token_bindings(bookstack_user_id)"
+        )
+        .execute(&pool)
+        .await
+        .ok();
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS global_settings (
                 id INT PRIMARY KEY CHECK (id = 1),
                 hive_shelf_id BIGINT,
                 user_journals_shelf_id BIGINT,
-                default_ai_identity_page_id BIGINT,
-                default_ai_identity_name TEXT,
-                default_ai_identity_ouid TEXT,
                 org_required_instructions_page_ids TEXT,
                 org_ai_usage_policy_page_ids TEXT,
                 org_identity_page_id BIGINT,
                 org_domains TEXT,
                 set_by_token_hash TEXT,
-                updated_at BIGINT NOT NULL DEFAULT 0
+                updated_at BIGINT NOT NULL DEFAULT 0,
+                guide_page_id BIGINT,
+                policies_scope TEXT,
+                sops_scope TEXT,
+                best_practices_scope TEXT,
+                friendly_structure BOOLEAN NOT NULL DEFAULT TRUE,
+                full_content_in_briefing BOOLEAN NOT NULL DEFAULT FALSE,
+                strict_setup BOOLEAN NOT NULL DEFAULT FALSE,
+                tool_defaults TEXT,
+                admin_setup_complete BOOLEAN NOT NULL DEFAULT FALSE
             )"
         )
         .execute(&pool)
@@ -152,23 +183,158 @@ impl PostgresDb {
         .map_err(|e| format!("Failed to create global_settings table: {e}"))?;
 
         // Migrations for older deployments — ADD COLUMN IF NOT EXISTS is supported in PG 9.6+.
-        // org_*_chapter_ids columns were briefly added during this PR's development and
-        // then dropped in favour of page-IDs-only — leaving any existing columns in place
-        // is harmless since we no longer read or write them.
         for sql in [
-            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS default_ai_identity_page_id BIGINT",
-            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS default_ai_identity_name TEXT",
-            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS default_ai_identity_ouid TEXT",
             "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS org_required_instructions_page_ids TEXT",
             "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS org_ai_usage_policy_page_ids TEXT",
             "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS org_identity_page_id BIGINT",
             "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS org_domains TEXT",
+            // v0.8.0 typed slots + org-wide booleans.
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS guide_page_id BIGINT",
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS policies_scope TEXT",
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS sops_scope TEXT",
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS best_practices_scope TEXT",
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS friendly_structure BOOLEAN NOT NULL DEFAULT TRUE",
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS full_content_in_briefing BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS strict_setup BOOLEAN NOT NULL DEFAULT FALSE",
+            // Phase 2.4d — per-tool admin defaults. Stored as JSON text
+            // (HashMap<String, bool>); empty / NULL decodes to an empty
+            // map. Same pattern as `org_domains`.
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS tool_defaults TEXT",
+            // Phase 2.4f — admin onboarding "run once" flag. Single bit.
+            // FALSE = not yet completed, TRUE = some admin has finished
+            // /setup/admin.
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS admin_setup_complete BOOLEAN NOT NULL DEFAULT FALSE",
+        ] {
+            sqlx::query(sql).execute(&pool).await.ok();
+        }
+
+        // v0.8.0 cleanup migrations — fully idempotent via IF EXISTS.
+        for sql in [
+            // remember_audit + indexes — fully retired in v0.8.0; no consumers.
+            "DROP TABLE IF EXISTS remember_audit CASCADE",
+            // default_ai_identity_* — orphaned when the personal-memory
+            // layer moved to memberberry.ai. Drop, don't preserve.
+            "ALTER TABLE global_settings DROP COLUMN IF EXISTS default_ai_identity_page_id",
+            "ALTER TABLE global_settings DROP COLUMN IF EXISTS default_ai_identity_name",
+            "ALTER TABLE global_settings DROP COLUMN IF EXISTS default_ai_identity_ouid",
         ] {
             sqlx::query(sql).execute(&pool).await.ok();
         }
 
         sqlx::query("INSERT INTO global_settings (id, updated_at) VALUES (1, 0) ON CONFLICT (id) DO NOTHING")
             .execute(&pool).await.ok();
+
+        // Rekey user_settings from token_id_hash PK to stable_id PK.
+        // Idempotent — checks information_schema.columns and only runs
+        // when the old shape is present. Fresh installs land on the new
+        // shape via CREATE TABLE above and skip this block.
+        //
+        // Wrapped in a single transaction; a crash mid-migration leaves
+        // the legacy table intact for retry.
+        let needs_rekey: Option<(i64,)> = sqlx::query_as::<_, (i64,)>(
+            "SELECT 1::BIGINT FROM information_schema.columns
+             WHERE table_name = 'user_settings'
+               AND column_name = 'token_id_hash'
+             LIMIT 1"
+        )
+        .fetch_optional(&pool)
+        .await
+        .ok()
+        .flatten();
+
+        if needs_rekey.is_some() {
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(|e| format!("Failed to start user_settings rekey transaction: {e}"))?;
+
+            sqlx::query("ALTER TABLE user_settings RENAME TO user_settings_legacy_token_keyed")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| format!("Failed to rename legacy user_settings: {e}"))?;
+
+            sqlx::query(
+                "CREATE TABLE user_settings (
+                    stable_id TEXT PRIMARY KEY,
+                    settings_json TEXT NOT NULL,
+                    updated_at BIGINT NOT NULL
+                )"
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("Failed to create new user_settings: {e}"))?;
+
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+
+            let legacy: Vec<(String, String, i64)> = sqlx::query_as(
+                "SELECT token_id_hash, settings_json, updated_at
+                 FROM user_settings_legacy_token_keyed"
+            )
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| format!("Failed to fetch legacy user_settings rows: {e}"))?;
+
+            for (token_id_hash, settings_json, updated_at) in legacy {
+                let parsed: serde_json::Value = match serde_json::from_str(&settings_json) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let bookstack_user_id = match parsed
+                    .get("bookstack_user_id")
+                    .and_then(|v| v.as_i64())
+                {
+                    Some(id) => id,
+                    None => continue,
+                };
+                let account_label = parsed
+                    .get("account_label")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| DEFAULT_ACCOUNT_LABEL.to_string());
+                let stable_id = stable_id_for(bookstack_user_id, &account_label);
+
+                sqlx::query(
+                    "INSERT INTO user_settings (stable_id, settings_json, updated_at)
+                     VALUES ($1, $2, $3)
+                     ON CONFLICT (stable_id) DO UPDATE SET
+                        settings_json = EXCLUDED.settings_json,
+                        updated_at = EXCLUDED.updated_at
+                     WHERE EXCLUDED.updated_at > user_settings.updated_at"
+                )
+                .bind(&stable_id)
+                .bind(&settings_json)
+                .bind(updated_at)
+                .execute(&mut *tx)
+                .await
+                .ok();
+
+                sqlx::query(
+                    "INSERT INTO token_bindings
+                        (token_id_hash, bookstack_user_id, account_label, created_at)
+                     VALUES ($1, $2, $3, $4)
+                     ON CONFLICT (token_id_hash) DO NOTHING"
+                )
+                .bind(&token_id_hash)
+                .bind(bookstack_user_id)
+                .bind(&account_label)
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .ok();
+            }
+
+            sqlx::query("DROP TABLE user_settings_legacy_token_keyed")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| format!("Failed to drop legacy user_settings table: {e}"))?;
+
+            tx.commit()
+                .await
+                .map_err(|e| format!("Failed to commit user_settings rekey: {e}"))?;
+        }
 
         // v1.0.0 — DB-as-index schema. Mirror of every BookStack content item
         // we care about. Phase 3 ships the schema only; the reconciliation
@@ -255,9 +421,19 @@ impl PostgresDb {
                 finished_at BIGINT,
                 progress BIGINT NOT NULL DEFAULT 0,
                 total BIGINT NOT NULL DEFAULT 0,
-                error TEXT
+                error TEXT,
+                resolved_status TEXT,
+                prev_status TEXT,
+                resolved_at BIGINT,
+                retry_of BIGINT
             )",
             "CREATE INDEX IF NOT EXISTS idx_index_jobs_pending ON index_jobs(status) WHERE status = 'pending'",
+            "ALTER TABLE index_jobs ADD COLUMN IF NOT EXISTS resolved_status TEXT",
+            "ALTER TABLE index_jobs ADD COLUMN IF NOT EXISTS prev_status TEXT",
+            "ALTER TABLE index_jobs ADD COLUMN IF NOT EXISTS resolved_at BIGINT",
+            "ALTER TABLE index_jobs ADD COLUMN IF NOT EXISTS retry_of BIGINT",
+            "UPDATE index_jobs SET status = 'failed' \
+             WHERE status = 'error' AND resolved_status IS NULL",
             // Singleton bookkeeping for the indexer (last_full_walk_at,
             // last_delta_walk_at, etc.).
             "CREATE TABLE IF NOT EXISTS index_meta (
@@ -477,14 +653,79 @@ impl DbBackend for PostgresDb {
         Ok(())
     }
 
-    async fn get_user_settings(&self, token_id_hash: &str) -> Result<Option<UserSettings>, String> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT settings_json FROM user_settings WHERE token_id_hash = $1"
+    async fn get_token_binding(&self, token_id_hash: &str)
+        -> Result<Option<TokenBinding>, String>
+    {
+        let row: Option<(i64, String, i64)> = sqlx::query_as(
+            "SELECT bookstack_user_id, account_label, created_at
+             FROM token_bindings WHERE token_id_hash = $1"
         )
         .bind(token_id_hash)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| format!("get_user_settings: {e}"))?;
+        .map_err(|e| format!("get_token_binding: {e}"))?;
+
+        Ok(row.map(|(bookstack_user_id, account_label, created_at)| TokenBinding {
+            token_id_hash: token_id_hash.to_string(),
+            bookstack_user_id,
+            account_label,
+            created_at,
+        }))
+    }
+
+    async fn set_token_binding(&self, binding: &TokenBinding) -> Result<(), String> {
+        sqlx::query(
+            "INSERT INTO token_bindings
+                (token_id_hash, bookstack_user_id, account_label, created_at)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (token_id_hash) DO UPDATE SET
+                bookstack_user_id = EXCLUDED.bookstack_user_id,
+                account_label = EXCLUDED.account_label"
+        )
+        .bind(&binding.token_id_hash)
+        .bind(binding.bookstack_user_id)
+        .bind(&binding.account_label)
+        .bind(binding.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("set_token_binding: {e}"))?;
+        Ok(())
+    }
+
+    async fn delete_token_binding(&self, token_id_hash: &str) -> Result<(), String> {
+        sqlx::query("DELETE FROM token_bindings WHERE token_id_hash = $1")
+            .bind(token_id_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("delete_token_binding: {e}"))?;
+        Ok(())
+    }
+
+    async fn list_account_labels_for_user(&self, bookstack_user_id: i64)
+        -> Result<Vec<String>, String>
+    {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT account_label FROM token_bindings
+             WHERE bookstack_user_id = $1
+             ORDER BY account_label"
+        )
+        .bind(bookstack_user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_account_labels_for_user: {e}"))?;
+        Ok(rows.into_iter().map(|(s,)| s).collect())
+    }
+
+    async fn get_user_settings_by_stable_id(&self, stable_id: &str)
+        -> Result<Option<UserSettings>, String>
+    {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT settings_json FROM user_settings WHERE stable_id = $1"
+        )
+        .bind(stable_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("get_user_settings_by_stable_id: {e}"))?;
 
         match row {
             Some((json,)) => serde_json::from_str(&json)
@@ -494,58 +735,64 @@ impl DbBackend for PostgresDb {
         }
     }
 
-    async fn save_user_settings(&self, token_id_hash: &str, settings: &UserSettings) -> Result<(), String> {
+    async fn save_user_settings_by_stable_id(
+        &self,
+        stable_id: &str,
+        settings: &UserSettings,
+    ) -> Result<(), String> {
         let json = serde_json::to_string(settings)
             .map_err(|e| format!("user_settings serialize: {e}"))?;
         sqlx::query(
-            "INSERT INTO user_settings (token_id_hash, settings_json, updated_at)
+            "INSERT INTO user_settings (stable_id, settings_json, updated_at)
              VALUES ($1, $2, $3)
-             ON CONFLICT (token_id_hash) DO UPDATE SET
+             ON CONFLICT (stable_id) DO UPDATE SET
                 settings_json = EXCLUDED.settings_json,
                 updated_at = EXCLUDED.updated_at"
         )
-        .bind(token_id_hash)
+        .bind(stable_id)
         .bind(&json)
         .bind(Self::now_secs())
         .execute(&self.pool)
         .await
-        .map_err(|e| format!("save_user_settings: {e}"))?;
+        .map_err(|e| format!("save_user_settings_by_stable_id: {e}"))?;
         Ok(())
     }
 
-    async fn insert_audit_entry(&self, entry: &AuditEntryInsert) -> Result<i64, String> {
-        let row = sqlx::query(
-            "INSERT INTO remember_audit
-                (token_id_hash, ai_identity_ouid, user_id, resource, action,
-                 target_page_id, target_key, success, error, trace_id, occurred_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-             RETURNING id"
-        )
-        .bind(&entry.token_id_hash)
-        .bind(&entry.ai_identity_ouid)
-        .bind(&entry.user_id)
-        .bind(&entry.resource)
-        .bind(&entry.action)
-        .bind(entry.target_page_id)
-        .bind(&entry.target_key)
-        .bind(entry.success)
-        .bind(&entry.error)
-        .bind(&entry.trace_id)
-        .bind(Self::now_secs())
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| format!("insert_audit_entry: {e}"))?;
-        Ok(row.get("id"))
+    async fn get_user_settings(&self, token_id_hash: &str)
+        -> Result<Option<UserSettings>, String>
+    {
+        match self.get_token_binding(token_id_hash).await? {
+            Some(binding) => self
+                .get_user_settings_by_stable_id(&binding.stable_id())
+                .await,
+            None => Ok(None),
+        }
+    }
+
+    async fn save_user_settings(&self, token_id_hash: &str, settings: &UserSettings)
+        -> Result<(), String>
+    {
+        match self.get_token_binding(token_id_hash).await? {
+            Some(binding) => self
+                .save_user_settings_by_stable_id(&binding.stable_id(), settings)
+                .await,
+            None => Err(format!(
+                "save_user_settings: no token binding for token_id_hash; \
+                 call set_token_binding before save"
+            )),
+        }
     }
 
     async fn get_global_settings(&self) -> Result<GlobalSettings, String> {
         let row = sqlx::query(
             "SELECT hive_shelf_id, user_journals_shelf_id,
-                    default_ai_identity_page_id, default_ai_identity_name, default_ai_identity_ouid,
                     org_required_instructions_page_ids,
                     org_ai_usage_policy_page_ids,
                     org_identity_page_id, org_domains,
-                    set_by_token_hash, updated_at
+                    set_by_token_hash, updated_at,
+                    guide_page_id, policies_scope, sops_scope, best_practices_scope,
+                    friendly_structure, full_content_in_briefing, strict_setup,
+                    tool_defaults, admin_setup_complete
              FROM global_settings WHERE id = 1"
         )
         .fetch_optional(&self.pool)
@@ -555,15 +802,21 @@ impl DbBackend for PostgresDb {
         Ok(row.map(|r| GlobalSettings {
             hive_shelf_id: r.get("hive_shelf_id"),
             user_journals_shelf_id: r.get("user_journals_shelf_id"),
-            default_ai_identity_page_id: r.get("default_ai_identity_page_id"),
-            default_ai_identity_name: r.get("default_ai_identity_name"),
-            default_ai_identity_ouid: r.get("default_ai_identity_ouid"),
             org_required_instructions_page_ids: decode_id_list(r.get("org_required_instructions_page_ids")),
             org_ai_usage_policy_page_ids: decode_id_list(r.get("org_ai_usage_policy_page_ids")),
             org_identity_page_id: r.get("org_identity_page_id"),
             org_domains: decode_str_list(r.get("org_domains")),
             set_by_token_hash: r.get("set_by_token_hash"),
             updated_at: r.get("updated_at"),
+            guide_page_id: r.get("guide_page_id"),
+            policies_scope: decode_kb_scope(r.get("policies_scope")),
+            sops_scope: decode_kb_scope(r.get("sops_scope")),
+            best_practices_scope: decode_kb_scope(r.get("best_practices_scope")),
+            friendly_structure: r.get("friendly_structure"),
+            full_content_in_briefing: r.get("full_content_in_briefing"),
+            strict_setup: r.get("strict_setup"),
+            tool_defaults: decode_bool_map(r.get("tool_defaults")),
+            admin_setup_complete: r.get("admin_setup_complete"),
         }).unwrap_or_default())
     }
 
@@ -585,72 +838,46 @@ impl DbBackend for PostgresDb {
             "UPDATE global_settings
              SET hive_shelf_id = $1,
                  user_journals_shelf_id = $2,
-                 default_ai_identity_page_id = $3,
-                 default_ai_identity_name = $4,
-                 default_ai_identity_ouid = $5,
-                 org_required_instructions_page_ids = $6,
-                 org_ai_usage_policy_page_ids = $7,
-                 org_identity_page_id = $8,
-                 org_domains = $9,
-                 set_by_token_hash = $10,
-                 updated_at = $11
+                 org_required_instructions_page_ids = $3,
+                 org_ai_usage_policy_page_ids = $4,
+                 org_identity_page_id = $5,
+                 org_domains = $6,
+                 set_by_token_hash = $7,
+                 updated_at = $8,
+                 guide_page_id = $9,
+                 policies_scope = $10,
+                 sops_scope = $11,
+                 best_practices_scope = $12,
+                 friendly_structure = $13,
+                 full_content_in_briefing = $14,
+                 strict_setup = $15,
+                 tool_defaults = $16,
+                 admin_setup_complete = $17
              WHERE id = 1"
         )
         .bind(settings.hive_shelf_id)
         .bind(settings.user_journals_shelf_id)
-        .bind(settings.default_ai_identity_page_id)
-        .bind(&settings.default_ai_identity_name)
-        .bind(&settings.default_ai_identity_ouid)
         .bind(encode_id_list(&settings.org_required_instructions_page_ids))
         .bind(encode_id_list(&settings.org_ai_usage_policy_page_ids))
         .bind(settings.org_identity_page_id)
         .bind(encode_str_list(&settings.org_domains))
         .bind(&final_setter)
         .bind(Self::now_secs())
+        .bind(settings.guide_page_id)
+        .bind(encode_kb_scope(settings.policies_scope.as_ref()))
+        .bind(encode_kb_scope(settings.sops_scope.as_ref()))
+        .bind(encode_kb_scope(settings.best_practices_scope.as_ref()))
+        .bind(settings.friendly_structure)
+        .bind(settings.full_content_in_briefing)
+        .bind(settings.strict_setup)
+        .bind(encode_bool_map(&settings.tool_defaults))
+        .bind(settings.admin_setup_complete)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("save_global_settings: {e}"))?;
         Ok(())
     }
 
-    async fn list_audit_entries(
-        &self,
-        token_id_hash: &str,
-        limit: i64,
-        offset: i64,
-        since_unix: Option<i64>,
-    ) -> Result<Vec<AuditEntry>, String> {
-        let rows = sqlx::query(
-            "SELECT id, token_id_hash, ai_identity_ouid, user_id, resource, action,
-                    target_page_id, target_key, success, error, trace_id, occurred_at
-             FROM remember_audit
-             WHERE token_id_hash = $1 AND occurred_at >= $2
-             ORDER BY occurred_at DESC
-             LIMIT $3 OFFSET $4"
-        )
-        .bind(token_id_hash)
-        .bind(since_unix.unwrap_or(0))
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| format!("list_audit_entries: {e}"))?;
-
-        Ok(rows.iter().map(|r| AuditEntry {
-            id: r.get("id"),
-            token_id_hash: r.get("token_id_hash"),
-            ai_identity_ouid: r.get("ai_identity_ouid"),
-            user_id: r.get("user_id"),
-            resource: r.get("resource"),
-            action: r.get("action"),
-            target_page_id: r.get("target_page_id"),
-            target_key: r.get("target_key"),
-            success: r.get("success"),
-            error: r.get("error"),
-            trace_id: r.get("trace_id"),
-            occurred_at: r.get("occurred_at"),
-        }).collect())
-    }
 }
 
 #[async_trait]
@@ -691,7 +918,11 @@ impl SemanticDb for PostgresDb {
                 started_at BIGINT,
                 finished_at BIGINT,
                 error TEXT,
-                worker_id TEXT
+                worker_id TEXT,
+                resolved_status TEXT,
+                prev_status TEXT,
+                resolved_at BIGINT,
+                retry_of BIGINT
             )",
         ];
         for sql in statements {
@@ -710,6 +941,20 @@ impl SemanticDb for PostgresDb {
         // Migration: add worker_id column if missing (existing databases)
         sqlx::query("ALTER TABLE embed_jobs ADD COLUMN IF NOT EXISTS worker_id TEXT")
             .execute(&self.pool).await.ok();
+
+        // Issue #54 — job lifecycle columns.
+        for sql in [
+            "ALTER TABLE embed_jobs ADD COLUMN IF NOT EXISTS resolved_status TEXT",
+            "ALTER TABLE embed_jobs ADD COLUMN IF NOT EXISTS prev_status TEXT",
+            "ALTER TABLE embed_jobs ADD COLUMN IF NOT EXISTS resolved_at BIGINT",
+            "ALTER TABLE embed_jobs ADD COLUMN IF NOT EXISTS retry_of BIGINT",
+            // Migrate v0.7.x rows that used 'error' as the failed sentinel.
+            // resolved_status stays NULL so the reconciler picks them up.
+            "UPDATE embed_jobs SET status = 'failed' \
+             WHERE status = 'error' AND resolved_status IS NULL",
+        ] {
+            sqlx::query(sql).execute(&self.pool).await.ok();
+        }
 
         // Metadata key-value store (v0.5.0+)
         sqlx::query("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
@@ -1045,8 +1290,15 @@ impl SemanticDb for PostgresDb {
         let mut tx = self.pool.begin().await
             .map_err(|e| format!("create_embed_job transaction failed: {e}"))?;
 
+        // Dedup: pending/running collapse onto the existing job. Failed jobs
+        // not yet touched by the reconciler also count as active so a webhook
+        // firing mid-retry-window doesn't double-enqueue.
         let existing = sqlx::query(
-            "SELECT id FROM embed_jobs WHERE scope = $1 AND status IN ('pending', 'running') ORDER BY id DESC LIMIT 1 FOR UPDATE"
+            "SELECT id FROM embed_jobs \
+             WHERE scope = $1 \
+               AND (status IN ('pending', 'running') \
+                    OR (status = 'failed' AND resolved_status IS NULL)) \
+             ORDER BY id DESC LIMIT 1 FOR UPDATE"
         )
         .bind(scope)
         .fetch_optional(&mut *tx)
@@ -1074,12 +1326,14 @@ impl SemanticDb for PostgresDb {
     async fn claim_next_job(&self, worker_id: &str) -> Result<Option<EmbedJob>, String> {
         // FOR UPDATE SKIP LOCKED enables concurrent embedder workers
         let row = sqlx::query(
-            "UPDATE embed_jobs SET status = 'running', started_at = $1, worker_id = $2
-             WHERE id = (
-                SELECT id FROM embed_jobs WHERE status = 'pending'
-                ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED
-             )
-             RETURNING id, scope, status, total_pages, done_pages, started_at, finished_at, error, worker_id"
+            &format!(
+                "UPDATE embed_jobs SET status = 'running', started_at = $1, worker_id = $2 \
+                 WHERE id = ( \
+                    SELECT id FROM embed_jobs WHERE status = 'pending' \
+                    ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED \
+                 ) \
+                 RETURNING {EMBED_JOB_COLS}"
+            )
         )
         .bind(Self::now_secs())
         .bind(worker_id)
@@ -1087,83 +1341,42 @@ impl SemanticDb for PostgresDb {
         .await
         .map_err(|e| format!("claim_next_job failed: {e}"))?;
 
-        Ok(row.map(|r| EmbedJob {
-            id: r.get("id"),
-            scope: r.get("scope"),
-            status: r.get("status"),
-            total_pages: r.get("total_pages"),
-            done_pages: r.get("done_pages"),
-            started_at: r.get("started_at"),
-            finished_at: r.get("finished_at"),
-            error: r.get("error"),
-            worker_id: r.get("worker_id"),
-        }))
+        Ok(row.map(embed_job_from_row))
     }
 
     async fn recover_worker_jobs(&self, worker_id: &str) -> Result<usize, String> {
-        // Mark duplicate-scope orphans as superseded (keep only the newest per scope)
-        let superseded = sqlx::query(
-            "UPDATE embed_jobs SET status = 'error', finished_at = $1, error = 'superseded'
-             WHERE status = 'running' AND (worker_id = $2 OR worker_id IS NULL)
-               AND EXISTS (
-                   SELECT 1 FROM embed_jobs e2
-                   WHERE e2.scope = embed_jobs.scope AND e2.id > embed_jobs.id
-                     AND e2.status = 'running' AND (e2.worker_id = $2 OR e2.worker_id IS NULL)
-               )"
+        // Process restart: jobs left running by this worker (or orphans
+        // pre-0.3.1) flip to failed-open. resolved_status stays NULL so the
+        // reconciler picks them up.
+        let failed = sqlx::query(
+            "UPDATE embed_jobs \
+             SET status = 'failed', finished_at = $1, error = 'worker_restart' \
+             WHERE status = 'running' AND (worker_id = $2 OR worker_id IS NULL)"
         )
         .bind(Self::now_secs())
         .bind(worker_id)
         .execute(&self.pool)
         .await
-        .map_err(|e| format!("recover_worker_jobs (supersede) failed: {e}"))?
+        .map_err(|e| format!("recover_worker_jobs failed: {e}"))?
         .rows_affected() as usize;
 
-        // Reset remaining jobs owned by this worker or orphaned from pre-0.3.1
-        let reset = sqlx::query(
-            "UPDATE embed_jobs SET status = 'pending', started_at = NULL, worker_id = NULL
-             WHERE status = 'running' AND (worker_id = $1 OR worker_id IS NULL)"
-        )
-        .bind(worker_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("recover_worker_jobs (reset) failed: {e}"))?
-        .rows_affected() as usize;
-
-        Ok(superseded + reset)
+        Ok(failed)
     }
 
     async fn expire_stale_jobs(&self, stale_secs: i64) -> Result<usize, String> {
         let cutoff = Self::now_secs() - stale_secs;
-
-        // Supersede stale jobs that have a newer job with the same scope
-        let superseded = sqlx::query(
-            "UPDATE embed_jobs SET status = 'error', finished_at = $1, error = 'superseded'
-             WHERE status = 'running' AND started_at < $2
-               AND EXISTS (
-                   SELECT 1 FROM embed_jobs e2
-                   WHERE e2.scope = embed_jobs.scope AND e2.id > embed_jobs.id
-                     AND e2.status IN ('pending', 'running')
-               )"
+        let failed = sqlx::query(
+            "UPDATE embed_jobs \
+             SET status = 'failed', finished_at = $1, error = 'timeout' \
+             WHERE status = 'running' AND started_at < $2"
         )
         .bind(Self::now_secs())
         .bind(cutoff)
         .execute(&self.pool)
         .await
-        .map_err(|e| format!("expire_stale_jobs (supersede) failed: {e}"))?
+        .map_err(|e| format!("expire_stale_jobs failed: {e}"))?
         .rows_affected() as usize;
-
-        // Reset remaining stale jobs (no newer sibling) back to pending
-        let reset = sqlx::query(
-            "UPDATE embed_jobs SET status = 'pending', started_at = NULL
-             WHERE status = 'running' AND started_at < $1"
-        )
-        .bind(cutoff)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("expire_stale_jobs (reset) failed: {e}"))?
-        .rows_affected() as usize;
-
-        Ok(superseded + reset)
+        Ok(failed)
     }
 
     async fn update_job_progress(&self, job_id: i64, done: i64, total: i64) -> Result<(), String> {
@@ -1176,38 +1389,51 @@ impl SemanticDb for PostgresDb {
     }
 
     async fn complete_job(&self, job_id: i64, error: Option<&str>) -> Result<(), String> {
-        let status = if error.is_some() { "error" } else { "completed" };
-        sqlx::query("UPDATE embed_jobs SET status = $1, finished_at = $2, error = $3 WHERE id = $4")
-            .bind(status)
-            .bind(Self::now_secs())
-            .bind(error)
+        let now = Self::now_secs();
+        if let Some(reason) = error {
+            // Failed-open: resolved_status stays NULL until the reconciler
+            // closes us with superseded/retried/gave_up. Status guard makes
+            // this idempotent — if the user cancelled the job mid-flight,
+            // the cancel wins and this is a no-op.
+            sqlx::query(
+                "UPDATE embed_jobs \
+                 SET status = 'failed', finished_at = $1, error = $2 \
+                 WHERE id = $3 AND status IN ('pending', 'running')"
+            )
+            .bind(now)
+            .bind(reason)
             .bind(job_id)
             .execute(&self.pool)
             .await
             .map_err(|e| format!("complete_job failed: {e}"))?;
+        } else {
+            // Status guard: a cancel that arrived after the pipeline's last
+            // should_stop_embed_job poll but before this write must not be
+            // silently overwritten back to 'succeeded'.
+            sqlx::query(
+                "UPDATE embed_jobs \
+                 SET status = 'succeeded', finished_at = $1, \
+                     resolved_status = 'succeeded', resolved_at = $1, error = NULL \
+                 WHERE id = $2 AND status IN ('pending', 'running')"
+            )
+            .bind(now)
+            .bind(job_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("complete_job failed: {e}"))?;
+        }
         Ok(())
     }
 
     async fn get_latest_job(&self) -> Result<Option<EmbedJob>, String> {
         let row = sqlx::query(
-            "SELECT id, scope, status, total_pages, done_pages, started_at, finished_at, error, worker_id
-             FROM embed_jobs ORDER BY id DESC LIMIT 1"
+            &format!("SELECT {EMBED_JOB_COLS} FROM embed_jobs ORDER BY id DESC LIMIT 1")
         )
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| format!("get_latest_job failed: {e}"))?;
 
-        Ok(row.map(|r| EmbedJob {
-            id: r.get("id"),
-            scope: r.get("scope"),
-            status: r.get("status"),
-            total_pages: r.get("total_pages"),
-            done_pages: r.get("done_pages"),
-            started_at: r.get("started_at"),
-            finished_at: r.get("finished_at"),
-            error: r.get("error"),
-            worker_id: r.get("worker_id"),
-        }))
+        Ok(row.map(embed_job_from_row))
     }
 
     async fn get_stats(&self) -> Result<EmbedStats, String> {
@@ -1226,31 +1452,191 @@ impl SemanticDb for PostgresDb {
     }
 
     async fn list_jobs(&self, recent: usize) -> Result<Vec<EmbedJob>, String> {
-        // All active jobs (pending/running) + most recent completed/failed
         let rows = sqlx::query(
             &format!(
-                "(SELECT id, scope, status, total_pages, done_pages, started_at, finished_at, error, worker_id
-                 FROM embed_jobs WHERE status IN ('pending', 'running') ORDER BY id ASC)
-                UNION ALL
-                (SELECT id, scope, status, total_pages, done_pages, started_at, finished_at, error, worker_id
-                 FROM embed_jobs WHERE status NOT IN ('pending', 'running') ORDER BY id DESC LIMIT {recent})"
+                "(SELECT {EMBED_JOB_COLS} FROM embed_jobs \
+                  WHERE status IN ('pending', 'running', 'failed') ORDER BY id ASC) \
+                 UNION ALL \
+                 (SELECT {EMBED_JOB_COLS} FROM embed_jobs \
+                  WHERE status NOT IN ('pending', 'running', 'failed') \
+                  ORDER BY id DESC LIMIT {recent})"
             )
         )
         .fetch_all(&self.pool)
         .await
         .map_err(|e| format!("list_jobs failed: {e}"))?;
 
-        Ok(rows.iter().map(|r| EmbedJob {
-            id: r.get("id"),
-            scope: r.get("scope"),
-            status: r.get("status"),
-            total_pages: r.get("total_pages"),
-            done_pages: r.get("done_pages"),
-            started_at: r.get("started_at"),
-            finished_at: r.get("finished_at"),
-            error: r.get("error"),
-            worker_id: r.get("worker_id"),
-        }).collect())
+        Ok(rows.into_iter().map(embed_job_from_row).collect())
+    }
+
+    async fn cancel_embed_job(&self, job_id: i64) -> Result<(), String> {
+        let now = Self::now_secs();
+        sqlx::query(
+            "UPDATE embed_jobs \
+             SET status = 'cancelled', resolved_status = 'cancelled', \
+                 resolved_at = $1, finished_at = $1 \
+             WHERE id = $2 AND status IN ('pending', 'running')"
+        )
+        .bind(now)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("cancel_embed_job: {e}"))?;
+        Ok(())
+    }
+
+    async fn should_stop_embed_job(&self, job_id: i64) -> Result<bool, String> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT status FROM embed_jobs WHERE id = $1"
+        )
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("should_stop_embed_job: {e}"))?;
+        Ok(matches!(row.as_ref().map(|r| r.0.as_str()), Some(s) if s != "running"))
+    }
+
+    async fn fail_embed_job(&self, job_id: i64, reason: &str) -> Result<(), String> {
+        let now = Self::now_secs();
+        sqlx::query(
+            "UPDATE embed_jobs \
+             SET status = 'failed', finished_at = $1, error = $2 \
+             WHERE id = $3 AND status IN ('pending', 'running')"
+        )
+        .bind(now)
+        .bind(reason)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("fail_embed_job: {e}"))?;
+        Ok(())
+    }
+
+    async fn list_failed_open_embed_jobs(&self) -> Result<Vec<EmbedJob>, String> {
+        let rows = sqlx::query(
+            &format!(
+                "SELECT {EMBED_JOB_COLS} FROM embed_jobs \
+                 WHERE status = 'failed' ORDER BY id ASC"
+            )
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_failed_open_embed_jobs: {e}"))?;
+        Ok(rows.into_iter().map(embed_job_from_row).collect())
+    }
+
+    async fn has_successor_embed_job(&self, scope: &str, excluded_id: i64) -> Result<bool, String> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1::BIGINT FROM embed_jobs \
+             WHERE scope = $1 AND id > $2 \
+               AND status IN ('pending','running','succeeded','cancelled','closed') \
+             LIMIT 1"
+        )
+        .bind(scope)
+        .bind(excluded_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("has_successor_embed_job: {e}"))?;
+        Ok(row.is_some())
+    }
+
+    async fn embed_job_retry_chain_len(&self, job_id: i64) -> Result<usize, String> {
+        let mut len = 1usize;
+        let mut current = job_id;
+        for _ in 0..1024 {
+            let parent: Option<(Option<i64>,)> = sqlx::query_as(
+                "SELECT retry_of FROM embed_jobs WHERE id = $1"
+            )
+            .bind(current)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| format!("embed_job_retry_chain_len: {e}"))?;
+            match parent.and_then(|(p,)| p) {
+                Some(p) => {
+                    len += 1;
+                    current = p;
+                }
+                None => break,
+            }
+        }
+        Ok(len)
+    }
+
+    async fn close_embed_job(
+        &self,
+        job_id: i64,
+        resolved_status: Option<&str>,
+    ) -> Result<(), String> {
+        if let Some(rs) = resolved_status {
+            sqlx::query(
+                "UPDATE embed_jobs \
+                 SET prev_status = status, status = 'closed', resolved_status = $1 \
+                 WHERE id = $2 AND status != 'closed'"
+            )
+            .bind(rs)
+            .bind(job_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("close_embed_job: {e}"))?;
+        } else {
+            sqlx::query(
+                "UPDATE embed_jobs \
+                 SET prev_status = status, status = 'closed' \
+                 WHERE id = $1 AND status != 'closed'"
+            )
+            .bind(job_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("close_embed_job: {e}"))?;
+        }
+        Ok(())
+    }
+
+    async fn create_retry_embed_job(&self, scope: &str, retry_of: i64) -> Result<i64, String> {
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO embed_jobs (scope, status, retry_of) VALUES ($1, 'pending', $2) RETURNING id"
+        )
+        .bind(scope)
+        .bind(retry_of)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| format!("create_retry_embed_job: {e}"))?;
+        Ok(row.0)
+    }
+
+    async fn list_archivable_embed_jobs(
+        &self,
+        older_than_secs: i64,
+    ) -> Result<Vec<i64>, String> {
+        let cutoff = Self::now_secs() - older_than_secs;
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT id FROM embed_jobs \
+             WHERE status IN ('succeeded', 'cancelled') AND resolved_at IS NOT NULL \
+               AND resolved_at <= $1 \
+             ORDER BY id ASC"
+        )
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_archivable_embed_jobs: {e}"))?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    async fn list_running_embed_jobs_started_before(
+        &self,
+        started_before_secs: i64,
+    ) -> Result<Vec<EmbedJob>, String> {
+        let rows = sqlx::query(
+            &format!(
+                "SELECT {EMBED_JOB_COLS} FROM embed_jobs \
+                 WHERE status = 'running' AND started_at IS NOT NULL AND started_at < $1"
+            )
+        )
+        .bind(started_before_secs)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_running_embed_jobs_started_before: {e}"))?;
+        Ok(rows.into_iter().map(embed_job_from_row).collect())
     }
 
     async fn vector_search(
@@ -1684,6 +2070,31 @@ impl IndexDb for PostgresDb {
         Ok(())
     }
 
+    async fn list_indexed_shelves(&self) -> Result<Vec<IndexedShelf>, String> {
+        let rows = sqlx::query(
+            "SELECT shelf_id, name, slug, shelf_kind, indexed_at, deleted
+             FROM bookstack_shelves WHERE deleted = FALSE
+             ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_indexed_shelves: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let kind_str: String = r.get("shelf_kind");
+                IndexedShelf {
+                    shelf_id: r.get("shelf_id"),
+                    name: r.get("name"),
+                    slug: r.get("slug"),
+                    shelf_kind: kind_str.parse().unwrap_or(ShelfKind::Unclassified),
+                    indexed_at: r.get("indexed_at"),
+                    deleted: r.get("deleted"),
+                }
+            })
+            .collect())
+    }
+
     // --- Books ---
 
     async fn upsert_indexed_book(&self, book: &IndexedBook) -> Result<(), String> {
@@ -1762,6 +2173,18 @@ impl IndexDb for PostgresDb {
             .await
             .map_err(|e| format!("soft_delete_indexed_book: {e}"))?;
         Ok(())
+    }
+
+    async fn list_indexed_orphan_books(&self) -> Result<Vec<IndexedBook>, String> {
+        let rows = sqlx::query(
+            "SELECT book_id, name, slug, shelf_id, identity_ouid, book_kind, indexed_at, deleted
+             FROM bookstack_books WHERE shelf_id IS NULL AND deleted = FALSE
+             ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_indexed_orphan_books: {e}"))?;
+        Ok(rows.into_iter().map(book_from_row).collect())
     }
 
     // --- Chapters ---
@@ -2043,18 +2466,20 @@ impl IndexDb for PostgresDb {
         kind: &str,
         triggered_by: &str,
     ) -> Result<(i64, bool), String> {
-        // Dedup on scope (mirrors create_embed_job): if a pending or running
-        // job exists for the same scope, return that one. Wrapped in a
-        // transaction so the check + insert is atomic.
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| format!("create_index_job tx: {e}"))?;
 
+        // Dedup: pending/running collapse onto the existing job. Failed jobs
+        // not yet touched by the reconciler also count as active so a webhook
+        // firing mid-retry-window doesn't double-enqueue.
         let existing = sqlx::query(
             "SELECT id FROM index_jobs
-             WHERE scope = $1 AND status IN ('pending', 'running')
+             WHERE scope = $1
+               AND (status IN ('pending', 'running')
+                    OR (status = 'failed' AND resolved_status IS NULL))
              ORDER BY id DESC LIMIT 1
              FOR UPDATE",
         )
@@ -2088,13 +2513,14 @@ impl IndexDb for PostgresDb {
         // FOR UPDATE SKIP LOCKED enables multiple worker processes to run
         // safely against the same database without claiming the same job.
         let row = sqlx::query(
-            "UPDATE index_jobs SET status = 'running', started_at = $1
-             WHERE id = (
-                 SELECT id FROM index_jobs WHERE status = 'pending'
-                 ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED
-             )
-             RETURNING id, scope, kind, status, triggered_by, started_at,
-                       finished_at, progress, total, error",
+            &format!(
+                "UPDATE index_jobs SET status = 'running', started_at = $1 \
+                 WHERE id = ( \
+                     SELECT id FROM index_jobs WHERE status = 'pending' \
+                     ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED \
+                 ) \
+                 RETURNING {INDEX_JOB_COLS}"
+            )
         )
         .bind(Self::now_secs())
         .fetch_optional(&self.pool)
@@ -2124,26 +2550,46 @@ impl IndexDb for PostgresDb {
         job_id: i64,
         error: Option<&str>,
     ) -> Result<(), String> {
-        let status = if error.is_some() { "failed" } else { "completed" };
-        sqlx::query(
-            "UPDATE index_jobs SET status = $1, finished_at = $2, error = $3 WHERE id = $4",
-        )
-        .bind(status)
-        .bind(Self::now_secs())
-        .bind(error)
-        .bind(job_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("complete_index_job: {e}"))?;
+        let now = Self::now_secs();
+        if let Some(reason) = error {
+            // Status guard makes this idempotent — a cancel that landed
+            // between the worker's last should_stop_index_job poll and this
+            // write must not be silently overwritten.
+            sqlx::query(
+                "UPDATE index_jobs \
+                 SET status = 'failed', finished_at = $1, error = $2 \
+                 WHERE id = $3 AND status IN ('pending', 'running')",
+            )
+            .bind(now)
+            .bind(reason)
+            .bind(job_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("complete_index_job: {e}"))?;
+        } else {
+            // Same guard on the success branch — a cancel-then-success race
+            // must leave the row in 'cancelled', not flip it back.
+            sqlx::query(
+                "UPDATE index_jobs \
+                 SET status = 'succeeded', finished_at = $1, \
+                     resolved_status = 'succeeded', resolved_at = $1, error = NULL \
+                 WHERE id = $2 AND status IN ('pending', 'running')",
+            )
+            .bind(now)
+            .bind(job_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("complete_index_job: {e}"))?;
+        }
         Ok(())
     }
 
     async fn list_pending_index_jobs(&self, limit: i64) -> Result<Vec<IndexJob>, String> {
         let rows = sqlx::query(
-            "SELECT id, scope, kind, status, triggered_by, started_at, finished_at,
-                    progress, total, error
-             FROM index_jobs WHERE status = 'pending'
-             ORDER BY id ASC LIMIT $1",
+            &format!(
+                "SELECT {INDEX_JOB_COLS} FROM index_jobs \
+                 WHERE status = 'pending' ORDER BY id ASC LIMIT $1"
+            )
         )
         .bind(limit)
         .fetch_all(&self.pool)
@@ -2154,14 +2600,206 @@ impl IndexDb for PostgresDb {
 
     async fn get_latest_index_job(&self) -> Result<Option<IndexJob>, String> {
         let row = sqlx::query(
-            "SELECT id, scope, kind, status, triggered_by, started_at, finished_at,
-                    progress, total, error
-             FROM index_jobs ORDER BY id DESC LIMIT 1",
+            &format!("SELECT {INDEX_JOB_COLS} FROM index_jobs ORDER BY id DESC LIMIT 1")
         )
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| format!("get_latest_index_job: {e}"))?;
         Ok(row.map(index_job_from_row))
+    }
+
+    async fn cancel_index_job(&self, job_id: i64) -> Result<(), String> {
+        let now = Self::now_secs();
+        sqlx::query(
+            "UPDATE index_jobs \
+             SET status = 'cancelled', resolved_status = 'cancelled', \
+                 resolved_at = $1, finished_at = $1 \
+             WHERE id = $2 AND status IN ('pending', 'running')"
+        )
+        .bind(now)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("cancel_index_job: {e}"))?;
+        Ok(())
+    }
+
+    async fn should_stop_index_job(&self, job_id: i64) -> Result<bool, String> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT status FROM index_jobs WHERE id = $1"
+        )
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("should_stop_index_job: {e}"))?;
+        Ok(matches!(row.as_ref().map(|r| r.0.as_str()), Some(s) if s != "running"))
+    }
+
+    async fn fail_index_job(&self, job_id: i64, reason: &str) -> Result<(), String> {
+        let now = Self::now_secs();
+        sqlx::query(
+            "UPDATE index_jobs \
+             SET status = 'failed', finished_at = $1, error = $2 \
+             WHERE id = $3 AND status IN ('pending', 'running')"
+        )
+        .bind(now)
+        .bind(reason)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("fail_index_job: {e}"))?;
+        Ok(())
+    }
+
+    async fn list_failed_open_index_jobs(&self) -> Result<Vec<IndexJob>, String> {
+        let rows = sqlx::query(
+            &format!(
+                "SELECT {INDEX_JOB_COLS} FROM index_jobs \
+                 WHERE status = 'failed' ORDER BY id ASC"
+            )
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_failed_open_index_jobs: {e}"))?;
+        Ok(rows.into_iter().map(index_job_from_row).collect())
+    }
+
+    async fn has_successor_index_job(&self, scope: &str, excluded_id: i64) -> Result<bool, String> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1::BIGINT FROM index_jobs \
+             WHERE scope = $1 AND id > $2 \
+               AND status IN ('pending','running','succeeded','cancelled','closed') \
+             LIMIT 1"
+        )
+        .bind(scope)
+        .bind(excluded_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("has_successor_index_job: {e}"))?;
+        Ok(row.is_some())
+    }
+
+    async fn index_job_retry_chain_len(&self, job_id: i64) -> Result<usize, String> {
+        let mut len = 1usize;
+        let mut current = job_id;
+        for _ in 0..1024 {
+            let parent: Option<(Option<i64>,)> = sqlx::query_as(
+                "SELECT retry_of FROM index_jobs WHERE id = $1"
+            )
+            .bind(current)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| format!("index_job_retry_chain_len: {e}"))?;
+            match parent.and_then(|(p,)| p) {
+                Some(p) => {
+                    len += 1;
+                    current = p;
+                }
+                None => break,
+            }
+        }
+        Ok(len)
+    }
+
+    async fn close_index_job(
+        &self,
+        job_id: i64,
+        resolved_status: Option<&str>,
+    ) -> Result<(), String> {
+        if let Some(rs) = resolved_status {
+            sqlx::query(
+                "UPDATE index_jobs \
+                 SET prev_status = status, status = 'closed', resolved_status = $1 \
+                 WHERE id = $2 AND status != 'closed'"
+            )
+            .bind(rs)
+            .bind(job_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("close_index_job: {e}"))?;
+        } else {
+            sqlx::query(
+                "UPDATE index_jobs \
+                 SET prev_status = status, status = 'closed' \
+                 WHERE id = $1 AND status != 'closed'"
+            )
+            .bind(job_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("close_index_job: {e}"))?;
+        }
+        Ok(())
+    }
+
+    async fn create_retry_index_job(
+        &self,
+        scope: &str,
+        kind: &str,
+        retry_of: i64,
+    ) -> Result<i64, String> {
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO index_jobs (scope, kind, status, triggered_by, retry_of) \
+             VALUES ($1, $2, 'pending', 'reconciler', $3) RETURNING id"
+        )
+        .bind(scope)
+        .bind(kind)
+        .bind(retry_of)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| format!("create_retry_index_job: {e}"))?;
+        Ok(row.0)
+    }
+
+    async fn list_archivable_index_jobs(
+        &self,
+        older_than_secs: i64,
+    ) -> Result<Vec<i64>, String> {
+        let cutoff = Self::now_secs() - older_than_secs;
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT id FROM index_jobs \
+             WHERE status IN ('succeeded', 'cancelled') AND resolved_at IS NOT NULL \
+               AND resolved_at <= $1 \
+             ORDER BY id ASC"
+        )
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_archivable_index_jobs: {e}"))?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    async fn list_running_index_jobs_started_before(
+        &self,
+        started_before_secs: i64,
+    ) -> Result<Vec<IndexJob>, String> {
+        let rows = sqlx::query(
+            &format!(
+                "SELECT {INDEX_JOB_COLS} FROM index_jobs \
+                 WHERE status = 'running' AND started_at IS NOT NULL AND started_at < $1"
+            )
+        )
+        .bind(started_before_secs)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_running_index_jobs_started_before: {e}"))?;
+        Ok(rows.into_iter().map(index_job_from_row).collect())
+    }
+
+    async fn list_index_jobs(&self, recent: usize) -> Result<Vec<IndexJob>, String> {
+        let rows = sqlx::query(
+            &format!(
+                "(SELECT {INDEX_JOB_COLS} FROM index_jobs \
+                  WHERE status IN ('pending', 'running', 'failed') ORDER BY id ASC) \
+                 UNION ALL \
+                 (SELECT {INDEX_JOB_COLS} FROM index_jobs \
+                  WHERE status NOT IN ('pending', 'running', 'failed') \
+                  ORDER BY id DESC LIMIT {recent})"
+            )
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_index_jobs: {e}"))?;
+        Ok(rows.into_iter().map(index_job_from_row).collect())
     }
 
     // --- Index meta ---
@@ -2257,5 +2895,35 @@ fn index_job_from_row(r: sqlx::postgres::PgRow) -> IndexJob {
         progress: r.get("progress"),
         total: r.get("total"),
         error: r.get("error"),
+        resolved_status: r.get("resolved_status"),
+        prev_status: r.get("prev_status"),
+        resolved_at: r.get("resolved_at"),
+        retry_of: r.get("retry_of"),
     }
 }
+
+const INDEX_JOB_COLS: &str =
+    "id, scope, kind, status, triggered_by, started_at, finished_at, progress, total, error, \
+     resolved_status, prev_status, resolved_at, retry_of";
+
+fn embed_job_from_row(r: sqlx::postgres::PgRow) -> EmbedJob {
+    EmbedJob {
+        id: r.get("id"),
+        scope: r.get("scope"),
+        status: r.get("status"),
+        total_pages: r.get("total_pages"),
+        done_pages: r.get("done_pages"),
+        started_at: r.get("started_at"),
+        finished_at: r.get("finished_at"),
+        error: r.get("error"),
+        worker_id: r.get("worker_id"),
+        resolved_status: r.get("resolved_status"),
+        prev_status: r.get("prev_status"),
+        resolved_at: r.get("resolved_at"),
+        retry_of: r.get("retry_of"),
+    }
+}
+
+const EMBED_JOB_COLS: &str =
+    "id, scope, status, total_pages, done_pages, started_at, finished_at, error, worker_id, \
+     resolved_status, prev_status, resolved_at, retry_of";

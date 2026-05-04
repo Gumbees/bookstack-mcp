@@ -1,35 +1,30 @@
-//! Browser-based settings UI for the Hive memory flow.
+//! Browser-based settings UI.
+//!
+//! v0.8.0: minimal text-input form covering the surviving fields. Typeahead
+//! pickers backed by `precision_search` ship in a follow-up commit on this
+//! branch (depends on #22).
 //!
 //! Auth flow:
 //! 1. User visits GET /settings → no cookie → redirect to /authorize?return_to=/settings
 //! 2. /authorize validates the BookStack token and (if return_to is /settings)
 //!    creates a settings session, sets a cookie, redirects to /settings.
-//! 3. /settings reads the cookie, looks up credentials in the session store,
-//!    renders the form.
-//! 4. POST /settings parses the form, persists to user_settings, redirects.
-//!
-//! Sessions are kept in memory; on restart users must re-authenticate. The cookie
-//! is HttpOnly, SameSite=Lax, 8h TTL.
+//! 3. /settings reads the cookie, looks up credentials, renders the form.
+//! 4. POST /settings parses the form, persists, redirects.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::State;
+use axum::extract::{RawForm, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use axum::Form;
 use serde::Deserialize;
-use serde_json::Value;
 use tokio::sync::RwLock;
 use zeroize::Zeroize;
 
-use bsmcp_common::bookstack::BookStackClient;
-use bsmcp_common::settings::{hash_token_id, GlobalSettings, UserSettings};
+use bsmcp_common::settings::{hash_token_id, GlobalSettings, KbScope, UserSettings};
 
-use crate::remember::naming::NamedResource;
-use crate::remember::provision;
-
+use crate::mcp;
 use crate::sse::AppState;
 
 pub const SETTINGS_COOKIE_NAME: &str = "bsmcp_settings_session";
@@ -54,7 +49,6 @@ pub fn new_settings_store() -> SettingsSessionStore {
     Arc::new(RwLock::new(HashMap::new()))
 }
 
-/// Periodically evict expired settings sessions. Spawn once at startup.
 pub fn spawn_settings_cleanup(store: SettingsSessionStore) {
     tokio::spawn(async move {
         loop {
@@ -65,8 +59,6 @@ pub fn spawn_settings_cleanup(store: SettingsSessionStore) {
     });
 }
 
-/// Issue a fresh settings session and return the cookie value.
-/// Called from oauth.rs after successful token validation when return_to=/settings.
 pub async fn issue_settings_session(
     store: &SettingsSessionStore,
     token_id: &str,
@@ -74,7 +66,6 @@ pub async fn issue_settings_session(
 ) -> String {
     let session_id = uuid::Uuid::new_v4().to_string();
     let mut sessions = store.write().await;
-    // Cap session count to prevent unbounded growth
     if sessions.len() >= 1000 {
         sessions.retain(|_, s| s.created_at.elapsed() < SETTINGS_SESSION_TTL);
     }
@@ -89,18 +80,27 @@ pub async fn issue_settings_session(
     session_id
 }
 
-/// Build the Set-Cookie header value for the settings session.
 pub fn build_session_cookie(session_id: &str) -> String {
+    // Path=/ so a single cookie covers both /settings (admin) and /setup/user
+    // (the onboarding wizard, sub-PR 2.4e). Earlier revisions scoped this
+    // narrowly to /settings; widening it to / is safe because the cookie is
+    // HttpOnly + SameSite=Lax + Secure, and the only consumers of the
+    // bsmcp_settings_session cookie are first-party browser routes on this
+    // server.
     format!(
-        "{name}={id}; Path=/settings; HttpOnly; SameSite=Lax; Max-Age={ttl}; Secure",
+        "{name}={id}; Path=/; HttpOnly; SameSite=Lax; Max-Age={ttl}; Secure",
         name = SETTINGS_COOKIE_NAME,
         id = session_id,
         ttl = SETTINGS_SESSION_TTL.as_secs(),
     )
 }
 
-/// Resolve cookie → (token_id, token_secret). Returns None if missing/expired.
-async fn resolve_session(
+/// Look up the (token_id, token_secret) for the cookie attached to the
+/// incoming request. Returns `None` if the cookie is absent, points at a
+/// missing/expired session, or fails to parse. Public so sibling modules
+/// (notably `setup_ui` for the onboarding wizard) can share the same
+/// session store without duplicating the cookie-parsing logic.
+pub async fn resolve_session_creds(
     headers: &HeaderMap,
     store: &SettingsSessionStore,
 ) -> Option<(String, String)> {
@@ -118,13 +118,11 @@ async fn resolve_session(
     Some((session.token_id.clone(), session.token_secret.clone()))
 }
 
-/// Public predicate for other handlers (e.g., /status) that want to honour the
-/// settings session cookie as a valid auth method without exposing credentials.
 pub async fn has_valid_session(
     headers: &HeaderMap,
     store: &SettingsSessionStore,
 ) -> bool {
-    resolve_session(headers, store).await.is_some()
+    resolve_session_creds(headers, store).await.is_some()
 }
 
 fn html_escape(s: &str) -> String {
@@ -141,1142 +139,569 @@ pub async fn handle_settings_get(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
-    let (token_id, token_secret) = match resolve_session(&headers, &state.settings_sessions).await {
+    let (token_id, token_secret) = match resolve_session_creds(&headers, &state.settings_sessions).await {
         Some(creds) => creds,
         None => return Redirect::to("/authorize?response_type=code&client_id=settings-ui&redirect_uri=/settings&code_challenge=&code_challenge_method=&return_to=/settings").into_response(),
     };
 
     let token_id_hash = hash_token_id(&token_id);
-    let settings = match state.db.get_user_settings(&token_id_hash).await {
-        Ok(Some(s)) => s,
-        Ok(None) => UserSettings::default(),
-        Err(e) => {
-            eprintln!("Settings: load failed: {e}");
-            UserSettings::default()
-        }
-    };
+    let settings = state
+        .db
+        .get_user_settings(&token_id_hash)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     let globals = state.db.get_global_settings().await.unwrap_or_default();
 
-    let client = BookStackClient::new(
-        &state.bookstack_url,
-        &token_id,
-        &token_secret,
-        state.http_client.clone(),
-    );
+    // Best-effort: resolve the User Journals shelf name so the form can show
+    // "Currently set to: <name> (<id>)". Failures are silent — the form still
+    // renders without the summary line.
+    let user_journals_shelf_summary = match globals.user_journals_shelf_id {
+        Some(id) => {
+            let bs_client = bsmcp_common::bookstack::BookStackClient::new(
+                &state.bookstack_url,
+                &token_id,
+                &token_secret,
+                state.http_client.clone(),
+            );
+            bs_client
+                .get_shelf(id)
+                .await
+                .ok()
+                .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                .map(|name| format!(" Currently set to: {} ({})", name, id))
+                .unwrap_or_default()
+        }
+        None => String::new(),
+    };
 
-    let (shelves_res, books_res, admin_res) = tokio::join!(
-        client.list_shelves(500, 0),
-        client.list_books(500, 0),
-        client.is_admin(),
-    );
-
-    let shelves = extract_named_list(shelves_res.ok().as_ref());
-    let books = extract_named_list(books_res.ok().as_ref());
-    let is_admin = admin_res.unwrap_or(false);
-
-    Html(render_settings_page(&settings, &globals, &shelves, &books, is_admin)).into_response()
+    let tool_defaults_section = render_tool_defaults_section(&globals, &settings);
+    Html(render_settings_page(
+        &settings,
+        &globals,
+        &user_journals_shelf_summary,
+        &tool_defaults_section,
+    ))
+    .into_response()
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct SettingsForm {
+    // Per-user
+    #[serde(default)]
     pub label: Option<String>,
+    #[serde(default)]
     pub role: Option<String>,
-    pub ai_identity_ouid: Option<String>,
-    pub ai_identity_book_id: Option<String>,
-    pub ai_identity_page_id: Option<String>,
-    pub ai_identity_name: Option<String>,
-    pub ai_hive_shelf_id: Option<String>,
-    pub ai_collage_book_id: Option<String>,
-    pub ai_shared_collage_book_id: Option<String>,
-    pub ai_hive_journal_book_id: Option<String>,
-    pub ai_identity_agents_chapter_id: Option<String>,
-    pub ai_identity_journal_chapter_id: Option<String>,
+    #[serde(default)]
     pub user_id: Option<String>,
+    #[serde(default)]
     pub bookstack_user_id: Option<String>,
-    pub user_identity_page_id: Option<String>,
-    pub user_identity_book_id: Option<String>,
-    pub user_journal_agent_page_id: Option<String>,
-    pub user_journal_book_id: Option<String>,
+    #[serde(default)]
     pub domains: Option<String>,
-    pub semantic_against_journal: Option<String>,
-    pub semantic_against_collage: Option<String>,
-    pub semantic_against_shared_collage: Option<String>,
-    pub semantic_against_user_journal: Option<String>,
-    pub semantic_against_full_kb: Option<String>,
-    pub use_follow_up_remember_agent: Option<String>,
-    pub recent_journal_count: Option<String>,
-    pub active_collage_count: Option<String>,
+    #[serde(default)]
     pub system_prompt_page_ids: Option<String>,
+    #[serde(default)]
     pub timezone: Option<String>,
+    #[serde(default)]
+    pub semantic_against_full_kb: Option<String>,
 
-    // Global shelves
-    pub hive_shelf_id: Option<String>,
-    pub user_journals_shelf_id: Option<String>,
-
-    // Auto-create checkboxes (presence + "on" means "create if missing").
-    pub create_hive_shelf: Option<String>,
-    pub create_user_journals_shelf: Option<String>,
-    pub create_ai_identity_book: Option<String>,
-    pub create_ai_hive_journal_book: Option<String>,
-    pub create_ai_collage_book: Option<String>,
-    pub create_ai_shared_collage_book: Option<String>,
-    pub create_user_journal_book: Option<String>,
-
-    // Org-default AI identity (admins only).
-    pub default_ai_identity_page_id: Option<String>,
-    pub default_ai_identity_name: Option<String>,
-    pub default_ai_identity_ouid: Option<String>,
-
-    // Org identity + domains (admins only). org_identity_page_id is
-    // first-write-wins like the shelves; org_domains is tunable.
+    // Globals (admin-only — server checks before persisting)
+    #[serde(default)]
+    pub guide_page_id: Option<String>,
+    #[serde(default)]
     pub org_identity_page_id: Option<String>,
+    #[serde(default)]
+    pub policies_scope_type: Option<String>,
+    #[serde(default)]
+    pub policies_scope_id: Option<String>,
+    #[serde(default)]
+    pub sops_scope_type: Option<String>,
+    #[serde(default)]
+    pub sops_scope_id: Option<String>,
+    #[serde(default)]
+    pub best_practices_scope_type: Option<String>,
+    #[serde(default)]
+    pub best_practices_scope_id: Option<String>,
+    #[serde(default)]
     pub org_domains: Option<String>,
-}
-
-fn empty_to_none(s: Option<String>) -> Option<String> {
-    s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
-}
-
-fn parse_id(s: Option<String>) -> Option<i64> {
-    empty_to_none(s).and_then(|v| v.parse().ok())
-}
-
-fn parse_count(s: Option<String>, default: usize) -> usize {
-    empty_to_none(s)
-        .and_then(|v| v.parse().ok())
-        .filter(|&n: &usize| n > 0 && n <= 100)
-        .unwrap_or(default)
-}
-
-fn parse_id_list(s: Option<String>) -> Vec<i64> {
-    let Some(raw) = empty_to_none(s) else { return Vec::new(); };
-    raw.split(|c: char| !c.is_ascii_digit())
-        .filter_map(|tok| tok.parse::<i64>().ok())
-        .collect()
-}
-
-/// Parse a free-form list of domains / strings. Splits on commas and
-/// whitespace, trims, drops empties, deduplicates.
-fn parse_str_list(s: Option<String>) -> Vec<String> {
-    let Some(raw) = empty_to_none(s) else { return Vec::new(); };
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for tok in raw.split(|c: char| c == ',' || c.is_whitespace()) {
-        let v = tok.trim().to_lowercase();
-        if v.is_empty() {
-            continue;
-        }
-        if seen.insert(v.clone()) {
-            out.push(v);
-        }
-    }
-    out
-}
-
-fn format_str_list(values: &[String]) -> String {
-    values.join(", ")
-}
-
-fn format_id_list(ids: &[i64]) -> String {
-    ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
-}
-
-fn checkbox_on(s: Option<String>) -> bool {
-    matches!(s.as_deref(), Some("on") | Some("true") | Some("1"))
+    #[serde(default)]
+    pub org_required_instructions_page_ids: Option<String>,
+    #[serde(default)]
+    pub org_ai_usage_policy_page_ids: Option<String>,
+    #[serde(default)]
+    pub friendly_structure: Option<String>,
+    #[serde(default)]
+    pub full_content_in_briefing: Option<String>,
+    #[serde(default)]
+    pub strict_setup: Option<String>,
+    #[serde(default)]
+    pub hive_shelf_id: Option<String>,
+    #[serde(default)]
+    pub user_journals_shelf_id: Option<String>,
 }
 
 pub async fn handle_settings_post(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Form(form): Form<SettingsForm>,
+    RawForm(body): RawForm,
 ) -> Response {
-    let (token_id, token_secret) = match resolve_session(&headers, &state.settings_sessions).await {
+    // Parse the urlencoded body into both:
+    //   1. The typed `SettingsForm` (the long-standing per-user / per-global
+    //      fields). serde_urlencoded handles this directly.
+    //   2. A flat (key, value) list, so we can pluck out the
+    //      dynamically-named `tool_default_<name>` checkboxes added in
+    //      Phase 2.4d. serde_urlencoded can't deserialize variable-name
+    //      fields into a typed struct, so the extra pass over the raw
+    //      bytes is unavoidable.
+    let body_str = std::str::from_utf8(&body).unwrap_or("");
+    let form: SettingsForm = serde_urlencoded::from_str(body_str).unwrap_or_default();
+    let raw_pairs: Vec<(String, String)> =
+        serde_urlencoded::from_str(body_str).unwrap_or_default();
+
+    let (token_id, token_secret) = match resolve_session_creds(&headers, &state.settings_sessions).await {
         Some(creds) => creds,
-        None => return Redirect::to("/authorize?response_type=code&client_id=settings-ui&redirect_uri=/settings&return_to=/settings").into_response(),
+        None => return Redirect::to("/authorize?response_type=code&client_id=settings-ui&redirect_uri=/settings&code_challenge=&code_challenge_method=&return_to=/settings").into_response(),
     };
+
     let token_id_hash = hash_token_id(&token_id);
-    let client = BookStackClient::new(
+    let mut settings = state
+        .db
+        .get_user_settings(&token_id_hash)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+
+    // Per-user fields
+    settings.label = nonempty(&form.label);
+    settings.role = nonempty(&form.role);
+    settings.user_id = nonempty(&form.user_id);
+    settings.bookstack_user_id = parse_optional_i64(&form.bookstack_user_id);
+    settings.domains = parse_string_list(&form.domains);
+    settings.system_prompt_page_ids = parse_id_list(&form.system_prompt_page_ids);
+    settings.timezone = nonempty(&form.timezone);
+    if settings.timezone.is_some() {
+        settings.timezone_fetched_at = Some(now_unix());
+    }
+    settings.semantic_against_full_kb = checkbox(&form.semantic_against_full_kb);
+
+    if let Err(e) = state.db.save_user_settings(&token_id_hash, &settings).await {
+        return error_response(format!("Failed to save user settings: {e}"));
+    }
+
+    // Globals: only persist when the calling token is admin.
+    let bs_client = bsmcp_common::bookstack::BookStackClient::new(
         &state.bookstack_url,
         &token_id,
         &token_secret,
         state.http_client.clone(),
     );
-
-    let mut settings = UserSettings {
-        label: empty_to_none(form.label),
-        role: empty_to_none(form.role),
-        ai_identity_ouid: empty_to_none(form.ai_identity_ouid),
-        ai_identity_book_id: parse_id(form.ai_identity_book_id),
-        ai_identity_page_id: parse_id(form.ai_identity_page_id),
-        ai_identity_name: empty_to_none(form.ai_identity_name),
-        ai_hive_shelf_id: parse_id(form.ai_hive_shelf_id),
-        ai_collage_book_id: parse_id(form.ai_collage_book_id),
-        ai_shared_collage_book_id: parse_id(form.ai_shared_collage_book_id),
-        ai_hive_journal_book_id: parse_id(form.ai_hive_journal_book_id),
-        ai_identity_agents_chapter_id: parse_id(form.ai_identity_agents_chapter_id),
-        ai_identity_journal_chapter_id: parse_id(form.ai_identity_journal_chapter_id),
-        user_id: empty_to_none(form.user_id.clone()),
-        bookstack_user_id: parse_id(form.bookstack_user_id.clone()),
-        user_identity_page_id: parse_id(form.user_identity_page_id),
-        user_identity_book_id: parse_id(form.user_identity_book_id.clone()),
-        user_journal_agent_page_id: parse_id(form.user_journal_agent_page_id.clone()),
-        user_journal_book_id: parse_id(form.user_journal_book_id),
-        domains: parse_str_list(form.domains.clone()),
-        semantic_against_journal: checkbox_on(form.semantic_against_journal),
-        semantic_against_collage: checkbox_on(form.semantic_against_collage),
-        semantic_against_shared_collage: checkbox_on(form.semantic_against_shared_collage),
-        semantic_against_user_journal: checkbox_on(form.semantic_against_user_journal),
-        semantic_against_full_kb: checkbox_on(form.semantic_against_full_kb),
-        use_follow_up_remember_agent: checkbox_on(form.use_follow_up_remember_agent),
-        recent_journal_count: parse_count(form.recent_journal_count, 3),
-        active_collage_count: parse_count(form.active_collage_count, 10),
-        system_prompt_page_ids: parse_id_list(form.system_prompt_page_ids),
-        timezone: empty_to_none(form.timezone.clone()),
-        // Manual /settings submit counts as a fresh fetch — stamp now so the
-        // briefing's refresh-due flag doesn't immediately fire afterwards.
-        timezone_fetched_at: if empty_to_none(form.timezone).is_some() {
-            Some(crate::remember::frontmatter::now_unix())
-        } else {
-            None
-        },
-        // Carry over the existing dismiss timestamp — saving via /settings
-        // doesn't change the snooze. (The nudge auto-stops showing once
-        // is_configured() is true.)
-        settings_nudge_dismissed_until: state
-            .db
-            .get_user_settings(&token_id_hash)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|s| s.settings_nudge_dismissed_until),
-    };
-
-    // Globals: server-side first-write-wins, gated to BookStack admins.
-    // Once a global field is set, it cannot be changed via this UI; once set
-    // by a non-admin (shouldn't happen — UI hides the controls), subsequent
-    // form submissions cannot rewrite them either.
-    let existing_globals = state.db.get_global_settings().await.unwrap_or_default();
-    let is_admin = client.is_admin().await.unwrap_or(false);
-
-    let mut globals = existing_globals.clone();
-    let mut global_warnings: Vec<String> = Vec::new();
-    let proposed_hive = parse_id(form.hive_shelf_id);
-    let proposed_user_journals = parse_id(form.user_journals_shelf_id);
-    let proposed_default_id = parse_id(form.default_ai_identity_page_id);
-    let proposed_default_name = empty_to_none(form.default_ai_identity_name);
-    let proposed_default_ouid = empty_to_none(form.default_ai_identity_ouid);
-
-    if existing_globals.hive_shelf_id.is_none() {
-        if let Some(new_id) = proposed_hive {
-            if is_admin {
-                globals.hive_shelf_id = Some(new_id);
-            } else {
-                global_warnings.push(
-                    "Ignoring hive_shelf_id submission — only BookStack admins can set global shelves.".into()
-                );
-            }
-        }
-    } else if proposed_hive.is_some() && proposed_hive != existing_globals.hive_shelf_id {
-        global_warnings.push(
-            "Ignoring hive_shelf_id change — global shelves are first-write-wins; current value preserved.".into()
-        );
-    }
-
-    if existing_globals.user_journals_shelf_id.is_none() {
-        if let Some(new_id) = proposed_user_journals {
-            if is_admin {
-                globals.user_journals_shelf_id = Some(new_id);
-            } else {
-                global_warnings.push(
-                    "Ignoring user_journals_shelf_id submission — only BookStack admins can set global shelves.".into()
-                );
-            }
-        }
-    } else if proposed_user_journals.is_some() && proposed_user_journals != existing_globals.user_journals_shelf_id {
-        global_warnings.push(
-            "Ignoring user_journals_shelf_id change — global shelves are first-write-wins; current value preserved.".into()
-        );
-    }
-
-    // Org-default identity fields — admin-only writes, but they're updatable
-    // (not first-write-wins) so admins can swap the house agent later.
+    let is_admin = bs_client.is_admin().await.unwrap_or(false);
     if is_admin {
-        globals.default_ai_identity_page_id = proposed_default_id;
-        globals.default_ai_identity_name = proposed_default_name;
-        globals.default_ai_identity_ouid = proposed_default_ouid;
-    } else if proposed_default_id.is_some() || proposed_default_name.is_some() || proposed_default_ouid.is_some() {
-        global_warnings.push(
-            "Ignoring org-default identity submission — only BookStack admins can set the org default.".into()
-        );
-    }
-
-    // Org identity page — first-write-wins (the page itself is structural;
-    // an admin can change its content but the page ID stays put).
-    let proposed_org_identity_page = parse_id(form.org_identity_page_id);
-    if existing_globals.org_identity_page_id.is_none() {
-        if let Some(new_id) = proposed_org_identity_page {
-            if is_admin {
-                globals.org_identity_page_id = Some(new_id);
-            } else {
-                global_warnings.push(
-                    "Ignoring org_identity_page_id submission — only BookStack admins can set org identity.".into()
-                );
-            }
-        }
-    } else if proposed_org_identity_page.is_some()
-        && proposed_org_identity_page != existing_globals.org_identity_page_id
-    {
-        global_warnings.push(
-            "Ignoring org_identity_page_id change — first-write-wins; current value preserved.".into()
-        );
-    }
-
-    // Org domains — admin-editable, replaces the existing list when provided.
-    let proposed_org_domains = parse_str_list(form.org_domains);
-    if is_admin {
-        // Empty list means "user cleared the textarea" — honor the clear.
-        // Non-empty replaces the old list outright.
-        globals.org_domains = proposed_org_domains;
-    } else if !proposed_org_domains.is_empty() {
-        global_warnings.push(
-            "Ignoring org_domains submission — only BookStack admins can edit org domains.".into()
-        );
-    }
-
-    // Same admin gate for create-if-missing on the global shelves themselves.
-    if !is_admin {
-        if checkbox_on(form.create_hive_shelf.clone()) || checkbox_on(form.create_user_journals_shelf.clone()) {
-            global_warnings.push(
-                "Ignoring create-if-missing for global shelves — only BookStack admins can provision them.".into()
-            );
+        let mut globals = state.db.get_global_settings().await.unwrap_or_default();
+        globals.guide_page_id = parse_optional_i64(&form.guide_page_id);
+        globals.org_identity_page_id = parse_optional_i64(&form.org_identity_page_id);
+        globals.policies_scope = parse_kb_scope(&form.policies_scope_type, &form.policies_scope_id);
+        globals.sops_scope = parse_kb_scope(&form.sops_scope_type, &form.sops_scope_id);
+        globals.best_practices_scope = parse_kb_scope(&form.best_practices_scope_type, &form.best_practices_scope_id);
+        globals.org_domains = parse_string_list(&form.org_domains);
+        globals.org_required_instructions_page_ids = parse_id_list(&form.org_required_instructions_page_ids);
+        globals.org_ai_usage_policy_page_ids = parse_id_list(&form.org_ai_usage_policy_page_ids);
+        globals.friendly_structure = checkbox(&form.friendly_structure);
+        globals.full_content_in_briefing = checkbox(&form.full_content_in_briefing);
+        globals.strict_setup = checkbox(&form.strict_setup);
+        globals.hive_shelf_id = parse_optional_i64(&form.hive_shelf_id);
+        globals.user_journals_shelf_id = parse_optional_i64(&form.user_journals_shelf_id);
+        globals.tool_defaults = parse_tool_defaults(&raw_pairs);
+        if let Err(e) = state.db.save_global_settings(&globals, &token_id_hash).await {
+            return error_response(format!("Failed to save global settings: {e}"));
         }
     }
 
-    // Auto-provisioning in dependency order. Each step writes back into
-    // `settings` / `globals` so later steps can use the just-created IDs.
-    // After each successful create we lock the new content to admin-only edit
-    // (everyone else read-only; owner keeps default edit). admin_role_id is
-    // looked up lazily so we only pay the cost when something is being created.
-    let mut provision_log: Vec<String> = Vec::new();
-    let mut admin_role_id: Option<i64> = None;
-    async fn ensure_admin_role(
-        cached: &mut Option<i64>,
-        client: &BookStackClient,
-    ) -> Option<i64> {
-        if cached.is_some() {
-            return *cached;
-        }
-        match client.find_admin_role_id().await {
-            Ok(id) => { *cached = Some(id); Some(id) }
-            Err(e) => {
-                eprintln!("Settings: admin role lookup failed (locking will be skipped): {e}");
-                None
-            }
-        }
-    }
-    use bsmcp_common::bookstack::ContentType;
-
-    if is_admin && globals.hive_shelf_id.is_none() && checkbox_on(form.create_hive_shelf) {
-        let r = provision::create_shelf(&client, NamedResource::HiveShelf).await;
-        provision_log.push(r.human(NamedResource::HiveShelf));
-        if let Some(id) = r.id() {
-            globals.hive_shelf_id = Some(id);
-            if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
-                provision::lock_to_admin_only(&client, ContentType::Shelf, id, role).await;
-            }
-        }
-    }
-    if is_admin && globals.user_journals_shelf_id.is_none() && checkbox_on(form.create_user_journals_shelf) {
-        let r = provision::create_shelf(&client, NamedResource::UserJournalsShelf).await;
-        provision_log.push(r.human(NamedResource::UserJournalsShelf));
-        if let Some(id) = r.id() {
-            globals.user_journals_shelf_id = Some(id);
-            if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
-                provision::lock_to_admin_only(&client, ContentType::Shelf, id, role).await;
-            }
-        }
-    }
-
-    // Books that live on the Hive shelf.
-    let hive_shelf = globals.hive_shelf_id;
-    if settings.ai_identity_book_id.is_none() && checkbox_on(form.create_ai_identity_book) {
-        let r = provision::create_book(&client, state.index_db.as_ref(), NamedResource::IdentityBook, hive_shelf).await;
-        provision_log.push(r.human(NamedResource::IdentityBook));
-        if let Some(id) = r.id() {
-            settings.ai_identity_book_id = Some(id);
-            if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
-                provision::lock_to_admin_only(&client, ContentType::Book, id, role).await;
-            }
-        }
-    }
-    if settings.ai_hive_journal_book_id.is_none() && checkbox_on(form.create_ai_hive_journal_book) {
-        let r = provision::create_book(&client, state.index_db.as_ref(), NamedResource::JournalBook, hive_shelf).await;
-        provision_log.push(r.human(NamedResource::JournalBook));
-        if let Some(id) = r.id() {
-            settings.ai_hive_journal_book_id = Some(id);
-        }
-    }
-    if settings.ai_collage_book_id.is_none() && checkbox_on(form.create_ai_collage_book) {
-        let r = provision::create_book(&client, state.index_db.as_ref(), NamedResource::CollageBook, hive_shelf).await;
-        provision_log.push(r.human(NamedResource::CollageBook));
-        if let Some(id) = r.id() {
-            settings.ai_collage_book_id = Some(id);
-            if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
-                provision::lock_to_admin_only(&client, ContentType::Book, id, role).await;
-            }
-        }
-    }
-    if settings.ai_shared_collage_book_id.is_none() && checkbox_on(form.create_ai_shared_collage_book) {
-        let r = provision::create_book(&client, state.index_db.as_ref(), NamedResource::SharedCollageBook, hive_shelf).await;
-        provision_log.push(r.human(NamedResource::SharedCollageBook));
-        if let Some(id) = r.id() {
-            settings.ai_shared_collage_book_id = Some(id);
-            if let Some(role) = ensure_admin_role(&mut admin_role_id, &client).await {
-                provision::lock_to_admin_only(&client, ContentType::Book, id, role).await;
-            }
-        }
-    }
-
-    // User journal book on the User Journals shelf — name personalized by user_id.
-    if settings.user_journal_book_id.is_none() && checkbox_on(form.create_user_journal_book) {
-        let user_label = settings.user_id.clone().unwrap_or_else(|| "User".to_string());
-        let book_name = format!("{user_label} Journal");
-        let book_desc = format!("Journal for {user_label}. Auto-created by /remember.");
-        match client.create_book(&book_name, &book_desc).await {
-            Ok(book) => {
-                if let Some(book_id) = book.get("id").and_then(|i| i.as_i64()) {
-                    settings.user_journal_book_id = Some(book_id);
-                    provision_log.push(format!("Created user journal book \"{book_name}\" (id={book_id})"));
-                    if let Some(shelf_id) = globals.user_journals_shelf_id {
-                        if let Ok(shelf) = client.get_shelf(shelf_id).await {
-                            let mut existing: Vec<i64> = shelf
-                                .get("books")
-                                .and_then(|v| v.as_array())
-                                .map(|arr| arr.iter().filter_map(|b| b.get("id").and_then(|i| i.as_i64())).collect())
-                                .unwrap_or_default();
-                            if !existing.contains(&book_id) { existing.push(book_id); }
-                            let _ = client.update_shelf(shelf_id, &serde_json::json!({ "books": existing })).await;
-                        }
-                    }
-                }
-            }
-            Err(e) => provision_log.push(format!("Failed to create user journal book: {e}")),
-        }
-    }
-
-    // Mirror the global hive_shelf_id into the per-user setting so existing
-    // briefing code paths that read `settings.ai_hive_shelf_id` still work.
-    if let Some(id) = globals.hive_shelf_id {
-        settings.ai_hive_shelf_id = Some(id);
-    }
-
-    // Lock journal books to owner-only — applies to both freshly auto-created
-    // books and previously-existing books the user selected. Idempotent.
-    provision::lock_journal_books_to_owner(
-        &client,
-        settings.ai_hive_journal_book_id,
-        settings.user_journal_book_id,
-    )
-    .await;
-
-    // Persist.
-    if let Err(e) = state.db.save_global_settings(&globals, &token_id_hash).await {
-        eprintln!("Settings: save_global_settings failed: {e}");
-    }
-    if let Err(e) = state.db.save_user_settings(&token_id_hash, &settings).await {
-        eprintln!("Settings: save_user_settings failed: {e}");
-        return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to save settings").into_response();
-    }
-
-    if !provision_log.is_empty() {
-        eprintln!("Settings: auto-provisioned items:");
-        for line in &provision_log { eprintln!("  - {line}"); }
-    }
-    if !global_warnings.is_empty() {
-        eprintln!("Settings: global-write warnings:");
-        for line in &global_warnings { eprintln!("  - {line}"); }
-    }
-    eprintln!("Settings: saved for user (token_id_hash={}…, admin={is_admin})", &token_id_hash[..16.min(token_id_hash.len())]);
-    Redirect::to("/settings?saved=1").into_response()
+    Redirect::to("/settings").into_response()
 }
 
-// --- Probe endpoint ---
-
+/// Probe handler stubbed for v0.8.0 — returns 410 until the typed-slot
+/// auto-discovery design is complete.
 pub async fn handle_settings_probe_get(
-    State(state): State<AppState>,
-    headers: HeaderMap,
+    State(_state): State<AppState>,
+    _headers: HeaderMap,
 ) -> Response {
-    let (token_id, token_secret) = match resolve_session(&headers, &state.settings_sessions).await {
-        Some(c) => c,
-        None => return Redirect::to("/authorize?response_type=code&client_id=settings-ui&redirect_uri=/settings&return_to=/settings").into_response(),
-    };
-    let globals = state.db.get_global_settings().await.unwrap_or_default();
-    let hive_shelf_id = match globals.hive_shelf_id {
-        Some(id) => id,
-        None => {
-            return Html(probe_no_shelf_page()).into_response();
-        }
-    };
-    let client = BookStackClient::new(&state.bookstack_url, &token_id, &token_secret, state.http_client.clone());
-    let matches = match probe_hive(&client, hive_shelf_id).await {
-        Ok(m) => m,
-        Err(e) => return Html(probe_error_page(&e)).into_response(),
-    };
-    Html(render_probe_page(&matches, hive_shelf_id)).into_response()
+    (StatusCode::GONE, Html("<p>Probe disabled in v0.8.0. Use <a href=\"/settings\">/settings</a> directly.</p>"))
+        .into_response()
 }
 
 pub async fn handle_settings_probe_post(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(form): Form<ProbeAcceptForm>,
+    State(_state): State<AppState>,
+    _headers: HeaderMap,
 ) -> Response {
-    let (token_id, token_secret) = match resolve_session(&headers, &state.settings_sessions).await {
-        Some(c) => c,
-        None => return Redirect::to("/authorize?response_type=code&client_id=settings-ui&redirect_uri=/settings&return_to=/settings").into_response(),
-    };
-    let token_id_hash = hash_token_id(&token_id);
-    let client = BookStackClient::new(&state.bookstack_url, &token_id, &token_secret, state.http_client.clone());
-    let mut settings = state.db.get_user_settings(&token_id_hash).await.ok().flatten().unwrap_or_default();
+    (StatusCode::GONE, "probe disabled in v0.8.0").into_response()
+}
 
-    let assign = |checked: Option<String>, id: Option<String>| -> Option<i64> {
-        if checkbox_on(checked) { parse_id(id) } else { None }
-    };
-    if let Some(v) = assign(form.accept_ai_identity_book_id, form.ai_identity_book_id) { settings.ai_identity_book_id = Some(v); }
-    if let Some(v) = assign(form.accept_ai_identity_page_id, form.ai_identity_page_id) { settings.ai_identity_page_id = Some(v); }
-    if let Some(v) = assign(form.accept_ai_hive_journal_book_id, form.ai_hive_journal_book_id) { settings.ai_hive_journal_book_id = Some(v); }
-    if let Some(v) = assign(form.accept_ai_collage_book_id, form.ai_collage_book_id) { settings.ai_collage_book_id = Some(v); }
-    if let Some(v) = assign(form.accept_ai_shared_collage_book_id, form.ai_shared_collage_book_id) { settings.ai_shared_collage_book_id = Some(v); }
+// --- Form parsing helpers ---
 
-    provision::lock_journal_books_to_owner(
-        &client,
-        settings.ai_hive_journal_book_id,
-        settings.user_journal_book_id,
-    )
-    .await;
+fn nonempty(v: &Option<String>) -> Option<String> {
+    v.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from)
+}
 
-    if let Err(e) = state.db.save_user_settings(&token_id_hash, &settings).await {
-        eprintln!("Probe: save failed: {e}");
-        return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to save settings").into_response();
+fn parse_optional_i64(v: &Option<String>) -> Option<i64> {
+    v.as_deref().map(str::trim).filter(|s| !s.is_empty()).and_then(|s| s.parse().ok())
+}
+
+fn parse_id_list(v: &Option<String>) -> Vec<i64> {
+    let Some(s) = v.as_deref() else { return Vec::new(); };
+    s.split(|c: char| c == ',' || c.is_whitespace())
+        .filter_map(|t| t.trim().parse::<i64>().ok())
+        .collect()
+}
+
+fn parse_string_list(v: &Option<String>) -> Vec<String> {
+    let Some(s) = v.as_deref() else { return Vec::new(); };
+    s.split(|c: char| c == ',' || c == '\n')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+fn parse_kb_scope(kind: &Option<String>, id: &Option<String>) -> Option<KbScope> {
+    let id = parse_optional_i64(id)?;
+    let kind = nonempty(kind)?;
+    match kind.to_ascii_lowercase().as_str() {
+        "shelf" => Some(KbScope::Shelf(id)),
+        "book" => Some(KbScope::Book(id)),
+        "page" => Some(KbScope::Page(id)),
+        _ => None,
     }
-    Redirect::to("/settings?saved=1").into_response()
 }
 
-#[derive(Deserialize)]
-pub struct ProbeAcceptForm {
-    pub accept_ai_identity_book_id: Option<String>,
-    pub ai_identity_book_id: Option<String>,
-    pub accept_ai_identity_page_id: Option<String>,
-    pub ai_identity_page_id: Option<String>,
-    pub accept_ai_hive_journal_book_id: Option<String>,
-    pub ai_hive_journal_book_id: Option<String>,
-    pub accept_ai_collage_book_id: Option<String>,
-    pub ai_collage_book_id: Option<String>,
-    pub accept_ai_shared_collage_book_id: Option<String>,
-    pub ai_shared_collage_book_id: Option<String>,
+fn checkbox(v: &Option<String>) -> bool {
+    matches!(v.as_deref(), Some("on") | Some("true") | Some("1"))
 }
 
-#[derive(Default)]
-struct ProbeMatches {
-    identity_book: Option<NamedItem>,
-    identity_page: Option<NamedItem>,  // page inside the Identity book
-    journal_book: Option<NamedItem>,
-    collage_book: Option<NamedItem>,
-    shared_collage_book: Option<NamedItem>,
-}
+/// Phase 2.4d. Pull the per-tool admin defaults out of the raw form pairs.
+/// The form emits a `tool_listed_<name>` marker for every tool present
+/// (so a missing checkbox is distinguishable from a tool that wasn't
+/// rendered) plus an optional `tool_default_<name>=on` for each checked
+/// one. Returns an explicit on/off entry for every listed tool — absent
+/// keys mean "no admin default set" and `is_tool_enabled` will fall
+/// through to the on-by-default branch.
+///
+/// This keeps the on-disk shape clean: we don't need to write `true` for
+/// every tool just to say "it's on by default." The map only ever
+/// captures the admin's explicit overrides.
+fn parse_tool_defaults(
+    pairs: &[(String, String)],
+) -> std::collections::HashMap<String, bool> {
+    use std::collections::{HashMap, HashSet};
 
-async fn probe_hive(client: &BookStackClient, hive_shelf_id: i64) -> Result<ProbeMatches, String> {
-    let mut out = ProbeMatches::default();
-
-    // Books on the Hive shelf
-    let shelf = client.get_shelf(hive_shelf_id).await?;
-    let books_on_shelf: Vec<NamedItem> = shelf
-        .get("books")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|b| {
-            let id = b.get("id").and_then(|i| i.as_i64())?;
-            let name = b.get("name").and_then(|n| n.as_str())?.to_string();
-            Some(NamedItem { id, name })
-        }).collect())
-        .unwrap_or_default();
-
-    out.identity_book = books_on_shelf.iter().find(|b| NamedResource::IdentityBook.matches(&b.name)).cloned();
-    out.journal_book = books_on_shelf.iter().find(|b| NamedResource::JournalBook.matches(&b.name)).cloned();
-    out.collage_book = books_on_shelf.iter().find(|b| NamedResource::CollageBook.matches(&b.name)).cloned();
-    out.shared_collage_book = books_on_shelf.iter().find(|b| NamedResource::SharedCollageBook.matches(&b.name)).cloned();
-
-    // Identity manifest page inside the Identity book.
-    // Goes through `list_book_pages_by_updated` (which uses `get_book`)
-    // rather than `search` — search silently returns system-wide results
-    // when the query has no positive keyword term, which would surface
-    // pages from outside the identity book.
-    if let Some(ref ib) = out.identity_book {
-        if let Ok(pages) = client.list_book_pages_by_updated(ib.id, usize::MAX).await {
-            out.identity_page = pages.iter().find_map(|p| {
-                let name = p.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                if NamedResource::IdentityPage.matches(name) {
-                    let id = p.get("id").and_then(|i| i.as_i64())?;
-                    Some(NamedItem { id, name: name.to_string() })
-                } else {
-                    None
-                }
-            });
+    let mut listed: HashSet<String> = HashSet::new();
+    let mut on: HashSet<String> = HashSet::new();
+    for (k, v) in pairs {
+        if let Some(name) = k.strip_prefix("tool_listed_") {
+            if !name.is_empty() {
+                listed.insert(name.to_string());
+            }
+        } else if let Some(name) = k.strip_prefix("tool_default_") {
+            if !name.is_empty() && matches!(v.as_str(), "on" | "true" | "1") {
+                on.insert(name.to_string());
+            }
         }
     }
 
-    Ok(out)
+    // Keep only "off" explicit overrides; leave "on" tools out of the
+    // map entirely so the default-ON contract holds without any storage.
+    // (If we wrote `true` for every listed tool we'd grow the map every
+    // settings save with no semantic difference from leaving it empty.)
+    listed
+        .into_iter()
+        .filter(|name| !on.contains(name))
+        .map(|name| (name, false))
+        .collect::<HashMap<_, _>>()
 }
 
-fn probe_no_shelf_page() -> String {
-    r##"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Probe — no Hive shelf</title>
-<style>body{font-family:-apple-system,sans-serif;background:#1a1a2e;color:#e0e0e0;padding:2rem;}a{color:#3498db;}</style></head>
-<body><h1>No Hive shelf set</h1><p>The global Hive shelf isn't configured yet. Set it on the <a href="/settings">/settings</a> page first, then come back.</p></body></html>"##.to_string()
+fn now_unix() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
-fn probe_error_page(err: &str) -> String {
-    format!(r##"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Probe error</title>
-<style>body{{font-family:-apple-system,sans-serif;background:#1a1a2e;color:#e0e0e0;padding:2rem;}}.err{{background:#3d1f1f;padding:1rem;border-radius:6px;}}</style></head>
-<body><h1>Probe failed</h1><div class="err">{}</div><p><a href="/settings" style="color:#3498db;">Back to settings</a></p></body></html>"##, html_escape(err))
+fn error_response(msg: String) -> Response {
+    (StatusCode::INTERNAL_SERVER_ERROR, Html(html_escape(&msg))).into_response()
 }
 
-fn render_probe_page(m: &ProbeMatches, hive_shelf_id: i64) -> String {
-    fn row(field: &str, label: &str, hit: &Option<NamedItem>) -> String {
-        match hit {
-            Some(item) => format!(
-                r#"<tr><td><label><input type="checkbox" name="accept_{field}" checked> {label}</label></td><td><code>{}</code></td><td>id={}<input type="hidden" name="{field}" value="{}"></td></tr>"#,
-                html_escape(&item.name), item.id, item.id,
-            ),
-            None => format!(
-                r#"<tr><td>{label}</td><td colspan="2" style="color:#64748b;">no match</td></tr>"#
-            ),
-        }
-    }
-    format!(r##"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Probe results</title>
-<style>
-*{{margin:0;padding:0;box-sizing:border-box;}}
-body{{font-family:-apple-system,sans-serif;background:#1a1a2e;color:#e0e0e0;padding:2rem;}}
-.container{{max-width:720px;margin:0 auto;}}
-h1{{font-size:1.4rem;margin-bottom:.3rem;color:#fff;}}
-.subtitle{{color:#888;font-size:.9rem;margin-bottom:1.5rem;}}
-.card{{background:#16213e;border-radius:12px;padding:1.5rem;margin-bottom:1rem;}}
-table{{width:100%;border-collapse:collapse;}}
-td{{padding:.4rem .5rem;border-bottom:1px solid #2a3a5c;font-size:.9rem;}}
-button{{background:#2980b9;color:#fff;border:none;padding:.7rem 1.4rem;border-radius:6px;cursor:pointer;}}
-button:hover{{background:#3498db;}}
-a{{color:#3498db;}}
-code{{background:#0f1a30;padding:.1rem .3rem;border-radius:3px;}}
-</style></head>
-<body><div class="container">
-<h1>Probe results</h1>
-<p class="subtitle">Scanned the Hive shelf (id={hive_shelf_id}) for known resources by name. Check the boxes for matches you want to assign to your settings, then save.</p>
-<form method="POST" action="/settings/probe">
-<div class="card">
-<table>
-{r1}{r2}{r3}{r4}{r5}
-</table>
-</div>
-<button type="submit">Apply selected</button>
-&nbsp;&nbsp;<a href="/settings">Back to settings</a>
-</form>
-</div></body></html>"##,
-        hive_shelf_id = hive_shelf_id,
-        r1 = row("ai_identity_book_id", "Identity book", &m.identity_book),
-        r2 = row("ai_identity_page_id", "Identity manifest page", &m.identity_page),
-        r3 = row("ai_hive_journal_book_id", "Journal book", &m.journal_book),
-        r4 = row("ai_collage_book_id", "Topics / Collage book", &m.collage_book),
-        r5 = row("ai_shared_collage_book_id", "Shared collage book", &m.shared_collage_book),
+// --- HTML rendering ---
+
+fn render_kb_scope_picker(name: &str, label: &str, scope: &Option<KbScope>) -> String {
+    let (kind, id) = match scope {
+        Some(KbScope::Shelf(id)) => ("shelf", *id),
+        Some(KbScope::Book(id)) => ("book", *id),
+        Some(KbScope::Page(id)) => ("page", *id),
+        None => ("", 0),
+    };
+    let id_value = if id == 0 { String::new() } else { id.to_string() };
+    format!(
+        r#"
+<div class="scope-picker">
+  <label>{label}</label>
+  <select name="{name}_type">
+    <option value=""{none_sel}>(none)</option>
+    <option value="shelf"{shelf_sel}>Shelf</option>
+    <option value="book"{book_sel}>Book</option>
+    <option value="page"{page_sel}>Page</option>
+  </select>
+  <input type="number" name="{name}_id" placeholder="ID" value="{id_value}" />
+</div>"#,
+        none_sel = if kind.is_empty() { " selected" } else { "" },
+        shelf_sel = if kind == "shelf" { " selected" } else { "" },
+        book_sel = if kind == "book" { " selected" } else { "" },
+        page_sel = if kind == "page" { " selected" } else { "" },
     )
 }
 
-// --- Helpers ---
-
-#[derive(Clone)]
-struct NamedItem {
-    id: i64,
-    name: String,
-}
-
-fn extract_named_list(value: Option<&Value>) -> Vec<NamedItem> {
-    let Some(v) = value else { return Vec::new(); };
-    let Some(arr) = v.get("data").and_then(|d| d.as_array()) else { return Vec::new(); };
-    let mut items: Vec<NamedItem> = arr
-        .iter()
-        .filter_map(|item| {
-            let id = item.get("id").and_then(|i| i.as_i64())?;
-            let name = item.get("name").and_then(|n| n.as_str())?.to_string();
-            Some(NamedItem { id, name })
-        })
-        .collect();
-    items.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    items
-}
-
-fn render_select(name: &str, items: &[NamedItem], current: Option<i64>, allow_blank: bool) -> String {
-    let mut html = String::new();
-    html.push_str(&format!(r#"<select name="{}" id="{}">"#, html_escape(name), html_escape(name)));
-    if allow_blank {
-        let selected = if current.is_none() { " selected" } else { "" };
-        html.push_str(&format!(r#"<option value=""{selected}>— none —</option>"#));
-    }
-    for item in items {
-        let selected = if current == Some(item.id) { " selected" } else { "" };
-        html.push_str(&format!(
-            r#"<option value="{id}"{selected}>{name} ({id})</option>"#,
-            id = item.id,
-            name = html_escape(&item.name),
+/// Phase 2.4d. Build the "Tool defaults (admin only)" section. Sources
+/// the tool list from `mcp::all_tool_names()` so the form stays in sync
+/// with whatever the server actually advertises — no hardcoded list.
+/// Each row carries a hidden `tool_listed_<name>` marker so the POST
+/// handler can distinguish "checkbox unchecked" from "tool not in form."
+///
+/// TODO(2.4e onboarding): the per-user override UI for these same tools
+/// lives in the onboarding setup page, not here. Users will be able to
+/// flip individual tools on or off (over the admin default) from there;
+/// `UserSettings.tool_overrides` already wires it up end-to-end. Linked
+/// from the "(your override: ...)" annotation on each row.
+fn render_tool_defaults_section(g: &GlobalSettings, s: &UserSettings) -> String {
+    let mut rows = String::new();
+    for name in mcp::all_tool_names() {
+        // Effective admin default: explicit value if set, else on.
+        let admin_on = g.tool_defaults.get(&name).copied().unwrap_or(true);
+        // Best-effort note when the calling user has overridden the
+        // global default in their per-user settings. Visible only to
+        // the user themselves (we don't render other users' overrides);
+        // the user-facing override UI lands in sub-PR 2.4e on the
+        // onboarding setup page.
+        let user_override_note = match s.tool_overrides.get(&name) {
+            Some(true) => " <span class=\"note\">(your override: ON)</span>",
+            Some(false) => " <span class=\"note\">(your override: OFF)</span>",
+            None => "",
+        };
+        let escaped_name = html_escape(&name);
+        let checked = if admin_on { " checked" } else { "" };
+        rows.push_str(&format!(
+            "<label class=\"tool-row\"><input type=\"hidden\" name=\"tool_listed_{name}\" value=\"1\">\
+             <input type=\"checkbox\" name=\"tool_default_{name}\"{checked}> \
+             <code>{escaped_name}</code>{user_override_note}</label>\n",
+            name = escaped_name,
+            checked = checked,
+            escaped_name = escaped_name,
+            user_override_note = user_override_note,
         ));
     }
-    html.push_str("</select>");
-    html
-}
 
-fn render_text(name: &str, value: Option<&str>, placeholder: &str) -> String {
     format!(
-        r#"<input type="text" name="{name}" id="{name}" value="{value}" placeholder="{placeholder}">"#,
-        name = html_escape(name),
-        value = html_escape(value.unwrap_or("")),
-        placeholder = html_escape(placeholder),
-    )
-}
-
-fn render_id_input(name: &str, value: Option<i64>) -> String {
-    format!(
-        r#"<input type="text" inputmode="numeric" name="{name}" id="{name}" value="{value}" placeholder="page id">"#,
-        name = html_escape(name),
-        value = value.map(|v| v.to_string()).unwrap_or_default(),
-    )
-}
-
-fn render_textarea(name: &str, value: &str, placeholder: &str, rows: usize) -> String {
-    format!(
-        r#"<textarea name="{name}" id="{name}" rows="{rows}" placeholder="{ph}" style="width:100%;padding:0.55rem 0.7rem;border:1px solid #2a3a5c;border-radius:6px;background:#0f1a30;color:#e0e0e0;font-size:0.9rem;font-family:inherit;resize:vertical;">{value}</textarea>"#,
-        name = html_escape(name),
-        rows = rows,
-        ph = html_escape(placeholder),
-        value = html_escape(value),
-    )
-}
-
-fn render_checkbox(name: &str, checked: bool, label: &str) -> String {
-    let chk = if checked { " checked" } else { "" };
-    format!(
-        r#"<label class="cb"><input type="checkbox" name="{name}" id="{name}"{chk}> {label}</label>"#,
-        name = html_escape(name),
-        chk = chk,
-        label = html_escape(label),
+        r#"
+  <h2>Tool defaults (admin only)</h2>
+  <p class="help">Per-tool admin default. Unchecked = disabled by default for all users (a user can still re-enable in their own settings; that UI lands in onboarding setup, sub-PR 2.4e). Checked = on (the default for any tool not listed here is also on).</p>
+  <div class="tool-defaults">
+    {rows}
+  </div>
+"#,
+        rows = rows
     )
 }
 
 fn render_settings_page(
     s: &UserSettings,
     g: &GlobalSettings,
-    shelves: &[NamedItem],
-    books: &[NamedItem],
-    is_admin: bool,
+    user_journals_shelf_summary: &str,
+    tool_defaults_section: &str,
 ) -> String {
-    let css = r#"
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #1a1a2e; color: #e0e0e0; padding: 2rem; }
-.container { max-width: 720px; margin: 0 auto; }
-h1 { font-size: 1.5rem; margin-bottom: 0.3rem; color: #fff; }
-.subtitle { color: #888; font-size: 0.9rem; margin-bottom: 2rem; }
-.card { background: #16213e; border-radius: 12px; padding: 1.5rem; margin-bottom: 1rem; box-shadow: 0 4px 16px rgba(0,0,0,0.2); }
-h2 { font-size: 1rem; font-weight: 600; margin-bottom: 1rem; color: #f8fafc; border-bottom: 1px solid #2a3a5c; padding-bottom: 0.5rem; }
-.field { margin-bottom: 1rem; }
-.field label { display: block; font-size: 0.82rem; color: #aaa; margin-bottom: 0.3rem; }
-.field .hint { font-size: 0.75rem; color: #64748b; margin-top: 0.2rem; }
-input[type="text"], select { width: 100%; padding: 0.55rem 0.7rem; border: 1px solid #2a3a5c; border-radius: 6px; background: #0f1a30; color: #e0e0e0; font-size: 0.9rem; font-family: inherit; }
-input:focus, select:focus { outline: none; border-color: #3498db; }
-.cb { display: flex; align-items: center; gap: 0.5rem; font-size: 0.88rem; color: #e0e0e0; cursor: pointer; padding: 0.3rem 0; }
-.cb input { width: auto; }
-.row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
-.actions { display: flex; gap: 0.75rem; align-items: center; }
-button.primary { background: #2980b9; color: #fff; border: none; padding: 0.7rem 1.4rem; border-radius: 6px; font-size: 0.95rem; font-weight: 600; cursor: pointer; }
-button.primary:hover { background: #3498db; }
-a.reauth { color: #94a3b8; font-size: 0.85rem; text-decoration: none; margin-left: auto; }
-a.reauth:hover { color: #cbd5e1; text-decoration: underline; }
-.saved { background: #14532d; color: #4ade80; padding: 0.6rem 1rem; border-radius: 6px; margin-bottom: 1rem; font-size: 0.9rem; }
-"#;
+    let domains = s.domains.join(", ");
+    let system_prompt = s.system_prompt_page_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+    let org_domains = g.org_domains.join(", ");
+    let org_instructions = g.org_required_instructions_page_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+    let org_policy = g.org_ai_usage_policy_page_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
 
-    let saved_banner = ""; // optional ?saved=1 banner — populated in caller if we add query parsing later
+    let policies = render_kb_scope_picker("policies_scope", "Policies scope", &g.policies_scope);
+    let sops = render_kb_scope_picker("sops_scope", "SOPs scope", &g.sops_scope);
+    let bp = render_kb_scope_picker("best_practices_scope", "Best practices scope", &g.best_practices_scope);
 
     format!(
-        r##"<!DOCTYPE html>
-<html lang="en">
+        r#"<!DOCTYPE html>
+<html>
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Hive Memory Settings — BookStack MCP</title>
-<style>{css}</style>
+<title>BookStack MCP Settings</title>
+<style>
+body {{ font-family: system-ui, sans-serif; max-width: 720px; margin: 2em auto; padding: 0 1em; color: #222; }}
+h1 {{ margin-bottom: 0.25em; }}
+h2 {{ margin-top: 2em; border-bottom: 1px solid #ddd; padding-bottom: 0.2em; }}
+.note {{ color: #666; font-size: 0.9em; }}
+label {{ display: block; margin: 0.8em 0 0.3em; font-weight: 600; }}
+input[type=text], input[type=number], textarea, select {{ padding: 0.5em; box-sizing: border-box; font-family: inherit; }}
+input[type=text], textarea {{ width: 100%; }}
+input[type=number] {{ width: 12em; }}
+textarea {{ min-height: 4em; }}
+.help {{ font-size: 0.85em; color: #555; margin-top: 0.2em; }}
+button {{ margin-top: 1.5em; padding: 0.6em 1.2em; font-size: 1em; cursor: pointer; }}
+.scope-picker {{ margin: 0.8em 0; display: grid; grid-template-columns: 1fr auto; gap: 0.5em; align-items: end; }}
+.scope-picker label {{ grid-column: 1 / -1; }}
+.tool-defaults {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 0.3em 1em; margin: 0.5em 0; }}
+.tool-defaults .tool-row {{ display: flex; align-items: center; gap: 0.4em; font-weight: normal; margin: 0; }}
+.tool-defaults code {{ font-size: 0.9em; }}
+</style>
 </head>
 <body>
-<div class="container">
-<h1>Hive Memory Settings</h1>
-<p class="subtitle">Configure where your AI agent's memory lives in this BookStack. Empty fields disable that part of the <code>remember</code> response — they don't break it. <a href="/settings/probe" style="color:#3498db;">Probe existing Hive shelf</a> to auto-detect IDs from page names.</p>
-{saved_banner}
-<form method="POST" action="/settings">
+<h1>BookStack MCP Settings</h1>
+<p class="note">v0.8.0 — typed setup slots. Typeahead pickers backed by precision_search are coming in a follow-up commit on this branch.</p>
+<form method="post" action="/settings">
+  <h2>Per-user</h2>
+  <label>Label <input type="text" name="label" value="{label}"></label>
+  <label>Role hint <input type="text" name="role" value="{role}"></label>
+  <label>user_id <input type="text" name="user_id" value="{user_id}"></label>
+  <p class="help">Stable identifier (typically email).</p>
+  <label>bookstack_user_id <input type="number" name="bookstack_user_id" value="{bookstack_user_id}"></label>
+  <p class="help">BookStack user row ID — enables ACL-filtered semantic search and role-gated tool exposure.</p>
+  <label>Owned domains <textarea name="domains">{domains}</textarea></label>
+  <p class="help">Comma- or newline-separated.</p>
+  <label>system_prompt_page_ids <input type="text" name="system_prompt_page_ids" value="{system_prompt}"></label>
+  <p class="help">Free-form fallback for the typed slots — page IDs always injected into the briefing.</p>
+  <label>Timezone <input type="text" name="timezone" value="{timezone}"></label>
+  <p class="help">IANA name like <code>America/New_York</code>.</p>
+  <label><input type="checkbox" name="semantic_against_full_kb" {full_kb_checked}> Search the entire knowledge base (expensive)</label>
 
-<div class="card">
-<h2>Global shelves <span style="font-weight:400;font-size:.78rem;color:#94a3b8;">{global_lock_note}</span></h2>
-<p class="subtitle" style="margin-bottom:.75rem;">Shared by every user on this BookStack. First-write-wins for the UI; once set, the dropdown is locked here.</p>
-<div class="row2">
-<div class="field">
-  <label for="hive_shelf_id">Hive shelf</label>
-  {hive_shelf_select}
-  <div class="hint">Contains every AI agent's Identity book.</div>
-  {hive_shelf_create}
-</div>
-<div class="field">
-  <label for="user_journals_shelf_id">User Journals shelf</label>
-  {user_journals_shelf_select}
-  <div class="hint">Contains every human user's journal book.</div>
-  {user_journals_shelf_create}
-</div>
-</div>
-</div>
-
-<div class="card">
-<h2>Org identity &amp; domains <span style="font-weight:400;font-size:.78rem;color:#94a3b8;">{org_identity_note}</span></h2>
-<p class="subtitle" style="margin-bottom:.75rem;">Page describing the organization itself + the domains it owns. Pulled into every briefing's <code>system_prompt_additions</code> so every agent on the instance has a shared baseline. Page ID is first-write-wins; domains list is editable.</p>
-<div class="field">
-  <label for="org_identity_page_id">Org identity page ID</label>
-  {org_identity_page_input}
-  <div class="hint">Single page describing the org (mission, structure, conventions). First-write-wins.</div>
-</div>
-<div class="field">
-  <label for="org_domains">Org-owned domains</label>
-  {org_domains_input}
-  <div class="hint">One per line, or comma-separated. Merged with each user's <code>domains</code> in the briefing.</div>
-</div>
-</div>
-
-<div class="card">
-<h2>Org-default AI identity <span style="font-weight:400;font-size:.78rem;color:#94a3b8;">{org_default_note}</span></h2>
-<p class="subtitle" style="margin-bottom:.75rem;">When a user hasn't set their own AI identity, the briefing falls back to this. The "house agent". Admin-editable; can be changed later.</p>
-<div class="field">
-  <label for="default_ai_identity_page_id">Default identity manifest page ID</label>
-  {default_id_input}
-  <div class="hint">The page that defines the fallback agent. Find the ID in BookStack's URL.</div>
-</div>
-<div class="row2">
-<div class="field">
-  <label for="default_ai_identity_name">Default name</label>
-  {default_name_input}
-</div>
-<div class="field">
-  <label for="default_ai_identity_ouid">Default OUID</label>
-  {default_ouid_input}
-</div>
-</div>
-</div>
-
-<div class="card">
-<h2>Instance</h2>
-<div class="row2">
-<div class="field">
-  <label for="label">Label</label>
-  {label_input}
-  <div class="hint">Free-form name for this BookStack (e.g., "DTC", "Bee's Roadhouse").</div>
-</div>
-<div class="field">
-  <label for="role">Role</label>
-  {role_input}
-  <div class="hint">Free-form role hint (e.g., "work", "personal").</div>
-</div>
-</div>
-</div>
-
-<div class="card">
-<h2>AI Identity</h2>
-<div class="row2">
-<div class="field">
-  <label for="ai_identity_name">Display name</label>
-  {ai_name_input}
-  <div class="hint">e.g., "Pia", "Apis"</div>
-</div>
-<div class="field">
-  <label for="ai_identity_ouid">OUID</label>
-  {ai_ouid_input}
-  <div class="hint">Stable identifier (ULID/UUID). Echoed back in the response.</div>
-</div>
-</div>
-<div class="row2">
-<div class="field">
-  <label for="ai_hive_shelf_id">Hive shelf</label>
-  {ai_shelf_select}
-  <div class="hint">The shelf this Hive lives on (informational).</div>
-</div>
-<div class="field">
-  <label for="ai_identity_book_id">Identity book</label>
-  {ai_identity_book_select}
-  <div class="hint">Container for the manifest page.</div>
-</div>
-</div>
-<div class="field">
-  <label for="ai_identity_page_id">Identity manifest page ID</label>
-  {ai_page_input}
-  <div class="hint">The page (inside the Identity book) that defines who the AI is.</div>
-</div>
-</div>
-
-<div class="card">
-<h2>AI Journal &amp; Topics</h2>
-<div class="row2">
-<div class="field">
-  <label for="ai_hive_journal_book_id">AI journal book</label>
-  {ai_journal_select}
-  <div class="hint">Daily entries organized by YYYY-MM chapters.</div>
-</div>
-<div class="field">
-  <label for="ai_collage_book_id">Topics / Collage book</label>
-  {ai_collage_select}
-</div>
-</div>
-<div class="field">
-  <label for="ai_shared_collage_book_id">Shared collage book (optional)</label>
-  {ai_shared_collage_select}
-  <div class="hint">Cross-agent shared topics.</div>
-</div>
-</div>
-
-<div class="card">
-<h2>Your Identity</h2>
-<div class="row2">
-<div class="field">
-  <label for="user_id">User ID</label>
-  {user_id_input}
-  <div class="hint">e.g., your email. Echoed back in the response and used as the prefix for auto-provisioned per-user resource names.</div>
-</div>
-<div class="field">
-  <label for="bookstack_user_id">BookStack user row ID</label>
-  {bookstack_user_id_input}
-  <div class="hint">Numeric row ID for your BookStack user. Required for ACL-filtered semantic search — without it, search falls back to per-page HTTP permission checks (slower). Find via <code>/api/users</code> if you're an admin, or ask one to look it up.</div>
-</div>
-</div>
-<div class="row2">
-<div class="field">
-  <label for="user_identity_page_id">Your identity page ID</label>
-  {user_page_input}
-  <div class="hint">Auto-provisioned on first <code>remember_user action=read</code> once <code>user_id</code> is set.</div>
-</div>
-<div class="field">
-  <label for="user_identity_book_id">Your identity book ID</label>
-  {user_identity_book_id_input}
-  <div class="hint">Container book holding your identity page + per-user agent definitions. Auto-provisioned.</div>
-</div>
-</div>
-<div class="row2">
-<div class="field">
-  <label for="user_journal_book_id">Your journal book</label>
-  {user_journal_select}
-  <div class="hint">Auto-provisioned and force-attached to the User Journals shelf on every write.</div>
-</div>
-<div class="field">
-  <label for="user_journal_agent_page_id">Your journal-agent page ID</label>
-  {user_journal_agent_page_id_input}
-  <div class="hint">Auto-provisioned page (Agent: {{user_id}}-journal-agent) — fetched into the local agent cache by the bootstrap protocol.</div>
-</div>
-</div>
-<div class="field">
-  <label for="domains">Your owned domains</label>
-  {domains_input}
-  <div class="hint">One per line, or comma-separated. Surfaced in every briefing's <code>system_prompt_additions</code> so the AI can distinguish ours vs external content (URLs, emails). E.g.: <code>example.com</code></div>
-</div>
-</div>
-
-<div class="card">
-<h2>Semantic Search Targets</h2>
-<p class="subtitle" style="margin-bottom: 0.75rem;">Which corpora to vector-search against the user's first message.</p>
-{cb_journal}
-{cb_collage}
-{cb_shared_collage}
-{cb_user_journal}
-{cb_full_kb}
-</div>
-
-<div class="card">
-<h2>Behavior</h2>
-{cb_followup}
-<div class="row2" style="margin-top: 1rem;">
-<div class="field">
-  <label for="recent_journal_count">Recent journal entries to include</label>
-  <input type="text" inputmode="numeric" name="recent_journal_count" id="recent_journal_count" value="{recent_count}">
-</div>
-<div class="field">
-  <label for="active_collage_count">Active collage entries to include</label>
-  <input type="text" inputmode="numeric" name="active_collage_count" id="active_collage_count" value="{collage_count}">
-</div>
-</div>
-<div class="field" style="margin-top: 1rem;">
-  <label for="system_prompt_page_ids">Always-on context page IDs</label>
-  <input type="text" name="system_prompt_page_ids" id="system_prompt_page_ids" value="{system_prompt_ids}" placeholder="e.g. 3281, 3299, 3402">
-  <div class="hint">Page IDs whose full markdown is included in every briefing response. Best for SHORT durable context — writing style, communication preferences, formatting rules, ethical constraints. Long pages bloat every response. Comma- or space-separated.</div>
-</div>
-<div class="field" style="margin-top: 1rem;">
-  <label for="timezone">Timezone</label>
-  <input type="text" name="timezone" id="timezone" value="{timezone_input}" placeholder="America/New_York">
-  <div class="hint">IANA timezone name. Surfaced in the briefing's <code>time</code> block so the AI can format timestamps in your local time. Leave blank for UTC. <a href="https://en.wikipedia.org/wiki/List_of_tz_database_time_zones" target="_blank">List of tz names</a>.</div>
-</div>
-</div>
-
-<div class="card">
-<h2>Auto-create missing structure</h2>
-<p class="subtitle" style="margin-bottom:.75rem;">For each blank field above, check the box to have the server create the book or chapter on save (with sensible default name and description). Permission denials surface as a warning — they don't block the rest of the save.</p>
-{create_ai_identity_book_cb}
-{create_ai_hive_journal_book_cb}
-{create_ai_collage_book_cb}
-{create_ai_shared_collage_book_cb}
-{create_user_journal_book_cb}
-</div>
-
-<div class="actions">
-  <button type="submit" class="primary">Save settings</button>
-  <a href="/authorize?response_type=code&client_id=settings-ui&redirect_uri=/settings&return_to=/settings" class="reauth">Re-authenticate with new BookStack token →</a>
-</div>
-
+  <h2>Org-wide (admin-only)</h2>
+  <p class="help">Non-admin saves silently drop the global fields below.</p>
+  <label>guide_page_id <input type="number" name="guide_page_id" value="{guide_page_id}"></label>
+  <p class="help">Page describing how to use this BookStack. Auto-included in every briefing's system_prompt_additions when set.</p>
+  <label>org_identity_page_id <input type="number" name="org_identity_page_id" value="{org_identity_page_id}"></label>
+  <p class="help">Page describing the organization. Pulled into every briefing.</p>
+  {policies}
+  {sops}
+  {bp}
+  <label>Org domains <textarea name="org_domains">{org_domains}</textarea></label>
+  <label>org_required_instructions_page_ids <input type="text" name="org_required_instructions_page_ids" value="{org_instructions}"></label>
+  <label>org_ai_usage_policy_page_ids <input type="text" name="org_ai_usage_policy_page_ids" value="{org_policy}"></label>
+  <label><input type="checkbox" name="friendly_structure" {fs_checked}> friendly_structure</label>
+  <label><input type="checkbox" name="full_content_in_briefing" {fc_checked}> full_content_in_briefing</label>
+  <label><input type="checkbox" name="strict_setup" {ss_checked}> strict_setup (block tools until configured)</label>
+  <label>hive_shelf_id <input type="number" name="hive_shelf_id" value="{hive_shelf_id}"></label>
+  <label>User Journals shelf <input type="number" name="user_journals_shelf_id" value="{user_journals_shelf_id}"></label>
+  <p class="help">BookStack shelf where each user's personal Journal book lives. Required to enable remember_user_journal / remember_agent_journal.{user_journals_shelf_summary}</p>
+{tool_defaults_section}
+  <button type="submit">Save</button>
 </form>
-</div>
 </body>
-</html>"##,
-        css = css,
-        saved_banner = saved_banner,
-        label_input = render_text("label", s.label.as_deref(), "DTC"),
-        role_input = render_text("role", s.role.as_deref(), "work"),
-        ai_name_input = render_text("ai_identity_name", s.ai_identity_name.as_deref(), "Pia"),
-        ai_ouid_input = render_text("ai_identity_ouid", s.ai_identity_ouid.as_deref(), "019dc66e4dd87ea080ebf5d5e2985d91"),
-        ai_page_input = render_id_input("ai_identity_page_id", s.ai_identity_page_id),
-        ai_shelf_select = render_select("ai_hive_shelf_id", shelves, s.ai_hive_shelf_id, true),
-        ai_journal_select = render_select("ai_hive_journal_book_id", books, s.ai_hive_journal_book_id, true),
-        ai_collage_select = render_select("ai_collage_book_id", books, s.ai_collage_book_id, true),
-        ai_shared_collage_select = render_select("ai_shared_collage_book_id", books, s.ai_shared_collage_book_id, true),
-        ai_identity_book_select = render_select("ai_identity_book_id", books, s.ai_identity_book_id, true),
-        user_id_input = render_text("user_id", s.user_id.as_deref(), "you@example.com"),
-        bookstack_user_id_input = render_id_input("bookstack_user_id", s.bookstack_user_id),
-        user_page_input = render_id_input("user_identity_page_id", s.user_identity_page_id),
-        user_identity_book_id_input = render_id_input("user_identity_book_id", s.user_identity_book_id),
-        user_journal_agent_page_id_input = render_id_input("user_journal_agent_page_id", s.user_journal_agent_page_id),
-        user_journal_select = render_select("user_journal_book_id", books, s.user_journal_book_id, true),
-        domains_input = render_textarea(
-            "domains",
-            &format_str_list(&s.domains),
-            "example.com\nexample.net",
-            3,
-        ),
-        cb_journal = render_checkbox("semantic_against_journal", s.semantic_against_journal, "AI journal"),
-        cb_collage = render_checkbox("semantic_against_collage", s.semantic_against_collage, "Topics / collage"),
-        cb_shared_collage = render_checkbox("semantic_against_shared_collage", s.semantic_against_shared_collage, "Shared collage"),
-        cb_user_journal = render_checkbox("semantic_against_user_journal", s.semantic_against_user_journal, "User journal"),
-        cb_full_kb = render_checkbox("semantic_against_full_kb", s.semantic_against_full_kb, "Full KB (off: scope vector search to the configured books above; on: search the entire KB and surface out-of-scope hits in kb_semantic_matches)"),
-        cb_followup = render_checkbox("use_follow_up_remember_agent", s.use_follow_up_remember_agent, "Run a follow-up reconstitution agent after the structured pull"),
-        recent_count = s.recent_journal_count,
-        collage_count = s.active_collage_count,
-        system_prompt_ids = html_escape(&format_id_list(&s.system_prompt_page_ids)),
-        timezone_input = html_escape(s.timezone.as_deref().unwrap_or("")),
-
-        global_lock_note = match (g.updated_at > 0, is_admin) {
-            (true, _) => "(set globally — locked)",
-            (false, true) => "(unset — you are an admin and may set this once)",
-            (false, false) => "(unset — only a BookStack admin can configure this)",
-        },
-        // Lock the field if globals are already set OR the user isn't an admin.
-        hive_shelf_select = render_select_locked("hive_shelf_id", shelves, g.hive_shelf_id, g.hive_shelf_id.is_some() || !is_admin),
-        user_journals_shelf_select = render_select_locked("user_journals_shelf_id", shelves, g.user_journals_shelf_id, g.user_journals_shelf_id.is_some() || !is_admin),
-        // Only show the create checkboxes for admins setting unset globals.
-        hive_shelf_create = if g.hive_shelf_id.is_none() && is_admin { create_inline("create_hive_shelf", "Create \"Hive\" shelf if missing") } else { String::new() },
-        user_journals_shelf_create = if g.user_journals_shelf_id.is_none() && is_admin { create_inline("create_user_journals_shelf", "Create \"User Journals\" shelf if missing") } else { String::new() },
-
-        org_identity_note = match (g.org_identity_page_id.is_some(), is_admin) {
-            (true, true) => "(set globally; page ID is locked, domains list editable)",
-            (false, true) => "(unset — you are an admin and may set this)",
-            (true, false) => "(set globally — read-only)",
-            (false, false) => "(unset — only a BookStack admin can configure)",
-        },
-        org_identity_page_input = if is_admin && g.org_identity_page_id.is_none() {
-            render_id_input("org_identity_page_id", g.org_identity_page_id)
-        } else {
-            render_locked_value(g.org_identity_page_id.map(|v| v.to_string()))
-        },
-        org_domains_input = if is_admin {
-            render_textarea(
-                "org_domains",
-                &format_str_list(&g.org_domains),
-                "example.com\nexample.net",
-                3,
-            )
-        } else {
-            render_locked_value(if g.org_domains.is_empty() {
-                None
-            } else {
-                Some(format_str_list(&g.org_domains))
-            })
-        },
-
-        org_default_note = if is_admin { "(admin-editable)" } else { "(read-only — admin only)" },
-        default_id_input = if is_admin {
-            render_id_input("default_ai_identity_page_id", g.default_ai_identity_page_id)
-        } else {
-            render_locked_value(g.default_ai_identity_page_id.map(|v| v.to_string()))
-        },
-        default_name_input = if is_admin {
-            render_text("default_ai_identity_name", g.default_ai_identity_name.as_deref(), "Pia")
-        } else {
-            render_locked_value(g.default_ai_identity_name.clone())
-        },
-        default_ouid_input = if is_admin {
-            render_text("default_ai_identity_ouid", g.default_ai_identity_ouid.as_deref(), "019dc66e4dd87ea080ebf5d5e2985d91")
-        } else {
-            render_locked_value(g.default_ai_identity_ouid.clone())
-        },
-
-        create_ai_identity_book_cb = create_row("create_ai_identity_book", "Create Identity book under the Hive shelf if blank above", s.ai_identity_book_id.is_some()),
-        create_ai_hive_journal_book_cb = create_row("create_ai_hive_journal_book", "Create Journal book under the Hive shelf if blank above", s.ai_hive_journal_book_id.is_some()),
-        create_ai_collage_book_cb = create_row("create_ai_collage_book", "Create Topics / Collage book under the Hive shelf if blank above", s.ai_collage_book_id.is_some()),
-        create_ai_shared_collage_book_cb = create_row("create_ai_shared_collage_book", "Create Shared Topics book under the Hive shelf if blank above", s.ai_shared_collage_book_id.is_some()),
-        create_user_journal_book_cb = create_row("create_user_journal_book", "Create your personal journal book under the User Journals shelf if blank above", s.user_journal_book_id.is_some()),
+</html>"#,
+        label = html_escape(s.label.as_deref().unwrap_or("")),
+        role = html_escape(s.role.as_deref().unwrap_or("")),
+        user_id = html_escape(s.user_id.as_deref().unwrap_or("")),
+        bookstack_user_id = s.bookstack_user_id.map(|i| i.to_string()).unwrap_or_default(),
+        domains = html_escape(&domains),
+        system_prompt = html_escape(&system_prompt),
+        timezone = html_escape(s.timezone.as_deref().unwrap_or("")),
+        full_kb_checked = if s.semantic_against_full_kb { "checked" } else { "" },
+        guide_page_id = g.guide_page_id.map(|i| i.to_string()).unwrap_or_default(),
+        org_identity_page_id = g.org_identity_page_id.map(|i| i.to_string()).unwrap_or_default(),
+        policies = policies,
+        sops = sops,
+        bp = bp,
+        org_domains = html_escape(&org_domains),
+        org_instructions = html_escape(&org_instructions),
+        org_policy = html_escape(&org_policy),
+        fs_checked = if g.friendly_structure { "checked" } else { "" },
+        fc_checked = if g.full_content_in_briefing { "checked" } else { "" },
+        ss_checked = if g.strict_setup { "checked" } else { "" },
+        hive_shelf_id = g.hive_shelf_id.map(|i| i.to_string()).unwrap_or_default(),
+        user_journals_shelf_id = g.user_journals_shelf_id.map(|i| i.to_string()).unwrap_or_default(),
+        user_journals_shelf_summary = html_escape(user_journals_shelf_summary),
+        tool_defaults_section = tool_defaults_section,
     )
 }
 
-fn create_row(field_name: &str, label: &str, already_set: bool) -> String {
-    if already_set {
-        format!(r#"<div class="cb" style="color:#64748b;">✓ {label} (already configured)</div>"#, label = html_escape(label))
-    } else {
-        format!(
-            r#"<label class="cb"><input type="checkbox" name="{name}" value="on"> {label}</label>"#,
-            name = html_escape(field_name),
-            label = html_escape(label),
-        )
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pair(k: &str, v: &str) -> (String, String) {
+        (k.to_string(), v.to_string())
     }
-}
 
-fn create_inline(field_name: &str, label: &str) -> String {
-    format!(
-        r#"<label class="cb" style="margin-top:.3rem;"><input type="checkbox" name="{name}" value="on"> {label}</label>"#,
-        name = html_escape(field_name),
-        label = html_escape(label),
-    )
-}
+    #[test]
+    fn parse_tool_defaults_marks_unchecked_listed_tools_as_off() {
+        // Form rendered three tools, user unchecked one.
+        let pairs = vec![
+            pair("tool_listed_briefing", "1"),
+            pair("tool_default_briefing", "on"),
+            pair("tool_listed_journal", "1"),
+            pair("tool_default_journal", "on"),
+            pair("tool_listed_identity", "1"),
+            // identity intentionally not checked
+        ];
+        let map = parse_tool_defaults(&pairs);
+        assert_eq!(map.get("identity"), Some(&false));
+        // Checked tools left out (default-ON, no need to store true).
+        assert!(!map.contains_key("briefing"));
+        assert!(!map.contains_key("journal"));
+    }
 
-fn render_locked_value(value: Option<String>) -> String {
-    let display = value.unwrap_or_else(|| "(unset)".into());
-    format!(
-        r#"<div style="padding:.55rem .7rem;border:1px solid #2a3a5c;border-radius:6px;background:#0a0f1f;color:#94a3b8;font-size:.9rem;">{}</div>"#,
-        html_escape(&display),
-    )
-}
+    #[test]
+    fn parse_tool_defaults_ignores_unrelated_pairs() {
+        let pairs = vec![
+            pair("label", "DTC"),
+            pair("guide_page_id", "42"),
+            pair("tool_listed_journal", "1"),
+            // No tool_default_journal — unchecked, so journal=false.
+        ];
+        let map = parse_tool_defaults(&pairs);
+        assert_eq!(map, [("journal".to_string(), false)].into_iter().collect());
+    }
 
-fn render_select_locked(name: &str, items: &[NamedItem], current: Option<i64>, locked: bool) -> String {
-    if locked {
-        let current_name = current
-            .and_then(|id| items.iter().find(|i| i.id == id))
-            .map(|i| i.name.clone())
-            .unwrap_or_else(|| String::from("(unknown)"));
-        format!(
-            r#"<input type="hidden" name="{name}" value="{value}"><div style="padding:.55rem .7rem;border:1px solid #2a3a5c;border-radius:6px;background:#0a0f1f;color:#94a3b8;font-size:.9rem;">{disp} <code style="font-size:.75rem;">id={id}</code></div>"#,
-            name = html_escape(name),
-            value = current.map(|v| v.to_string()).unwrap_or_default(),
-            disp = html_escape(&current_name),
-            id = current.map(|v| v.to_string()).unwrap_or_default(),
-        )
-    } else {
-        render_select(name, items, current, true)
+    #[test]
+    fn parse_tool_defaults_empty_when_no_listed_keys() {
+        // No `tool_listed_*` keys = admin section absent. Result is empty
+        // even if a stray `tool_default_*` shows up.
+        let pairs = vec![pair("tool_default_journal", "on")];
+        let map = parse_tool_defaults(&pairs);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn render_tool_defaults_section_lists_every_advertised_tool() {
+        let g = GlobalSettings::default();
+        let s = UserSettings::default();
+        let html = render_tool_defaults_section(&g, &s);
+        for name in mcp::all_tool_names() {
+            assert!(
+                html.contains(&format!("tool_listed_{name}")),
+                "missing hidden marker for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_tool_defaults_section_marks_admin_off_unchecked() {
+        let mut g = GlobalSettings::default();
+        // Use a known stable tool name from the catalog.
+        g.tool_defaults.insert("search_content".to_string(), false);
+        let s = UserSettings::default();
+        let html = render_tool_defaults_section(&g, &s);
+
+        // The search_content checkbox row should NOT carry " checked".
+        // Find the row by its hidden marker, then walk backwards a
+        // small window to confirm the checkbox is absent of "checked".
+        let marker = "tool_listed_search_content";
+        let pos = html.find(marker).expect("search_content row missing");
+        // The label spans a single line; the checkbox lives within
+        // ~200 chars after the marker.
+        let window_end = (pos + 400).min(html.len());
+        let window = &html[pos..window_end];
+        assert!(
+            !window.contains("type=\"checkbox\" name=\"tool_default_search_content\" checked"),
+            "search_content should be unchecked when admin set it false"
+        );
     }
 }

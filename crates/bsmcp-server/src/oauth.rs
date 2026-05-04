@@ -1,5 +1,5 @@
 use std::env;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -13,6 +13,8 @@ use zeroize::Zeroize;
 
 use bsmcp_common::bookstack::BookStackClient;
 use bsmcp_common::config::access_token_ttl;
+use bsmcp_common::db::{DbBackend, TokenBinding};
+use bsmcp_common::settings::{hash_token_id, DEFAULT_ACCOUNT_LABEL};
 
 use crate::sse::AppState;
 
@@ -48,9 +50,11 @@ pub struct AuthorizeParams {
     state: Option<String>,
     code_challenge: Option<String>,
     code_challenge_method: Option<String>,
-    /// When set to "/settings", short-circuits the OAuth code flow: after validating
-    /// the BookStack token, the server issues a settings-session cookie and redirects
-    /// the browser directly to /settings. Used by the in-server settings UI.
+    /// When set to a recognized in-server browser path (`/settings`,
+    /// `/setup/user`), short-circuits the OAuth code flow: after validating
+    /// the BookStack token, the server issues a settings-session cookie and
+    /// redirects the browser directly to the return path. Used by the
+    /// in-server settings UI and the user-onboarding wizard.
     return_to: Option<String>,
 }
 
@@ -146,6 +150,25 @@ fn html_escape(s: &str) -> String {
 /// Returns true if the given path is a safe in-server redirect (no scheme/host).
 fn is_safe_internal_path(s: &str) -> bool {
     s.starts_with('/') && !s.starts_with("//") && !s.contains(':')
+}
+
+/// In-server browser paths the OAuth handler will short-circuit to (skip
+/// the OAuth code-exchange dance, issue a settings-session cookie, redirect
+/// directly). Kept as a closed allow-list so a malicious `?return_to=` can't
+/// turn the auth endpoint into an open redirector — `is_safe_internal_path`
+/// catches scheme/host injection, but this catches arbitrary internal paths
+/// (anything outside the allow-list goes through the normal OAuth code flow
+/// instead, which won't redirect a browser to an unknown URL).
+const COOKIE_FLOW_RETURN_PATHS: &[&str] = &["/settings", "/setup/user", "/setup/admin"];
+
+/// True when `return_to` matches a path the cookie-issuing flow should
+/// service directly. Reads tolerantly — leading/trailing whitespace stripped,
+/// trailing slash on `/setup/user/` collapsed.
+fn is_cookie_flow_return(p: Option<&str>) -> bool {
+    let Some(p) = p else { return false };
+    let trimmed = p.trim().trim_end_matches('/');
+    let normalized = if trimmed.is_empty() { "/" } else { trimmed };
+    COOKIE_FLOW_RETURN_PATHS.contains(&normalized)
 }
 
 fn render_login_form(
@@ -291,11 +314,8 @@ pub async fn handle_authorize(
     // Browser settings flow bypasses the OAuth code dance entirely — no PKCE required,
     // no response_type check. The form renders, the user enters their token, and on
     // success the server sets a session cookie and redirects to the return_to path.
-    let is_settings_flow = params
-        .return_to
-        .as_deref()
-        .map(|p| p == "/settings")
-        .unwrap_or(false);
+    // Allowed targets: /settings (admin) + /setup/user (onboarding wizard).
+    let is_settings_flow = is_cookie_flow_return(params.return_to.as_deref());
 
     if !is_settings_flow {
         if params.response_type != "code" {
@@ -316,6 +336,110 @@ pub async fn handle_authorize(
     Html(render_login_form(&params, &state.bookstack_url, None)).into_response()
 }
 
+/// Best-effort: bind a BookStack API token to a stable identity
+/// `(bookstack_user_id, account_label)` in `token_bindings`, and stamp
+/// `bookstack_user_id` onto the corresponding `user_settings` row.
+///
+/// Idempotent and short-circuiting:
+///  - If a binding already exists for this token hash, returns it
+///    without hitting BookStack.
+///  - Otherwise, hits BookStack `/api/users/me` once. If it returns a
+///    user, writes a binding with the default account label (the
+///    `/setup/user` wizard offers reattaching to an existing label
+///    later).
+///
+/// All failures are non-fatal and logged. The OAuth login still
+/// succeeds even when BookStack rejects `/api/users/me`; the user just
+/// sees the manual `/settings` path on a permanent `setup_nudge` for
+/// `bookstack_user_id` until they fix the token's permissions.
+///
+/// Used by:
+///  - `handle_authorize_submit` — wires bindings on first /authorize.
+///  - `sse::handle_sse` — wires bindings for SSE GET (legacy Bearer).
+///  - `sse::handle_streamable` — wires bindings on Streamable HTTP
+///    `initialize` (the only method that runs before any other tool).
+pub(crate) async fn ensure_token_binding(
+    db: &dyn DbBackend,
+    client: &BookStackClient,
+    token_id: &str,
+) -> Option<TokenBinding> {
+    let token_id_hash = hash_token_id(token_id);
+
+    // Fast path: already bound. Skip the /api/users/me round-trip.
+    match db.get_token_binding(&token_id_hash).await {
+        Ok(Some(binding)) => return Some(binding),
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("oauth: get_token_binding failed (non-fatal): {e}");
+            return None;
+        }
+    }
+
+    // Slow path: need /api/users/me to learn the bookstack_user_id.
+    let identity = match client.whoami().await {
+        Ok(Some(id)) => id,
+        Ok(None) => return None,
+        Err(e) => {
+            eprintln!("oauth: whoami failed (non-fatal): {e}");
+            return None;
+        }
+    };
+
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let binding = TokenBinding {
+        token_id_hash: token_id_hash.clone(),
+        bookstack_user_id: identity.bookstack_user_id,
+        account_label: DEFAULT_ACCOUNT_LABEL.to_string(),
+        created_at: now_secs,
+    };
+
+    if let Err(e) = db.set_token_binding(&binding).await {
+        eprintln!("oauth: set_token_binding failed (non-fatal): {e}");
+        return None;
+    }
+
+    // Stamp bookstack_user_id + account_label on settings (replaces the
+    // old v0.7.x auto-populate that lived directly on the user_settings
+    // row keyed by token_id_hash).
+    let mut settings = db
+        .get_user_settings_by_stable_id(&binding.stable_id())
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let mut dirty = false;
+    if settings.bookstack_user_id != Some(identity.bookstack_user_id) {
+        settings.bookstack_user_id = Some(identity.bookstack_user_id);
+        dirty = true;
+    }
+    if settings.account_label != binding.account_label {
+        settings.account_label = binding.account_label.clone();
+        dirty = true;
+    }
+    if dirty {
+        if let Err(e) = db
+            .save_user_settings_by_stable_id(&binding.stable_id(), &settings)
+            .await
+        {
+            eprintln!(
+                "oauth: save settings on first bind failed (non-fatal): {e}"
+            );
+            // Binding is already persisted — return Some so callers know
+            // the auth path is complete enough to proceed.
+        }
+    }
+
+    eprintln!(
+        "auth: bound token to bookstack_user_id={} account_label={}",
+        binding.bookstack_user_id, binding.account_label
+    );
+    Some(binding)
+}
+
 pub async fn handle_authorize_submit(
     State(state): State<AppState>,
     Form(form): Form<AuthorizeFormSubmit>,
@@ -331,11 +455,7 @@ pub async fn handle_authorize_submit(
         }
     }
 
-    let is_settings_flow = form
-        .return_to
-        .as_deref()
-        .map(|p| p == "/settings")
-        .unwrap_or(false);
+    let is_settings_flow = is_cookie_flow_return(form.return_to.as_deref());
 
     if !is_settings_flow && form.response_type != "code" {
         return oauth_error(
@@ -365,8 +485,16 @@ pub async fn handle_authorize_submit(
         .into_response();
     }
 
+    // Best-effort: bind this token to a stable identity now that we know
+    // it's valid. Writes a `token_bindings` row + stamps
+    // `bookstack_user_id` / `account_label` on settings. Idempotent and
+    // silent on failure — never blocks login.
+    let _ = ensure_token_binding(state.db.as_ref(), &bs_client, &form.token_id).await;
+
     // Browser settings flow: skip the OAuth code dance entirely. Issue a settings
-    // session, set the cookie, and redirect to the return path.
+    // session, set the cookie, and redirect to the return path. Both the admin
+    // /settings page and the onboarding /setup/user wizard land here; the
+    // redirect honors whichever return_to the form carried.
     if is_settings_flow {
         let session_id = crate::settings_ui::issue_settings_session(
             &state.settings_sessions,
@@ -375,12 +503,18 @@ pub async fn handle_authorize_submit(
         )
         .await;
         let cookie = crate::settings_ui::build_session_cookie(&session_id);
-        eprintln!("OAuth: issued settings-UI session for /settings flow");
+        let location = form
+            .return_to
+            .as_deref()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| "/settings".to_string());
+        eprintln!("OAuth: issued settings-UI session for cookie flow → {location}");
         return (
             StatusCode::FOUND,
             [
                 (header::SET_COOKIE, cookie),
-                (header::LOCATION, "/settings".to_string()),
+                (header::LOCATION, location),
             ],
         )
             .into_response();
@@ -771,4 +905,36 @@ fn oauth_error(status: StatusCode, error: &str, description: Option<&str>) -> Re
         body["error_description"] = json!(desc);
     }
     (status, Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cookie_flow_recognizes_settings_and_setup_user() {
+        assert!(is_cookie_flow_return(Some("/settings")));
+        assert!(is_cookie_flow_return(Some("/setup/user")));
+        // Phase 2.4f — admin onboarding wizard.
+        assert!(is_cookie_flow_return(Some("/setup/admin")));
+        // Trailing slash collapsed.
+        assert!(is_cookie_flow_return(Some("/setup/user/")));
+        assert!(is_cookie_flow_return(Some("/setup/admin/")));
+        // Surrounding whitespace tolerated.
+        assert!(is_cookie_flow_return(Some("  /settings  ")));
+    }
+
+    #[test]
+    fn cookie_flow_rejects_arbitrary_paths_and_open_redirects() {
+        // Outside the allow-list — these fall through to the normal
+        // OAuth code flow rather than getting a cookie issued + a
+        // redirect to whatever the caller asked for.
+        assert!(!is_cookie_flow_return(Some("/")));
+        assert!(!is_cookie_flow_return(Some("/admin")));
+        assert!(!is_cookie_flow_return(Some("/settings/probe")));
+        assert!(!is_cookie_flow_return(Some("https://evil.example/")));
+        assert!(!is_cookie_flow_return(Some("//evil.example/")));
+        assert!(!is_cookie_flow_return(None));
+        assert!(!is_cookie_flow_return(Some("")));
+    }
 }

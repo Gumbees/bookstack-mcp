@@ -1,6 +1,6 @@
 # Software Bill of Materials
 
-_Auto-generated on 2026-05-02 18:13 UTC from commit `499c111` via `cargo metadata --locked`._
+_Auto-generated on 2026-05-04 19:07 UTC from commit `6691c9e` via `cargo metadata --locked`._
 
 | Package | Version | License | Repository |
 |---------|---------|---------|------------|

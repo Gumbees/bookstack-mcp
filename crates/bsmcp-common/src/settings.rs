@@ -12,8 +12,16 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Default value for `UserSettings.account_label`. A new field on a
+/// row-without-the-key deserializes to this; constructing via
+/// `UserSettings::default()` also lands here.
+pub const DEFAULT_ACCOUNT_LABEL: &str = "default";
+
+fn default_account_label() -> String { DEFAULT_ACCOUNT_LABEL.to_string() }
+fn default_use_org_identity() -> bool { true }
+
 /// Per-user settings.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UserSettings {
     /// Free-form label for this BookStack instance (e.g. "DTC", "Bee's Roadhouse").
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -34,6 +42,21 @@ pub struct UserSettings {
     /// filters tools by the user's BookStack role.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bookstack_user_id: Option<i64>,
+
+    /// Per-account-personality label. Combined with `bookstack_user_id` this
+    /// is the **stable identity key** that survives BookStack API token
+    /// rotations — the `token_bindings` table maps `token_id_hash` to
+    /// `(bookstack_user_id, account_label)`, and `user_settings` rows live
+    /// against that pair instead of the raw token hash.
+    ///
+    /// Single-account users never see this — defaults to `"default"`. Users
+    /// running the same BookStack as two different personalities (e.g. one
+    /// MCP wired to the DTC Anthropic account, one to the personal account)
+    /// distinguish them with labels like `"dtc"` and `"personal"`. The
+    /// `/setup/user` wizard offers existing labels to pick from on first
+    /// authentication of a new token, so token rotation preserves settings.
+    #[serde(default = "default_account_label")]
+    pub account_label: String,
 
     /// Domains owned by the user. Surfaced in the briefing's
     /// `system_prompt_additions` so the AI can distinguish "ours" (URLs/emails
@@ -118,10 +141,27 @@ pub struct UserSettings {
     // `user write` once they've decided journaling fits their workflow.
 
     /// When true, the briefing payload appends a "remember to journal …"
-    /// reminder. The journal tool itself remains usable regardless of this
-    /// flag — turning it off just silences the nudge.
+    /// reminder AND the `journal` and `identity` (target=agent) write tools
+    /// will accept writes on this instance. When false, the reminder is
+    /// silent and write attempts return `Forbidden` with a "journaling not
+    /// enabled on this instance" message.
+    ///
+    /// This is the per-instance "is this MCP a journaling target?" toggle.
+    /// Multi-instance setups (e.g. one personal MCP, one DTC MCP wired to
+    /// the same Claude session) flip it on for the primary and leave it off
+    /// for bootstrap-only sources. Default `false` so an unconfigured
+    /// instance never accidentally accepts journal/identity writes.
     #[serde(default)]
     pub journaling_enabled: bool,
+
+    /// Inject `globals.org_identity_page_id` (when admin-configured) into
+    /// this user's `system_prompt_additions`. Default `true` — the
+    /// admin-set org identity applies by default. Users who don't want the
+    /// org's canonical identity bound to their session (e.g. a DTC-employed
+    /// contractor whose primary identity lives on their personal MCP) flip
+    /// this off and the org_identity entry is omitted from their briefing.
+    #[serde(default = "default_use_org_identity")]
+    pub use_org_identity: bool,
 
     /// User's preferred AI identity name. When set, the briefing's
     /// journaling reminder addresses the agent by this name even if the
@@ -185,6 +225,41 @@ pub struct UserSettings {
     /// after surfacing the warning, on the same call.
     #[serde(default, flatten)]
     pub extras: std::collections::HashMap<String, Value>,
+}
+
+impl Default for UserSettings {
+    /// Manual `Default` impl rather than `#[derive]` because `account_label`
+    /// must default to `"default"` (not `""`) and `use_org_identity` to
+    /// `true` (not `false`). Every other field matches its serde-default.
+    fn default() -> Self {
+        Self {
+            label: None,
+            role: None,
+            user_id: None,
+            bookstack_user_id: None,
+            account_label: default_account_label(),
+            domains: Vec::new(),
+            system_prompt_page_ids: Vec::new(),
+            semantic_against_full_kb: false,
+            timezone: None,
+            timezone_fetched_at: None,
+            settings_nudge_dismissed_until: None,
+            config_extras: std::collections::HashMap::new(),
+            user_journal_book_id: None,
+            cached_user_email: None,
+            cached_user_email_fetched_at: None,
+            cached_first_name: None,
+            cached_first_name_fetched_at: None,
+            journaling_enabled: false,
+            use_org_identity: default_use_org_identity(),
+            chosen_ai_identity: None,
+            tool_overrides: std::collections::HashMap::new(),
+            cached_is_admin: None,
+            cached_is_admin_fetched_at: None,
+            setup_complete: false,
+            extras: std::collections::HashMap::new(),
+        }
+    }
 }
 
 impl UserSettings {

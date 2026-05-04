@@ -34,6 +34,7 @@ pub mod briefing;
 pub mod config;
 pub mod directory;
 pub mod envelope;
+pub mod events;
 pub mod identity;
 pub mod journal;
 pub mod migrate;
@@ -167,6 +168,9 @@ async fn route(resource: &str, action: &str, ctx: &Context) -> DispatchResult {
         ("reminders", "list") => reminders::list(ctx).await,
         ("reminders", "complete") => reminders::complete(ctx).await,
         ("reminders", "delete") => reminders::delete(ctx).await,
+        ("events", "create") => events::create(ctx).await,
+        ("events", "list") => events::list(ctx).await,
+        ("events", "cancel") => events::cancel(ctx).await,
         (r, _) if !known_resource(r) => Err((
             ErrorCode::UnknownResource,
             format!("Unknown resource: {r}"),
@@ -189,6 +193,7 @@ fn known_resource(resource: &str) -> bool {
             | "journal"
             | "migrate"
             | "reminders"
+            | "events"
     )
 }
 
@@ -232,6 +237,7 @@ mod tests {
         assert!(known_resource("journal"));
         assert!(known_resource("migrate"));
         assert!(known_resource("reminders"));
+        assert!(known_resource("events"));
     }
 
     #[test]

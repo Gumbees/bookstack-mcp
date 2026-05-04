@@ -2603,6 +2603,41 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             }),
         ));
         tools.push(tool(
+            "events",
+            "Future-scheduled calendar items living on monthly pages inside the user's per-user Journal book. Layout: singleton `Events` chapter, monthly pages `{YYYY-MM}-Events` (page month matches the event's scheduled month, not the creation month), single section `## 📅 Scheduled`. Bullet shape `- {scheduled_at} — {title} _[{label}: {natural_key}]_` (no checkbox — events are scheduled or cancelled, and cancellation removes the bullet). Three actions: `create` (auto-routes to the right monthly page based on `scheduled_at`), `list` (current month, optional `label` filter), `cancel` (removes bullet from current month's page). Cross-month list/cancel is out of scope.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["create", "list", "cancel"],
+                        "description": "Operation to perform"
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Required for `create`. Free-form event title."
+                    },
+                    "scheduled_at": {
+                        "type": "string",
+                        "description": "Required for `create`. Accepts `YYYY-MM-DD`, `YYYY-MM-DD HH:MM`, `YYYY-MM-DD HH:MM TZ`, or RFC 3339. Bare date/time without TZ assumes the user's saved timezone (default UTC)."
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Optional for `create` (defaults to `user`) and `list` (filter). `user` or a normalized agent name."
+                    },
+                    "natural_key": {
+                        "type": "string",
+                        "description": "Optional for `create`. Stable slug used as the `event_id` second half. Auto-derived from `title` when absent."
+                    },
+                    "event_id": {
+                        "type": "string",
+                        "description": "Required for `cancel`. Format `{label}:{natural_key}` — exactly what `create` returned."
+                    }
+                },
+                "required": ["action"]
+            }),
+        ));
+        tools.push(tool(
             "session_event",
             "Signal a session-level event. Currently supported: `action: 'compacted'` resets the briefing-injection state so the next tool response includes the full briefing again. Useful after the AI gets compacted by its harness and loses context.",
             json!({
@@ -2651,6 +2686,7 @@ fn remember_resource(tool_name: &str) -> Option<&'static str> {
         "journal" => Some("journal"),
         "migrate" => Some("migrate"),
         "reminders" => Some("reminders"),
+        "events" => Some("events"),
         _ => None,
     }
 }

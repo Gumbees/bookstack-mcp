@@ -2558,6 +2558,51 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             }),
         ));
         tools.push(tool(
+            "reminders",
+            "Simple labeled task list living on monthly pages inside the user's per-user Journal book. Layout: singleton `Reminders` chapter, monthly pages `{YYYY-MM}-Reminders` with `## 🟢 Open` and `## ✅ Done` sections. Bullet shape `- [ ] {priority_emoji?} {created} — {action} _[{label}: {natural_key}]_`. Four actions: `create` (appends a bullet under Open; auto-slugifies `natural_key` from text if absent; returns the assembled `reminder_id` = `{label}:{natural_key}`), `list` (filterable by `owner` + `status`), `complete` (flips `[ ]` → `[x]`, stamps ` · done {ts}`, moves bullet to Done section), `delete` (removes the bullet). Cross-month operations are out of scope — complete/delete look at the current month's page.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["create", "list", "complete", "delete"],
+                        "description": "Operation to perform"
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Required for `create`. The reminder body, rendered after the timestamp. e.g. 'rotate the CF AI Gateway token'."
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Required for `create`. Owner — `user` or a normalized agent name (lowercase ASCII alphanumerics + dashes/underscores; whitespace -> dash). Becomes the first half of the `reminder_id`."
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": ["today", "this-week", "whenever"],
+                        "description": "Optional for `create`. Maps to a priority emoji in the bullet (🔥 / ⚡ / 🌱). Omit for no emoji."
+                    },
+                    "natural_key": {
+                        "type": "string",
+                        "description": "Optional for `create`. Stable slug used as the `reminder_id` second half. Auto-derived from `text` when absent."
+                    },
+                    "owner": {
+                        "type": "string",
+                        "description": "Optional filter for `list`. Pass `user` or an agent name to limit results to that label."
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["open", "done", "all"],
+                        "description": "Optional filter for `list`. Defaults to `all`."
+                    },
+                    "reminder_id": {
+                        "type": "string",
+                        "description": "Required for `complete` and `delete`. Format `{label}:{natural_key}` — exactly what `create` returned."
+                    }
+                },
+                "required": ["action"]
+            }),
+        ));
+        tools.push(tool(
             "session_event",
             "Signal a session-level event. Currently supported: `action: 'compacted'` resets the briefing-injection state so the next tool response includes the full briefing again. Useful after the AI gets compacted by its harness and loses context.",
             json!({
@@ -2605,6 +2650,7 @@ fn remember_resource(tool_name: &str) -> Option<&'static str> {
         "identity" => Some("identity"),
         "journal" => Some("journal"),
         "migrate" => Some("migrate"),
+        "reminders" => Some("reminders"),
         _ => None,
     }
 }

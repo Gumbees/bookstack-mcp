@@ -159,7 +159,7 @@ fn is_safe_internal_path(s: &str) -> bool {
 /// catches scheme/host injection, but this catches arbitrary internal paths
 /// (anything outside the allow-list goes through the normal OAuth code flow
 /// instead, which won't redirect a browser to an unknown URL).
-const COOKIE_FLOW_RETURN_PATHS: &[&str] = &["/settings", "/setup/user"];
+const COOKIE_FLOW_RETURN_PATHS: &[&str] = &["/settings", "/setup/user", "/setup/admin"];
 
 /// True when `return_to` matches a path the cookie-issuing flow should
 /// service directly. Reads tolerantly — leading/trailing whitespace stripped,
@@ -862,8 +862,11 @@ mod tests {
     fn cookie_flow_recognizes_settings_and_setup_user() {
         assert!(is_cookie_flow_return(Some("/settings")));
         assert!(is_cookie_flow_return(Some("/setup/user")));
+        // Phase 2.4f — admin onboarding wizard.
+        assert!(is_cookie_flow_return(Some("/setup/admin")));
         // Trailing slash collapsed.
         assert!(is_cookie_flow_return(Some("/setup/user/")));
+        assert!(is_cookie_flow_return(Some("/setup/admin/")));
         // Surrounding whitespace tolerated.
         assert!(is_cookie_flow_return(Some("  /settings  ")));
     }

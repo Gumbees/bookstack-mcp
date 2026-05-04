@@ -220,6 +220,15 @@ fn build_briefing_meta_body(args: &Value, request_id: Option<&Value>) -> Value {
 ///   this is NOT one-shot: it rides on every response until
 ///   `UserSettings.setup_complete` flips. Gated by `BSMCP_ONBOARDING_ENABLED`
 ///   (default on); see `is_onboarding_visible`.
+///
+/// For BookStack admins on a freshly-installed instance, every call also
+/// gets:
+/// - `admin_onboarding_pending` — `{message, url}`. Same shape as
+///   `onboarding_pending` but pointed at `/setup/admin`. "Run once"
+///   semantics — the first admin to submit the wizard flips the org-wide
+///   `GlobalSettings.admin_setup_complete` flag and the nudge stops for
+///   every admin. `BSMCP_FORCE_ADMIN_SETUP=1` env override re-arms the
+///   nudge for ops recovery without touching the DB.
 async fn build_response_meta(
     args: &Value,
     request_id: Option<&Value>,
@@ -227,7 +236,7 @@ async fn build_response_meta(
     client: &BookStackClient,
     deps: &BriefingDeps,
 ) -> Value {
-    let settings = deps
+    let mut settings = deps
         .db
         .get_user_settings(&deps.token_id_hash)
         .await
@@ -259,6 +268,45 @@ async fn build_response_meta(
 
     if is_onboarding_visible(onboarding_enabled(), settings.setup_complete) {
         meta["onboarding_pending"] = build_onboarding_pending_meta();
+    }
+
+    // Admin onboarding nudge. Independent from the per-user `setup_complete`
+    // gate above: a single agent who is both a first-time user AND a
+    // BookStack admin can see BOTH `onboarding_pending` and
+    // `admin_onboarding_pending` on the same response (different keys, no
+    // conflict).
+    //
+    // The admin-status check has to do real work (refresh the cache when
+    // stale, hit BookStack's `/api/users/{id}` endpoint). To stay fast on
+    // the hot path we:
+    //   1. Skip entirely when env or global flag already says "no".
+    //   2. Use the user's existing cached bit via `resolve_is_admin_cached`.
+    //      That helper refreshes opportunistically when stale — the brief
+    //      asks for a "background" refresh, but the cache TTL is 24h so
+    //      paying one BookStack round-trip per day per user is acceptable
+    //      and keeps the implementation synchronous and deterministic.
+    //   3. If admin status can't be determined (no bookstack_user_id, or
+    //      the BookStack call errored with no stale cache to fall back
+    //      on), `resolve_is_admin_cached` returns None — we treat that as
+    //      "not admin" so non-admins never get nagged.
+    let global_settings = deps.db.get_global_settings().await.unwrap_or_default();
+    let force_override = crate::setup_ui::force_admin_setup_env();
+    let effective_complete = crate::setup_ui::effective_admin_setup_complete(
+        global_settings.admin_setup_complete,
+        force_override,
+    );
+    if onboarding_enabled() && !effective_complete {
+        let user_is_admin = crate::setup_ui::resolve_is_admin_cached(
+            &deps.token_id_hash,
+            &mut settings,
+            client,
+            deps.db.clone(),
+        )
+        .await
+        .unwrap_or(false);
+        if crate::setup_ui::is_admin_onboarding_visible(true, false, user_is_admin) {
+            meta["admin_onboarding_pending"] = build_admin_onboarding_pending_meta();
+        }
     }
 
     meta
@@ -2591,21 +2639,40 @@ pub fn is_onboarding_visible(env_enabled: bool, setup_complete: bool) -> bool {
 /// a relative `/setup/user` path so the AI can still render a clickable
 /// link inside its own UI.
 pub fn build_onboarding_pending_meta() -> Value {
-    let url = match std::env::var("BSMCP_PUBLIC_DOMAIN") {
-        Ok(d) => {
-            let d = d.trim().trim_end_matches('/');
-            if d.is_empty() {
-                "/setup/user".to_string()
-            } else {
-                format!("https://{d}/setup/user")
-            }
-        }
-        Err(_) => "/setup/user".to_string(),
-    };
+    let url = onboarding_url("/setup/user");
     json!({
         "message": "Welcome to bookstack-mcp. Please complete user setup.",
         "url": url,
     })
+}
+
+/// Build the `meta.admin_onboarding_pending` payload. Same domain /
+/// relative-fallback rules as `build_onboarding_pending_meta` but points
+/// at `/setup/admin` and uses the admin-flavored message string.
+pub fn build_admin_onboarding_pending_meta() -> Value {
+    let url = onboarding_url("/setup/admin");
+    json!({
+        "message": "First-time admin setup pending. Please complete org configuration.",
+        "url": url,
+    })
+}
+
+/// Shared URL builder: resolves `BSMCP_PUBLIC_DOMAIN` to an absolute
+/// `https://{domain}{path}` when set + non-empty, else returns the path
+/// itself so the AI still has a clickable in-app link. Trailing slashes
+/// on the env value are collapsed.
+fn onboarding_url(path: &str) -> String {
+    match std::env::var("BSMCP_PUBLIC_DOMAIN") {
+        Ok(d) => {
+            let d = d.trim().trim_end_matches('/');
+            if d.is_empty() {
+                path.to_string()
+            } else {
+                format!("https://{d}{path}")
+            }
+        }
+        Err(_) => path.to_string(),
+    }
 }
 
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {
@@ -2816,7 +2883,9 @@ mod tests {
     /// `cargo test` doesn't race them against each other when running the
     /// in-process tests in parallel. We capture+restore the ambient value
     /// at the boundaries so we don't pollute the test binary's env across
-    /// modules.
+    /// modules. Covers BOTH `build_onboarding_pending_meta` (user) and
+    /// `build_admin_onboarding_pending_meta` (admin) so any divergence
+    /// between the two URL paths surfaces here.
     #[test]
     fn build_onboarding_pending_meta_url_cases() {
         let prev = std::env::var("BSMCP_PUBLIC_DOMAIN").ok();
@@ -2832,12 +2901,26 @@ mod tests {
             .as_str()
             .unwrap_or("")
             .starts_with("Welcome"));
+        // Admin variant.
+        let admin_payload = build_admin_onboarding_pending_meta();
+        assert_eq!(
+            admin_payload["url"].as_str(),
+            Some("https://mcp.example.com/setup/admin")
+        );
+        assert!(admin_payload["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("admin setup"));
 
         // 2. Trailing slash collapsed.
         std::env::set_var("BSMCP_PUBLIC_DOMAIN", "mcp.example.com/");
         assert_eq!(
             build_onboarding_pending_meta()["url"].as_str(),
             Some("https://mcp.example.com/setup/user")
+        );
+        assert_eq!(
+            build_admin_onboarding_pending_meta()["url"].as_str(),
+            Some("https://mcp.example.com/setup/admin")
         );
 
         // 3. Blank/whitespace → relative fallback.
@@ -2846,12 +2929,20 @@ mod tests {
             build_onboarding_pending_meta()["url"].as_str(),
             Some("/setup/user")
         );
+        assert_eq!(
+            build_admin_onboarding_pending_meta()["url"].as_str(),
+            Some("/setup/admin")
+        );
 
         // 4. Unset → relative fallback.
         std::env::remove_var("BSMCP_PUBLIC_DOMAIN");
         assert_eq!(
             build_onboarding_pending_meta()["url"].as_str(),
             Some("/setup/user")
+        );
+        assert_eq!(
+            build_admin_onboarding_pending_meta()["url"].as_str(),
+            Some("/setup/admin")
         );
 
         // Restore.

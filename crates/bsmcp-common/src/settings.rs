@@ -143,6 +143,25 @@ pub struct UserSettings {
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub tool_overrides: std::collections::HashMap<String, bool>,
 
+    // --- Admin status cache (Phase 2.4f) ---
+    //
+    // Cached "is this user a BookStack admin" bit, used by the
+    // `meta.admin_onboarding_pending` injection on every MCP response and
+    // by the `/setup/admin` POST guard. Refreshed every 24 hours. `None`
+    // means "never fetched / unknown" — callers err on the side of NOT
+    // injecting the admin nudge, so non-admins don't get nagged.
+
+    /// Cached result of `is_bookstack_admin` — true if the user's BookStack
+    /// role list contains a role with `system_name == "admin"`. Refreshed
+    /// every 24 hours; populated lazily on the first MCP response after the
+    /// cache expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_is_admin: Option<bool>,
+
+    /// Unix epoch seconds the `cached_is_admin` value was last fetched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_is_admin_fetched_at: Option<i64>,
+
     // --- Onboarding (Phase 2.4e) ---
     //
     // True once the user has completed the `/setup/user` onboarding wizard.
@@ -288,6 +307,21 @@ pub struct GlobalSettings {
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub tool_defaults: std::collections::HashMap<String, bool>,
 
+    // --- Admin onboarding (Phase 2.4f) ---
+    //
+    // True once any BookStack admin has submitted the `/setup/admin` wizard.
+    // Drives `meta.admin_onboarding_pending` injection: while false AND the
+    // calling user is a BookStack admin, every MCP tool response carries an
+    // admin onboarding nudge. "Run once" semantics — the first admin to
+    // complete it flips this for everyone.
+    /// True once any admin has submitted the `/setup/admin` wizard.
+    /// Distinct from `UserSettings.setup_complete` (per-user) — this is a
+    /// single global bit. Set by `setup_ui::handle_setup_admin_post`;
+    /// `BSMCP_FORCE_ADMIN_SETUP=1` env override ignores this for ops
+    /// recovery (restored backup, re-onboarding).
+    #[serde(default)]
+    pub admin_setup_complete: bool,
+
     // --- Bookkeeping ---
 
     /// Hash of the first token_id that set these values (informational).
@@ -316,6 +350,7 @@ impl Default for GlobalSettings {
             hive_shelf_id: None,
             user_journals_shelf_id: None,
             tool_defaults: std::collections::HashMap::new(),
+            admin_setup_complete: false,
             set_by_token_hash: None,
             updated_at: 0,
         }
@@ -458,5 +493,46 @@ mod tests {
         let u = user_with(&[("identity", true)]);
         let g = GlobalSettings::default();
         assert!(is_tool_enabled("identity", &u, &g));
+    }
+
+    // --- Admin onboarding (Phase 2.4f) ---
+
+    #[test]
+    fn global_settings_decodes_without_admin_setup_complete() {
+        // Pre-2.4f rows have no admin_setup_complete key. Must decode
+        // cleanly with the field defaulting to false.
+        let json = r#"{"updated_at": 0}"#;
+        let g: GlobalSettings = serde_json::from_str(json).expect("legacy decode");
+        assert!(!g.admin_setup_complete);
+    }
+
+    #[test]
+    fn global_settings_round_trips_admin_setup_complete() {
+        let mut g = GlobalSettings::default();
+        g.admin_setup_complete = true;
+        let json = serde_json::to_string(&g).expect("serialize");
+        let back: GlobalSettings = serde_json::from_str(&json).expect("deserialize");
+        assert!(back.admin_setup_complete);
+    }
+
+    #[test]
+    fn user_settings_decodes_without_cached_is_admin() {
+        // Pre-2.4f rows have no cached_is_admin key. Must decode cleanly
+        // with both fields defaulting to None.
+        let json = r#"{"label":"DTC"}"#;
+        let s: UserSettings = serde_json::from_str(json).expect("legacy decode");
+        assert!(s.cached_is_admin.is_none());
+        assert!(s.cached_is_admin_fetched_at.is_none());
+    }
+
+    #[test]
+    fn user_settings_round_trips_cached_is_admin() {
+        let mut s = UserSettings::default();
+        s.cached_is_admin = Some(true);
+        s.cached_is_admin_fetched_at = Some(1_700_000_000);
+        let json = serde_json::to_string(&s).expect("serialize");
+        let back: UserSettings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.cached_is_admin, Some(true));
+        assert_eq!(back.cached_is_admin_fetched_at, Some(1_700_000_000));
     }
 }

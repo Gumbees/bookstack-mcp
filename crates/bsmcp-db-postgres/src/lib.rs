@@ -149,7 +149,8 @@ impl PostgresDb {
                 friendly_structure BOOLEAN NOT NULL DEFAULT TRUE,
                 full_content_in_briefing BOOLEAN NOT NULL DEFAULT FALSE,
                 strict_setup BOOLEAN NOT NULL DEFAULT FALSE,
-                tool_defaults TEXT
+                tool_defaults TEXT,
+                admin_setup_complete BOOLEAN NOT NULL DEFAULT FALSE
             )"
         )
         .execute(&pool)
@@ -174,6 +175,10 @@ impl PostgresDb {
             // (HashMap<String, bool>); empty / NULL decodes to an empty
             // map. Same pattern as `org_domains`.
             "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS tool_defaults TEXT",
+            // Phase 2.4f — admin onboarding "run once" flag. Single bit.
+            // FALSE = not yet completed, TRUE = some admin has finished
+            // /setup/admin.
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS admin_setup_complete BOOLEAN NOT NULL DEFAULT FALSE",
         ] {
             sqlx::query(sql).execute(&pool).await.ok();
         }
@@ -556,7 +561,7 @@ impl DbBackend for PostgresDb {
                     set_by_token_hash, updated_at,
                     guide_page_id, policies_scope, sops_scope, best_practices_scope,
                     friendly_structure, full_content_in_briefing, strict_setup,
-                    tool_defaults
+                    tool_defaults, admin_setup_complete
              FROM global_settings WHERE id = 1"
         )
         .fetch_optional(&self.pool)
@@ -580,6 +585,7 @@ impl DbBackend for PostgresDb {
             full_content_in_briefing: r.get("full_content_in_briefing"),
             strict_setup: r.get("strict_setup"),
             tool_defaults: decode_bool_map(r.get("tool_defaults")),
+            admin_setup_complete: r.get("admin_setup_complete"),
         }).unwrap_or_default())
     }
 
@@ -614,7 +620,8 @@ impl DbBackend for PostgresDb {
                  friendly_structure = $13,
                  full_content_in_briefing = $14,
                  strict_setup = $15,
-                 tool_defaults = $16
+                 tool_defaults = $16,
+                 admin_setup_complete = $17
              WHERE id = 1"
         )
         .bind(settings.hive_shelf_id)
@@ -633,6 +640,7 @@ impl DbBackend for PostgresDb {
         .bind(settings.full_content_in_briefing)
         .bind(settings.strict_setup)
         .bind(encode_bool_map(&settings.tool_defaults))
+        .bind(settings.admin_setup_complete)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("save_global_settings: {e}"))?;

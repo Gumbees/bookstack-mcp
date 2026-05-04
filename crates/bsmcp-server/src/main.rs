@@ -286,6 +286,10 @@ async fn main() {
             "/setup/user",
             get(setup_ui::handle_setup_user_get).post(setup_ui::handle_setup_user_post),
         )
+        .route(
+            "/setup/admin",
+            get(setup_ui::handle_setup_admin_get).post(setup_ui::handle_setup_admin_post),
+        )
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }));
     if briefing_enabled {
         app = app.route(
@@ -303,7 +307,11 @@ async fn main() {
     }
     eprintln!("Settings: UI active at GET/POST /settings");
     if mcp::onboarding_enabled() {
-        eprintln!("Onboarding: wizard active at GET/POST /setup/user");
+        eprintln!("Onboarding: user wizard active at GET/POST /setup/user");
+        eprintln!("Onboarding: admin wizard active at GET/POST /setup/admin");
+        if setup_ui::force_admin_setup_env() {
+            eprintln!("Onboarding: BSMCP_FORCE_ADMIN_SETUP=1 — admin nudge re-armed regardless of stored flag");
+        }
     } else {
         eprintln!("Onboarding: DISABLED (set BSMCP_ONBOARDING_ENABLED=true to enable)");
     }

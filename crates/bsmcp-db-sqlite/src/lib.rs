@@ -68,7 +68,8 @@ impl SqliteDb {
                  friendly_structure INTEGER NOT NULL DEFAULT 1,
                  full_content_in_briefing INTEGER NOT NULL DEFAULT 0,
                  strict_setup INTEGER NOT NULL DEFAULT 0,
-                 tool_defaults TEXT
+                 tool_defaults TEXT,
+                 admin_setup_complete INTEGER NOT NULL DEFAULT 0
              );
              INSERT OR IGNORE INTO global_settings (id, updated_at) VALUES (1, 0);
              DROP TABLE IF EXISTS registrations;
@@ -199,6 +200,9 @@ impl SqliteDb {
             // (HashMap<String, bool>); empty / NULL decodes to an empty
             // map. Same pattern as `org_domains`.
             "ALTER TABLE global_settings ADD COLUMN tool_defaults TEXT",
+            // Phase 2.4f — admin onboarding "run once" flag. Single bit.
+            // 0 = not yet completed, 1 = some admin has finished /setup/admin.
+            "ALTER TABLE global_settings ADD COLUMN admin_setup_complete INTEGER NOT NULL DEFAULT 0",
         ] {
             conn.execute_batch(sql).ok();
         }
@@ -536,7 +540,7 @@ impl DbBackend for SqliteDb {
                         set_by_token_hash, updated_at,
                         guide_page_id, policies_scope, sops_scope, best_practices_scope,
                         friendly_structure, full_content_in_briefing, strict_setup,
-                        tool_defaults
+                        tool_defaults, admin_setup_complete
                  FROM global_settings WHERE id = 1",
                 [],
                 |row| Ok(GlobalSettings {
@@ -556,6 +560,7 @@ impl DbBackend for SqliteDb {
                     full_content_in_briefing: row.get::<_, i64>(13)? != 0,
                     strict_setup: row.get::<_, i64>(14)? != 0,
                     tool_defaults: decode_bool_map(row.get::<_, Option<String>>(15)?),
+                    admin_setup_complete: row.get::<_, i64>(16)? != 0,
                 }),
             ).unwrap_or_default();
             Ok(row)
@@ -597,7 +602,8 @@ impl DbBackend for SqliteDb {
                      friendly_structure = ?13,
                      full_content_in_briefing = ?14,
                      strict_setup = ?15,
-                     tool_defaults = ?16
+                     tool_defaults = ?16,
+                     admin_setup_complete = ?17
                  WHERE id = 1",
                 params![
                     s.hive_shelf_id,
@@ -616,6 +622,7 @@ impl DbBackend for SqliteDb {
                     if s.full_content_in_briefing { 1i64 } else { 0i64 },
                     if s.strict_setup { 1i64 } else { 0i64 },
                     encode_bool_map(&s.tool_defaults),
+                    if s.admin_setup_complete { 1i64 } else { 0i64 },
                 ],
             ).map_err(|e| format!("save_global_settings: {e}"))?;
             Ok(())

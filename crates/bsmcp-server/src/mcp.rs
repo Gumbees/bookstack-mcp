@@ -2638,6 +2638,41 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             }),
         ));
         tools.push(tool(
+            "sessions",
+            "Capture AI sessions (forager, Claude Code hooks, external clients) into the user's per-user Journal book. Layout: per-agent chapter `Sessions: {agent_name}`; one page per session named `{YYYY-MM-DD}-{title|session_id_short}`; each `append` adds a new `## Block N — {ts}` markdown block to the bottom of that page. The `sessions` DB table indexes session_id → page_id so resume flows don't re-walk BookStack. Three actions: `append` (creates page on first call, appends blocks on resume; gated on `journaling_enabled = true`), `list` (paged by `last_appended_at DESC`, optional `agent_name` filter), `read` (returns the full transcript markdown). Search is deferred to Phase 6's precision_search. The same flow is reachable via HTTP for non-MCP clients (forager): `POST /sessions/v1/append`, `GET /sessions/v1/list`, `GET /sessions/v1/{session_id}`.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["append", "list", "read"],
+                        "description": "Operation to perform"
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Required for `append` and `read`. Opaque, caller-chosen (UUID, ULID, etc.). The first append for a given session_id creates the page; subsequent appends resume on the same page."
+                    },
+                    "agent_name": {
+                        "type": "string",
+                        "description": "Required for `append`. Optional filter for `list`. Free-form name; normalized to lowercase ASCII alphanumerics + dashes/underscores (whitespace -> dash)."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Required for `append`. Markdown body of the new block. Appended below any prior blocks on the same session page."
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Optional for `append` (only honored on first call for a session). Used in the page name when present, else page falls back to `{date}-{session_id_short}`."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Optional for `list`. Defaults to 50, clamped 1..=500."
+                    }
+                },
+                "required": ["action"]
+            }),
+        ));
+        tools.push(tool(
             "session_event",
             "Signal a session-level event. Currently supported: `action: 'compacted'` resets the briefing-injection state so the next tool response includes the full briefing again. Useful after the AI gets compacted by its harness and loses context.",
             json!({
@@ -2687,6 +2722,7 @@ fn remember_resource(tool_name: &str) -> Option<&'static str> {
         "migrate" => Some("migrate"),
         "reminders" => Some("reminders"),
         "events" => Some("events"),
+        "sessions" => Some("sessions"),
         _ => None,
     }
 }

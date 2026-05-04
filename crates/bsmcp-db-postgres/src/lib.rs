@@ -12,7 +12,7 @@ use sqlx::{PgPool, Row};
 use zeroize::Zeroizing;
 
 use bsmcp_common::config::{access_token_ttl, refresh_token_ttl};
-use bsmcp_common::db::{stable_id_for, DbBackend, IndexDb, SemanticDb, TokenBinding};
+use bsmcp_common::db::{stable_id_for, DbBackend, IndexDb, SemanticDb, SessionRow, TokenBinding};
 use bsmcp_common::index::*;
 use bsmcp_common::settings::{
     memory_protocol_tool_defaults_seed, GlobalSettings, UserSettings, DEFAULT_ACCOUNT_LABEL,
@@ -153,6 +153,40 @@ impl PostgresDb {
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_token_bindings_user
              ON token_bindings(bookstack_user_id)"
+        )
+        .execute(&pool)
+        .await
+        .ok();
+
+        // sessions index — one row per AI session captured to BookStack.
+        // Pure additive table; no migration needed for existing installs.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT PRIMARY KEY,
+                token_id_hash TEXT NOT NULL,
+                agent_name TEXT NOT NULL,
+                bookstack_page_id BIGINT NOT NULL,
+                chapter_id BIGINT NOT NULL,
+                book_id BIGINT NOT NULL,
+                started_at BIGINT NOT NULL,
+                last_appended_at BIGINT NOT NULL,
+                block_count BIGINT NOT NULL DEFAULT 0,
+                title TEXT
+            )"
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("Failed to create sessions table: {e}"))?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_token_recent
+             ON sessions(token_id_hash, last_appended_at DESC)"
+        )
+        .execute(&pool)
+        .await
+        .ok();
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_token_agent
+             ON sessions(token_id_hash, agent_name)"
         )
         .execute(&pool)
         .await
@@ -798,6 +832,123 @@ impl DbBackend for PostgresDb {
                  call set_token_binding before save"
             )),
         }
+    }
+
+    async fn get_session(&self, session_id: &str) -> Result<Option<SessionRow>, String> {
+        let row: Option<(String, String, String, i64, i64, i64, i64, i64, i64, Option<String>)> =
+            sqlx::query_as(
+                "SELECT session_id, token_id_hash, agent_name,
+                        bookstack_page_id, chapter_id, book_id,
+                        started_at, last_appended_at, block_count, title
+                   FROM sessions WHERE session_id = $1",
+            )
+            .bind(session_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| format!("get_session: {e}"))?;
+
+        Ok(row.map(|(sid, tid, agent, page, chap, book, st, la, bc, title)| SessionRow {
+            session_id: sid,
+            token_id_hash: tid,
+            agent_name: agent,
+            bookstack_page_id: page,
+            chapter_id: chap,
+            book_id: book,
+            started_at: st,
+            last_appended_at: la,
+            block_count: bc,
+            title,
+        }))
+    }
+
+    async fn upsert_session(&self, row: &SessionRow) -> Result<(), String> {
+        sqlx::query(
+            "INSERT INTO sessions
+                (session_id, token_id_hash, agent_name,
+                 bookstack_page_id, chapter_id, book_id,
+                 started_at, last_appended_at, block_count, title)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             ON CONFLICT (session_id) DO UPDATE SET
+                token_id_hash = EXCLUDED.token_id_hash,
+                agent_name = EXCLUDED.agent_name,
+                bookstack_page_id = EXCLUDED.bookstack_page_id,
+                chapter_id = EXCLUDED.chapter_id,
+                book_id = EXCLUDED.book_id,
+                last_appended_at = EXCLUDED.last_appended_at,
+                block_count = EXCLUDED.block_count,
+                title = EXCLUDED.title",
+        )
+        .bind(&row.session_id)
+        .bind(&row.token_id_hash)
+        .bind(&row.agent_name)
+        .bind(row.bookstack_page_id)
+        .bind(row.chapter_id)
+        .bind(row.book_id)
+        .bind(row.started_at)
+        .bind(row.last_appended_at)
+        .bind(row.block_count)
+        .bind(&row.title)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("upsert_session: {e}"))?;
+        Ok(())
+    }
+
+    async fn list_sessions(
+        &self,
+        token_id_hash: &str,
+        agent_name: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<SessionRow>, String> {
+        let limit = limit.max(1);
+        let rows: Vec<(String, String, String, i64, i64, i64, i64, i64, i64, Option<String>)> =
+            if let Some(agent) = agent_name {
+                sqlx::query_as(
+                    "SELECT session_id, token_id_hash, agent_name,
+                            bookstack_page_id, chapter_id, book_id,
+                            started_at, last_appended_at, block_count, title
+                       FROM sessions
+                      WHERE token_id_hash = $1 AND agent_name = $2
+                      ORDER BY last_appended_at DESC
+                      LIMIT $3",
+                )
+                .bind(token_id_hash)
+                .bind(agent)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+            } else {
+                sqlx::query_as(
+                    "SELECT session_id, token_id_hash, agent_name,
+                            bookstack_page_id, chapter_id, book_id,
+                            started_at, last_appended_at, block_count, title
+                       FROM sessions
+                      WHERE token_id_hash = $1
+                      ORDER BY last_appended_at DESC
+                      LIMIT $2",
+                )
+                .bind(token_id_hash)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+            }
+            .map_err(|e| format!("list_sessions: {e}"))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(sid, tid, agent, page, chap, book, st, la, bc, title)| SessionRow {
+                session_id: sid,
+                token_id_hash: tid,
+                agent_name: agent,
+                bookstack_page_id: page,
+                chapter_id: chap,
+                book_id: book,
+                started_at: st,
+                last_appended_at: la,
+                block_count: bc,
+                title,
+            })
+            .collect())
     }
 
     async fn get_global_settings(&self) -> Result<GlobalSettings, String> {

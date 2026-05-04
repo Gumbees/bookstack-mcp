@@ -558,6 +558,61 @@ pub fn events_seed() -> String {
     "## 📅 Scheduled\n".to_string()
 }
 
+/// Description stamped on per-agent `Sessions: {agent_name}` chapters
+/// at create time.
+const SESSIONS_CHAPTER_DESCRIPTION: &str =
+    "AI session captures (forager / Claude Code / external clients) — page-per-session, append-only blocks";
+
+/// Find-or-create the `Sessions: {agent_name}` chapter inside the
+/// user's per-user Journal book. Mirrors the `AI Identity:` chapter
+/// pattern.
+pub async fn resolve_sessions_chapter(
+    book_id: i64,
+    agent_name: &str,
+    client: &BookStackClient,
+) -> Result<i64, ResolverError> {
+    let chapter_name = sessions_chapter_name(agent_name);
+    find_or_create_chapter(client, book_id, &chapter_name, SESSIONS_CHAPTER_DESCRIPTION).await
+}
+
+/// Render the chapter name `Sessions: {agent_name}`. Pure helper so
+/// tests can assert the formatting.
+pub fn sessions_chapter_name(agent_name: &str) -> String {
+    format!("Sessions: {agent_name}")
+}
+
+/// Render a session page name. Used on first append for the session.
+/// Format: `{YYYY-MM-DD}-{title-slug}` when a title is supplied,
+/// `{YYYY-MM-DD}-{session_id_short}` otherwise.
+pub fn session_page_name(date: chrono::NaiveDate, title: Option<&str>, session_id: &str) -> String {
+    let date_part = format!(
+        "{:04}-{:02}-{:02}",
+        date.year(),
+        date.month(),
+        date.day()
+    );
+    let suffix = match title {
+        Some(t) if !t.trim().is_empty() => slugify_natural_key(t),
+        _ => session_id_short(session_id),
+    };
+    format!("{date_part}-{suffix}")
+}
+
+/// Take the first 8 ASCII alphanumeric characters of a session_id for
+/// use in a page name when no title is supplied. Stable + readable.
+fn session_id_short(session_id: &str) -> String {
+    let s: String = session_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect();
+    if s.is_empty() {
+        "session".to_string()
+    } else {
+        s
+    }
+}
+
 /// Slugify free-form text into a stable natural-key. Used by reminders
 /// + events when the caller doesn't supply one explicitly. Lowercase,
 /// non-alphanumeric → dash, collapse runs, trim, cap to 40 chars.

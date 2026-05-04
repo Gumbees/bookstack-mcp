@@ -11,7 +11,7 @@ use sha2::Digest;
 use zeroize::Zeroizing;
 
 use bsmcp_common::config::{access_token_ttl, refresh_token_ttl};
-use bsmcp_common::db::{stable_id_for, DbBackend, IndexDb, SemanticDb, TokenBinding};
+use bsmcp_common::db::{stable_id_for, DbBackend, IndexDb, SemanticDb, SessionRow, TokenBinding};
 use bsmcp_common::index::*;
 use bsmcp_common::settings::{
     memory_protocol_tool_defaults_seed, GlobalSettings, UserSettings, DEFAULT_ACCOUNT_LABEL,
@@ -71,6 +71,28 @@ impl SqliteDb {
              );
              CREATE INDEX IF NOT EXISTS idx_token_bindings_user
                  ON token_bindings(bookstack_user_id);
+             /* sessions index — one row per AI session captured to
+                BookStack via the `sessions` MCP tool / HTTP surface.
+                The actual transcript lives on a BookStack page; this
+                table is the (session_id -> page) lookup plus enough
+                metadata to render the list call without re-walking
+                BookStack. */
+             CREATE TABLE IF NOT EXISTS sessions (
+                 session_id TEXT PRIMARY KEY,
+                 token_id_hash TEXT NOT NULL,
+                 agent_name TEXT NOT NULL,
+                 bookstack_page_id INTEGER NOT NULL,
+                 chapter_id INTEGER NOT NULL,
+                 book_id INTEGER NOT NULL,
+                 started_at INTEGER NOT NULL,
+                 last_appended_at INTEGER NOT NULL,
+                 block_count INTEGER NOT NULL DEFAULT 0,
+                 title TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_sessions_token_recent
+                 ON sessions(token_id_hash, last_appended_at DESC);
+             CREATE INDEX IF NOT EXISTS idx_sessions_token_agent
+                 ON sessions(token_id_hash, agent_name);
              CREATE TABLE IF NOT EXISTS global_settings (
                  id INTEGER PRIMARY KEY CHECK (id = 1),
                  hive_shelf_id INTEGER,
@@ -345,6 +367,23 @@ impl SqliteDb {
             }
         }
     }
+}
+
+/// Map a `sessions` row to `SessionRow`. Reused by both list_sessions
+/// query paths (with and without `agent_name` filter).
+fn session_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
+    Ok(SessionRow {
+        session_id: row.get(0)?,
+        token_id_hash: row.get(1)?,
+        agent_name: row.get(2)?,
+        bookstack_page_id: row.get(3)?,
+        chapter_id: row.get(4)?,
+        book_id: row.get(5)?,
+        started_at: row.get(6)?,
+        last_appended_at: row.get(7)?,
+        block_count: row.get(8)?,
+        title: row.get(9)?,
+    })
 }
 
 /// One-time seed of `GlobalSettings.tool_defaults` so memory-protocol
@@ -842,6 +881,128 @@ impl DbBackend for SqliteDb {
                  call set_token_binding before save"
             )),
         }
+    }
+
+    async fn get_session(&self, session_id: &str) -> Result<Option<SessionRow>, String> {
+        let conn = self.conn.clone();
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Option<SessionRow>, String> {
+            let conn = conn.lock().unwrap();
+            let row = conn.query_row(
+                "SELECT session_id, token_id_hash, agent_name,
+                        bookstack_page_id, chapter_id, book_id,
+                        started_at, last_appended_at, block_count, title
+                   FROM sessions WHERE session_id = ?1",
+                params![session_id],
+                |r| {
+                    Ok(SessionRow {
+                        session_id: r.get(0)?,
+                        token_id_hash: r.get(1)?,
+                        agent_name: r.get(2)?,
+                        bookstack_page_id: r.get(3)?,
+                        chapter_id: r.get(4)?,
+                        book_id: r.get(5)?,
+                        started_at: r.get(6)?,
+                        last_appended_at: r.get(7)?,
+                        block_count: r.get(8)?,
+                        title: r.get(9)?,
+                    })
+                },
+            ).ok();
+            Ok(row)
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn upsert_session(&self, row: &SessionRow) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let row = row.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO sessions
+                    (session_id, token_id_hash, agent_name,
+                     bookstack_page_id, chapter_id, book_id,
+                     started_at, last_appended_at, block_count, title)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                    token_id_hash = excluded.token_id_hash,
+                    agent_name = excluded.agent_name,
+                    bookstack_page_id = excluded.bookstack_page_id,
+                    chapter_id = excluded.chapter_id,
+                    book_id = excluded.book_id,
+                    last_appended_at = excluded.last_appended_at,
+                    block_count = excluded.block_count,
+                    title = excluded.title",
+                params![
+                    row.session_id,
+                    row.token_id_hash,
+                    row.agent_name,
+                    row.bookstack_page_id,
+                    row.chapter_id,
+                    row.book_id,
+                    row.started_at,
+                    row.last_appended_at,
+                    row.block_count,
+                    row.title,
+                ],
+            ).map_err(|e| format!("upsert_session: {e}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn list_sessions(
+        &self,
+        token_id_hash: &str,
+        agent_name: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<SessionRow>, String> {
+        let conn = self.conn.clone();
+        let token_id_hash = token_id_hash.to_string();
+        let agent_name = agent_name.map(|s| s.to_string());
+        let limit = limit.max(1);
+        tokio::task::spawn_blocking(move || -> Result<Vec<SessionRow>, String> {
+            let conn = conn.lock().unwrap();
+            let rows: Vec<SessionRow> = if let Some(agent) = agent_name {
+                let mut stmt = conn.prepare(
+                    "SELECT session_id, token_id_hash, agent_name,
+                            bookstack_page_id, chapter_id, book_id,
+                            started_at, last_appended_at, block_count, title
+                       FROM sessions
+                      WHERE token_id_hash = ?1 AND agent_name = ?2
+                      ORDER BY last_appended_at DESC
+                      LIMIT ?3",
+                ).map_err(|e| format!("list_sessions prepare: {e}"))?;
+                let collected: Vec<SessionRow> = stmt
+                    .query_map(params![token_id_hash, agent, limit], session_row_from)
+                    .map_err(|e| format!("list_sessions query: {e}"))?
+                    .filter_map(Result::ok)
+                    .collect();
+                collected
+            } else {
+                let mut stmt = conn.prepare(
+                    "SELECT session_id, token_id_hash, agent_name,
+                            bookstack_page_id, chapter_id, book_id,
+                            started_at, last_appended_at, block_count, title
+                       FROM sessions
+                      WHERE token_id_hash = ?1
+                      ORDER BY last_appended_at DESC
+                      LIMIT ?2",
+                ).map_err(|e| format!("list_sessions prepare: {e}"))?;
+                let collected: Vec<SessionRow> = stmt
+                    .query_map(params![token_id_hash, limit], session_row_from)
+                    .map_err(|e| format!("list_sessions query: {e}"))?
+                    .filter_map(Result::ok)
+                    .collect();
+                collected
+            };
+            Ok(rows)
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
     }
 
     async fn get_global_settings(&self) -> Result<GlobalSettings, String> {

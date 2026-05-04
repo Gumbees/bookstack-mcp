@@ -20,6 +20,7 @@ pub mod briefing;
 pub mod config;
 pub mod directory;
 pub mod envelope;
+pub mod resolvers;
 pub mod user;
 
 use std::sync::Arc;

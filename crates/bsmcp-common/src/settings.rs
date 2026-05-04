@@ -76,6 +76,40 @@ pub struct UserSettings {
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub config_extras: std::collections::HashMap<String, String>,
 
+    // --- Journal-resolver caches (Phase 2.3) ---
+    //
+    // Populated lazily by `crate::remember::resolvers` so the journal
+    // endpoints landing in 2.4 don't pay BookStack round-trips on every
+    // write. All three are TTL-refreshed; resolvers re-fetch when the
+    // *_fetched_at watermark is older than the per-field threshold.
+
+    /// Cached BookStack book ID for this user's per-user "Journal" book on
+    /// the global `user_journals_shelf_id`. Populated by
+    /// `resolve_user_journal_book` after find-or-create. Cleared by the
+    /// resolver when the cached ID stops resolving (book deleted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_journal_book_id: Option<i64>,
+
+    /// Cached BookStack user email. The user's Journal book is named
+    /// exactly by this email, so the resolver caches it to avoid hitting
+    /// `/api/users/{id}` on every journal write. Refreshed every 7 days.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_user_email: Option<String>,
+
+    /// Unix epoch seconds the cached email was last fetched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_user_email_fetched_at: Option<i64>,
+
+    /// Cached first-name token (whitespace-split [0]) of the BookStack
+    /// `users.name` field. Used by 2.4 chapter/page naming. Refreshed
+    /// every 24 hours.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_first_name: Option<String>,
+
+    /// Unix epoch seconds the cached first name was last fetched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_first_name_fetched_at: Option<i64>,
+
     /// v0.7.x leftover keys captured on deserialize. Round-trips through
     /// saves until the briefing builder explicitly clears them — that way an
     /// unrelated save path (oauth auto-populate, settings UI, dismiss tool)

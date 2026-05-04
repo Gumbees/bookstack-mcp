@@ -128,7 +128,7 @@ pub async fn handle_settings_get(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
-    let (token_id, _token_secret) = match resolve_session(&headers, &state.settings_sessions).await {
+    let (token_id, token_secret) = match resolve_session(&headers, &state.settings_sessions).await {
         Some(creds) => creds,
         None => return Redirect::to("/authorize?response_type=code&client_id=settings-ui&redirect_uri=/settings&code_challenge=&code_challenge_method=&return_to=/settings").into_response(),
     };
@@ -143,7 +143,29 @@ pub async fn handle_settings_get(
         .unwrap_or_default();
     let globals = state.db.get_global_settings().await.unwrap_or_default();
 
-    Html(render_settings_page(&settings, &globals)).into_response()
+    // Best-effort: resolve the User Journals shelf name so the form can show
+    // "Currently set to: <name> (<id>)". Failures are silent — the form still
+    // renders without the summary line.
+    let user_journals_shelf_summary = match globals.user_journals_shelf_id {
+        Some(id) => {
+            let bs_client = bsmcp_common::bookstack::BookStackClient::new(
+                &state.bookstack_url,
+                &token_id,
+                &token_secret,
+                state.http_client.clone(),
+            );
+            bs_client
+                .get_shelf(id)
+                .await
+                .ok()
+                .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                .map(|name| format!(" Currently set to: {} ({})", name, id))
+                .unwrap_or_default()
+        }
+        None => String::new(),
+    };
+
+    Html(render_settings_page(&settings, &globals, &user_journals_shelf_summary)).into_response()
 }
 
 #[derive(Deserialize, Default)]
@@ -367,7 +389,11 @@ fn render_kb_scope_picker(name: &str, label: &str, scope: &Option<KbScope>) -> S
     )
 }
 
-fn render_settings_page(s: &UserSettings, g: &GlobalSettings) -> String {
+fn render_settings_page(
+    s: &UserSettings,
+    g: &GlobalSettings,
+    user_journals_shelf_summary: &str,
+) -> String {
     let domains = s.domains.join(", ");
     let system_prompt = s.system_prompt_page_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
     let org_domains = g.org_domains.join(", ");
@@ -435,7 +461,8 @@ button {{ margin-top: 1.5em; padding: 0.6em 1.2em; font-size: 1em; cursor: point
   <label><input type="checkbox" name="full_content_in_briefing" {fc_checked}> full_content_in_briefing</label>
   <label><input type="checkbox" name="strict_setup" {ss_checked}> strict_setup (block tools until configured)</label>
   <label>hive_shelf_id <input type="number" name="hive_shelf_id" value="{hive_shelf_id}"></label>
-  <label>user_journals_shelf_id <input type="number" name="user_journals_shelf_id" value="{user_journals_shelf_id}"></label>
+  <label>User Journals shelf <input type="number" name="user_journals_shelf_id" value="{user_journals_shelf_id}"></label>
+  <p class="help">BookStack shelf where each user's personal Journal book lives. Required to enable remember_user_journal / remember_agent_journal.{user_journals_shelf_summary}</p>
 
   <button type="submit">Save</button>
 </form>
@@ -462,5 +489,6 @@ button {{ margin-top: 1.5em; padding: 0.6em 1.2em; font-size: 1em; cursor: point
         ss_checked = if g.strict_setup { "checked" } else { "" },
         hive_shelf_id = g.hive_shelf_id.map(|i| i.to_string()).unwrap_or_default(),
         user_journals_shelf_id = g.user_journals_shelf_id.map(|i| i.to_string()).unwrap_or_default(),
+        user_journals_shelf_summary = html_escape(user_journals_shelf_summary),
     )
 }

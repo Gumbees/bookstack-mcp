@@ -110,6 +110,26 @@ pub struct UserSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_first_name_fetched_at: Option<i64>,
 
+    // --- Journaling toggle (Phase 2.4c) ---
+    //
+    // Surfaced through the briefing as a per-session reminder. The journal
+    // tool itself is always available; this flag only controls whether the
+    // briefing nudges the AI to use it. Off by default — a user opts in via
+    // `user write` once they've decided journaling fits their workflow.
+
+    /// When true, the briefing payload appends a "remember to journal …"
+    /// reminder. The journal tool itself remains usable regardless of this
+    /// flag — turning it off just silences the nudge.
+    #[serde(default)]
+    pub journaling_enabled: bool,
+
+    /// User's preferred AI identity name. When set, the briefing's
+    /// journaling reminder addresses the agent by this name even if the
+    /// caller didn't pass an `agent_name` on the briefing call. Normalized
+    /// to whatever the user set — not auto-lowercased here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chosen_ai_identity: Option<String>,
+
     /// v0.7.x leftover keys captured on deserialize. Round-trips through
     /// saves until the briefing builder explicitly clears them — that way an
     /// unrelated save path (oauth auto-populate, settings UI, dismiss tool)

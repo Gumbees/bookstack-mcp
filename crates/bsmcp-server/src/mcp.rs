@@ -2295,6 +2295,38 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             }),
         ));
         tools.push(tool(
+            "journal",
+            "Append-only structured journal entries on the user's per-user Journal book. Layout: monthly chapter `{YYYY-MM}-{name}` containing daily page `{YYYY-MM-DD}-{name}`, where `name` is the user's first name (entry_type='user') or the normalized agent name (entry_type='agent'). `action: 'write'` appends a `## YYYY-MM-DD HH:MM:SS TZ` section to the daily page (creates chapter+page on demand if missing). `action: 'read'` returns the daily page's full markdown body, defaulting to today in user TZ; pass `date: 'YYYY-MM-DD'` to read a specific day. Read is passive: missing pages return `{exists: false, content: null}` instead of bootstrapping. `agent_name` normalization matches the identity tool: lowercase ASCII alphanumerics + dashes/underscores; whitespace becomes a dash.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["read", "write"],
+                        "description": "Operation to perform"
+                    },
+                    "entry_type": {
+                        "type": "string",
+                        "enum": ["user", "agent"],
+                        "description": "Whose journal to read/write. `user` = the human's daily journal. `agent` = the named AI agent's daily journal."
+                    },
+                    "agent_name": {
+                        "type": "string",
+                        "description": "Required when entry_type='agent'. Free-form name; normalized to lowercase ASCII alphanumerics + dashes/underscores (whitespace -> dash)."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Required when action='write'. Markdown body for the new section. Appended below any prior sections on the same daily page — never overwrites."
+                    },
+                    "date": {
+                        "type": "string",
+                        "description": "Optional for action='read'. Format YYYY-MM-DD. Defaults to today in the user's timezone."
+                    }
+                },
+                "required": ["action", "entry_type"]
+            }),
+        ));
+        tools.push(tool(
             "session_event",
             "Signal a session-level event. Currently supported: `action: 'compacted'` resets the briefing-injection state so the next tool response includes the full briefing again. Useful after the AI gets compacted by its harness and loses context.",
             json!({
@@ -2340,6 +2372,7 @@ fn remember_resource(tool_name: &str) -> Option<&'static str> {
         "config" => Some("config"),
         "directory" => Some("directory"),
         "identity" => Some("identity"),
+        "journal" => Some("journal"),
         _ => None,
     }
 }

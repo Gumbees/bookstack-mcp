@@ -351,7 +351,50 @@ pub async fn read(ctx: &Context) -> Value {
         }),
     );
 
+    // Journaling reminder. Off entirely when the user hasn't opted in.
+    // When opted in, prefer the per-call `agent_name` (the AI's harness
+    // pushes its identity on each briefing call when it knows it), then
+    // the user's saved `chosen_ai_identity`. With neither, fall back to
+    // a generic phrasing.
+    let body_agent_name = ctx
+        .body
+        .get("agent_name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    if let Some(reminder) = select_journaling_reminder(
+        ctx.settings.journaling_enabled,
+        body_agent_name.as_deref(),
+        ctx.settings.chosen_ai_identity.as_deref(),
+    ) {
+        payload.insert("journaling_reminder".to_string(), json!(reminder));
+    }
+
     Value::Object(payload)
+}
+
+/// Select the journaling reminder string for this briefing call. Returns
+/// `None` when journaling is disabled (no field appended). Returns the
+/// generic "remember to journal throughout the session" when on but no
+/// agent name is available; appends ` {name}` when one is.
+///
+/// `body_agent_name` (per-call) takes precedence over `chosen_ai_identity`
+/// (user-saved). Both are trimmed; empty strings count as absent.
+pub fn select_journaling_reminder(
+    enabled: bool,
+    body_agent_name: Option<&str>,
+    chosen_ai_identity: Option<&str>,
+) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    let agent = body_agent_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| chosen_ai_identity.map(str::trim).filter(|s| !s.is_empty()));
+    Some(match agent {
+        Some(name) => format!("remember to journal throughout the session {name}"),
+        None => "remember to journal throughout the session".to_string(),
+    })
 }
 
 /// "Setup is done" = no pending user or global fields. Mirrors the same
@@ -762,4 +805,62 @@ fn format_domains_block(domains: &[String]) -> String {
          redact, share, or treat content as trusted.)\n",
     );
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- journaling reminder selection ---
+
+    #[test]
+    fn journaling_reminder_disabled_returns_none() {
+        assert!(select_journaling_reminder(false, None, None).is_none());
+        assert!(select_journaling_reminder(false, Some("claude"), None).is_none());
+        assert!(select_journaling_reminder(false, None, Some("claude")).is_none());
+    }
+
+    #[test]
+    fn journaling_reminder_with_per_call_agent_name_uses_it() {
+        let r = select_journaling_reminder(true, Some("claude"), None).unwrap();
+        assert_eq!(r, "remember to journal throughout the session claude");
+    }
+
+    #[test]
+    fn journaling_reminder_per_call_overrides_chosen_identity() {
+        // Per-call name wins — the AI knows its identity for THIS call.
+        let r = select_journaling_reminder(true, Some("opus"), Some("claude")).unwrap();
+        assert_eq!(r, "remember to journal throughout the session opus");
+    }
+
+    #[test]
+    fn journaling_reminder_falls_back_to_chosen_identity() {
+        let r = select_journaling_reminder(true, None, Some("claude")).unwrap();
+        assert_eq!(r, "remember to journal throughout the session claude");
+    }
+
+    #[test]
+    fn journaling_reminder_generic_when_neither_name_available() {
+        let r = select_journaling_reminder(true, None, None).unwrap();
+        assert_eq!(r, "remember to journal throughout the session");
+    }
+
+    #[test]
+    fn journaling_reminder_treats_empty_strings_as_absent() {
+        // Whitespace-only agent name → fall back as if missing.
+        let r = select_journaling_reminder(true, Some("   "), Some("claude")).unwrap();
+        assert_eq!(r, "remember to journal throughout the session claude");
+
+        let r = select_journaling_reminder(true, Some(""), None).unwrap();
+        assert_eq!(r, "remember to journal throughout the session");
+
+        let r = select_journaling_reminder(true, None, Some("")).unwrap();
+        assert_eq!(r, "remember to journal throughout the session");
+    }
+
+    #[test]
+    fn journaling_reminder_trims_agent_names() {
+        let r = select_journaling_reminder(true, Some("  claude  "), None).unwrap();
+        assert_eq!(r, "remember to journal throughout the session claude");
+    }
 }

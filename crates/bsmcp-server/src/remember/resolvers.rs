@@ -25,7 +25,9 @@
 
 use std::sync::Arc;
 
-use bsmcp_common::bookstack::BookStackClient;
+use chrono::{Datelike, NaiveDate};
+
+use bsmcp_common::bookstack::{BookStackClient, ContentType};
 use bsmcp_common::db::DbBackend;
 use bsmcp_common::settings::{GlobalSettings, UserSettings};
 
@@ -301,11 +303,154 @@ pub async fn resolve_user_journal_book(
         .await
         .map_err(ResolverError::BookstackError)?;
 
+    // Scrub permissions: this book is per-user-private. The user is the
+    // creator (BookStack sets owner_id automatically on POST /books). We
+    // strip role-based grants and disable inheritance via fallback so no
+    // other registered user can view it. BookStack admins still see
+    // everything via the system-level `*-view-all` / `content-export`
+    // role permissions — that admin override is independent of
+    // content_permissions and intentionally untouched here.
+    //
+    // API: PUT /api/content-permissions/book/{id} with the scrub payload
+    // built by `private_book_permission_scrub_payload`. Single round-trip;
+    // BookStack accepts owner_id + role_permissions + fallback_permissions
+    // on the same call (admin role required for owner_id changes; user
+    // tokens can update permissions on books they own without it as long
+    // as we don't change owner_id, which we omit here since the create
+    // already stamped it).
+    if let Err(e) = scrub_book_permissions(client, new_book_id).await {
+        // Non-fatal: book exists and is usable; permissions just didn't
+        // lock. Surface a loud eprintln so admins notice but don't fail
+        // the user's first journal write. The book is still readable
+        // (default ACL) — just not user-private. A subsequent retry path
+        // (admin reconciliation, or a manual PUT) can re-scrub later.
+        let user_id = settings.bookstack_user_id.unwrap_or(-1);
+        eprintln!(
+            "Resolvers: failed to scrub permissions on new journal book {new_book_id} for user {user_id}: {e}"
+        );
+    }
+
     settings.user_journal_book_id = Some(new_book_id);
     db.save_user_settings(token_id_hash, settings)
         .await
         .map_err(ResolverError::DbError)?;
     Ok(new_book_id)
+}
+
+/// Scrub permissions on a freshly-created per-user Journal book so only the
+/// owner (and BookStack admins via the system-level admin override) can see
+/// it. Sends one PUT to `/api/content-permissions/book/{id}` with:
+/// - `role_permissions: []` — strip every role grant
+/// - `fallback_permissions: { inheriting: false, view: false, create: false,
+///                            update: false, delete: false }` — block
+///                            non-owner non-admin access
+///
+/// `owner_id` is intentionally NOT included: it was set on `POST /books`
+/// to the creating user (us) and including it on the PUT requires admin
+/// privileges. Leaving it omitted keeps this call working with the user's
+/// own token.
+async fn scrub_book_permissions(
+    client: &BookStackClient,
+    book_id: i64,
+) -> Result<(), String> {
+    let payload = private_book_permission_scrub_payload();
+    client
+        .update_content_permissions(ContentType::Book, book_id, &payload)
+        .await?;
+    Ok(())
+}
+
+/// Pure helper exposed for tests: produces the JSON payload sent to
+/// `PUT /api/content-permissions/book/{id}` to lock a book down to its
+/// owner. Kept separate so the test can assert the wire shape without
+/// any mock-HTTP scaffolding.
+pub fn private_book_permission_scrub_payload() -> serde_json::Value {
+    serde_json::json!({
+        "role_permissions": [],
+        "fallback_permissions": {
+            "inheriting": false,
+            "view": false,
+            "create": false,
+            "update": false,
+            "delete": false,
+        },
+    })
+}
+
+/// Find-or-create the `{YYYY-MM}-{name}` monthly journal chapter inside
+/// the user's Journal book. Single chapter per (month, name) tuple —
+/// match is case-insensitive against the rendered chapter name.
+///
+/// Caller is responsible for resolving `book_id` via
+/// `resolve_user_journal_book` so this stays a pure chapter-scoped op.
+pub async fn resolve_journal_chapter(
+    book_id: i64,
+    year: i32,
+    month: u32,
+    name: &str,
+    client: &BookStackClient,
+) -> Result<i64, ResolverError> {
+    let chapter_name = journal_chapter_name(year, month, name);
+    find_or_create_chapter(client, book_id, &chapter_name, JOURNAL_CHAPTER_DESCRIPTION)
+        .await
+}
+
+/// Find-or-create the `{YYYY-MM-DD}-{name}` daily journal page inside
+/// the given chapter. Returns `(page_id, was_created)`. On create the
+/// body is empty — the journal `write` action appends the first
+/// time-stamped section after this returns.
+pub async fn resolve_journal_page(
+    chapter_id: i64,
+    date: NaiveDate,
+    name: &str,
+    client: &BookStackClient,
+) -> Result<(i64, bool), ResolverError> {
+    let page_name = journal_page_name(date, name);
+    if let Some(existing) = client
+        .find_page_in_chapter(chapter_id, &page_name)
+        .await
+        .map_err(ResolverError::BookstackError)?
+    {
+        let id = existing
+            .get("id")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| ResolverError::BookstackError("page missing id".to_string()))?;
+        return Ok((id, false));
+    }
+    let page = client
+        .create_page(&serde_json::json!({
+            "chapter_id": chapter_id,
+            "name": page_name,
+            "markdown": "",
+        }))
+        .await
+        .map_err(ResolverError::BookstackError)?;
+    let id = page
+        .get("id")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| ResolverError::BookstackError("create_page: missing id in response".to_string()))?;
+    Ok((id, true))
+}
+
+/// Description stamped on monthly journal chapters at create time.
+const JOURNAL_CHAPTER_DESCRIPTION: &str =
+    "Monthly journal entries — one daily page per session-day, append-only";
+
+/// Render the chapter name `{YYYY-MM}-{name}`. Pure helper so tests can
+/// assert the formatting without hitting BookStack.
+pub fn journal_chapter_name(year: i32, month: u32, name: &str) -> String {
+    format!("{year:04}-{month:02}-{name}")
+}
+
+/// Render the page name `{YYYY-MM-DD}-{name}`. Pure helper.
+pub fn journal_page_name(date: NaiveDate, name: &str) -> String {
+    format!(
+        "{:04}-{:02}-{:02}-{}",
+        date.year(),
+        date.month(),
+        date.day(),
+        name
+    )
 }
 
 /// Normalize a raw agent_name into the canonical form used in chapter
@@ -734,6 +879,54 @@ mod tests {
         assert!(
             !body.contains("# AI Identity"),
             "bootstrap must not duplicate the page title as an H1: {body}"
+        );
+    }
+
+    // --- journal name rendering ---
+
+    #[test]
+    fn journal_chapter_name_pads_year_and_month() {
+        assert_eq!(journal_chapter_name(2026, 5, "nate"), "2026-05-nate");
+        assert_eq!(journal_chapter_name(2026, 12, "claude"), "2026-12-claude");
+        // January = 01, not 1.
+        assert_eq!(journal_chapter_name(2026, 1, "nate"), "2026-01-nate");
+        // Single-digit year stays four-wide.
+        assert_eq!(journal_chapter_name(99, 7, "nate"), "0099-07-nate");
+    }
+
+    #[test]
+    fn journal_page_name_pads_full_date() {
+        let date = NaiveDate::from_ymd_opt(2026, 5, 3).unwrap();
+        assert_eq!(journal_page_name(date, "nate"), "2026-05-03-nate");
+
+        let date = NaiveDate::from_ymd_opt(2026, 12, 31).unwrap();
+        assert_eq!(journal_page_name(date, "claude"), "2026-12-31-claude");
+    }
+
+    // --- permission scrub payload shape ---
+
+    #[test]
+    fn private_book_permission_scrub_payload_has_expected_shape() {
+        let payload = private_book_permission_scrub_payload();
+        // role_permissions: empty array — strip every role grant.
+        let roles = payload.get("role_permissions").expect("role_permissions present");
+        assert!(roles.is_array(), "role_permissions must be an array");
+        assert_eq!(roles.as_array().unwrap().len(), 0, "role_permissions must be empty");
+
+        // fallback_permissions: deny everything, no inheritance.
+        let fb = payload
+            .get("fallback_permissions")
+            .expect("fallback_permissions present");
+        assert_eq!(fb.get("inheriting").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(fb.get("view").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(fb.get("create").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(fb.get("update").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(fb.get("delete").and_then(|v| v.as_bool()), Some(false));
+
+        // owner_id is intentionally NOT included — see scrub fn comment.
+        assert!(
+            payload.get("owner_id").is_none(),
+            "owner_id must be omitted so the user's own token can send this PUT"
         );
     }
 }

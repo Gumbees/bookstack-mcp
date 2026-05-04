@@ -18,7 +18,11 @@
 //!     per-user Journal book. Bootstraps chapter + page on first read
 //!     or first write when missing.
 //!
-//! Resources arriving in later sub-PRs: journal, migrate.
+//! Added in sub-PR 2.4c:
+//!   - `journal`   — append-only structured journal entries (one daily
+//!     page per (user|agent, day) pair, sectioned by time-of-write).
+//!
+//! Resources arriving in later sub-PRs: migrate.
 //!
 //! Every handler returns the standard `{ok, data, meta, error}` envelope.
 
@@ -27,6 +31,7 @@ pub mod config;
 pub mod directory;
 pub mod envelope;
 pub mod identity;
+pub mod journal;
 pub mod resolvers;
 pub mod user;
 
@@ -147,6 +152,8 @@ async fn route(resource: &str, action: &str, ctx: &Context) -> DispatchResult {
         ("directory", "read") => directory::read(ctx).await,
         ("identity", "read") => identity::read(ctx).await,
         ("identity", "write") => identity::write(ctx).await,
+        ("journal", "read") => journal::read(ctx).await,
+        ("journal", "write") => journal::write(ctx).await,
         (r, _) if !known_resource(r) => Err((
             ErrorCode::UnknownResource,
             format!("Unknown resource: {r}"),
@@ -161,7 +168,7 @@ async fn route(resource: &str, action: &str, ctx: &Context) -> DispatchResult {
 fn known_resource(resource: &str) -> bool {
     matches!(
         resource,
-        "briefing" | "user" | "config" | "directory" | "identity"
+        "briefing" | "user" | "config" | "directory" | "identity" | "journal"
     )
 }
 
@@ -202,11 +209,11 @@ mod tests {
         assert!(known_resource("config"));
         assert!(known_resource("directory"));
         assert!(known_resource("identity"));
+        assert!(known_resource("journal"));
     }
 
     #[test]
     fn known_resource_rejects_unshipped() {
-        assert!(!known_resource("journal"));
         assert!(!known_resource("migrate"));
         assert!(!known_resource("nonsense"));
         assert!(!known_resource(""));

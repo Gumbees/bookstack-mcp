@@ -287,6 +287,10 @@ async fn main() {
             get(setup_ui::handle_setup_user_get).post(setup_ui::handle_setup_user_post),
         )
         .route(
+            "/setup/user/migrate/preview",
+            axum::routing::post(setup_ui::handle_setup_user_migrate_preview),
+        )
+        .route(
             "/setup/admin",
             get(setup_ui::handle_setup_admin_get).post(setup_ui::handle_setup_admin_post),
         )

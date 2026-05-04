@@ -31,12 +31,14 @@ use axum::extract::{RawForm, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use serde::Deserialize;
+use serde_json::{json, Value};
 
 use bsmcp_common::bookstack::BookStackClient;
 use bsmcp_common::db::DbBackend;
 use bsmcp_common::settings::{hash_token_id, GlobalSettings, UserSettings};
 
 use crate::mcp;
+use crate::remember;
 use crate::settings_ui::resolve_session_creds;
 use crate::sse::AppState;
 
@@ -55,8 +57,8 @@ pub async fn handle_setup_user_get(
         return not_found_response();
     }
 
-    let token_id = match resolve_session_creds(&headers, &state.settings_sessions).await {
-        Some((tid, _)) => tid,
+    let (token_id, token_secret) = match resolve_session_creds(&headers, &state.settings_sessions).await {
+        Some(creds) => creds,
         None => return redirect_to_authorize(),
     };
 
@@ -69,7 +71,20 @@ pub async fn handle_setup_user_get(
         .flatten()
         .unwrap_or_default();
 
-    Html(render_setup_page(&settings, None)).into_response()
+    let bs_client = BookStackClient::new(
+        &state.bookstack_url,
+        &token_id,
+        &token_secret,
+        state.http_client.clone(),
+    );
+
+    let migration = MigrationView {
+        sources: load_migration_sources(&token_id, &bs_client, state.db.clone(), state.directory.clone()).await,
+        form: MigrationFormFields::default(),
+        plan: None,
+    };
+
+    Html(render_setup_page(&settings, &migration)).into_response()
 }
 
 #[derive(Deserialize, Default)]
@@ -89,8 +104,8 @@ pub async fn handle_setup_user_post(
         return not_found_response();
     }
 
-    let token_id = match resolve_session_creds(&headers, &state.settings_sessions).await {
-        Some((tid, _)) => tid,
+    let (token_id, token_secret) = match resolve_session_creds(&headers, &state.settings_sessions).await {
+        Some(creds) => creds,
         None => return redirect_to_authorize(),
     };
 
@@ -114,13 +129,110 @@ pub async fn handle_setup_user_post(
         return error_response(format!("Failed to save user settings: {e}"));
     }
 
-    Html(render_success_page()).into_response()
+    // Optional inline migration. The migration form fields ride along on
+    // the same submit; if the user picked a source book and at least one
+    // page (or accepted the all-dated default), run `execute` now so the
+    // result lands on the success page in the same round-trip. Sync is
+    // fine while typical legacy journals are <100 pages — see brief.
+    let migration_form = parse_migration_form(&raw_pairs);
+    let migration_result = if migration_form.execute_requested && migration_form.book_id.is_some() {
+        let bs_client = BookStackClient::new(
+            &state.bookstack_url,
+            &token_id,
+            &token_secret,
+            state.http_client.clone(),
+        );
+        Some(
+            run_migration_execute(
+                &migration_form,
+                &token_id,
+                &bs_client,
+                state.db.clone(),
+                state.directory.clone(),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+
+    Html(render_success_page(migration_result.as_ref())).into_response()
+}
+
+/// POST `/setup/user/migrate/preview` — re-render the wizard with the
+/// migration plan attached. The form posts back the same SetupForm fields
+/// (so we don't lose the user's journaling/tool-overrides edits) plus the
+/// migration source/entry-type fields. We DO NOT save settings on this
+/// route — preview is a dry-run pass; only the main POST persists.
+pub async fn handle_setup_user_migrate_preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawForm(body): RawForm,
+) -> Response {
+    if !mcp::onboarding_enabled() {
+        return not_found_response();
+    }
+
+    let (token_id, token_secret) = match resolve_session_creds(&headers, &state.settings_sessions).await {
+        Some(creds) => creds,
+        None => return redirect_to_authorize(),
+    };
+
+    let body_str = std::str::from_utf8(&body).unwrap_or("");
+    let raw_pairs: Vec<(String, String)> =
+        serde_urlencoded::from_str(body_str).unwrap_or_default();
+    let form: SetupForm = serde_urlencoded::from_str(body_str).unwrap_or_default();
+
+    let token_id_hash = hash_token_id(&token_id);
+    // Use the in-memory settings shape so the rest of the form re-renders
+    // with the user's draft values. We DON'T save — preview is read-only.
+    let mut settings = state
+        .db
+        .get_user_settings(&token_id_hash)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    settings.chosen_ai_identity = nonempty(&form.chosen_ai_identity);
+    settings.journaling_enabled = checkbox(&form.journaling_enabled);
+    settings.tool_overrides = parse_tool_overrides(&raw_pairs);
+
+    let migration_form = parse_migration_form(&raw_pairs);
+    let bs_client = BookStackClient::new(
+        &state.bookstack_url,
+        &token_id,
+        &token_secret,
+        state.http_client.clone(),
+    );
+
+    let plan = run_migration_plan(
+        &migration_form,
+        &token_id,
+        &bs_client,
+        state.db.clone(),
+        state.directory.clone(),
+    )
+    .await;
+
+    let migration = MigrationView {
+        sources: load_migration_sources(&token_id, &bs_client, state.db.clone(), state.directory.clone()).await,
+        form: migration_form,
+        plan: Some(plan),
+    };
+
+    Html(render_setup_page(&settings, &migration)).into_response()
 }
 
 /// Apply the parsed wizard form to a `UserSettings` instance. Pure (no
 /// I/O) so the test suite can exercise the field-flip semantics directly.
 /// Always stamps `setup_complete = true` — a successful POST means the
 /// user submitted the wizard, even if they left every field blank.
+///
+/// Note: migration form fields are NOT applied here. Migration is runtime
+/// state (which source book + which pages were imported) — the result
+/// shows on the success page but isn't persisted to UserSettings. The
+/// post-import target book id is already cached on UserSettings via
+/// `resolve_user_journal_book` during the import itself.
 pub fn apply_setup_form(
     settings: &mut UserSettings,
     form: &SetupForm,
@@ -130,6 +242,240 @@ pub fn apply_setup_form(
     settings.journaling_enabled = checkbox(&form.journaling_enabled);
     settings.tool_overrides = parse_tool_overrides(raw_pairs);
     settings.setup_complete = true;
+}
+
+// =====================================================================
+// Migration wizard helpers (Phase 2.5)
+// =====================================================================
+
+/// Form fields harvested from the wizard's migration section. Captures
+/// both step 1 (source picker) and step 2 (per-page selection +
+/// optional manual date for undated pages) so a single parser handles
+/// both submit shapes.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MigrationFormFields {
+    /// Numeric BookStack book ID picked from the source dropdown.
+    pub book_id: Option<i64>,
+    /// `"user"` or `"agent"`.
+    pub entry_type: Option<String>,
+    /// Required when `entry_type = "agent"`. Free-form before
+    /// normalization — passed verbatim to the migrate tool, which calls
+    /// `normalize_agent_name` and surfaces the same error the user would
+    /// get from the MCP tool.
+    pub agent_name: Option<String>,
+    /// Source page IDs the user explicitly checked in step 2. When
+    /// `execute_requested` is true and this is empty AND no date overrides
+    /// were supplied, the migration is a no-op (matches the `execute`
+    /// tool's empty-`pages` behavior).
+    pub selected_pages: Vec<i64>,
+    /// Per-page manual date overrides for undated pages — keyed by source
+    /// page id, value is `YYYY-MM-DD`. Only entries with a non-empty value
+    /// are kept; bare checkboxes without a date are dropped.
+    pub date_overrides: HashMap<i64, String>,
+    /// True when the user clicked "Import" (the main wizard submit), as
+    /// opposed to "Preview" (preview-only round-trip).
+    pub execute_requested: bool,
+}
+
+/// Snapshot of everything the migration section needs to render. Gathers
+/// the listed sources, the form values to repopulate, and (optionally)
+/// the planned page set after a preview round-trip or the result after
+/// an execute round-trip. Kept small — both the user wizard and its
+/// tests build it the same way.
+pub struct MigrationView {
+    /// Books on the User Journals shelf the calling user can see, plus
+    /// `owned`/`page_count` annotations from `migrate list_sources`. An
+    /// `Err` here disables the migration section in the UI (e.g. shelf
+    /// not configured yet) — the rest of the wizard still works.
+    pub sources: Result<Value, String>,
+    /// Form values from the most-recent submit, used to re-populate the
+    /// dropdown / radio / checkboxes after a preview round-trip.
+    pub form: MigrationFormFields,
+    /// Result of `migrate plan` — present only on the preview render.
+    /// Execute results don't go here; they ride straight onto the
+    /// success page (different render path).
+    pub plan: Option<Result<Value, String>>,
+}
+
+/// Parse the migration section out of the raw form pairs. Pure (no I/O)
+/// so both wizard handlers + the test suite can use it. Two states it
+/// covers:
+///
+/// - **Step 1 (source picked, no preview yet):** caller submitted
+///   `migration_book_id`, `migration_entry_type`, optionally
+///   `migration_agent_name`, plus `migration_action=preview`.
+/// - **Step 2 (after preview, ready to import):** the same fields plus
+///   `migration_page_<source_page_id>=on` for each checked page and
+///   optional `migration_date_<source_page_id>=YYYY-MM-DD` for undated
+///   pages where the user typed a date. `migration_action=execute`.
+///
+/// The `execute_requested` bit lets the caller distinguish a preview
+/// round-trip (don't import yet) from a final submit (do import).
+pub fn parse_migration_form(pairs: &[(String, String)]) -> MigrationFormFields {
+    let mut out = MigrationFormFields::default();
+    for (k, v) in pairs {
+        match k.as_str() {
+            "migration_book_id" => {
+                let trimmed = v.trim();
+                if !trimmed.is_empty() {
+                    out.book_id = trimmed.parse().ok();
+                }
+            }
+            "migration_entry_type" => {
+                let t = v.trim();
+                if !t.is_empty() {
+                    out.entry_type = Some(t.to_string());
+                }
+            }
+            "migration_agent_name" => {
+                let t = v.trim();
+                if !t.is_empty() {
+                    out.agent_name = Some(t.to_string());
+                }
+            }
+            "migration_action" => {
+                if v == "execute" {
+                    out.execute_requested = true;
+                }
+            }
+            _ => {
+                if let Some(rest) = k.strip_prefix("migration_page_") {
+                    if matches!(v.as_str(), "on" | "true" | "1") {
+                        if let Ok(id) = rest.parse::<i64>() {
+                            out.selected_pages.push(id);
+                        }
+                    }
+                } else if let Some(rest) = k.strip_prefix("migration_date_") {
+                    let trimmed = v.trim();
+                    if !trimmed.is_empty() {
+                        if let Ok(id) = rest.parse::<i64>() {
+                            out.date_overrides.insert(id, trimmed.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Build the body the migrate dispatcher expects from a parsed
+/// MigrationFormFields + chosen action. Pure helper — no I/O. Exists so
+/// the wizard's "construct the dispatch body" step is testable without
+/// spinning up an HTTP request.
+pub fn build_migration_dispatch_body(form: &MigrationFormFields, include_pages: bool) -> Value {
+    let mut body = serde_json::Map::new();
+    if let Some(id) = form.book_id {
+        body.insert("book_id".to_string(), json!(id));
+    }
+    if let Some(et) = &form.entry_type {
+        body.insert("entry_type".to_string(), json!(et));
+    }
+    if let Some(an) = &form.agent_name {
+        body.insert("agent_name".to_string(), json!(an));
+    }
+    if include_pages {
+        // Selected page ids ride through as an integer array. Empty
+        // array is intentional — see `migrate::execute` no-op path.
+        body.insert("pages".to_string(), json!(form.selected_pages));
+        if !form.date_overrides.is_empty() {
+            // Convert i64 keys to strings so the JSON object is valid.
+            let mut map = serde_json::Map::new();
+            for (id, date) in &form.date_overrides {
+                map.insert(id.to_string(), json!(date));
+            }
+            body.insert("page_date_overrides".to_string(), Value::Object(map));
+        }
+    }
+    Value::Object(body)
+}
+
+/// Call `migrate list_sources` for the wizard. Returns the dispatcher's
+/// `data` payload on success or a stringified error on failure (so the
+/// UI can show a clean message instead of crashing).
+async fn load_migration_sources(
+    token_id: &str,
+    client: &BookStackClient,
+    db: Arc<dyn DbBackend>,
+    directory: Arc<crate::directory::DirectoryService>,
+) -> Result<Value, String> {
+    let envelope = remember::dispatch(
+        "migrate",
+        "list_sources",
+        json!({}),
+        token_id,
+        client,
+        db,
+        None,
+        Some(directory),
+    )
+    .await;
+    extract_envelope_data(&envelope)
+}
+
+/// Call `migrate plan` for the wizard preview round-trip. Same envelope
+/// unpacking as `load_migration_sources`.
+async fn run_migration_plan(
+    form: &MigrationFormFields,
+    token_id: &str,
+    client: &BookStackClient,
+    db: Arc<dyn DbBackend>,
+    directory: Arc<crate::directory::DirectoryService>,
+) -> Result<Value, String> {
+    let body = build_migration_dispatch_body(form, false);
+    let envelope = remember::dispatch(
+        "migrate",
+        "plan",
+        body,
+        token_id,
+        client,
+        db,
+        None,
+        Some(directory),
+    )
+    .await;
+    extract_envelope_data(&envelope)
+}
+
+/// Call `migrate execute` from the main submit handler. Same envelope
+/// unpacking as the other two.
+async fn run_migration_execute(
+    form: &MigrationFormFields,
+    token_id: &str,
+    client: &BookStackClient,
+    db: Arc<dyn DbBackend>,
+    directory: Arc<crate::directory::DirectoryService>,
+) -> Result<Value, String> {
+    let body = build_migration_dispatch_body(form, true);
+    let envelope = remember::dispatch(
+        "migrate",
+        "execute",
+        body,
+        token_id,
+        client,
+        db,
+        None,
+        Some(directory),
+    )
+    .await;
+    extract_envelope_data(&envelope)
+}
+
+/// Pull `data` out of the standard `{ok, data, meta, error}` envelope.
+/// On failure, surface the error message (or `"unknown error"` if the
+/// envelope shape is wrong). Pure helper.
+fn extract_envelope_data(envelope: &Value) -> Result<Value, String> {
+    let ok = envelope.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    if ok {
+        Ok(envelope.get("data").cloned().unwrap_or(Value::Null))
+    } else {
+        Err(envelope
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown error")
+            .to_string())
+    }
 }
 
 // --- Form parsing helpers (mirror settings_ui.rs's helpers but kept
@@ -214,7 +560,7 @@ fn render_user_tool_overrides_section(s: &UserSettings) -> String {
     rows
 }
 
-fn render_setup_page(s: &UserSettings, _flash: Option<&str>) -> String {
+fn render_setup_page(s: &UserSettings, migration: &MigrationView) -> String {
     let chosen = html_escape(s.chosen_ai_identity.as_deref().unwrap_or(""));
     let journaling_checked = if s.journaling_enabled { "checked" } else { "" };
     let tool_rows = render_user_tool_overrides_section(s);
@@ -223,6 +569,7 @@ fn render_setup_page(s: &UserSettings, _flash: Option<&str>) -> String {
     } else {
         ""
     };
+    let migration_section = render_migration_section(migration);
 
     format!(
         r#"<!DOCTYPE html>
@@ -237,15 +584,25 @@ h2 {{ margin-top: 2em; border-bottom: 1px solid #ddd; padding-bottom: 0.2em; }}
 .note {{ color: #666; font-size: 0.9em; }}
 .help {{ font-size: 0.85em; color: #555; margin-top: 0.2em; }}
 .banner {{ background: #fff8c5; border: 1px solid #d4a72c; padding: 0.6em 0.8em; border-radius: 4px; margin-bottom: 1em; }}
+.banner.error {{ background: #fbeae9; border-color: #c0392b; color: #6a1f1a; }}
 label {{ display: block; margin: 0.5em 0; }}
 label.inline {{ display: inline-block; margin-right: 1em; }}
-input[type=text] {{ padding: 0.5em; box-sizing: border-box; font-family: inherit; width: 100%; }}
-button {{ margin-top: 1.5em; padding: 0.6em 1.2em; font-size: 1em; cursor: pointer; }}
+input[type=text], input[type=date] {{ padding: 0.5em; box-sizing: border-box; font-family: inherit; }}
+input[type=text] {{ width: 100%; }}
+input[type=date] {{ width: 12em; }}
+select {{ padding: 0.5em; font-family: inherit; max-width: 100%; }}
+button {{ margin-top: 1em; padding: 0.6em 1.2em; font-size: 1em; cursor: pointer; }}
 .tool-overrides {{ display: grid; grid-template-columns: 1fr; gap: 0.4em; margin: 0.5em 0; }}
 .tool-overrides .tool-row {{ display: grid; grid-template-columns: 220px repeat(3, auto); gap: 0.5em; align-items: center; padding: 0.2em 0.4em; border-bottom: 1px solid #eee; font-size: 0.9em; }}
 .tool-overrides .tool-row code {{ font-size: 0.95em; }}
 .tool-overrides label {{ display: inline-flex; align-items: center; gap: 0.3em; margin: 0; font-weight: normal; }}
-.migration-stub {{ background: #f6f8fa; border: 1px dashed #d0d7de; padding: 1em; border-radius: 4px; color: #555; }}
+.migration-section {{ background: #f6f8fa; border: 1px solid #d0d7de; padding: 1em; border-radius: 4px; }}
+.migration-section.disabled {{ opacity: 0.6; }}
+.migration-table {{ width: 100%; border-collapse: collapse; margin-top: 0.6em; font-size: 0.9em; }}
+.migration-table th, .migration-table td {{ border: 1px solid #d0d7de; padding: 0.3em 0.5em; text-align: left; vertical-align: middle; }}
+.migration-table th {{ background: #ececec; font-weight: 600; }}
+.migration-table td.target {{ font-family: ui-monospace, monospace; font-size: 0.85em; color: #444; }}
+.migration-actions {{ margin-top: 0.6em; display: flex; gap: 0.6em; flex-wrap: wrap; }}
 </style>
 </head>
 <body>
@@ -269,12 +626,11 @@ button {{ margin-top: 1.5em; padding: 0.6em 1.2em; font-size: 1em; cursor: point
   </div>
 
   <h2>4. Migration</h2>
-  <div class="migration-stub">
-    <strong>Coming next:</strong> import existing journals.
-    <p class="help" style="margin-top: 0.4em;">The migration UI lights up in sub-PR 2.5. For now this is a placeholder.</p>
-  </div>
+  {migration_section}
 
-  <button type="submit">Complete setup</button>
+  <div class="migration-actions">
+    <button type="submit" name="migration_action" value="complete">Complete setup</button>
+  </div>
 </form>
 </body>
 </html>"#,
@@ -282,29 +638,260 @@ button {{ margin-top: 1.5em; padding: 0.6em 1.2em; font-size: 1em; cursor: point
         chosen = chosen,
         journaling_checked = journaling_checked,
         tool_rows = tool_rows,
+        migration_section = migration_section,
     )
 }
 
-fn render_success_page() -> String {
-    r#"<!DOCTYPE html>
+/// Render the migration block. Three modes:
+/// - sources unavailable (e.g. shelf not configured) → show explanatory
+///   note instead of the dropdown
+/// - sources available, no plan → step-1 form (dropdown + radio + Preview)
+/// - plan present → step-2 form (table of pages + Import button)
+fn render_migration_section(view: &MigrationView) -> String {
+    let sources = match &view.sources {
+        Ok(v) => v,
+        Err(e) => {
+            return format!(
+                r#"<div class="migration-section disabled"><p class="help">Migration unavailable: {}. Ask your admin to configure the User Journals shelf in <code>/setup/admin</code>, then revisit this page.</p></div>"#,
+                html_escape(e),
+            );
+        }
+    };
+    let source_list = sources
+        .get("sources")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if source_list.is_empty() {
+        return r#"<div class="migration-section disabled"><p class="help">No source books found on the User Journals shelf. Skip this step.</p></div>"#.to_string();
+    }
+
+    if let Some(Ok(plan)) = &view.plan {
+        return render_migration_plan(view, plan, &source_list);
+    }
+
+    let plan_error_banner = if let Some(Err(e)) = &view.plan {
+        format!(
+            r#"<div class="banner error">Preview failed: {}</div>"#,
+            html_escape(e),
+        )
+    } else {
+        String::new()
+    };
+
+    let mut options = String::new();
+    for src in &source_list {
+        let id = src.get("book_id").and_then(|v| v.as_i64()).unwrap_or_default();
+        let name = src.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let owned = src.get("owned").and_then(|v| v.as_bool()).unwrap_or(false);
+        let count = src.get("page_count").and_then(|v| v.as_u64()).unwrap_or(0);
+        let selected = if Some(id) == view.form.book_id { " selected" } else { "" };
+        let owned_marker = if owned { " (owned)" } else { "" };
+        options.push_str(&format!(
+            "<option value=\"{id}\"{selected}>{name} — {count} pages{owned_marker}</option>",
+            id = id,
+            selected = selected,
+            name = html_escape(name),
+            count = count,
+            owned_marker = owned_marker,
+        ));
+    }
+
+    let entry_user_checked = if view.form.entry_type.as_deref() == Some("user") || view.form.entry_type.is_none() {
+        " checked"
+    } else {
+        ""
+    };
+    let entry_agent_checked = if view.form.entry_type.as_deref() == Some("agent") {
+        " checked"
+    } else {
+        ""
+    };
+    let agent_name = html_escape(view.form.agent_name.as_deref().unwrap_or(""));
+
+    format!(
+        r#"<div class="migration-section">
+{plan_error_banner}
+<p class="help">Optional. Import an existing journal book into the v1.0.0 layout. Pick a source book, choose whether to import as your user journal or as an agent's journal, then preview the page list before committing.</p>
+<label>Source book
+  <select name="migration_book_id">
+    <option value="">-- pick a source --</option>
+    {options}
+  </select>
+</label>
+<fieldset style="border: none; padding: 0; margin: 0.4em 0;">
+  <legend class="help" style="padding: 0;">Import as</legend>
+  <label class="inline"><input type="radio" name="migration_entry_type" value="user"{entry_user_checked}> user (your first name)</label>
+  <label class="inline"><input type="radio" name="migration_entry_type" value="agent"{entry_agent_checked}> agent</label>
+</fieldset>
+<label>Agent name <input type="text" name="migration_agent_name" value="{agent_name}" placeholder="e.g. pia"></label>
+<p class="help">Required when "agent" is picked. Lowercase ASCII letters, digits, dashes, underscores; whitespace becomes a dash.</p>
+<div class="migration-actions">
+  <button type="submit" formaction="/setup/user/migrate/preview" name="migration_action" value="preview">Preview import</button>
+</div>
+</div>"#,
+        plan_error_banner = plan_error_banner,
+        options = options,
+        entry_user_checked = entry_user_checked,
+        entry_agent_checked = entry_agent_checked,
+        agent_name = agent_name,
+    )
+}
+
+/// Render the step-2 page table after a successful preview.
+fn render_migration_plan(
+    view: &MigrationView,
+    plan: &Value,
+    source_list: &[Value],
+) -> String {
+    let book_id = view.form.book_id.unwrap_or_default();
+    let entry_type = view.form.entry_type.as_deref().unwrap_or("user");
+    let agent_name = view.form.agent_name.as_deref().unwrap_or("");
+
+    // Find the source book name from the list for the heading.
+    let source_name = source_list
+        .iter()
+        .find(|s| s.get("book_id").and_then(|v| v.as_i64()) == Some(book_id))
+        .and_then(|s| s.get("name").and_then(|v| v.as_str()))
+        .unwrap_or("(unknown)");
+
+    let dated = plan
+        .get("pages")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let undated = plan
+        .get("undated_pages")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut rows = String::new();
+    for p in &dated {
+        let id = p.get("source_page_id").and_then(|v| v.as_i64()).unwrap_or_default();
+        let name = p.get("source_name").and_then(|v| v.as_str()).unwrap_or("");
+        let date = p.get("detected_date").and_then(|v| v.as_str()).unwrap_or("");
+        let target_chapter = p.get("target_chapter").and_then(|v| v.as_str()).unwrap_or("");
+        let target_page = p.get("target_page").and_then(|v| v.as_str()).unwrap_or("");
+        rows.push_str(&format!(
+            "<tr><td><input type=\"checkbox\" name=\"migration_page_{id}\" value=\"on\" checked></td>\
+             <td>{name}</td><td>{date}</td>\
+             <td class=\"target\">{tc} / {tp}</td></tr>",
+            id = id,
+            name = html_escape(name),
+            date = html_escape(date),
+            tc = html_escape(target_chapter),
+            tp = html_escape(target_page),
+        ));
+    }
+    for p in &undated {
+        let id = p.get("source_page_id").and_then(|v| v.as_i64()).unwrap_or_default();
+        let name = p.get("source_name").and_then(|v| v.as_str()).unwrap_or("");
+        rows.push_str(&format!(
+            "<tr><td><input type=\"checkbox\" name=\"migration_page_{id}\" value=\"on\"></td>\
+             <td>{name}</td>\
+             <td><input type=\"date\" name=\"migration_date_{id}\" placeholder=\"YYYY-MM-DD\"></td>\
+             <td class=\"target\"><em>(undated — pick a date to import)</em></td></tr>",
+            id = id,
+            name = html_escape(name),
+        ));
+    }
+
+    let entry_hidden = format!(
+        r#"<input type="hidden" name="migration_book_id" value="{id}">
+<input type="hidden" name="migration_entry_type" value="{et}">
+<input type="hidden" name="migration_agent_name" value="{an}">"#,
+        id = book_id,
+        et = html_escape(entry_type),
+        an = html_escape(agent_name),
+    );
+
+    let total = dated.len() + undated.len();
+
+    format!(
+        r#"<div class="migration-section">
+<p class="note"><strong>Source:</strong> {source_name} ({total} pages)</p>
+{entry_hidden}
+<table class="migration-table">
+  <thead><tr><th>Import</th><th>Source page</th><th>Date</th><th>Target chapter / page</th></tr></thead>
+  <tbody>
+    {rows}
+  </tbody>
+</table>
+<p class="help">Dated pages are checked by default. Undated pages need a date you pick manually before they'll import. Toggle individual rows as needed.</p>
+<div class="migration-actions">
+  <button type="submit" name="migration_action" value="execute">Import selected pages and complete setup</button>
+  <button type="submit" formaction="/setup/user/migrate/preview" name="migration_action" value="preview">Re-preview</button>
+</div>
+</div>"#,
+        source_name = html_escape(source_name),
+        total = total,
+        entry_hidden = entry_hidden,
+        rows = rows,
+    )
+}
+
+fn render_success_page(migration: Option<&Result<Value, String>>) -> String {
+    let migration_block = match migration {
+        None => String::new(),
+        Some(Ok(v)) => {
+            let imported = v.get("imported").and_then(|x| x.as_u64()).unwrap_or(0);
+            let skipped = v.get("skipped").and_then(|x| x.as_u64()).unwrap_or(0);
+            let errors = v.get("errors").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+            let mut error_list = String::new();
+            if !errors.is_empty() {
+                error_list.push_str("<ul style=\"text-align: left; max-width: 480px; margin: 0.5em auto;\">");
+                for e in &errors {
+                    let name = e.get("source_name").and_then(|x| x.as_str()).unwrap_or("(unknown)");
+                    let reason = e.get("reason").and_then(|x| x.as_str()).unwrap_or("(unknown)");
+                    error_list.push_str(&format!(
+                        "<li><code>{}</code>: {}</li>",
+                        html_escape(name),
+                        html_escape(reason),
+                    ));
+                }
+                error_list.push_str("</ul>");
+            }
+            format!(
+                r#"<h2 style="color: #1a7f37; margin-top: 1.5em;">Migration result</h2>
+<p class="note">Imported <strong>{imported}</strong> pages. Skipped <strong>{skipped}</strong>.</p>
+{error_list}"#,
+                imported = imported,
+                skipped = skipped,
+                error_list = error_list,
+            )
+        }
+        Some(Err(e)) => format!(
+            r#"<h2 style="color: #c0392b; margin-top: 1.5em;">Migration failed</h2>
+<p class="note">{}</p>"#,
+            html_escape(e),
+        ),
+    };
+
+    format!(
+        r#"<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <title>Setup complete</title>
 <style>
-body { font-family: system-ui, sans-serif; max-width: 540px; margin: 4em auto; padding: 0 1em; text-align: center; color: #222; }
-h1 { color: #1a7f37; }
-.note { color: #666; font-size: 0.95em; line-height: 1.5; }
-a { color: #0969da; }
+body {{ font-family: system-ui, sans-serif; max-width: 600px; margin: 4em auto; padding: 0 1em; text-align: center; color: #222; }}
+h1 {{ color: #1a7f37; }}
+h2 {{ font-size: 1.2em; }}
+.note {{ color: #666; font-size: 0.95em; line-height: 1.5; }}
+code {{ background: #f3f3f3; padding: 0 0.3em; border-radius: 3px; font-size: 0.9em; }}
+a {{ color: #0969da; }}
 </style>
 </head>
 <body>
 <h1>&#10003; Setup complete</h1>
 <p class="note">Your user setup has been saved. The onboarding link will stop appearing on your MCP tool responses.</p>
+{migration_block}
 <p class="note">You can close this window. To revise your preferences later, visit <a href="/setup/user">/setup/user</a> again or use the admin <a href="/settings">/settings</a> page.</p>
 </body>
-</html>"#
-        .to_string()
+</html>"#,
+        migration_block = migration_block,
+    )
 }
 
 fn redirect_to_authorize() -> Response {
@@ -1151,5 +1738,369 @@ mod tests {
     fn unknown_admin_status_hides_nudge() {
         let user_is_admin: bool = false; // mapping of `Option::None`
         assert!(!is_admin_onboarding_visible(true, false, user_is_admin));
+    }
+
+    // =====================================================================
+    // Migration wizard (Phase 2.5)
+    // =====================================================================
+
+    #[test]
+    fn parse_migration_form_step1_picks_book_and_entry_type() {
+        // Step 1: user picked a source + entry_type, clicked Preview.
+        // No per-page selections yet.
+        let pairs = vec![
+            pair("chosen_ai_identity", "pia"),
+            pair("migration_book_id", "42"),
+            pair("migration_entry_type", "user"),
+            pair("migration_action", "preview"),
+        ];
+        let f = parse_migration_form(&pairs);
+        assert_eq!(f.book_id, Some(42));
+        assert_eq!(f.entry_type.as_deref(), Some("user"));
+        assert!(f.agent_name.is_none());
+        assert!(f.selected_pages.is_empty());
+        assert!(f.date_overrides.is_empty());
+        assert!(!f.execute_requested, "preview action must not flip execute_requested");
+    }
+
+    #[test]
+    fn parse_migration_form_step1_with_agent_carries_agent_name() {
+        let pairs = vec![
+            pair("migration_book_id", "42"),
+            pair("migration_entry_type", "agent"),
+            pair("migration_agent_name", "Pia"),
+            pair("migration_action", "preview"),
+        ];
+        let f = parse_migration_form(&pairs);
+        assert_eq!(f.entry_type.as_deref(), Some("agent"));
+        assert_eq!(f.agent_name.as_deref(), Some("Pia"));
+        // We deliberately don't normalize at parse-time — the dispatcher
+        // does that and surfaces the same error the MCP tool would.
+    }
+
+    #[test]
+    fn parse_migration_form_step2_collects_page_selections_and_overrides() {
+        // Step 2: user clicked Import, with checkboxes + a manual date
+        // for one undated page.
+        let pairs = vec![
+            pair("migration_book_id", "42"),
+            pair("migration_entry_type", "user"),
+            pair("migration_action", "execute"),
+            pair("migration_page_100", "on"),
+            pair("migration_page_101", "on"),
+            // Page 102's checkbox unchecked → the field isn't submitted
+            // at all (browser convention). Date input still rides along
+            // — we keep the override only because it might land on
+            // another future submit.
+            pair("migration_date_103", "2026-04-12"),
+            pair("migration_page_103", "on"),
+            // Empty date input → dropped, not stored as empty string.
+            pair("migration_date_104", ""),
+        ];
+        let f = parse_migration_form(&pairs);
+        assert!(f.execute_requested);
+        assert_eq!(f.selected_pages, vec![100, 101, 103]);
+        assert_eq!(f.date_overrides.get(&103).map(String::as_str), Some("2026-04-12"));
+        assert!(!f.date_overrides.contains_key(&104), "empty date string must not be stored");
+    }
+
+    #[test]
+    fn parse_migration_form_handles_blank_book_id() {
+        // User left the dropdown on its placeholder option ("-- pick a
+        // source --"). Empty value stays None.
+        let pairs = vec![
+            pair("migration_book_id", ""),
+            pair("migration_entry_type", "user"),
+        ];
+        let f = parse_migration_form(&pairs);
+        assert!(f.book_id.is_none());
+    }
+
+    #[test]
+    fn parse_migration_form_ignores_unrelated_pairs() {
+        // SetupForm + tool override pairs share the same urlencoded body;
+        // the migration parser must not pick them up.
+        let pairs = vec![
+            pair("chosen_ai_identity", "pia"),
+            pair("journaling_enabled", "on"),
+            pair("tool_user_briefing", "on"),
+        ];
+        let f = parse_migration_form(&pairs);
+        assert_eq!(f, MigrationFormFields::default());
+    }
+
+    #[test]
+    fn build_migration_dispatch_body_step1_excludes_pages_array() {
+        let f = MigrationFormFields {
+            book_id: Some(42),
+            entry_type: Some("user".to_string()),
+            agent_name: None,
+            selected_pages: vec![],
+            date_overrides: HashMap::new(),
+            execute_requested: false,
+        };
+        let body = build_migration_dispatch_body(&f, false);
+        assert_eq!(body.get("book_id").and_then(|v| v.as_i64()), Some(42));
+        assert_eq!(body.get("entry_type").and_then(|v| v.as_str()), Some("user"));
+        assert!(body.get("pages").is_none(), "step 1 must not include pages array");
+        assert!(body.get("page_date_overrides").is_none());
+    }
+
+    #[test]
+    fn build_migration_dispatch_body_step2_stringifies_override_keys() {
+        let mut overrides = HashMap::new();
+        overrides.insert(103_i64, "2026-04-12".to_string());
+        let f = MigrationFormFields {
+            book_id: Some(42),
+            entry_type: Some("agent".to_string()),
+            agent_name: Some("Pia".to_string()),
+            selected_pages: vec![100, 101, 103],
+            date_overrides: overrides,
+            execute_requested: true,
+        };
+        let body = build_migration_dispatch_body(&f, true);
+        assert_eq!(body.get("agent_name").and_then(|v| v.as_str()), Some("Pia"));
+        let pages = body.get("pages").and_then(|v| v.as_array()).cloned().unwrap();
+        let ids: Vec<i64> = pages.iter().filter_map(|v| v.as_i64()).collect();
+        assert_eq!(ids, vec![100, 101, 103]);
+        // Override map: keys must be strings (JSON object keys are
+        // always strings); values are dates as strings.
+        let pdo = body.get("page_date_overrides").and_then(|v| v.as_object()).unwrap();
+        assert_eq!(pdo.get("103").and_then(|v| v.as_str()), Some("2026-04-12"));
+    }
+
+    #[test]
+    fn extract_envelope_data_handles_ok_and_err() {
+        let ok = json!({ "ok": true, "data": { "x": 1 } });
+        assert_eq!(extract_envelope_data(&ok).unwrap(), json!({ "x": 1 }));
+
+        let err = json!({ "ok": false, "error": { "message": "boom", "code": "internal_error" } });
+        assert_eq!(extract_envelope_data(&err).unwrap_err(), "boom");
+
+        let malformed = json!({ "weird": "shape" });
+        // Missing `ok` is treated as failure with `unknown error` placeholder.
+        assert_eq!(extract_envelope_data(&malformed).unwrap_err(), "unknown error");
+    }
+
+    #[test]
+    fn apply_setup_form_does_not_touch_migration_settings() {
+        // Migration is runtime state, not persisted to UserSettings.
+        // Apply_setup_form must remain a pure function over the four
+        // documented fields, not pick up anything migration-shaped.
+        let mut s = UserSettings::default();
+        let form = SetupForm::default();
+        let pairs = vec![
+            pair("migration_book_id", "42"),
+            pair("migration_entry_type", "user"),
+            pair("migration_action", "execute"),
+            pair("migration_page_100", "on"),
+        ];
+        apply_setup_form(&mut s, &form, &pairs);
+        assert!(s.setup_complete);
+        // The four documented fields hold their default values; nothing
+        // migration-shaped landed on the settings struct.
+        assert!(s.chosen_ai_identity.is_none());
+        assert!(!s.journaling_enabled);
+        assert!(s.tool_overrides.is_empty());
+    }
+
+    /// Round-trip the wizard: form pairs that include a migration submit
+    /// must (a) parse cleanly via `parse_migration_form`, (b) project to
+    /// a dispatch body we can hand to `migrate execute`, and (c) NOT
+    /// pollute the settings save.
+    #[test]
+    fn form_submit_with_migration_round_trips_choices() {
+        let pairs = vec![
+            pair("chosen_ai_identity", "pia"),
+            pair("journaling_enabled", "on"),
+            pair("tool_user_briefing", "on"),
+            pair("migration_book_id", "42"),
+            pair("migration_entry_type", "agent"),
+            pair("migration_agent_name", "pia"),
+            pair("migration_action", "execute"),
+            pair("migration_page_100", "on"),
+            pair("migration_page_101", "on"),
+            pair("migration_date_103", "2026-04-12"),
+            pair("migration_page_103", "on"),
+        ];
+
+        // 1. parse_migration_form pulls out only migration fields.
+        let mform = parse_migration_form(&pairs);
+        assert_eq!(mform.book_id, Some(42));
+        assert_eq!(mform.entry_type.as_deref(), Some("agent"));
+        assert_eq!(mform.agent_name.as_deref(), Some("pia"));
+        assert!(mform.execute_requested);
+        assert_eq!(mform.selected_pages, vec![100, 101, 103]);
+        assert_eq!(mform.date_overrides.get(&103).map(String::as_str), Some("2026-04-12"));
+
+        // 2. The dispatch body for execute matches what `migrate execute`
+        //    expects (per the migrate.rs unit tests on the parsing side).
+        let body = build_migration_dispatch_body(&mform, true);
+        assert_eq!(body.get("book_id").and_then(|v| v.as_i64()), Some(42));
+        assert_eq!(body.get("entry_type").and_then(|v| v.as_str()), Some("agent"));
+        let ids: Vec<i64> = body
+            .get("pages")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| v.as_i64())
+            .collect();
+        assert_eq!(ids, vec![100, 101, 103]);
+
+        // 3. apply_setup_form populates UserSettings from the rest of the
+        //    form. Migration field don't pollute the settings struct.
+        let mut settings = UserSettings::default();
+        let setup_form = SetupForm {
+            chosen_ai_identity: Some("pia".to_string()),
+            journaling_enabled: Some("on".to_string()),
+        };
+        apply_setup_form(&mut settings, &setup_form, &pairs);
+        assert_eq!(settings.chosen_ai_identity.as_deref(), Some("pia"));
+        assert!(settings.journaling_enabled);
+        assert_eq!(settings.tool_overrides.get("briefing"), Some(&true));
+        assert!(settings.setup_complete);
+    }
+
+    #[test]
+    fn render_setup_page_disables_migration_when_sources_unavailable() {
+        let s = UserSettings::default();
+        let view = MigrationView {
+            sources: Err("user_journals_shelf_id not configured".to_string()),
+            form: MigrationFormFields::default(),
+            plan: None,
+        };
+        let html = render_setup_page(&s, &view);
+        assert!(
+            html.contains("Migration unavailable"),
+            "should explain why migration is off when sources errored"
+        );
+        assert!(html.contains("user_journals_shelf_id not configured"));
+    }
+
+    #[test]
+    fn render_setup_page_step1_lists_each_source_in_dropdown() {
+        let s = UserSettings::default();
+        let view = MigrationView {
+            sources: Ok(json!({
+                "sources": [
+                    { "book_id": 100, "name": "Pia's Old Journal", "slug": "pia", "page_count": 47, "owned": true },
+                    { "book_id": 101, "name": "Other User's Journal", "slug": "other", "page_count": 3, "owned": false },
+                ],
+            })),
+            form: MigrationFormFields::default(),
+            plan: None,
+        };
+        let html = render_setup_page(&s, &view);
+        assert!(html.contains("value=\"100\""), "should include book 100 option");
+        assert!(html.contains("Pia&#x27;s Old Journal"), "should html-escape names");
+        assert!(html.contains("47 pages"));
+        assert!(html.contains("(owned)"), "owned books should be marked");
+        assert!(html.contains("Preview import"));
+    }
+
+    #[test]
+    fn render_setup_page_step2_renders_table_after_preview() {
+        let s = UserSettings::default();
+        let view = MigrationView {
+            sources: Ok(json!({
+                "sources": [
+                    { "book_id": 100, "name": "Pia's Old Journal", "slug": "pia", "page_count": 2, "owned": true },
+                ],
+            })),
+            form: MigrationFormFields {
+                book_id: Some(100),
+                entry_type: Some("user".to_string()),
+                ..MigrationFormFields::default()
+            },
+            plan: Some(Ok(json!({
+                "source": { "book_id": 100, "name": "Pia's Old Journal" },
+                "target": { "book_id": null, "chapter_naming": "{YYYY-MM}-pia" },
+                "pages": [
+                    {
+                        "source_page_id": 1,
+                        "source_name": "2025-11-08-conversation",
+                        "detected_date": "2025-11-08",
+                        "target_chapter": "2025-11-pia",
+                        "target_page": "2025-11-08-pia",
+                        "import": true,
+                    }
+                ],
+                "undated_pages": [
+                    {
+                        "source_page_id": 2,
+                        "source_name": "untitled",
+                        "detected_date": null,
+                        "target_chapter": null,
+                        "target_page": null,
+                        "import": false,
+                    }
+                ],
+                "estimated_block_count": 1,
+            }))),
+        };
+        let html = render_setup_page(&s, &view);
+        // Dated row: checkbox is pre-checked.
+        assert!(
+            html.contains("name=\"migration_page_1\" value=\"on\" checked"),
+            "dated page checkbox should be pre-checked"
+        );
+        // Target chapter / page name surfaces in the row.
+        assert!(html.contains("2025-11-pia"));
+        assert!(html.contains("2025-11-08-pia"));
+        // Undated row: NOT pre-checked, plus a date input.
+        assert!(html.contains("name=\"migration_page_2\" value=\"on\">"));
+        assert!(html.contains("name=\"migration_date_2\""));
+        // Import button is the primary action on step 2.
+        assert!(html.contains("Import selected pages and complete setup"));
+    }
+
+    #[test]
+    fn render_setup_page_step1_surfaces_preview_error() {
+        // Plan failed (e.g. missing entry_type) — the wizard re-renders
+        // step 1 with an error banner so the user can fix the form.
+        let s = UserSettings::default();
+        let view = MigrationView {
+            sources: Ok(json!({
+                "sources": [
+                    { "book_id": 100, "name": "Pia", "slug": "pia", "page_count": 1, "owned": true },
+                ],
+            })),
+            form: MigrationFormFields {
+                book_id: Some(100),
+                entry_type: None,
+                ..MigrationFormFields::default()
+            },
+            plan: Some(Err("Missing required argument: entry_type".to_string())),
+        };
+        let html = render_setup_page(&s, &view);
+        assert!(html.contains("Preview failed"));
+        assert!(html.contains("entry_type"));
+    }
+
+    #[test]
+    fn render_success_page_shows_migration_result_when_present() {
+        let html = render_success_page(Some(&Ok(json!({
+            "imported": 5,
+            "skipped": 1,
+            "errors": [
+                { "source_page_id": 99, "source_name": "broken", "reason": "undated" }
+            ],
+        }))));
+        assert!(html.contains("Imported"));
+        assert!(html.contains("<strong>5</strong>"));
+        assert!(html.contains("<strong>1</strong>"));
+        // Error list surfaces source name and reason.
+        assert!(html.contains("broken"));
+        assert!(html.contains("undated"));
+    }
+
+    #[test]
+    fn render_success_page_omits_migration_block_when_none() {
+        let html = render_success_page(None);
+        assert!(!html.contains("Migration result"));
+        assert!(!html.contains("Migration failed"));
+        // Core success message still there.
+        assert!(html.contains("Setup complete"));
     }
 }

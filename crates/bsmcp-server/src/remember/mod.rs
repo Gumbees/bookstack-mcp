@@ -22,7 +22,11 @@
 //!   - `journal`   — append-only structured journal entries (one daily
 //!     page per (user|agent, day) pair, sectioned by time-of-write).
 //!
-//! Resources arriving in later sub-PRs: migrate.
+//! Added in sub-PR 2.5:
+//!   - `migrate`   — import legacy journal content (pre-v1.0.0 layout, or
+//!     any other book on the User Journals shelf the user owns) into the
+//!     new per-user-Journal-book layout. Three actions: `list_sources`,
+//!     `plan` (DRY RUN), `execute`.
 //!
 //! Every handler returns the standard `{ok, data, meta, error}` envelope.
 
@@ -32,6 +36,7 @@ pub mod directory;
 pub mod envelope;
 pub mod identity;
 pub mod journal;
+pub mod migrate;
 pub mod resolvers;
 pub mod user;
 
@@ -154,6 +159,9 @@ async fn route(resource: &str, action: &str, ctx: &Context) -> DispatchResult {
         ("identity", "write") => identity::write(ctx).await,
         ("journal", "read") => journal::read(ctx).await,
         ("journal", "write") => journal::write(ctx).await,
+        ("migrate", "list_sources") => migrate::list_sources(ctx).await,
+        ("migrate", "plan") => migrate::plan(ctx).await,
+        ("migrate", "execute") => migrate::execute(ctx).await,
         (r, _) if !known_resource(r) => Err((
             ErrorCode::UnknownResource,
             format!("Unknown resource: {r}"),
@@ -168,7 +176,7 @@ async fn route(resource: &str, action: &str, ctx: &Context) -> DispatchResult {
 fn known_resource(resource: &str) -> bool {
     matches!(
         resource,
-        "briefing" | "user" | "config" | "directory" | "identity" | "journal"
+        "briefing" | "user" | "config" | "directory" | "identity" | "journal" | "migrate"
     )
 }
 
@@ -210,11 +218,11 @@ mod tests {
         assert!(known_resource("directory"));
         assert!(known_resource("identity"));
         assert!(known_resource("journal"));
+        assert!(known_resource("migrate"));
     }
 
     #[test]
     fn known_resource_rejects_unshipped() {
-        assert!(!known_resource("migrate"));
         assert!(!known_resource("nonsense"));
         assert!(!known_resource(""));
     }

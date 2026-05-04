@@ -2516,6 +2516,48 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             }),
         ));
         tools.push(tool(
+            "migrate",
+            "Import legacy journal content into the v1.0.0 per-user-Journal-book layout. Three actions: \
+             `list_sources` (returns the books on the User Journals shelf the calling user can see, with `owned` and `page_count`), \
+             `plan` (DRY RUN — walks the source `book_id`, parses each page name for `YYYY-MM-DD` (with H1 fallback), and returns the projected target chapter+page names per the v1.0.0 layout), \
+             `execute` (imports the chosen pages — for each source page, fetches its markdown body and appends a single `## Imported from {source_name} — {original_updated_at}` section to the per-day target page; one block per source page, content verbatim). \
+             `entry_type='user'` imports under the user's first name; `entry_type='agent'` imports under the normalized `agent_name`. The optional `pages` array on `execute` lets you pick a subset of source page IDs from the plan; omit it to import every dated page in the source book. Page-name date parsing tolerates `YYYY-MM-DD`, `YYYY-MM-DD-anything`, `YYYY-MM-DD anything`, `YYYY-MM-DD_anything`. Anything not matched is reported in `undated_pages` for the wizard to handle.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list_sources", "plan", "execute"],
+                        "description": "Operation to perform"
+                    },
+                    "book_id": {
+                        "type": "integer",
+                        "description": "Source book to walk. Required for `plan` and `execute`."
+                    },
+                    "entry_type": {
+                        "type": "string",
+                        "enum": ["user", "agent"],
+                        "description": "Whose journal layout to import into. Required for `plan` and `execute`. `user` = first-name chapters; `agent` = normalized-agent-name chapters."
+                    },
+                    "agent_name": {
+                        "type": "string",
+                        "description": "Required when entry_type='agent'. Normalized like the journal/identity tools (lowercase ASCII alphanumerics + dashes/underscores; whitespace -> dash)."
+                    },
+                    "pages": {
+                        "type": "array",
+                        "items": { "type": "integer" },
+                        "description": "Optional for `execute`. Subset of source `source_page_id` values from the `plan` response. Defaults to every dated page (plus any with a `page_date_overrides` entry) when omitted; an explicit empty array is a safe no-op."
+                    },
+                    "page_date_overrides": {
+                        "type": "object",
+                        "description": "Optional for `execute`. Object mapping `\"<source_page_id>\"` (string keys) to `\"YYYY-MM-DD\"`. Used to give undated pages a date the user picked manually. Override wins over both name-prefix and H1 fallback.",
+                        "additionalProperties": { "type": "string" }
+                    }
+                },
+                "required": ["action"]
+            }),
+        ));
+        tools.push(tool(
             "session_event",
             "Signal a session-level event. Currently supported: `action: 'compacted'` resets the briefing-injection state so the next tool response includes the full briefing again. Useful after the AI gets compacted by its harness and loses context.",
             json!({
@@ -2562,6 +2604,7 @@ fn remember_resource(tool_name: &str) -> Option<&'static str> {
         "directory" => Some("directory"),
         "identity" => Some("identity"),
         "journal" => Some("journal"),
+        "migrate" => Some("migrate"),
         _ => None,
     }
 }

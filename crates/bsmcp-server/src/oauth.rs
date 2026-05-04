@@ -1,5 +1,5 @@
 use std::env;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -13,8 +13,8 @@ use zeroize::Zeroize;
 
 use bsmcp_common::bookstack::BookStackClient;
 use bsmcp_common::config::access_token_ttl;
-use bsmcp_common::db::DbBackend;
-use bsmcp_common::settings::hash_token_id;
+use bsmcp_common::db::{DbBackend, TokenBinding};
+use bsmcp_common::settings::{hash_token_id, DEFAULT_ACCOUNT_LABEL};
 
 use crate::sse::AppState;
 
@@ -336,57 +336,108 @@ pub async fn handle_authorize(
     Html(render_login_form(&params, &state.bookstack_url, None)).into_response()
 }
 
-/// Best-effort: probe BookStack for the calling token's user row and store the
-/// numeric `bookstack_user_id` on the user's settings. Skipped silently if
-/// already set, the probe fails, or persistence fails — login still succeeds.
+/// Best-effort: bind a BookStack API token to a stable identity
+/// `(bookstack_user_id, account_label)` in `token_bindings`, and stamp
+/// `bookstack_user_id` onto the corresponding `user_settings` row.
 ///
-/// This restores the v0.7.x auto-populate (lost in the v0.8.0 refactor) so a
-/// freshly authorized user doesn't see a permanent `setup_nudge` for
-/// `bookstack_user_id`. Tokens without `/api/users` access fall back to the
-/// existing manual `/settings` path.
-async fn try_auto_populate_bookstack_user_id(
+/// Idempotent and short-circuiting:
+///  - If a binding already exists for this token hash, returns it
+///    without hitting BookStack.
+///  - Otherwise, hits BookStack `/api/users/me` once. If it returns a
+///    user, writes a binding with the default account label (the
+///    `/setup/user` wizard offers reattaching to an existing label
+///    later).
+///
+/// All failures are non-fatal and logged. The OAuth login still
+/// succeeds even when BookStack rejects `/api/users/me`; the user just
+/// sees the manual `/settings` path on a permanent `setup_nudge` for
+/// `bookstack_user_id` until they fix the token's permissions.
+///
+/// Used by:
+///  - `handle_authorize_submit` — wires bindings on first /authorize.
+///  - `sse::handle_sse` — wires bindings for SSE GET (legacy Bearer).
+///  - `sse::handle_streamable` — wires bindings on Streamable HTTP
+///    `initialize` (the only method that runs before any other tool).
+pub(crate) async fn ensure_token_binding(
     db: &dyn DbBackend,
     client: &BookStackClient,
     token_id: &str,
-) {
+) -> Option<TokenBinding> {
     let token_id_hash = hash_token_id(token_id);
 
-    let mut settings = match db.get_user_settings(&token_id_hash).await {
-        Ok(Some(s)) => s,
-        Ok(None) => Default::default(),
+    // Fast path: already bound. Skip the /api/users/me round-trip.
+    match db.get_token_binding(&token_id_hash).await {
+        Ok(Some(binding)) => return Some(binding),
+        Ok(None) => {}
         Err(e) => {
-            eprintln!("oauth: bookstack_user_id auto-populate failed (non-fatal): load settings: {e}");
-            return;
+            eprintln!("oauth: get_token_binding failed (non-fatal): {e}");
+            return None;
         }
-    };
-
-    // Idempotent: skip if already set.
-    if settings.bookstack_user_id.is_some() {
-        return;
     }
 
+    // Slow path: need /api/users/me to learn the bookstack_user_id.
     let identity = match client.whoami().await {
         Ok(Some(id)) => id,
-        Ok(None) => {
-            // Brand-new account with no content yet; nothing to introspect.
-            return;
-        }
+        Ok(None) => return None,
         Err(e) => {
-            eprintln!("oauth: bookstack_user_id auto-populate failed (non-fatal): whoami: {e}");
-            return;
+            eprintln!("oauth: whoami failed (non-fatal): {e}");
+            return None;
         }
     };
 
-    settings.bookstack_user_id = Some(identity.bookstack_user_id);
-    if let Err(e) = db.save_user_settings(&token_id_hash, &settings).await {
-        eprintln!("oauth: bookstack_user_id auto-populate failed (non-fatal): save settings: {e}");
-        return;
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let binding = TokenBinding {
+        token_id_hash: token_id_hash.clone(),
+        bookstack_user_id: identity.bookstack_user_id,
+        account_label: DEFAULT_ACCOUNT_LABEL.to_string(),
+        created_at: now_secs,
+    };
+
+    if let Err(e) = db.set_token_binding(&binding).await {
+        eprintln!("oauth: set_token_binding failed (non-fatal): {e}");
+        return None;
+    }
+
+    // Stamp bookstack_user_id + account_label on settings (replaces the
+    // old v0.7.x auto-populate that lived directly on the user_settings
+    // row keyed by token_id_hash).
+    let mut settings = db
+        .get_user_settings_by_stable_id(&binding.stable_id())
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let mut dirty = false;
+    if settings.bookstack_user_id != Some(identity.bookstack_user_id) {
+        settings.bookstack_user_id = Some(identity.bookstack_user_id);
+        dirty = true;
+    }
+    if settings.account_label != binding.account_label {
+        settings.account_label = binding.account_label.clone();
+        dirty = true;
+    }
+    if dirty {
+        if let Err(e) = db
+            .save_user_settings_by_stable_id(&binding.stable_id(), &settings)
+            .await
+        {
+            eprintln!(
+                "oauth: save settings on first bind failed (non-fatal): {e}"
+            );
+            // Binding is already persisted — return Some so callers know
+            // the auth path is complete enough to proceed.
+        }
     }
 
     eprintln!(
-        "oauth: auto-populated bookstack_user_id={} for new authorization",
-        identity.bookstack_user_id
+        "auth: bound token to bookstack_user_id={} account_label={}",
+        binding.bookstack_user_id, binding.account_label
     );
+    Some(binding)
 }
 
 pub async fn handle_authorize_submit(
@@ -434,9 +485,11 @@ pub async fn handle_authorize_submit(
         .into_response();
     }
 
-    // Best-effort: stamp `bookstack_user_id` on user_settings now that we know
-    // the token is valid. Idempotent and silent on failure — never blocks login.
-    try_auto_populate_bookstack_user_id(state.db.as_ref(), &bs_client, &form.token_id).await;
+    // Best-effort: bind this token to a stable identity now that we know
+    // it's valid. Writes a `token_bindings` row + stamps
+    // `bookstack_user_id` / `account_label` on settings. Idempotent and
+    // silent on failure — never blocks login.
+    let _ = ensure_token_binding(state.db.as_ref(), &bs_client, &form.token_id).await;
 
     // Browser settings flow: skip the OAuth code dance entirely. Issue a settings
     // session, set the cookie, and redirect to the return path. Both the admin

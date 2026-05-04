@@ -298,6 +298,11 @@ pub async fn handle_sse(
         );
     }
 
+    // First-bind on the SSE GET path. Idempotent — short-circuits when
+    // a binding already exists. Captures the BookStack user_id +
+    // account_label so settings can be written via the binding.
+    let _ = crate::oauth::ensure_token_binding(state.db.as_ref(), &client, &token_id).await;
+
     let session_id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(32);
 
@@ -510,6 +515,12 @@ pub async fn handle_streamable(
                 &state.known_urls,
             );
         }
+
+        // First-bind on Streamable HTTP `initialize` (the only method
+        // guaranteed to run before any tool call per MCP 2025-03-26).
+        // Idempotent — short-circuits when a binding already exists.
+        let _ =
+            crate::oauth::ensure_token_binding(state.db.as_ref(), &client, &token_id).await;
     }
 
     if request.get("id").is_none() {

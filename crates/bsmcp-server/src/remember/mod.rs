@@ -12,7 +12,13 @@
 //!   - `config`    — read/write per-user `config_extras` + dismiss_setup_nudge
 //!   - `directory` — serve the in-memory `DirectoryService` snapshot
 //!
-//! Resources arriving in later sub-PRs: user_journal, agent_journal, migrate.
+//! Added in sub-PR 2.4b:
+//!   - `identity`  — read/write the user-identity page and per-agent
+//!     AI-identity pages (one chapter+page per agent) inside the user's
+//!     per-user Journal book. Bootstraps chapter + page on first read
+//!     or first write when missing.
+//!
+//! Resources arriving in later sub-PRs: journal, migrate.
 //!
 //! Every handler returns the standard `{ok, data, meta, error}` envelope.
 
@@ -20,6 +26,7 @@ pub mod briefing;
 pub mod config;
 pub mod directory;
 pub mod envelope;
+pub mod identity;
 pub mod resolvers;
 pub mod user;
 
@@ -138,6 +145,8 @@ async fn route(resource: &str, action: &str, ctx: &Context) -> DispatchResult {
         ("config", "write") => config::write(ctx).await,
         ("config", "dismiss_setup_nudge") => config::dismiss_setup_nudge(ctx).await,
         ("directory", "read") => directory::read(ctx).await,
+        ("identity", "read") => identity::read(ctx).await,
+        ("identity", "write") => identity::write(ctx).await,
         (r, _) if !known_resource(r) => Err((
             ErrorCode::UnknownResource,
             format!("Unknown resource: {r}"),
@@ -150,7 +159,10 @@ async fn route(resource: &str, action: &str, ctx: &Context) -> DispatchResult {
 }
 
 fn known_resource(resource: &str) -> bool {
-    matches!(resource, "briefing" | "user" | "config" | "directory")
+    matches!(
+        resource,
+        "briefing" | "user" | "config" | "directory" | "identity"
+    )
 }
 
 /// Per-call context passed to every handler.
@@ -189,12 +201,13 @@ mod tests {
         assert!(known_resource("user"));
         assert!(known_resource("config"));
         assert!(known_resource("directory"));
+        assert!(known_resource("identity"));
     }
 
     #[test]
     fn known_resource_rejects_unshipped() {
-        assert!(!known_resource("user_journal"));
-        assert!(!known_resource("agent_journal"));
+        assert!(!known_resource("journal"));
+        assert!(!known_resource("migrate"));
         assert!(!known_resource("nonsense"));
         assert!(!known_resource(""));
     }

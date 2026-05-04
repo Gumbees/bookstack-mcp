@@ -285,8 +285,8 @@ async fn execute_tool(
 ) -> Result<String, String> {
     // `briefing` is the top-level entry into the briefing subsystem
     // (besides auto-injection on every other tool's response meta). The
-    // memory-protocol tools (`briefing` / `user` / `config` / `directory`)
-    // are first-class primitives — no `remember_` prefix.
+    // memory-protocol tools (`briefing` / `user` / `config` / `directory`
+    // / `identity`) are first-class primitives — no `remember_` prefix.
     if name == "briefing" {
         if !briefing_enabled() {
             return Err(
@@ -328,7 +328,7 @@ async fn execute_tool(
         return Ok(serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| envelope.to_string()));
     }
 
-    // `user` / `config` / `directory` route through the
+    // `user` / `config` / `directory` / `identity` route through the
     // `/remember/v1/{resource}/{action}` dispatcher. The MCP arg shape is
     // FLAT: `action` plus the resource-specific fields at the top level.
     // We pull `action` out and re-collect everything else into the `body`
@@ -2267,6 +2267,34 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             }),
         ));
         tools.push(tool(
+            "identity",
+            "Read or write the user-identity narrative or a per-agent AI-identity narrative. Layout: a single `User Identity` chapter+page (target='user') and one `AI Identity: {agent_name}` chapter+page per agent (target='agent'), all inside the user's per-user Journal book. Pages are raw markdown the AI writes wholesale — no append-only, no time-stamped sections. Bootstrap fires on first read or first write when the chapter/page is missing; the seed contains name+email frontmatter and a 'replace this content' marker the AI overwrites on its first `write`. Returns `{content, page_id, chapter_id, bootstrapped}` on read; `{page_id, chapter_id, bytes_written}` on write. `agent_name` is normalized to lowercase ASCII alphanumerics + dashes/underscores; whitespace becomes a dash.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["read", "write"],
+                        "description": "Operation to perform"
+                    },
+                    "target": {
+                        "type": "string",
+                        "enum": ["user", "agent"],
+                        "description": "Whose identity to read/write. `user` = the human's identity narrative (one per user). `agent` = the named AI agent's identity (one per (user, agent_name) pair)."
+                    },
+                    "agent_name": {
+                        "type": "string",
+                        "description": "Required when target='agent'. Free-form name; normalized to lowercase ASCII alphanumerics + dashes/underscores (whitespace -> dash). Rejected if normalization yields empty or contains other characters."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Required when action='write'. Raw markdown body — overwrites the page wholesale. Do NOT include the page title as an H1; BookStack renders the page name as an H1 automatically."
+                    }
+                },
+                "required": ["action", "target"]
+            }),
+        ));
+        tools.push(tool(
             "session_event",
             "Signal a session-level event. Currently supported: `action: 'compacted'` resets the briefing-injection state so the next tool response includes the full briefing again. Useful after the AI gets compacted by its harness and loses context.",
             json!({
@@ -2311,6 +2339,7 @@ fn remember_resource(tool_name: &str) -> Option<&'static str> {
         "user" => Some("user"),
         "config" => Some("config"),
         "directory" => Some("directory"),
+        "identity" => Some("identity"),
         _ => None,
     }
 }

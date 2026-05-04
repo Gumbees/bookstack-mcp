@@ -38,6 +38,23 @@ pub const EMAIL_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 /// Description applied to the per-user Journal book on auto-create.
 const JOURNAL_BOOK_DESCRIPTION: &str = "Personal journal — agent + user entries";
 
+/// Chapter name for the user's first-person identity narrative. Single
+/// chapter per Journal book; one page of the same name lives inside.
+pub const USER_IDENTITY_CHAPTER_NAME: &str = "User Identity";
+
+/// Description stamped on the User Identity chapter at create time.
+const USER_IDENTITY_CHAPTER_DESCRIPTION: &str =
+    "User's first-person identity narrative — written by the AI on the user's behalf";
+
+/// Description stamped on a per-agent AI Identity chapter at create time.
+const AI_IDENTITY_CHAPTER_DESCRIPTION: &str =
+    "Per-agent identity narrative — evolved by the named AI agent for this user";
+
+/// Build the chapter name for a normalized agent name.
+pub fn ai_identity_chapter_name(normalized_agent_name: &str) -> String {
+    format!("AI Identity: {normalized_agent_name}")
+}
+
 /// Typed errors surfaced by the resolvers. Callers in 2.4 will translate to
 /// the remember-envelope `ErrorCode` of their choosing.
 #[derive(Debug, Clone)]
@@ -291,6 +308,223 @@ pub async fn resolve_user_journal_book(
     Ok(new_book_id)
 }
 
+/// Normalize a raw agent_name into the canonical form used in chapter
+/// titles: trimmed, lowercased, internal whitespace runs collapsed to a
+/// single dash. Returns `None` when the result is empty or contains
+/// characters outside `[a-z0-9_-]` (the AI gets a clear error rather
+/// than discovering BookStack rejects the chapter create later).
+pub fn normalize_agent_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Lowercase + replace whitespace runs with a single dash. Multi-pass:
+    // split_whitespace handles tabs/newlines too and collapses runs.
+    let lowered = trimmed
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("-")
+        .to_lowercase();
+    if lowered.is_empty() {
+        return None;
+    }
+    // Defensive char filter — BookStack itself is permissive but the
+    // chapter title gets composed into "AI Identity: {name}", so we keep
+    // it to ASCII alphanumerics + dash + underscore. Anything weirder
+    // probably points at copy-paste noise rather than a deliberate name.
+    if !lowered
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    Some(lowered)
+}
+
+/// Find-or-create the "User Identity" chapter inside the user's per-user
+/// Journal book. Single chapter per book — name match is case-insensitive
+/// against `USER_IDENTITY_CHAPTER_NAME`. Returns the chapter ID.
+pub async fn resolve_user_identity_chapter(
+    token_id_hash: &str,
+    settings: &mut UserSettings,
+    client: &BookStackClient,
+    db: Arc<dyn DbBackend>,
+    globals: &GlobalSettings,
+) -> Result<i64, ResolverError> {
+    let book_id =
+        resolve_user_journal_book(token_id_hash, settings, client, db.clone(), globals).await?;
+    find_or_create_chapter(
+        client,
+        book_id,
+        USER_IDENTITY_CHAPTER_NAME,
+        USER_IDENTITY_CHAPTER_DESCRIPTION,
+    )
+    .await
+}
+
+/// Find-or-create the "User Identity" page inside the User Identity
+/// chapter. On bootstrap (page missing), writes the seed markdown
+/// rendered against `resolve_first_name` + `resolve_email`. Returns
+/// `(page_id, was_bootstrapped)`.
+pub async fn resolve_user_identity_page(
+    token_id_hash: &str,
+    settings: &mut UserSettings,
+    client: &BookStackClient,
+    db: Arc<dyn DbBackend>,
+    globals: &GlobalSettings,
+) -> Result<(i64, bool), ResolverError> {
+    let chapter_id =
+        resolve_user_identity_chapter(token_id_hash, settings, client, db.clone(), globals)
+            .await?;
+
+    if let Some(existing) = client
+        .find_page_in_chapter(chapter_id, USER_IDENTITY_CHAPTER_NAME)
+        .await
+        .map_err(ResolverError::BookstackError)?
+    {
+        let id = existing
+            .get("id")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| ResolverError::BookstackError("page missing id".to_string()))?;
+        return Ok((id, false));
+    }
+
+    let first_name =
+        resolve_first_name(token_id_hash, settings, client, db.clone()).await?;
+    let email = resolve_email(token_id_hash, settings, client, db.clone()).await?;
+    let body = user_identity_bootstrap(&first_name, &email);
+    let page = client
+        .create_page(&serde_json::json!({
+            "chapter_id": chapter_id,
+            "name": USER_IDENTITY_CHAPTER_NAME,
+            "markdown": body,
+        }))
+        .await
+        .map_err(ResolverError::BookstackError)?;
+    let id = page
+        .get("id")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| ResolverError::BookstackError("create_page: missing id in response".to_string()))?;
+    Ok((id, true))
+}
+
+/// Find-or-create the "AI Identity: {agent_name}" chapter inside the
+/// user's per-user Journal book. `agent_name` must already be normalized
+/// via `normalize_agent_name`. Returns the chapter ID.
+pub async fn resolve_ai_identity_chapter(
+    agent_name: &str,
+    token_id_hash: &str,
+    settings: &mut UserSettings,
+    client: &BookStackClient,
+    db: Arc<dyn DbBackend>,
+    globals: &GlobalSettings,
+) -> Result<i64, ResolverError> {
+    let book_id =
+        resolve_user_journal_book(token_id_hash, settings, client, db.clone(), globals).await?;
+    let chapter_name = ai_identity_chapter_name(agent_name);
+    find_or_create_chapter(
+        client,
+        book_id,
+        &chapter_name,
+        AI_IDENTITY_CHAPTER_DESCRIPTION,
+    )
+    .await
+}
+
+/// Find-or-create the AI Identity page inside its chapter. On bootstrap
+/// (page missing), writes the seed markdown rendered with the agent's
+/// name. Returns `(page_id, was_bootstrapped)`.
+pub async fn resolve_ai_identity_page(
+    agent_name: &str,
+    token_id_hash: &str,
+    settings: &mut UserSettings,
+    client: &BookStackClient,
+    db: Arc<dyn DbBackend>,
+    globals: &GlobalSettings,
+) -> Result<(i64, bool), ResolverError> {
+    let chapter_id = resolve_ai_identity_chapter(
+        agent_name,
+        token_id_hash,
+        settings,
+        client,
+        db.clone(),
+        globals,
+    )
+    .await?;
+    let page_name = ai_identity_chapter_name(agent_name);
+
+    if let Some(existing) = client
+        .find_page_in_chapter(chapter_id, &page_name)
+        .await
+        .map_err(ResolverError::BookstackError)?
+    {
+        let id = existing
+            .get("id")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| ResolverError::BookstackError("page missing id".to_string()))?;
+        return Ok((id, false));
+    }
+
+    let body = ai_identity_bootstrap(agent_name);
+    let page = client
+        .create_page(&serde_json::json!({
+            "chapter_id": chapter_id,
+            "name": page_name,
+            "markdown": body,
+        }))
+        .await
+        .map_err(ResolverError::BookstackError)?;
+    let id = page
+        .get("id")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| ResolverError::BookstackError("create_page: missing id in response".to_string()))?;
+    Ok((id, true))
+}
+
+/// Find-or-create a chapter by name in `book_id`. One `find_chapter_in_book`
+/// call (which itself is one `get_book`); on miss, one `create_chapter`.
+async fn find_or_create_chapter(
+    client: &BookStackClient,
+    book_id: i64,
+    chapter_name: &str,
+    description: &str,
+) -> Result<i64, ResolverError> {
+    if let Some(existing) = client
+        .find_chapter_in_book(book_id, chapter_name)
+        .await
+        .map_err(ResolverError::BookstackError)?
+    {
+        return existing
+            .get("id")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| ResolverError::BookstackError("chapter missing id".to_string()));
+    }
+    let chapter = client
+        .create_chapter(book_id, chapter_name, description)
+        .await
+        .map_err(ResolverError::BookstackError)?;
+    chapter
+        .get("id")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| ResolverError::BookstackError("create_chapter: missing id in response".to_string()))
+}
+
+/// Bootstrap markdown for the user-identity page. The AI overwrites this
+/// wholesale on its first `identity write target=user` call.
+pub fn user_identity_bootstrap(first_name: &str, email: &str) -> String {
+    format!(
+        "name: {first_name}\nemail: {email}\n\n(Replace this content with your own narrative.)\n"
+    )
+}
+
+/// Bootstrap markdown for an AI-identity page. The AI overwrites this
+/// wholesale on its first `identity write target=agent` call.
+pub fn ai_identity_bootstrap(agent_name: &str) -> String {
+    format!(
+        "name: {agent_name}\n\n(Replace this content with your own narrative.)\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,5 +626,114 @@ mod tests {
             ResolverError::BookstackError(s) => assert_eq!(s, "boom"),
             other => panic!("expected BookstackError, got {other:?}"),
         }
+    }
+
+    // --- normalize_agent_name ---
+
+    #[test]
+    fn normalize_agent_name_lowercases() {
+        assert_eq!(normalize_agent_name("Claude").as_deref(), Some("claude"));
+        assert_eq!(normalize_agent_name("GPT-4").as_deref(), Some("gpt-4"));
+    }
+
+    #[test]
+    fn normalize_agent_name_trims_outer_whitespace() {
+        assert_eq!(
+            normalize_agent_name("  claude  ").as_deref(),
+            Some("claude")
+        );
+    }
+
+    #[test]
+    fn normalize_agent_name_replaces_inner_whitespace_with_dash() {
+        assert_eq!(
+            normalize_agent_name("Claude Opus").as_deref(),
+            Some("claude-opus"),
+        );
+        // Multiple whitespace runs (including mixed tab/newline) collapse
+        // to a single dash apiece.
+        assert_eq!(
+            normalize_agent_name("  Claude   Opus  Lite  ").as_deref(),
+            Some("claude-opus-lite"),
+        );
+        assert_eq!(
+            normalize_agent_name("Claude\tOpus\nLite").as_deref(),
+            Some("claude-opus-lite"),
+        );
+    }
+
+    #[test]
+    fn normalize_agent_name_allows_dash_and_underscore() {
+        assert_eq!(
+            normalize_agent_name("my_agent-7").as_deref(),
+            Some("my_agent-7"),
+        );
+    }
+
+    #[test]
+    fn normalize_agent_name_rejects_empty_after_trim() {
+        assert_eq!(normalize_agent_name(""), None);
+        assert_eq!(normalize_agent_name("   "), None);
+        assert_eq!(normalize_agent_name("\t\n"), None);
+    }
+
+    #[test]
+    fn normalize_agent_name_rejects_special_characters() {
+        // Punctuation, slashes, dots, colons — anything outside
+        // [a-z0-9_-] after normalization is rejected.
+        assert_eq!(normalize_agent_name("claude.opus"), None);
+        assert_eq!(normalize_agent_name("claude/opus"), None);
+        assert_eq!(normalize_agent_name("claude:opus"), None);
+        assert_eq!(normalize_agent_name("claude!"), None);
+        assert_eq!(normalize_agent_name("AI Identity: claude"), None);
+    }
+
+    #[test]
+    fn normalize_agent_name_rejects_non_ascii() {
+        // Non-ASCII alphabetics aren't alphanumeric per is_ascii_alphanumeric.
+        assert_eq!(normalize_agent_name("café"), None);
+        assert_eq!(normalize_agent_name("クロード"), None);
+    }
+
+    #[test]
+    fn ai_identity_chapter_name_renders_predictably() {
+        assert_eq!(
+            ai_identity_chapter_name("claude"),
+            "AI Identity: claude"
+        );
+        assert_eq!(
+            ai_identity_chapter_name("gpt-4o"),
+            "AI Identity: gpt-4o"
+        );
+    }
+
+    // --- bootstrap content shape ---
+
+    #[test]
+    fn user_identity_bootstrap_includes_name_and_email() {
+        let body = user_identity_bootstrap("Nate", "nate@example.com");
+        assert!(body.contains("name: Nate"), "missing name line: {body}");
+        assert!(
+            body.contains("email: nate@example.com"),
+            "missing email line: {body}"
+        );
+        assert!(body.contains("Replace this content"));
+        // Sanity: don't accidentally embed the page's own H1 — the
+        // BookStack renderer adds the page name as an H1 already.
+        assert!(
+            !body.contains("# User Identity"),
+            "bootstrap must not duplicate the page title as an H1: {body}"
+        );
+    }
+
+    #[test]
+    fn ai_identity_bootstrap_includes_agent_name() {
+        let body = ai_identity_bootstrap("claude");
+        assert!(body.contains("name: claude"));
+        assert!(body.contains("Replace this content"));
+        assert!(
+            !body.contains("# AI Identity"),
+            "bootstrap must not duplicate the page title as an H1: {body}"
+        );
     }
 }

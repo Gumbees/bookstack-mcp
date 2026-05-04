@@ -118,23 +118,31 @@ All prefixed `BSMCP_`. See `.env.example` for full list. Key ones:
 - `BSMCP_SUMMARY_INTERVAL` — hours between regenerations (0 = only on first startup)
 - `BSMCP_SUMMARY_TOKEN_ID/SECRET` — BookStack token (falls back to BSMCP_EMBED_TOKEN_*)
 
-## Briefing flow (`/briefing`)
+## Memory protocol (briefing + journal + identity + …)
 
-Server-side per-session reconstitution. The personal-memory layer (journals, collages, identities, whoami, user) moved to memberberry.ai in v0.8.0 — what remains here is the **briefing**: a single response shape that gives the AI everything it needs about the current session.
+Server-side per-session reconstitution + memory CRUD. v0.8.0 stripped the surface back to just `briefing`; v1.0.0 reintroduced it as nine MCP tools (no shared HTTP namespace — each tool is reachable only as MCP).
 
-**HTTP:** `POST /briefing/v1/read` — JSON body in, JSON envelope out (`{ok, data, meta, error}`). Auth via the same Bearer token as `/mcp/sse`.
+**Tools:** `briefing`, `user`, `config`, `directory`, `identity`, `journal`, `migrate`, `session_event`, `dismiss_setup_nudge`. The first carries the bootstrap shape; the rest are the working surface for an AI's evolved identity, journal entries, per-user settings, and migration of legacy structure.
 
-**MCP:** one tool, `briefing`. Optional `user_prompt` (drives semantic prioritization), `client_timezone`, `session_id`. No `action` dispatch.
+**HTTP:** `POST /briefing/v1/read` — JSON body in, JSON envelope out (`{ok, data, meta, error}`). Auth via the same Bearer token as `/mcp/sse`. The other memory tools are MCP-only — no HTTP namespace.
 
-**Response shape (`data`):** time block, org/user identity context, `system_prompt_additions` (guide page, org_identity, org_required_instructions, org_ai_usage_policy, user `system_prompt_page_ids`, owned-domains synthetic block), `setup_status` / `setup_nudge` when settings are incomplete, `kb_semantic_matches` against the `user_prompt`, and a thin config echo.
+**Briefing call:** `briefing` MCP tool with optional `user_prompt` (drives semantic prioritization), `client_timezone`, `session_id`, `agent_name`. No `action` dispatch.
 
-**Auto-injection on every MCP tool response:** the briefing payload is also added as `meta.briefing` on every other tool call's response. Full content on the first call per session, sticky-only (time + setup_summary) thereafter. State is keyed by `(token_hash, session_id)` and tracked in `crates/bsmcp-server/src/session.rs`. When `session_id` is absent (Streamable HTTP is stateless), the server falls back to a per-hour bucket per token. Calling the `briefing` tool explicitly resets the session so the next response carries full content again — useful after compaction.
+**Response shape (`data`):** time block, org/user identity context, `system_prompt_additions` (guide page, org_identity if `use_org_identity`, org_required_instructions, org_ai_usage_policy, user `system_prompt_page_ids`, owned-domains synthetic block), `setup_nudge` when settings are incomplete, `kb_semantic_matches` against the `user_prompt`, journaling reminder when `journaling_enabled`, and a thin config echo.
+
+**Auto-injection on every MCP tool response:** the briefing payload is also added as `meta.briefing` on every other tool call's response. Full content on the first call per session, sticky-only (time + setup_summary) thereafter. State is keyed by `(token_hash, session_id)` and tracked in `crates/bsmcp-server/src/session.rs`. When `session_id` is absent (Streamable HTTP is stateless), the server falls back to a per-hour bucket per token. Calling the `briefing` tool explicitly (or `session_event action=compacted`) resets the session so the next response carries full content again — useful after compaction.
+
+**Per-account stable identity (v1.0.0):** settings are keyed by `stable_id = "{bookstack_user_id}:{account_label}"`, not by the rotating `token_id_hash`. The `token_bindings` table maps each token hash onto a stable identity. Auth flow: `oauth.rs::ensure_token_binding` writes the binding on first contact (called from `/authorize`, SSE GET, and Streamable HTTP `initialize`). Multi-Anthropic-account users running the same BookStack user distinguish personalities via `account_label` (defaults `"default"`); the `/setup/user` wizard offers re-attaching to an existing label on a fresh token's first authentication so token rotation preserves settings.
+
+**Per-user write gates (v1.0.0):**
+- `journaling_enabled` — when false, both `journal::write` and `identity::write` (target=agent) return `ErrorCode::Forbidden` with a remediation hint. Lets a user wire DTC's MCP alongside a personal MCP and only journal to the personal one.
+- `use_org_identity` — when false, the briefing's `org_identity` injection is suppressed for this user even if the admin set `globals.org_identity_page_id`. Lets a user opt out of an instance's canonical identity binding their session.
 
 **Settings backing the briefing:**
-- Per-user `user_settings` (JSON blob): label, role, user_id, timezone, owned `domains`, `system_prompt_page_ids` (always-on context — short, durable docs like style guides), `semantic_against_full_kb` toggle.
+- Per-user `user_settings` (JSON blob, keyed by stable_id): label, role, user_id, bookstack_user_id, **account_label**, owned `domains`, `system_prompt_page_ids`, `semantic_against_full_kb`, timezone, **journaling_enabled** (also gates writes), **use_org_identity**, `chosen_ai_identity`, per-tool overrides, `setup_complete`.
 - Global `global_settings` (single row): typed setup slots `guide_page_id`, `org_identity_page_id`, `policies_scope`, `sops_scope`, `best_practices_scope`; always-on lists `org_required_instructions_page_ids`, `org_ai_usage_policy_page_ids`, `org_domains`; org-wide booleans `friendly_structure`, `full_content_in_briefing`, `strict_setup`.
 
-Null settings just omit the affected section from the briefing; with `strict_setup=true` they instead surface `setup_required` errors on tool calls until configured.
+Null settings just omit the affected section from the briefing; with `strict_setup=true` they instead surface `setup_required` errors on tool calls until configured. `org_identity_page_id` is intentionally NOT on the pending-fields list — no org identity is a valid admin choice.
 
 ## Settings UI (`/settings`)
 
@@ -166,13 +174,13 @@ Single-row table holding instance-wide pointers used by the briefing builder, se
 
 Writes are admin-only (BookStack admin probed via `/api/users` access in the settings handler).
 
-## Implemented Tools (56 + 3 semantic + 3 briefing = 62)
+## Implemented Tools (59 BookStack + 9 memory protocol + 3 semantic = 71)
 
 - **search_content** - Full-text search with BookStack query operators
 - **semantic_search** - Natural language vector search (when semantic enabled)
 - **reembed** - Trigger re-embedding of all pages (when semantic enabled)
 - **embedding_status** - Check semantic index status (when semantic enabled)
-- **briefing** - Per-session reconstitution shell (also auto-injected as `meta.briefing` on every tool response)
+- **Memory protocol (9)** - `briefing`, `user`, `config`, `directory`, `identity`, `journal`, `migrate`, `session_event`, `dismiss_setup_nudge`. Briefing also auto-injected as `meta.briefing` on every other tool response. `journal::write` and `identity::write` (target=agent) are gated on `UserSettings.journaling_enabled`; the briefing's `org_identity` injection is gated on `UserSettings.use_org_identity`. Settings keyed by stable identity `(bookstack_user_id, account_label)` via `token_bindings` so they survive BookStack API token rotation.
 - **Shelves** - list, get, create, update (assign books), delete (5)
 - **Books** - list, get, create, update, delete (5)
 - **Chapters** - list, get, create, update (move between books), delete (5)
@@ -223,6 +231,15 @@ The server implements OAuth 2.1 (authorization code + PKCE) with a browser-based
 2. **Legacy Bearer:** `Authorization: Bearer token_id:token_secret` on SSE/messages endpoints (Claude Code direct connection).
 
 ## Breaking Changes Log
+
+### v1.0.0 (from v0.8.0)
+- **Memory protocol re-introduced.** v0.8.0's `3d9370f` deleted the `crates/bsmcp-server/src/remember/` subtree (~17 files / 8k lines) and shipped only `briefing`. v1.0.0 restores nine memory-protocol MCP tools: `briefing`, `user`, `config`, `directory`, `identity`, `journal`, `migrate`, `session_event`, `dismiss_setup_nudge`. No HTTP namespace — each tool is reachable only as MCP. The v0.7.x `/remember/v1/{resource}/{action}` HTTP routes are gone.
+- **`user_settings` rekeyed from `token_id_hash` PK to `stable_id` PK** (= `bookstack_user_id` + `:` + `account_label`). Idempotent in-Rust migration walks legacy rows on first startup, parses each JSON blob to extract `bookstack_user_id`, builds `stable_id`, copies the row to a fresh `user_settings` table, and writes a `token_bindings` entry mapping the old `token_id_hash` to the new identity. Rows with NULL `bookstack_user_id` are dropped — the user re-onboards via `/authorize`. Both backends; transactional; safe under crash mid-migration.
+- **New `token_bindings` table** (both backends) — `(token_id_hash PK, bookstack_user_id, account_label, created_at)`. Populated by `oauth.rs::ensure_token_binding` on first contact via `/authorize`, SSE GET, or Streamable HTTP `initialize`. `save_user_settings(token_id_hash, …)` is now binding-conditional — it returns an error when no binding exists. Auth path guarantees a binding before any save.
+- **New `UserSettings` fields:** `account_label: String` (default `"default"`), `use_org_identity: bool` (default `true`). Pure additive — the JSON blob in `settings_json` accepts new fields via `#[serde(default)]`. `Default` impl is now manual (was derived) because `account_label` defaults to `"default"` not `""` and `use_org_identity` defaults to `true` not `false`.
+- **`journaling_enabled` now also gates writes,** not just the briefing reminder. `journal::write` and `identity::write` (target=agent) return `ErrorCode::Forbidden` ("forbidden", new variant) when the flag is false. Lets a user wire two MCPs into the same Claude session and have the AI naturally write only to the primary.
+- **`org_identity_page_id` dropped from pending-global-fields.** No longer surfaces in `setup_nudge.summary` or `pending_global` — "no org identity" is a first-class admin choice, not unfinished setup.
+- **`/setup/user` wizard adds two fields:** `account_label` (text input + HTML5 `<datalist>` of existing personalities for autocomplete) and `use_org_identity` (checkbox). POST handler is binding-aware: detects label change vs binding's current label, optionally re-attaches to existing settings under the new label, updates `token_bindings` before save.
 
 ### v0.8.0 (from v0.7.x)
 - **All `remember_*` MCP tools removed.** The personal-memory layer (journals, collages, identities, whoami, user) moved to memberberry.ai. The 12 `remember_briefing` / `remember_journal` / `remember_collage` / `remember_shared_collage` / `remember_user_journal` / `remember_whoami` / `remember_user` / `remember_identity` / `remember_directory` / `remember_config` / `remember_audit` / `remember_search` tools no longer ship with the server.

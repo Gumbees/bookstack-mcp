@@ -7,13 +7,13 @@ An MCP (Model Context Protocol) server that gives Claude full access to a [BookS
 - Full CRUD on all core BookStack resources (shelves, books, chapters, pages, attachments)
 - Full-text search with BookStack query operators
 - **Semantic vector search** — natural language search across all content via embeddings (optional). Hybrid (vector + keyword) with Markov-blanket re-ranking; ACL-filtered when the caller's BookStack user ID is configured.
-- **Hive memory flow (`/remember`)** — server-side reconstitution + memory CRUD that replaces the multi-call AI bootstrap with one structured `briefing` pull. 12 `remember_*` MCP tools cover identity, journals, topics, search, audit, directory, and per-user/global config. Auto-provisions per-user identity + journal structure on first call.
+- **Memory protocol** — server-side reconstitution + memory CRUD that replaces the multi-call AI bootstrap with one structured `briefing` pull. Nine MCP tools cover identity, journals, per-user/global config, the directory tree, the migrate flow, and session-state signals. Auto-provisions per-user identity + journal structure on first call. Stable identity per `(bookstack_user_id, account_label)` survives BookStack API token rotation; multi-Anthropic-account users distinguish personalities with the `account_label` field.
 - **Settings UI (`/settings`)** — browser-based admin/user configuration page (token-gated via the same `/authorize` flow). Pick book/chapter IDs from dropdowns populated by BookStack; toggle semantic-search scopes; one-shot admin-only globals (Hive shelf, User Journals shelf, org identity page, org domains).
 - **Pluggable database** — SQLite for simple deployments, PostgreSQL + pgvector for production
 - **Separate embedder** — background embedding service with pluggable backends (local ONNX, Ollama, OpenAI)
 - **Server-side markdown to HTML conversion** — send markdown, server converts before sending to BookStack
 - **Staging upload flow** — upload local images and attachments through a two-step staging endpoint without exposing local paths to the container ([see below](#uploading-local-files-images--attachments))
-- **Time-aware responses** — every `/remember` response carries a `meta.time` block (now_unix/now_utc/now_local/now_human/timezone) sourced from a per-user cached IANA timezone. Lets agents reason about "yesterday" / "this morning" without re-deriving it.
+- **Time-aware responses** — every briefing response (and every other MCP tool response, via `meta.briefing`) carries a `meta.time` block (now_unix/now_utc/now_local/now_human/timezone) sourced from a per-user cached IANA timezone. Lets agents reason about "yesterday" / "this morning" without re-deriving it.
 - **OAuth 2.1 support** — use as a Claude.ai or Claude Desktop custom connector without config files
 - **Encrypted token storage** — OAuth tokens encrypted at rest with AES-256-GCM
 - **Dual transport** — SSE (MCP 2024-11-05) and Streamable HTTP (MCP 2025-03-26)
@@ -42,7 +42,7 @@ docker/
 
 The MCP server handles all client-facing protocol, OAuth, and search. The embedder runs separately, polling a database-backed job queue to embed pages and serving a `/embed` HTTP endpoint for query-time embedding. The embedder supports three backends: local ONNX models (fastembed), Ollama, or OpenAI-compatible APIs.
 
-## Available Tools (61 BookStack + 12 Hive memory = 73)
+## Available Tools (59 BookStack + 9 memory protocol + 3 semantic = 71)
 
 | Category | Tools |
 |----------|-------|
@@ -64,11 +64,13 @@ The MCP server handles all client-facing protocol, OAuth, and search. The embedd
 | **Images** | `list_images`, `get_image`, `upload_image`, `update_image`, `delete_image` |
 | **Permissions** | `get_content_permissions`, `update_content_permissions` |
 | **Roles** | `list_roles`, `get_role` |
-| **Hive memory (`/remember`)** | `briefing`, `remember_whoami`, `user`, `config`, `remember_identity`, `directory`, `remember_journal`, `remember_collage`, `remember_shared_collage`, `remember_user_journal`, `remember_audit`, `remember_search` |
+| **Memory protocol** | `briefing`, `user`, `config`, `directory`, `identity`, `journal`, `migrate`, `session_event`, `dismiss_setup_nudge` |
 
-Semantic tools (`semantic_search`, `reembed`, `embedding_status`) only appear when `BSMCP_SEMANTIC_SEARCH=true` and an embedder is running. Without semantic search: 58 BookStack + 12 Hive = 70 tools.
+Semantic tools (`semantic_search`, `reembed`, `embedding_status`) only appear when `BSMCP_SEMANTIC_SEARCH=true` and an embedder is running. Without semantic search: 59 BookStack + 9 memory protocol = 68 tools.
 
-Hive memory tools require user/global settings. The `briefing` tool returns a `setup_nudge` listing every pending field with the exact MCP call to fix it; configure via the `/settings` UI or `config action=write`.
+Memory-protocol tools require per-user / global settings. The `briefing` tool (and `meta.briefing` on every other tool response) carries a `setup_nudge` listing pending fields; configure via the `/setup/user` wizard, the `/settings` UI, or `user action=write` / `config action=write`. The `setup_nudge` is dismissable for N days via `config action=dismiss_setup_nudge` or the dedicated `dismiss_setup_nudge` tool.
+
+Per-user memory tools survive BookStack API token rotation: settings live at the stable identity `(bookstack_user_id, account_label)`, and the `token_bindings` table maps each rotating token hash onto an identity. A user running this MCP with multiple Anthropic accounts against the same BookStack user distinguishes personalities by `account_label` (defaults to `"default"`). The `/setup/user` wizard offers re-attaching to an existing label on a fresh token's first authentication.
 
 ## Setup
 

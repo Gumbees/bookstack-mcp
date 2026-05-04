@@ -63,9 +63,18 @@ pub struct UserSettings {
     pub timezone_fetched_at: Option<i64>,
 
     /// Unix epoch seconds until which the briefing's "configure your settings"
-    /// nudge is snoozed.
+    /// nudge is snoozed. Written by `remember_config dismiss_setup_nudge` and
+    /// the legacy `dismiss_setup_nudge` MCP tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_nudge_dismissed_until: Option<i64>,
+
+    /// Free-form per-user K/V store. Written by `remember_config write` for
+    /// arbitrary keys that don't fit one of the typed slots above (e.g.
+    /// per-Hive shelf/book/page IDs locked in by the setup workflow). Distinct
+    /// from `extras` — these are deliberate writes, not v0.7.x roundtrip
+    /// leftovers.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub config_extras: std::collections::HashMap<String, String>,
 
     /// v0.7.x leftover keys captured on deserialize. Round-trips through
     /// saves until the briefing builder explicitly clears them — that way an

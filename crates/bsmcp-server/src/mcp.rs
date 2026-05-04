@@ -79,8 +79,8 @@ pub async fn handle_request(
 
             // Build the tool-result object first so we can decorate it with
             // `meta.briefing`. The meta-injection runs for every tool except
-            // `briefing` itself (where the response IS the briefing — duplicating
-            // it under meta would be wasteful).
+            // `remember_briefing` itself (where the response IS the briefing —
+            // duplicating it under meta would be wasteful).
             let mut tool_result = match result {
                 Ok(text) => json!({
                     "content": [{ "type": "text", "text": text }],
@@ -91,8 +91,8 @@ pub async fn handle_request(
                 }),
             };
 
-            if name != "briefing" && briefing_enabled() {
-                // Calling `briefing` explicitly resets the session via task 5;
+            if name != "remember_briefing" && briefing_enabled() {
+                // Calling `remember_briefing` explicitly resets the session via task 5;
                 // for every other tool, record_call decides full-vs-sticky.
                 let key = session::session_key(&deps.token_id_hash, deps.session_id.as_deref());
                 let was_first = session::record_call(&deps.session_store, &key).await;
@@ -165,12 +165,14 @@ async fn execute_tool(
     staging: &crate::staging::StagingStore,
     deps: &BriefingDeps,
 ) -> Result<String, String> {
-    // The `briefing` tool is the only top-level entry into the briefing
-    // subsystem (besides auto-injection on every other tool's response meta).
-    if name == "briefing" {
+    // `remember_briefing` is the top-level entry into the briefing subsystem
+    // (besides auto-injection on every other tool's response meta). Renamed
+    // from `briefing` in v1.0.0 — the `remember_*` family is the canonical
+    // surface for the personal-memory layer.
+    if name == "remember_briefing" {
         if !briefing_enabled() {
             return Err(
-                "Briefing disabled (BSMCP_BRIEFING_ENABLED=false on this server)".to_string(),
+                "remember_briefing disabled (BSMCP_BRIEFING_ENABLED=false on this server)".to_string(),
             );
         }
         let mut body = args.clone();
@@ -182,8 +184,8 @@ async fn execute_tool(
         if let Value::Object(ref mut map) = body {
             map.remove("action");
         }
-        // Calling `briefing` explicitly resets the session for the next
-        // response — useful after the AI gets compacted by its harness.
+        // Calling `remember_briefing` explicitly resets the session for the
+        // next response — useful after the AI gets compacted by its harness.
         // Honor the tool's own `session_id` arg if present (lets a client
         // without HTTP-header session_id support still get sticky-vs-full
         // behavior); otherwise fall back to the transport-layer id.
@@ -192,6 +194,33 @@ async fn execute_tool(
         session::mark_compacted(&deps.session_store, &key).await;
 
         let envelope = briefing::read(
+            body,
+            &deps.token_id,
+            client,
+            deps.db.clone(),
+            deps.semantic.clone(),
+        )
+        .await;
+        return Ok(serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| envelope.to_string()));
+    }
+
+    // `remember_user` / `remember_config` route through the
+    // `/remember/v1/{resource}/{action}` dispatcher. Each tool takes an
+    // `action` string + a `body` object of resource-specific fields.
+    if let Some(resource) = remember_resource(name) {
+        if !briefing_enabled() {
+            return Err(format!(
+                "{name} disabled (BSMCP_BRIEFING_ENABLED=false on this server)"
+            ));
+        }
+        let action = arg_str(args, "action")?;
+        let body = args
+            .get("body")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let envelope = crate::remember::dispatch(
+            resource,
+            &action,
             body,
             &deps.token_id,
             client,
@@ -1432,11 +1461,11 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool, su
 
     // Briefing flow — surface this FIRST so it lands before any other guidance.
     instructions.push_str(
-        "Call the `briefing` tool at session start with the user's opening message as \
+        "Call the `remember_briefing` tool at session start with the user's opening message as \
          `user_prompt`. It returns time, system_prompt_additions (guide page, org_identity, \
          org_required_instructions, org_ai_usage_policy, user-supplied pages, owned-domains), \
          kb_semantic_matches against the prompt, and a `setup_nudge` block when settings are \
-         incomplete. Equivalent to POST /briefing/v1/read.\n\n\
+         incomplete. Equivalent to POST /briefing/v1/read or POST /remember/v1/briefing/read.\n\n\
          The briefing payload is also auto-injected as `meta.briefing` on every other tool \
          response — full content on the first call per session, sticky-only (time + setup \
          summary) thereafter. After your harness compacts you and you lose context, call \
@@ -2043,8 +2072,8 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
     // make sense when the briefing surface is enabled.
     if briefing_enabled() {
         tools.push(json!({
-            "name": "briefing",
-            "description": "Reconstitution shell — returns time, system_prompt_additions (guide page, org_identity, org_required_instructions, org_ai_usage_policy, user system_prompt_page_ids, owned-domains synthetic block), kb_semantic_matches against the user_prompt, setup_nudge when settings are incomplete, and a thin config echo. Auto-injected into meta.briefing on every MCP tool response (full content first call, sticky bits thereafter); call this tool explicitly after compaction to reset to first-call form.",
+            "name": "remember_briefing",
+            "description": "Reconstitution shell — returns time, system_prompt_additions (guide page, org_identity, org_required_instructions, org_ai_usage_policy, user system_prompt_page_ids, owned-domains synthetic block), kb_semantic_matches against the user_prompt, setup_nudge when settings are incomplete, and a thin config echo. Auto-injected into meta.briefing on every MCP tool response (full content first call, sticky bits thereafter); call this tool explicitly after compaction to reset to first-call form. Renamed from `briefing` in v1.0.0 — the `remember_*` family is the canonical surface for the personal-memory layer.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
@@ -2054,6 +2083,44 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
                 }
             }),
         }));
+        tools.push(tool(
+            "remember_user",
+            "Read or write the per-user UserSettings row. `action: 'read'` returns the current settings (no secrets). `action: 'write'` accepts `body.patch` (JSON object) and merges it into existing settings — keys not provided are preserved. Use this to set label, role, user_id, bookstack_user_id, domains, system_prompt_page_ids, timezone, semantic_against_full_kb.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["read", "write"],
+                        "description": "Operation to perform"
+                    },
+                    "body": {
+                        "type": "object",
+                        "description": "Action-specific payload. For `write`, must contain `patch: {field: value, ...}`."
+                    }
+                },
+                "required": ["action"]
+            }),
+        ));
+        tools.push(tool(
+            "remember_config",
+            "Read or write the per-user config_extras K/V store, or dismiss the briefing's setup_nudge. `action: 'read'` returns the current config. `action: 'write'` accepts `body.config: {key: value, ...}` (string values, pass null to delete a key) and merges into existing extras. `action: 'dismiss_setup_nudge'` accepts `body.days: int` (1..=365) and snoozes the briefing nudge.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["read", "write", "dismiss_setup_nudge"],
+                        "description": "Operation to perform"
+                    },
+                    "body": {
+                        "type": "object",
+                        "description": "Action-specific payload. For `write`: `{config: {key: value, ...}}`. For `dismiss_setup_nudge`: `{days: int}`."
+                    }
+                },
+                "required": ["action"]
+            }),
+        ));
         tools.push(tool(
             "session_event",
             "Signal a session-level event. Currently supported: `action: 'compacted'` resets the briefing-injection state so the next tool response includes the full briefing again. Useful after the AI gets compacted by its harness and loses context.",
@@ -2088,6 +2155,18 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
     }
 
     tools
+}
+
+/// Map an MCP tool name to its `/remember/v1/{resource}` resource, if any.
+/// Returns `None` for tools that aren't `remember_*` dispatchers (or for
+/// `remember_briefing`, which is handled separately so it can run the
+/// session-compaction reset before delegating).
+fn remember_resource(tool_name: &str) -> Option<&'static str> {
+    match tool_name {
+        "remember_user" => Some("user"),
+        "remember_config" => Some("config"),
+        _ => None,
+    }
 }
 
 /// Whether the briefing surface is enabled. Reads BSMCP_BRIEFING_ENABLED;

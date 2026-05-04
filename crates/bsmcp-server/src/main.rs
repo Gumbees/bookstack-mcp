@@ -3,6 +3,7 @@ mod llm;
 mod mcp;
 mod migrate;
 mod oauth;
+mod remember;
 mod semantic;
 mod session;
 mod settings_ui;
@@ -285,7 +286,12 @@ async fn main() {
             "/briefing/v1/read",
             axum::routing::post(handle_briefing_http),
         );
+        app = app.route(
+            "/remember/v1/{resource}/{action}",
+            axum::routing::post(handle_remember_http),
+        );
         eprintln!("Briefing: HTTP endpoint active at POST /briefing/v1/read");
+        eprintln!("Remember: HTTP endpoint active at POST /remember/v1/{{resource}}/{{action}}");
     } else {
         eprintln!("Briefing: DISABLED (set BSMCP_BRIEFING_ENABLED=true to enable)");
     }
@@ -374,6 +380,56 @@ async fn handle_briefing_http(
     );
 
     let envelope = briefing::read(
+        body_value,
+        &token_id,
+        &client,
+        state.db.clone(),
+        state.semantic.clone(),
+    )
+    .await;
+
+    (StatusCode::OK, Json(envelope)).into_response()
+}
+
+/// HTTP handler for `POST /remember/v1/{resource}/{action}`. Same auth +
+/// body parsing as `handle_briefing_http`; routes through
+/// `crate::remember::dispatch`.
+async fn handle_remember_http(
+    State(state): State<sse::AppState>,
+    Path((resource, action)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: String,
+) -> impl IntoResponse {
+    let (token_id, token_secret) = match sse::resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+
+    let body_value: serde_json::Value = if body.is_empty() {
+        serde_json::Value::Object(Default::default())
+    } else {
+        match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"ok": false, "error": {"code": "invalid_argument", "message": "request body must be JSON"}})),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    let client = bsmcp_common::bookstack::BookStackClient::new(
+        &state.bookstack_url,
+        &token_id,
+        &token_secret,
+        state.http_client.clone(),
+    );
+
+    let envelope = remember::dispatch(
+        &resource,
+        &action,
         body_value,
         &token_id,
         &client,

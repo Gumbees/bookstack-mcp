@@ -53,6 +53,20 @@ fn decode_kb_scope(value: Option<String>) -> Option<bsmcp_common::settings::KbSc
     }
 }
 
+/// Encode a HashMap<String, bool> as a JSON object string. Returns None
+/// when the map is empty so the column round-trips as NULL — matches the
+/// `org_domains` / `policies_scope` pattern.
+fn encode_bool_map(map: &std::collections::HashMap<String, bool>) -> Option<String> {
+    if map.is_empty() { None } else { serde_json::to_string(map).ok() }
+}
+
+fn decode_bool_map(value: Option<String>) -> std::collections::HashMap<String, bool> {
+    match value {
+        Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_default(),
+        _ => std::collections::HashMap::new(),
+    }
+}
+
 pub struct PostgresDb {
     pool: PgPool,
     encryption_key: Zeroizing<[u8; 32]>,
@@ -134,7 +148,8 @@ impl PostgresDb {
                 best_practices_scope TEXT,
                 friendly_structure BOOLEAN NOT NULL DEFAULT TRUE,
                 full_content_in_briefing BOOLEAN NOT NULL DEFAULT FALSE,
-                strict_setup BOOLEAN NOT NULL DEFAULT FALSE
+                strict_setup BOOLEAN NOT NULL DEFAULT FALSE,
+                tool_defaults TEXT
             )"
         )
         .execute(&pool)
@@ -155,6 +170,10 @@ impl PostgresDb {
             "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS friendly_structure BOOLEAN NOT NULL DEFAULT TRUE",
             "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS full_content_in_briefing BOOLEAN NOT NULL DEFAULT FALSE",
             "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS strict_setup BOOLEAN NOT NULL DEFAULT FALSE",
+            // Phase 2.4d — per-tool admin defaults. Stored as JSON text
+            // (HashMap<String, bool>); empty / NULL decodes to an empty
+            // map. Same pattern as `org_domains`.
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS tool_defaults TEXT",
         ] {
             sqlx::query(sql).execute(&pool).await.ok();
         }
@@ -536,7 +555,8 @@ impl DbBackend for PostgresDb {
                     org_identity_page_id, org_domains,
                     set_by_token_hash, updated_at,
                     guide_page_id, policies_scope, sops_scope, best_practices_scope,
-                    friendly_structure, full_content_in_briefing, strict_setup
+                    friendly_structure, full_content_in_briefing, strict_setup,
+                    tool_defaults
              FROM global_settings WHERE id = 1"
         )
         .fetch_optional(&self.pool)
@@ -559,6 +579,7 @@ impl DbBackend for PostgresDb {
             friendly_structure: r.get("friendly_structure"),
             full_content_in_briefing: r.get("full_content_in_briefing"),
             strict_setup: r.get("strict_setup"),
+            tool_defaults: decode_bool_map(r.get("tool_defaults")),
         }).unwrap_or_default())
     }
 
@@ -592,7 +613,8 @@ impl DbBackend for PostgresDb {
                  best_practices_scope = $12,
                  friendly_structure = $13,
                  full_content_in_briefing = $14,
-                 strict_setup = $15
+                 strict_setup = $15,
+                 tool_defaults = $16
              WHERE id = 1"
         )
         .bind(settings.hive_shelf_id)
@@ -610,6 +632,7 @@ impl DbBackend for PostgresDb {
         .bind(settings.friendly_structure)
         .bind(settings.full_content_in_briefing)
         .bind(settings.strict_setup)
+        .bind(encode_bool_map(&settings.tool_defaults))
         .execute(&self.pool)
         .await
         .map_err(|e| format!("save_global_settings: {e}"))?;

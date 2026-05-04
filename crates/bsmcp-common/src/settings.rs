@@ -130,6 +130,19 @@ pub struct UserSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chosen_ai_identity: Option<String>,
 
+    // --- Per-tool enable/disable (Phase 2.4d) ---
+    //
+    // Map of tool_name -> enabled flag. Absent key = fall back to
+    // `GlobalSettings.tool_defaults` (which itself defaults ON for absent
+    // keys). The user-level override always wins over the global default.
+    // Empty map encoded as omitted JSON so v0.7.x rows decode unchanged.
+    /// Per-tool enable/disable overrides. Keyed by MCP tool name (the
+    /// `name` field of `tool_definitions`). `true` forces on, `false`
+    /// forces off, absent = use the global default. Read by
+    /// `bsmcp_common::settings::is_tool_enabled`.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub tool_overrides: std::collections::HashMap<String, bool>,
+
     /// v0.7.x leftover keys captured on deserialize. Round-trips through
     /// saves until the briefing builder explicitly clears them — that way an
     /// unrelated save path (oauth auto-populate, settings UI, dismiss tool)
@@ -251,6 +264,15 @@ pub struct GlobalSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_journals_shelf_id: Option<i64>,
 
+    // --- Per-tool defaults (Phase 2.4d) ---
+
+    /// Admin-set per-tool default enabled flag. Keyed by MCP tool name
+    /// (the `name` field of `tool_definitions`). `true` forces on for all
+    /// users (subject to per-user override), `false` forces off, absent =
+    /// default ON. Read by `bsmcp_common::settings::is_tool_enabled`.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub tool_defaults: std::collections::HashMap<String, bool>,
+
     // --- Bookkeeping ---
 
     /// Hash of the first token_id that set these values (informational).
@@ -278,6 +300,7 @@ impl Default for GlobalSettings {
             strict_setup: false,
             hive_shelf_id: None,
             user_journals_shelf_id: None,
+            tool_defaults: std::collections::HashMap::new(),
             set_by_token_hash: None,
             updated_at: 0,
         }
@@ -286,4 +309,139 @@ impl Default for GlobalSettings {
 
 fn default_true() -> bool {
     true
+}
+
+/// Decide whether a tool is enabled for a given (user, global) settings pair.
+///
+/// Resolution order:
+/// 1. `user_settings.tool_overrides[name]` — user-level override always wins.
+/// 2. `global_settings.tool_defaults[name]` — admin-set default.
+/// 3. `true` — tools default ON when neither side has an opinion.
+///
+/// Pure (no I/O); safe to call from any thread. Used by both the MCP
+/// `tools/list` filter and the `execute_tool` defense-in-depth guard, plus
+/// the briefing meta-injection's `briefing` self-check.
+pub fn is_tool_enabled(
+    tool_name: &str,
+    user_settings: &UserSettings,
+    global_settings: &GlobalSettings,
+) -> bool {
+    if let Some(&v) = user_settings.tool_overrides.get(tool_name) {
+        return v;
+    }
+    if let Some(&v) = global_settings.tool_defaults.get(tool_name) {
+        return v;
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user_with(overrides: &[(&str, bool)]) -> UserSettings {
+        UserSettings {
+            tool_overrides: overrides.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
+            ..UserSettings::default()
+        }
+    }
+
+    fn global_with(defaults: &[(&str, bool)]) -> GlobalSettings {
+        GlobalSettings {
+            tool_defaults: defaults.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
+            ..GlobalSettings::default()
+        }
+    }
+
+    #[test]
+    fn is_tool_enabled_defaults_on_when_neither_set() {
+        let u = UserSettings::default();
+        let g = GlobalSettings::default();
+        assert!(is_tool_enabled("anything", &u, &g));
+    }
+
+    #[test]
+    fn is_tool_enabled_global_off_propagates() {
+        let u = UserSettings::default();
+        let g = global_with(&[("journal", false)]);
+        assert!(!is_tool_enabled("journal", &u, &g));
+        // Other tools unaffected.
+        assert!(is_tool_enabled("identity", &u, &g));
+    }
+
+    #[test]
+    fn is_tool_enabled_user_override_on_beats_global_off() {
+        let u = user_with(&[("journal", true)]);
+        let g = global_with(&[("journal", false)]);
+        assert!(is_tool_enabled("journal", &u, &g));
+    }
+
+    #[test]
+    fn is_tool_enabled_user_override_off_beats_global_on() {
+        let u = user_with(&[("journal", false)]);
+        let g = global_with(&[("journal", true)]);
+        assert!(!is_tool_enabled("journal", &u, &g));
+    }
+
+    #[test]
+    fn is_tool_enabled_user_override_off_beats_default_on() {
+        let u = user_with(&[("briefing", false)]);
+        let g = GlobalSettings::default();
+        assert!(!is_tool_enabled("briefing", &u, &g));
+    }
+
+    #[test]
+    fn user_settings_round_trips_tool_overrides() {
+        let s = user_with(&[("journal", false), ("identity", true)]);
+
+        let json = serde_json::to_string(&s).expect("serialize");
+        let back: UserSettings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.tool_overrides.get("journal"), Some(&false));
+        assert_eq!(back.tool_overrides.get("identity"), Some(&true));
+    }
+
+    #[test]
+    fn user_settings_decodes_legacy_row_without_tool_overrides() {
+        // v0.7.x rows have no tool_overrides key. Must decode cleanly.
+        let json = r#"{"label":"DTC","role":"work"}"#;
+        let s: UserSettings = serde_json::from_str(json).expect("legacy decode");
+        assert!(s.tool_overrides.is_empty());
+        assert_eq!(s.label.as_deref(), Some("DTC"));
+    }
+
+    #[test]
+    fn global_settings_round_trips_tool_defaults() {
+        let g = global_with(&[("journal", false), ("identity", true)]);
+
+        let json = serde_json::to_string(&g).expect("serialize");
+        let back: GlobalSettings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.tool_defaults.get("journal"), Some(&false));
+        assert_eq!(back.tool_defaults.get("identity"), Some(&true));
+    }
+
+    #[test]
+    fn global_settings_decodes_without_tool_defaults_field() {
+        // Pre-2.4d global row encoded without the column / field.
+        let json = r#"{"updated_at": 0}"#;
+        let g: GlobalSettings = serde_json::from_str(json).expect("legacy decode");
+        assert!(g.tool_defaults.is_empty());
+    }
+
+    #[test]
+    fn empty_tool_defaults_serializes_compact() {
+        // Empty map should be omitted from JSON output (skip_serializing_if).
+        let g = GlobalSettings::default();
+        let json = serde_json::to_string(&g).expect("serialize");
+        assert!(
+            !json.contains("tool_defaults"),
+            "expected empty tool_defaults to be omitted, got: {json}"
+        );
+    }
+
+    #[test]
+    fn is_tool_enabled_handles_explicit_user_true_with_no_global() {
+        let u = user_with(&[("identity", true)]);
+        let g = GlobalSettings::default();
+        assert!(is_tool_enabled("identity", &u, &g));
+    }
 }

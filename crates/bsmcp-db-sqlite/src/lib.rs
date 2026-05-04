@@ -67,7 +67,8 @@ impl SqliteDb {
                  best_practices_scope TEXT,
                  friendly_structure INTEGER NOT NULL DEFAULT 1,
                  full_content_in_briefing INTEGER NOT NULL DEFAULT 0,
-                 strict_setup INTEGER NOT NULL DEFAULT 0
+                 strict_setup INTEGER NOT NULL DEFAULT 0,
+                 tool_defaults TEXT
              );
              INSERT OR IGNORE INTO global_settings (id, updated_at) VALUES (1, 0);
              DROP TABLE IF EXISTS registrations;
@@ -194,6 +195,10 @@ impl SqliteDb {
             "ALTER TABLE global_settings ADD COLUMN friendly_structure INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE global_settings ADD COLUMN full_content_in_briefing INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE global_settings ADD COLUMN strict_setup INTEGER NOT NULL DEFAULT 0",
+            // Phase 2.4d — per-tool admin defaults. Stored as JSON text
+            // (HashMap<String, bool>); empty / NULL decodes to an empty
+            // map. Same pattern as `org_domains`.
+            "ALTER TABLE global_settings ADD COLUMN tool_defaults TEXT",
         ] {
             conn.execute_batch(sql).ok();
         }
@@ -530,7 +535,8 @@ impl DbBackend for SqliteDb {
                         org_identity_page_id, org_domains,
                         set_by_token_hash, updated_at,
                         guide_page_id, policies_scope, sops_scope, best_practices_scope,
-                        friendly_structure, full_content_in_briefing, strict_setup
+                        friendly_structure, full_content_in_briefing, strict_setup,
+                        tool_defaults
                  FROM global_settings WHERE id = 1",
                 [],
                 |row| Ok(GlobalSettings {
@@ -549,6 +555,7 @@ impl DbBackend for SqliteDb {
                     friendly_structure: row.get::<_, i64>(12)? != 0,
                     full_content_in_briefing: row.get::<_, i64>(13)? != 0,
                     strict_setup: row.get::<_, i64>(14)? != 0,
+                    tool_defaults: decode_bool_map(row.get::<_, Option<String>>(15)?),
                 }),
             ).unwrap_or_default();
             Ok(row)
@@ -589,7 +596,8 @@ impl DbBackend for SqliteDb {
                      best_practices_scope = ?12,
                      friendly_structure = ?13,
                      full_content_in_briefing = ?14,
-                     strict_setup = ?15
+                     strict_setup = ?15,
+                     tool_defaults = ?16
                  WHERE id = 1",
                 params![
                     s.hive_shelf_id,
@@ -607,6 +615,7 @@ impl DbBackend for SqliteDb {
                     if s.friendly_structure { 1i64 } else { 0i64 },
                     if s.full_content_in_briefing { 1i64 } else { 0i64 },
                     if s.strict_setup { 1i64 } else { 0i64 },
+                    encode_bool_map(&s.tool_defaults),
                 ],
             ).map_err(|e| format!("save_global_settings: {e}"))?;
             Ok(())
@@ -1921,6 +1930,20 @@ fn decode_kb_scope(value: Option<String>) -> Option<bsmcp_common::settings::KbSc
     match value {
         Some(s) if !s.is_empty() => serde_json::from_str(&s).ok(),
         _ => None,
+    }
+}
+
+/// Encode a HashMap<String, bool> as a JSON object string. Returns None
+/// when the map is empty so the column round-trips as NULL — matches the
+/// `org_domains` / `policies_scope` pattern.
+fn encode_bool_map(map: &std::collections::HashMap<String, bool>) -> Option<String> {
+    if map.is_empty() { None } else { serde_json::to_string(map).ok() }
+}
+
+fn decode_bool_map(value: Option<String>) -> std::collections::HashMap<String, bool> {
+    match value {
+        Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_default(),
+        _ => std::collections::HashMap::new(),
     }
 }
 

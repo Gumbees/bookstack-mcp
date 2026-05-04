@@ -8,6 +8,7 @@ use pulldown_cmark::{html, Options, Parser};
 
 use bsmcp_common::bookstack::{self, BookStackClient, ContentType, ExportFormat};
 use bsmcp_common::db::DbBackend;
+use bsmcp_common::settings::is_tool_enabled;
 use crate::briefing;
 use crate::directory::DirectoryService;
 use crate::semantic::{trim_match, SemanticState};
@@ -77,7 +78,38 @@ pub async fn handle_request(
             })))
         }
         "notifications/initialized" => None,
-        "tools/list" => Some(json_rpc_result(id, json!({ "tools": tool_definitions(semantic.is_some()) }))),
+        "tools/list" => {
+            // Filter the tool list by per-user + global enable/disable
+            // settings. Both lookups are cheap (one row each, server-side
+            // only) and the filter is best-effort: if either lookup
+            // errors out we fall back to the unfiltered list rather than
+            // hand the client an empty or partial response.
+            //
+            // The token_id_hash is always present in BriefingDeps for
+            // authenticated transports — sse.rs and the streamable
+            // handler both populate it. There's no anonymous tools/list
+            // entry point in this server today; if one is added later,
+            // it should call `tool_definitions(...)` directly without the
+            // filter.
+            let user_settings = deps
+                .db
+                .get_user_settings(&deps.token_id_hash)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let global_settings = deps
+                .db
+                .get_global_settings()
+                .await
+                .unwrap_or_default();
+            let tools = filter_tools_by_enabled(
+                tool_definitions(semantic.is_some()),
+                &user_settings,
+                &global_settings,
+            );
+            Some(json_rpc_result(id, json!({ "tools": tools })))
+        }
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
@@ -86,8 +118,30 @@ pub async fn handle_request(
             // session record_call flip happens BEFORE execute_tool so that
             // an explicit `briefing` call in the same JSON-RPC
             // request won't double-set the flag (mark_compacted resets it).
+            //
+            // Phase 2.4d: also short-circuit when the `briefing` tool itself
+            // is disabled for this caller (per-user override or admin
+            // default). User opted out — skip the work. Deliberately don't
+            // record_call in that branch so that re-enabling briefing later
+            // restores the first-call full-injection behavior.
+            let briefing_tool_enabled = {
+                let user_settings = deps
+                    .db
+                    .get_user_settings(&deps.token_id_hash)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let global_settings = deps
+                    .db
+                    .get_global_settings()
+                    .await
+                    .unwrap_or_default();
+                is_tool_enabled("briefing", &user_settings, &global_settings)
+            };
             let attach_briefing_pending = name != "briefing"
                 && briefing_enabled()
+                && briefing_tool_enabled
                 && {
                     let key = session::session_key(
                         &deps.token_id_hash,
@@ -283,6 +337,31 @@ async fn execute_tool(
     staging: &crate::staging::StagingStore,
     deps: &BriefingDeps,
 ) -> Result<String, String> {
+    // Per-user + global tool enable/disable guard. Defense-in-depth:
+    // tools/list already filters disabled tools out of the catalog, but a
+    // determined client could still issue a call by name. Refuse cleanly
+    // with a structured `tool_disabled` error rather than silently running
+    // the work.
+    //
+    // Lookups are best-effort: if either fails we default to enabled
+    // (matches the helper's "absent = on" semantics) — same posture the
+    // `tools/list` filter takes when the DB is unhappy.
+    let user_settings = deps
+        .db
+        .get_user_settings(&deps.token_id_hash)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let global_settings = deps
+        .db
+        .get_global_settings()
+        .await
+        .unwrap_or_default();
+    if !is_tool_enabled(name, &user_settings, &global_settings) {
+        return Err(tool_disabled_error(name));
+    }
+
     // `briefing` is the top-level entry into the briefing subsystem
     // (besides auto-injection on every other tool's response meta). The
     // memory-protocol tools (`briefing` / `user` / `config` / `directory`
@@ -1810,6 +1889,58 @@ async fn build_structure(client: &BookStackClient) -> Option<String> {
 
 // --- Tool definitions ---
 
+/// All tool names this server can advertise — the union of every tool
+/// `tool_definitions` would emit with semantic search enabled. Single
+/// source of truth for the settings UI's per-tool toggle list (Phase 2.4d)
+/// and any future code that needs to enumerate the catalog. Order matches
+/// `tool_definitions(true)` so the UI lays toggles out the same way the
+/// MCP `tools/list` reply does.
+pub fn all_tool_names() -> Vec<String> {
+    tool_definitions(true)
+        .into_iter()
+        .filter_map(|t| t.get("name").and_then(|v| v.as_str()).map(String::from))
+        .collect()
+}
+
+/// Filter a `tool_definitions(...)` Vec down to the tools enabled for the
+/// given (user, global) settings pair. Used by the MCP `tools/list`
+/// handler so the catalog the AI sees matches what `execute_tool` will
+/// actually run. Tools without a `name` field are kept (defensive — the
+/// shape only ever omits `name` if `tool_definitions` itself is broken).
+fn filter_tools_by_enabled(
+    tools: Vec<Value>,
+    user: &bsmcp_common::settings::UserSettings,
+    global: &bsmcp_common::settings::GlobalSettings,
+) -> Vec<Value> {
+    tools
+        .into_iter()
+        .filter(|t| {
+            t.get("name")
+                .and_then(|v| v.as_str())
+                .map(|n| is_tool_enabled(n, user, global))
+                .unwrap_or(true)
+        })
+        .collect()
+}
+
+/// Render the structured error returned by `execute_tool` when a tool is
+/// disabled. Matches the brief's contract — JSON-encoded so the upstream
+/// `Err -> "Error: {e}"` envelope still surfaces an inspectable shape to
+/// the client.
+fn tool_disabled_error(name: &str) -> String {
+    let payload = json!({
+        "error": {
+            "code": "tool_disabled",
+            "message": format!(
+                "Tool '{name}' is disabled in your settings or by the admin"
+            ),
+        }
+    });
+    serde_json::to_string(&payload).unwrap_or_else(|_| {
+        format!("tool_disabled: '{name}' is disabled in your settings or by the admin")
+    })
+}
+
 pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
     let mut tools = vec![
         tool("search_content",
@@ -2461,4 +2592,93 @@ fn update_schema(id_name: &str, fields: &[&str]) -> Value {
         "properties": props,
         "required": [id_name]
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bsmcp_common::settings::{GlobalSettings, UserSettings};
+
+    fn names_of(tools: &[Value]) -> Vec<String> {
+        tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|v| v.as_str()).map(String::from))
+            .collect()
+    }
+
+    #[test]
+    fn all_tool_names_matches_definitions() {
+        let names = all_tool_names();
+        let from_defs = names_of(&tool_definitions(true));
+        assert_eq!(names, from_defs, "all_tool_names diverged from tool_definitions");
+        assert!(names.contains(&"search_content".to_string()));
+        assert!(names.contains(&"briefing".to_string()));
+        assert!(!names.is_empty());
+    }
+
+    #[test]
+    fn filter_keeps_everything_when_settings_empty() {
+        let tools = tool_definitions(false);
+        let user = UserSettings::default();
+        let global = GlobalSettings::default();
+        let filtered = filter_tools_by_enabled(tools.clone(), &user, &global);
+        assert_eq!(names_of(&tools), names_of(&filtered));
+    }
+
+    #[test]
+    fn filter_drops_globally_disabled_tools() {
+        let tools = tool_definitions(false);
+        let user = UserSettings::default();
+        let mut global = GlobalSettings::default();
+        global.tool_defaults.insert("search_content".to_string(), false);
+        let filtered = filter_tools_by_enabled(tools, &user, &global);
+        let names = names_of(&filtered);
+        assert!(!names.contains(&"search_content".to_string()));
+        // Other tools survive.
+        assert!(names.contains(&"list_books".to_string()));
+    }
+
+    #[test]
+    fn filter_user_override_on_keeps_globally_disabled_tool() {
+        let tools = tool_definitions(false);
+        let mut user = UserSettings::default();
+        user.tool_overrides.insert("search_content".to_string(), true);
+        let mut global = GlobalSettings::default();
+        global.tool_defaults.insert("search_content".to_string(), false);
+        let filtered = filter_tools_by_enabled(tools, &user, &global);
+        let names = names_of(&filtered);
+        assert!(
+            names.contains(&"search_content".to_string()),
+            "user override should override global"
+        );
+    }
+
+    #[test]
+    fn filter_user_override_off_drops_default_on_tool() {
+        let tools = tool_definitions(false);
+        let mut user = UserSettings::default();
+        user.tool_overrides.insert("list_books".to_string(), false);
+        let global = GlobalSettings::default();
+        let filtered = filter_tools_by_enabled(tools, &user, &global);
+        let names = names_of(&filtered);
+        assert!(
+            !names.contains(&"list_books".to_string()),
+            "user opt-out should suppress the tool"
+        );
+    }
+
+    #[test]
+    fn tool_disabled_error_is_structured_json_with_code() {
+        let s = tool_disabled_error("journal");
+        let v: Value = serde_json::from_str(&s).expect("valid JSON");
+        assert_eq!(
+            v["error"]["code"].as_str(),
+            Some("tool_disabled"),
+            "expected tool_disabled code, got {v}"
+        );
+        assert!(
+            v["error"]["message"].as_str().unwrap_or("").contains("journal"),
+            "message should mention the tool name"
+        );
+    }
 }

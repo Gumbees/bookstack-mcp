@@ -504,7 +504,8 @@ fn render_tool_defaults_section(g: &GlobalSettings, s: &UserSettings) -> String 
     format!(
         r#"
   <h2>Tool defaults (admin only)</h2>
-  <p class="help">Per-tool admin default. Unchecked = disabled by default for all users (a user can still re-enable in their own settings; that UI lands in onboarding setup, sub-PR 2.4e). Checked = on (the default for any tool not listed here is also on).</p>
+  <p class="help">Per-tool admin default. Unchecked = disabled by default for all users (a user can still re-enable in their own settings via <code>/setup/user</code>). Checked = on. Tools not listed at all default ON.</p>
+  <p class="help"><strong>Memory-protocol tools ship default OFF on a fresh install</strong> (<code>briefing</code>, <code>journal</code>, <code>identity</code>, <code>reminders</code>, <code>events</code>, <code>sessions</code>, <code>migrate</code>, <code>user</code>, <code>config</code>, <code>directory</code>, <code>session_event</code>, <code>dismiss_setup_nudge</code>) so the AI sees just KB CRUD + semantic search until you opt in. Toggle them on here for everyone, or let users enable per-account in <code>/setup/user</code>. Note: disabling <code>briefing</code> kills <code>meta.briefing</code> auto-injection on every tool response, so the AI loses session context — re-enable if you want the AI to know what time it is.</p>
   <div class="tool-defaults">
     {rows}
   </div>

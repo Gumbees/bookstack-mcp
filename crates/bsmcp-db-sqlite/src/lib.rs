@@ -13,7 +13,9 @@ use zeroize::Zeroizing;
 use bsmcp_common::config::{access_token_ttl, refresh_token_ttl};
 use bsmcp_common::db::{stable_id_for, DbBackend, IndexDb, SemanticDb, TokenBinding};
 use bsmcp_common::index::*;
-use bsmcp_common::settings::{GlobalSettings, UserSettings, DEFAULT_ACCOUNT_LABEL};
+use bsmcp_common::settings::{
+    memory_protocol_tool_defaults_seed, GlobalSettings, UserSettings, DEFAULT_ACCOUNT_LABEL,
+};
 use bsmcp_common::types::*;
 use bsmcp_common::vector;
 
@@ -271,6 +273,14 @@ impl SqliteDb {
         // above and skip this block entirely.
         rekey_user_settings_to_stable_id(&mut conn);
 
+        // Memory-protocol tools default-OFF on fresh installs.
+        // Idempotent: only seeds when the row's `set_by_token_hash` is
+        // NULL (no admin has touched it) AND `tool_defaults` is NULL
+        // (no seed already in place). Existing installs that already
+        // have a populated row are untouched, preserving whatever the
+        // admin configured.
+        seed_memory_protocol_tool_defaults(&conn);
+
         let hash = sha2::Sha256::digest(encryption_key.as_bytes());
         let mut key = Zeroizing::new([0u8; 32]);
         key.copy_from_slice(&hash);
@@ -335,6 +345,35 @@ impl SqliteDb {
             }
         }
     }
+}
+
+/// One-time seed of `GlobalSettings.tool_defaults` so memory-protocol
+/// tools (briefing, journal, identity, reminders, events, sessions, …)
+/// land default-OFF on a fresh install. Lets the AI pick up KB CRUD +
+/// semantic search out of the box without surfacing a wall of memory
+/// tools that all error until the admin configures
+/// `user_journals_shelf_id` etc.
+///
+/// Guard: only fires when `set_by_token_hash IS NULL AND tool_defaults
+/// IS NULL` — i.e., no admin has written a global-settings row through
+/// /settings yet AND no seed is already in place. Existing installs
+/// (admin already touched the row, or any explicit `tool_defaults` is
+/// set) are left untouched.
+fn seed_memory_protocol_tool_defaults(conn: &Connection) {
+    let seed = memory_protocol_tool_defaults_seed();
+    let json = match serde_json::to_string(&seed) {
+        Ok(s) => s,
+        Err(_) => return, // unreachable; HashMap<String, bool> always serializes
+    };
+    conn.execute(
+        "UPDATE global_settings
+            SET tool_defaults = ?1
+          WHERE id = 1
+            AND tool_defaults IS NULL
+            AND set_by_token_hash IS NULL",
+        params![json],
+    )
+    .ok();
 }
 
 /// One-time rekey of `user_settings` from the v0.x token_id_hash PK to the

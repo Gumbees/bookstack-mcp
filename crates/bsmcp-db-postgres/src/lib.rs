@@ -14,7 +14,9 @@ use zeroize::Zeroizing;
 use bsmcp_common::config::{access_token_ttl, refresh_token_ttl};
 use bsmcp_common::db::{stable_id_for, DbBackend, IndexDb, SemanticDb, TokenBinding};
 use bsmcp_common::index::*;
-use bsmcp_common::settings::{GlobalSettings, UserSettings, DEFAULT_ACCOUNT_LABEL};
+use bsmcp_common::settings::{
+    memory_protocol_tool_defaults_seed, GlobalSettings, UserSettings, DEFAULT_ACCOUNT_LABEL,
+};
 use bsmcp_common::types::*;
 
 const BASE64: base64::engine::general_purpose::GeneralPurpose =
@@ -223,6 +225,21 @@ impl PostgresDb {
 
         sqlx::query("INSERT INTO global_settings (id, updated_at) VALUES (1, 0) ON CONFLICT (id) DO NOTHING")
             .execute(&pool).await.ok();
+
+        // Memory-protocol tools default-OFF on fresh installs. Idempotent:
+        // only seeds when the admin hasn't written a row yet AND no seed
+        // is already in place. Existing installs are untouched.
+        if let Ok(seed_json) = serde_json::to_string(&memory_protocol_tool_defaults_seed()) {
+            sqlx::query(
+                "UPDATE global_settings
+                    SET tool_defaults = $1
+                  WHERE id = 1
+                    AND tool_defaults IS NULL
+                    AND set_by_token_hash IS NULL"
+            )
+            .bind(&seed_json)
+            .execute(&pool).await.ok();
+        }
 
         // Rekey user_settings from token_id_hash PK to stable_id PK.
         // Idempotent — checks information_schema.columns and only runs

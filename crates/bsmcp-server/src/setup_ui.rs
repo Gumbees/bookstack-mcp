@@ -790,7 +790,7 @@ button {{ margin-top: 1em; padding: 0.6em 1.2em; font-size: 1em; cursor: pointer
   <p class="help">When on, the briefing reminds you to journal AND the <code>journal write</code> / <code>identity write</code> tools accept writes here. Multi-MCP setups: turn on for the primary, off for bootstrap-only sources.</p>
 
   <h2>3. Tool overrides</h2>
-  <p class="help">Per-tool overrides for your account. <em>Use admin default</em> follows whatever the admin sets globally; <em>on</em> and <em>off</em> force the tool regardless of the global setting.</p>
+  <p class="help">Per-tool overrides for your account. <em>Use admin default</em> follows whatever the admin sets globally; <em>on</em> and <em>off</em> force the tool regardless of the global setting. Fresh installs ship the memory-protocol tools (<code>briefing</code>, <code>journal</code>, <code>identity</code>, <code>reminders</code>, <code>events</code>, <code>sessions</code>, <code>migrate</code>, …) <strong>off by default</strong> — flip them to <em>on</em> here once you've finished onboarding if you want them.</p>
   <div class="tool-overrides">
     {tool_rows}
   </div>

@@ -64,11 +64,11 @@ The MCP server handles all client-facing protocol, OAuth, and search. The embedd
 | **Images** | `list_images`, `get_image`, `upload_image`, `update_image`, `delete_image` |
 | **Permissions** | `get_content_permissions`, `update_content_permissions` |
 | **Roles** | `list_roles`, `get_role` |
-| **Hive memory (`/remember`)** | `remember_briefing`, `remember_whoami`, `remember_user`, `remember_config`, `remember_identity`, `remember_directory`, `remember_journal`, `remember_collage`, `remember_shared_collage`, `remember_user_journal`, `remember_audit`, `remember_search` |
+| **Hive memory (`/remember`)** | `briefing`, `remember_whoami`, `user`, `config`, `remember_identity`, `directory`, `remember_journal`, `remember_collage`, `remember_shared_collage`, `remember_user_journal`, `remember_audit`, `remember_search` |
 
 Semantic tools (`semantic_search`, `reembed`, `embedding_status`) only appear when `BSMCP_SEMANTIC_SEARCH=true` and an embedder is running. Without semantic search: 58 BookStack + 12 Hive = 70 tools.
 
-Hive memory tools require user/global settings. The `remember_briefing` tool returns a `setup_nudge` listing every pending field with the exact MCP call to fix it; configure via the `/settings` UI or `remember_config action=write`.
+Hive memory tools require user/global settings. The `briefing` tool returns a `setup_nudge` listing every pending field with the exact MCP call to fix it; configure via the `/settings` UI or `config action=write`.
 
 ## Setup
 
@@ -294,10 +294,10 @@ All schema migrations are automatic on startup (CREATE TABLE IF NOT EXISTS, ALTE
 
 #### What's new
 
-- **Briefing latency cut** — book-scoped semantic-search candidate filtering, parallel KB fetches, batched DB lookups. `remember_briefing` is significantly faster on instances with large embedded corpora.
+- **Briefing latency cut** — book-scoped semantic-search candidate filtering, parallel KB fetches, batched DB lookups. `briefing` is significantly faster on instances with large embedded corpora.
 - **`kb_semantic_matches` reshape** — now an envelope `{enabled, reason, detail, results}` so consumers can branch on `enabled` rather than guessing whether an empty list means opt-out vs. zero hits.
 - **Permission ACL filtering** for semantic search — set `bookstack_user_id` in user settings to enable role-based filtering at the candidate-pool layer (much faster than the per-page HTTP fallback).
-- **Per-user identity auto-provisioning** — first call to `remember_user action=read` creates the per-user Identity book + Identity page + journal-agent page if missing, returning what was created in `auto_provisioned`.
+- **Per-user identity auto-provisioning** — first call to `user action=read` creates the per-user Identity book + Identity page + journal-agent page if missing, returning what was created in `auto_provisioned`.
 - **Global org settings** — admin-only `org_identity_page_id`, `org_domains`, `org_required_instructions_page_ids`, `org_ai_usage_policy_page_ids` shared across every user on the instance. First-write-wins for the structural IDs.
 - **Owner-only journal pages** — auto-applied content permission lock so journal entries are visible only to the owning agent/user.
 
@@ -305,7 +305,7 @@ All schema migrations are automatic on startup (CREATE TABLE IF NOT EXISTS, ALTE
 
 #### What's new
 
-- **`/remember` protocol** — server-side reconstitution + memory CRUD. 12 MCP tools: `remember_briefing`, `remember_whoami`, `remember_user`, `remember_config`, `remember_identity`, `remember_directory`, `remember_journal`, `remember_collage`, `remember_shared_collage`, `remember_user_journal`, `remember_audit`, `remember_search`. HTTP form: `POST /remember/v1/{resource}/{action}`.
+- **`/remember` protocol** — server-side reconstitution + memory CRUD. 12 MCP tools: `briefing`, `remember_whoami`, `user`, `config`, `remember_identity`, `directory`, `remember_journal`, `remember_collage`, `remember_shared_collage`, `remember_user_journal`, `remember_audit`, `remember_search`. HTTP form: `POST /remember/v1/{resource}/{action}`.
 - **`/settings` UI** — browser-based configuration page, token-gated via `/authorize`. Settings session cookie stored server-side (in-memory, 8h TTL).
 - **YAML-frontmatter provenance** — every collection write stamps `written_by`, `ai_identity_ouid`, `user_id`, `written_at`, `trace_id`, `resource`, `key`, `supersedes_page` at the top of the page body. Invisible in BookStack's renderer; readable by tools.
 - **Soft delete** — `remember_*_collection action=delete` prepends `[archived]` to the page name and stamps `deleted: true` in frontmatter rather than hard-deleting.

@@ -84,9 +84,9 @@ pub async fn handle_request(
 
             // Decide pre-tool whether to attach `meta.briefing_pending`. The
             // session record_call flip happens BEFORE execute_tool so that
-            // an explicit `remember_briefing` call in the same JSON-RPC
+            // an explicit `briefing` call in the same JSON-RPC
             // request won't double-set the flag (mark_compacted resets it).
-            let attach_briefing_pending = name != "remember_briefing"
+            let attach_briefing_pending = name != "briefing"
                 && briefing_enabled()
                 && {
                     let key = session::session_key(
@@ -283,14 +283,14 @@ async fn execute_tool(
     staging: &crate::staging::StagingStore,
     deps: &BriefingDeps,
 ) -> Result<String, String> {
-    // `remember_briefing` is the top-level entry into the briefing subsystem
-    // (besides auto-injection on every other tool's response meta). Renamed
-    // from `briefing` in v1.0.0 — the `remember_*` family is the canonical
-    // surface for the personal-memory layer.
-    if name == "remember_briefing" {
+    // `briefing` is the top-level entry into the briefing subsystem
+    // (besides auto-injection on every other tool's response meta). The
+    // memory-protocol tools (`briefing` / `user` / `config` / `directory`)
+    // are first-class primitives — no `remember_` prefix.
+    if name == "briefing" {
         if !briefing_enabled() {
             return Err(
-                "remember_briefing disabled (BSMCP_BRIEFING_ENABLED=false on this server)".to_string(),
+                "briefing disabled (BSMCP_BRIEFING_ENABLED=false on this server)".to_string(),
             );
         }
         let mut body = args.clone();
@@ -307,7 +307,7 @@ async fn execute_tool(
         // `meta.briefing_pending`. The post-compaction reset (which sets
         // `needs_full_briefing = true` again) lives in the
         // `session_event action=compacted` tool, NOT here — calling
-        // remember_briefing manually means "I want it now", not "I just lost
+        // briefing manually means "I want it now", not "I just lost
         // context".
         //
         // Honor the tool's own `session_id` arg if present (lets a client
@@ -328,11 +328,11 @@ async fn execute_tool(
         return Ok(serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| envelope.to_string()));
     }
 
-    // `remember_user` / `remember_config` / `remember_directory` route
-    // through the `/remember/v1/{resource}/{action}` dispatcher. The MCP
-    // arg shape is FLAT: `action` plus the resource-specific fields at the
-    // top level. We pull `action` out and re-collect everything else into
-    // the `body` map the dispatcher expects.
+    // `user` / `config` / `directory` route through the
+    // `/remember/v1/{resource}/{action}` dispatcher. The MCP arg shape is
+    // FLAT: `action` plus the resource-specific fields at the top level.
+    // We pull `action` out and re-collect everything else into the `body`
+    // map the dispatcher expects.
     if let Some(resource) = remember_resource(name) {
         if !briefing_enabled() {
             return Err(format!(
@@ -1585,7 +1585,7 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool, su
 
     // Briefing flow — surface this FIRST so it lands before any other guidance.
     instructions.push_str(
-        "Call the `remember_briefing` tool at session start with the user's opening message as \
+        "Call the `briefing` tool at session start with the user's opening message as \
          `user_prompt`. It returns time, system_prompt_additions (guide page, org_identity, \
          org_required_instructions, org_ai_usage_policy, user-supplied pages, owned-domains), \
          kb_semantic_matches against the prompt, and a `setup_nudge` block when settings are \
@@ -2196,8 +2196,8 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
     // make sense when the briefing surface is enabled.
     if briefing_enabled() {
         tools.push(json!({
-            "name": "remember_briefing",
-            "description": "Reconstitution shell — returns time, system_prompt_additions (guide page, org_identity, org_required_instructions, org_ai_usage_policy, user system_prompt_page_ids, owned-domains synthetic block), kb_semantic_matches against the user_prompt, setup_nudge when settings are incomplete, and a thin config echo. Auto-injected into meta.briefing on every MCP tool response (full content first call, sticky bits thereafter); call this tool explicitly after compaction to reset to first-call form. Renamed from `briefing` in v1.0.0 — the `remember_*` family is the canonical surface for the personal-memory layer.",
+            "name": "briefing",
+            "description": "Reconstitution shell — returns time, system_prompt_additions (guide page, org_identity, org_required_instructions, org_ai_usage_policy, user system_prompt_page_ids, owned-domains synthetic block), kb_semantic_matches against the user_prompt, setup_nudge when settings are incomplete, and a thin config echo. Auto-injected into meta.briefing on every MCP tool response (full content first call, sticky bits thereafter); call this tool explicitly after compaction to reset to first-call form.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
@@ -2208,7 +2208,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             }),
         }));
         tools.push(tool(
-            "remember_user",
+            "user",
             "Read or write the per-user UserSettings row. `action: 'read'` returns the current settings (no secrets). `action: 'write'` requires a `patch` object alongside `action` and merges it into existing settings — keys not provided are preserved. Use this to set label, role, user_id, bookstack_user_id, domains, system_prompt_page_ids, timezone, semantic_against_full_kb.",
             json!({
                 "type": "object",
@@ -2227,7 +2227,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             }),
         ));
         tools.push(tool(
-            "remember_config",
+            "config",
             "Read or write the per-user config_extras K/V store, or dismiss the briefing's setup_nudge. `action: 'read'` returns the current config. `action: 'write'` accepts a top-level `config: {key: value, ...}` (string values, pass null to delete a key) and merges into existing extras. `action: 'dismiss_setup_nudge'` accepts a top-level `days: int` (1..=365) and snoozes the briefing nudge.",
             json!({
                 "type": "object",
@@ -2252,7 +2252,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             }),
         ));
         tools.push(tool(
-            "remember_directory",
+            "directory",
             "Return the in-memory directory tree (shelves -> books -> chapters -> pages, plus orphan books) with names, slugs, ids, and page updated_at timestamps. Built from the index DB, refreshed automatically on BookStack webhook events. The same snapshot auto-attaches to every MCP tool response under `meta.directory` (full first call per session, then a `{version, hash}` pointer); call this tool to force a re-pull.",
             json!({
                 "type": "object",
@@ -2303,19 +2303,19 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
 }
 
 /// Map an MCP tool name to its `/remember/v1/{resource}` resource, if any.
-/// Returns `None` for tools that aren't `remember_*` dispatchers (or for
-/// `remember_briefing`, which is handled separately so it can run the
+/// Returns `None` for tools that aren't memory-protocol dispatchers (or for
+/// `briefing`, which is handled separately so it can run the
 /// session-compaction reset before delegating).
 fn remember_resource(tool_name: &str) -> Option<&'static str> {
     match tool_name {
-        "remember_user" => Some("user"),
-        "remember_config" => Some("config"),
-        "remember_directory" => Some("directory"),
+        "user" => Some("user"),
+        "config" => Some("config"),
+        "directory" => Some("directory"),
         _ => None,
     }
 }
 
-/// Flatten the MCP `remember_*` tool arguments into the body map the
+/// Flatten the MCP memory-protocol tool arguments into the body map the
 /// dispatcher expects. The MCP arg shape is `{action, key1, key2, ...}`
 /// (flat, easier for AI to call); the dispatcher's body map is just the
 /// resource-specific fields without the `action` envelope. So we drop

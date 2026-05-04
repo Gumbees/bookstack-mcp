@@ -116,10 +116,10 @@ pub async fn mark_compacted(store: &SessionStore, key: &str) {
 }
 
 /// Mark a session as having received its briefing in-band (the AI called
-/// `remember_briefing` directly). Sub-PR 2.2 changed the auto-injection to
+/// `briefing` directly). Sub-PR 2.2 changed the auto-injection to
 /// be one-shot: instead of attaching `meta.briefing` on every response, we
 /// attach `meta.briefing_pending` only on the first non-briefing tool call
-/// per session. When the AI calls `remember_briefing` itself, that response
+/// per session. When the AI calls `briefing` itself, that response
 /// IS the briefing — flipping `needs_full_briefing` to false here prevents
 /// the next non-briefing call from re-emitting it.
 ///
@@ -234,7 +234,7 @@ mod tests {
     #[tokio::test]
     async fn mark_briefing_delivered_prevents_redundant_attach() {
         let store = new_store();
-        // AI calls remember_briefing on a fresh session.
+        // AI calls briefing on a fresh session.
         mark_briefing_delivered(&store, key()).await;
         // The next non-briefing tool call must NOT see briefing_pending.
         assert!(

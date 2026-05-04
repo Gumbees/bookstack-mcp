@@ -12,9 +12,9 @@ use sqlx::{PgPool, Row};
 use zeroize::Zeroizing;
 
 use bsmcp_common::config::{access_token_ttl, refresh_token_ttl};
-use bsmcp_common::db::{DbBackend, IndexDb, SemanticDb};
+use bsmcp_common::db::{stable_id_for, DbBackend, IndexDb, SemanticDb, TokenBinding};
 use bsmcp_common::index::*;
-use bsmcp_common::settings::{GlobalSettings, UserSettings};
+use bsmcp_common::settings::{GlobalSettings, UserSettings, DEFAULT_ACCOUNT_LABEL};
 use bsmcp_common::types::*;
 
 const BASE64: base64::engine::general_purpose::GeneralPurpose =
@@ -122,7 +122,7 @@ impl PostgresDb {
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS user_settings (
-                token_id_hash TEXT PRIMARY KEY,
+                stable_id TEXT PRIMARY KEY,
                 settings_json TEXT NOT NULL,
                 updated_at BIGINT NOT NULL
             )"
@@ -130,6 +130,31 @@ impl PostgresDb {
         .execute(&pool)
         .await
         .map_err(|e| format!("Failed to create user_settings table: {e}"))?;
+
+        // token_bindings: token_id_hash -> stable identity. The
+        // user_settings row lives at the bound stable_id, so when a
+        // BookStack API token rotates the user attaches the new token's
+        // binding to the same stable_id via /setup/user and keeps every
+        // saved setting.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS token_bindings (
+                token_id_hash TEXT PRIMARY KEY,
+                bookstack_user_id BIGINT NOT NULL,
+                account_label TEXT NOT NULL DEFAULT 'default',
+                created_at BIGINT NOT NULL
+            )"
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("Failed to create token_bindings table: {e}"))?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_token_bindings_user
+             ON token_bindings(bookstack_user_id)"
+        )
+        .execute(&pool)
+        .await
+        .ok();
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS global_settings (
@@ -198,6 +223,118 @@ impl PostgresDb {
 
         sqlx::query("INSERT INTO global_settings (id, updated_at) VALUES (1, 0) ON CONFLICT (id) DO NOTHING")
             .execute(&pool).await.ok();
+
+        // Rekey user_settings from token_id_hash PK to stable_id PK.
+        // Idempotent — checks information_schema.columns and only runs
+        // when the old shape is present. Fresh installs land on the new
+        // shape via CREATE TABLE above and skip this block.
+        //
+        // Wrapped in a single transaction; a crash mid-migration leaves
+        // the legacy table intact for retry.
+        let needs_rekey: Option<(i64,)> = sqlx::query_as::<_, (i64,)>(
+            "SELECT 1::BIGINT FROM information_schema.columns
+             WHERE table_name = 'user_settings'
+               AND column_name = 'token_id_hash'
+             LIMIT 1"
+        )
+        .fetch_optional(&pool)
+        .await
+        .ok()
+        .flatten();
+
+        if needs_rekey.is_some() {
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(|e| format!("Failed to start user_settings rekey transaction: {e}"))?;
+
+            sqlx::query("ALTER TABLE user_settings RENAME TO user_settings_legacy_token_keyed")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| format!("Failed to rename legacy user_settings: {e}"))?;
+
+            sqlx::query(
+                "CREATE TABLE user_settings (
+                    stable_id TEXT PRIMARY KEY,
+                    settings_json TEXT NOT NULL,
+                    updated_at BIGINT NOT NULL
+                )"
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("Failed to create new user_settings: {e}"))?;
+
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+
+            let legacy: Vec<(String, String, i64)> = sqlx::query_as(
+                "SELECT token_id_hash, settings_json, updated_at
+                 FROM user_settings_legacy_token_keyed"
+            )
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| format!("Failed to fetch legacy user_settings rows: {e}"))?;
+
+            for (token_id_hash, settings_json, updated_at) in legacy {
+                let parsed: serde_json::Value = match serde_json::from_str(&settings_json) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let bookstack_user_id = match parsed
+                    .get("bookstack_user_id")
+                    .and_then(|v| v.as_i64())
+                {
+                    Some(id) => id,
+                    None => continue,
+                };
+                let account_label = parsed
+                    .get("account_label")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| DEFAULT_ACCOUNT_LABEL.to_string());
+                let stable_id = stable_id_for(bookstack_user_id, &account_label);
+
+                sqlx::query(
+                    "INSERT INTO user_settings (stable_id, settings_json, updated_at)
+                     VALUES ($1, $2, $3)
+                     ON CONFLICT (stable_id) DO UPDATE SET
+                        settings_json = EXCLUDED.settings_json,
+                        updated_at = EXCLUDED.updated_at
+                     WHERE EXCLUDED.updated_at > user_settings.updated_at"
+                )
+                .bind(&stable_id)
+                .bind(&settings_json)
+                .bind(updated_at)
+                .execute(&mut *tx)
+                .await
+                .ok();
+
+                sqlx::query(
+                    "INSERT INTO token_bindings
+                        (token_id_hash, bookstack_user_id, account_label, created_at)
+                     VALUES ($1, $2, $3, $4)
+                     ON CONFLICT (token_id_hash) DO NOTHING"
+                )
+                .bind(&token_id_hash)
+                .bind(bookstack_user_id)
+                .bind(&account_label)
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .ok();
+            }
+
+            sqlx::query("DROP TABLE user_settings_legacy_token_keyed")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| format!("Failed to drop legacy user_settings table: {e}"))?;
+
+            tx.commit()
+                .await
+                .map_err(|e| format!("Failed to commit user_settings rekey: {e}"))?;
+        }
 
         // v1.0.0 — DB-as-index schema. Mirror of every BookStack content item
         // we care about. Phase 3 ships the schema only; the reconciliation
@@ -516,14 +653,79 @@ impl DbBackend for PostgresDb {
         Ok(())
     }
 
-    async fn get_user_settings(&self, token_id_hash: &str) -> Result<Option<UserSettings>, String> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT settings_json FROM user_settings WHERE token_id_hash = $1"
+    async fn get_token_binding(&self, token_id_hash: &str)
+        -> Result<Option<TokenBinding>, String>
+    {
+        let row: Option<(i64, String, i64)> = sqlx::query_as(
+            "SELECT bookstack_user_id, account_label, created_at
+             FROM token_bindings WHERE token_id_hash = $1"
         )
         .bind(token_id_hash)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| format!("get_user_settings: {e}"))?;
+        .map_err(|e| format!("get_token_binding: {e}"))?;
+
+        Ok(row.map(|(bookstack_user_id, account_label, created_at)| TokenBinding {
+            token_id_hash: token_id_hash.to_string(),
+            bookstack_user_id,
+            account_label,
+            created_at,
+        }))
+    }
+
+    async fn set_token_binding(&self, binding: &TokenBinding) -> Result<(), String> {
+        sqlx::query(
+            "INSERT INTO token_bindings
+                (token_id_hash, bookstack_user_id, account_label, created_at)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (token_id_hash) DO UPDATE SET
+                bookstack_user_id = EXCLUDED.bookstack_user_id,
+                account_label = EXCLUDED.account_label"
+        )
+        .bind(&binding.token_id_hash)
+        .bind(binding.bookstack_user_id)
+        .bind(&binding.account_label)
+        .bind(binding.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("set_token_binding: {e}"))?;
+        Ok(())
+    }
+
+    async fn delete_token_binding(&self, token_id_hash: &str) -> Result<(), String> {
+        sqlx::query("DELETE FROM token_bindings WHERE token_id_hash = $1")
+            .bind(token_id_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("delete_token_binding: {e}"))?;
+        Ok(())
+    }
+
+    async fn list_account_labels_for_user(&self, bookstack_user_id: i64)
+        -> Result<Vec<String>, String>
+    {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT account_label FROM token_bindings
+             WHERE bookstack_user_id = $1
+             ORDER BY account_label"
+        )
+        .bind(bookstack_user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_account_labels_for_user: {e}"))?;
+        Ok(rows.into_iter().map(|(s,)| s).collect())
+    }
+
+    async fn get_user_settings_by_stable_id(&self, stable_id: &str)
+        -> Result<Option<UserSettings>, String>
+    {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT settings_json FROM user_settings WHERE stable_id = $1"
+        )
+        .bind(stable_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("get_user_settings_by_stable_id: {e}"))?;
 
         match row {
             Some((json,)) => serde_json::from_str(&json)
@@ -533,23 +735,52 @@ impl DbBackend for PostgresDb {
         }
     }
 
-    async fn save_user_settings(&self, token_id_hash: &str, settings: &UserSettings) -> Result<(), String> {
+    async fn save_user_settings_by_stable_id(
+        &self,
+        stable_id: &str,
+        settings: &UserSettings,
+    ) -> Result<(), String> {
         let json = serde_json::to_string(settings)
             .map_err(|e| format!("user_settings serialize: {e}"))?;
         sqlx::query(
-            "INSERT INTO user_settings (token_id_hash, settings_json, updated_at)
+            "INSERT INTO user_settings (stable_id, settings_json, updated_at)
              VALUES ($1, $2, $3)
-             ON CONFLICT (token_id_hash) DO UPDATE SET
+             ON CONFLICT (stable_id) DO UPDATE SET
                 settings_json = EXCLUDED.settings_json,
                 updated_at = EXCLUDED.updated_at"
         )
-        .bind(token_id_hash)
+        .bind(stable_id)
         .bind(&json)
         .bind(Self::now_secs())
         .execute(&self.pool)
         .await
-        .map_err(|e| format!("save_user_settings: {e}"))?;
+        .map_err(|e| format!("save_user_settings_by_stable_id: {e}"))?;
         Ok(())
+    }
+
+    async fn get_user_settings(&self, token_id_hash: &str)
+        -> Result<Option<UserSettings>, String>
+    {
+        match self.get_token_binding(token_id_hash).await? {
+            Some(binding) => self
+                .get_user_settings_by_stable_id(&binding.stable_id())
+                .await,
+            None => Ok(None),
+        }
+    }
+
+    async fn save_user_settings(&self, token_id_hash: &str, settings: &UserSettings)
+        -> Result<(), String>
+    {
+        match self.get_token_binding(token_id_hash).await? {
+            Some(binding) => self
+                .save_user_settings_by_stable_id(&binding.stable_id(), settings)
+                .await,
+            None => Err(format!(
+                "save_user_settings: no token binding for token_id_hash; \
+                 call set_token_binding before save"
+            )),
+        }
     }
 
     async fn get_global_settings(&self) -> Result<GlobalSettings, String> {

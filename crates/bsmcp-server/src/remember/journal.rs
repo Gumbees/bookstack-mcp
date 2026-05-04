@@ -33,6 +33,20 @@ use super::{Context, DispatchResult};
 const PAGE_MARKDOWN_FIELD: &str = "markdown";
 
 pub async fn write(ctx: &Context) -> DispatchResult {
+    // Per-instance opt-in. The whole point of this gate is the
+    // multi-MCP topology: a user wires DTC's MCP alongside their
+    // personal MCP and only wants the personal one to accept journal
+    // writes. DTC's `UserSettings.journaling_enabled` stays false, the
+    // AI hits this branch, and the personal MCP picks up the write.
+    if !ctx.settings.journaling_enabled {
+        return Err((
+            ErrorCode::Forbidden,
+            "journaling not enabled on this instance — flip \
+             `journaling_enabled = true` in /setup/user (or `user write`) \
+             if you want this MCP to be a journal target".to_string(),
+        ));
+    }
+
     let entry = parse_entry(ctx)?;
     let content = ctx
         .body

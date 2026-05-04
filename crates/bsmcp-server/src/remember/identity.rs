@@ -90,6 +90,22 @@ pub async fn read(ctx: &Context) -> DispatchResult {
 
 pub async fn write(ctx: &Context) -> DispatchResult {
     let target = parse_target(ctx)?;
+
+    // Per-instance opt-in for `target=agent`. The agent-identity page
+    // is the AI's lived-experience layer and follows the same
+    // primary/secondary topology as `journal::write` — write only on
+    // instances the user has opted into. `target=user` is a
+    // user-driven action (the user explicitly editing their own
+    // identity narrative) and is always allowed.
+    if matches!(target, Target::Agent(_)) && !ctx.settings.journaling_enabled {
+        return Err((
+            ErrorCode::Forbidden,
+            "agent identity writes not enabled on this instance — flip \
+             `journaling_enabled = true` in /setup/user (or `user write`) \
+             if you want this MCP to be the AI's lived-experience target".to_string(),
+        ));
+    }
+
     let content = ctx
         .body
         .get("content")

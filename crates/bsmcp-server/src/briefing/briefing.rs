@@ -216,10 +216,15 @@ pub async fn read(ctx: &Context) -> Value {
         full_content,
         friendly,
     );
-    let org_identity_page_ids: Vec<i64> = globals
-        .org_identity_page_id
-        .map(|id| vec![id])
-        .unwrap_or_default();
+    // org_identity is gated by the per-user `use_org_identity` opt-out.
+    // Default-on: admin-configured org identities apply. Users who don't
+    // want this instance's canonical identity bound to their session flip
+    // it false and the org_identity entry is omitted entirely.
+    let org_identity_page_ids: Vec<i64> = if ctx.settings.use_org_identity {
+        globals.org_identity_page_id.map(|id| vec![id]).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let org_identity_fut = fetch_pages_with_source(
         &ctx.client,
         &org_identity_page_ids,
@@ -776,13 +781,12 @@ fn pending_global_fields(g: &bsmcp_common::settings::GlobalSettings) -> Vec<Valu
             "admin_only": true,
         }));
     }
-    if g.org_identity_page_id.is_none() {
-        out.push(json!({
-            "field": "org_identity_page_id",
-            "why": "Single page describing the organization. Pulled into every briefing's system_prompt_additions. Admin-only.",
-            "admin_only": true,
-        }));
-    }
+    // org_identity_page_id is intentionally NOT pending. "No org identity"
+    // is a first-class admin choice, not an unfinished setup step — some
+    // orgs don't have a canonical identity manifest, and per-user
+    // `use_org_identity = false` already lets users opt out when one is
+    // set. Keeping it on the pending list would nag admins into picking a
+    // page that doesn't apply.
     if g.org_domains.is_empty() {
         out.push(json!({
             "field": "org_domains",

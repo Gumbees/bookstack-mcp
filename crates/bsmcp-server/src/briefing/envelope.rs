@@ -109,7 +109,9 @@ fn pending_user_summary(s: &UserSettings) -> Vec<&'static str> {
 fn pending_global_summary(g: &GlobalSettings) -> Vec<&'static str> {
     let mut out = Vec::new();
     if g.guide_page_id.is_none() { out.push("guide_page_id"); }
-    if g.org_identity_page_id.is_none() { out.push("org_identity_page_id"); }
+    // org_identity_page_id is intentionally absent — see briefing.rs's
+    // `pending_global_fields` for the rationale (no org identity is a
+    // valid admin choice, not an unfinished step).
     if g.org_domains.is_empty() { out.push("org_domains"); }
     out
 }

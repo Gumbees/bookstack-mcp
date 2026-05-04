@@ -16,6 +16,11 @@ pub enum ErrorCode {
     UnknownAction,
     UnknownResource,
     InternalError,
+    /// The action is well-formed and the user is authenticated, but
+    /// settings on this instance opt out of the operation. Most common
+    /// cause: `journaling_enabled = false` on a secondary MCP wired
+    /// alongside a primary; the AI is being told "don't journal here."
+    Forbidden,
 }
 
 impl ErrorCode {
@@ -25,6 +30,7 @@ impl ErrorCode {
             Self::UnknownAction => "unknown_action",
             Self::UnknownResource => "unknown_resource",
             Self::InternalError => "internal_error",
+            Self::Forbidden => "forbidden",
         }
     }
 }

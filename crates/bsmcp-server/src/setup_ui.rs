@@ -34,8 +34,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use bsmcp_common::bookstack::BookStackClient;
-use bsmcp_common::db::DbBackend;
-use bsmcp_common::settings::{hash_token_id, GlobalSettings, UserSettings};
+use bsmcp_common::db::{stable_id_for, DbBackend, TokenBinding};
+use bsmcp_common::settings::{
+    hash_token_id, GlobalSettings, UserSettings, DEFAULT_ACCOUNT_LABEL,
+};
 
 use crate::mcp;
 use crate::remember;
@@ -71,6 +73,11 @@ pub async fn handle_setup_user_get(
         .flatten()
         .unwrap_or_default();
 
+    // Existing personalities for this BookStack user → drive the
+    // account_label datalist on the form. Empty when the user is
+    // single-account or the binding lookup fails (non-fatal).
+    let existing_labels = labels_for_token(state.db.as_ref(), &token_id_hash).await;
+
     let bs_client = BookStackClient::new(
         &state.bookstack_url,
         &token_id,
@@ -84,7 +91,22 @@ pub async fn handle_setup_user_get(
         plan: None,
     };
 
-    Html(render_setup_page(&settings, &migration)).into_response()
+    Html(render_setup_page(&settings, &migration, &existing_labels)).into_response()
+}
+
+/// Resolve the list of `account_label`s already bound for the
+/// BookStack user behind `token_id_hash`. Returns empty Vec on any
+/// error or missing binding — the wizard treats it as "no other
+/// personalities exist." Pulled out into a helper so the migrate
+/// preview path uses the same logic.
+async fn labels_for_token(db: &dyn DbBackend, token_id_hash: &str) -> Vec<String> {
+    match db.get_token_binding(token_id_hash).await {
+        Ok(Some(binding)) => db
+            .list_account_labels_for_user(binding.bookstack_user_id)
+            .await
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -93,6 +115,17 @@ pub struct SetupForm {
     pub chosen_ai_identity: Option<String>,
     #[serde(default)]
     pub journaling_enabled: Option<String>,
+    /// Per-account-personality label. Empty input becomes
+    /// `DEFAULT_ACCOUNT_LABEL` so single-account users get the
+    /// expected behavior even when leaving the field blank.
+    #[serde(default)]
+    pub account_label: Option<String>,
+    /// Inject `globals.org_identity_page_id` (when admin-configured)
+    /// into this user's `system_prompt_additions`. Default true; the
+    /// HTML form sends nothing when unchecked, so an absent field
+    /// flips the bool to `false` (`checkbox()` returns false on None).
+    #[serde(default)]
+    pub use_org_identity: Option<String>,
 }
 
 pub async fn handle_setup_user_post(
@@ -115,17 +148,79 @@ pub async fn handle_setup_user_post(
     let form: SetupForm = serde_urlencoded::from_str(body_str).unwrap_or_default();
 
     let token_id_hash = hash_token_id(&token_id);
-    let mut settings = state
-        .db
-        .get_user_settings(&token_id_hash)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_default();
+
+    // Look up the current binding so we can detect a label change.
+    // No binding = the SSE/oauth path didn't run for this token yet,
+    // which shouldn't happen here (the settings session was issued by
+    // /authorize and that always calls ensure_token_binding) but is
+    // still a coherent failure mode worth surfacing.
+    let binding = match state.db.get_token_binding(&token_id_hash).await {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            return error_response(
+                "no token binding for this session — re-authenticate via /authorize".to_string(),
+            );
+        }
+        Err(e) => return error_response(format!("get_token_binding failed: {e}")),
+    };
+
+    // Stage a settings draft. If the label is unchanged, this is just
+    // the existing row with form fields re-applied. If the label is
+    // changing AND a row already exists at the new stable_id, that's a
+    // re-attach: pull the existing settings and overlay the form
+    // fields, so the user keeps everything they had under that label
+    // and only the wizard's editable fields get refreshed.
+    let new_label = normalize_account_label(form.account_label.as_deref());
+    let label_changed = new_label != binding.account_label;
+
+    let mut settings = if label_changed {
+        let new_stable_id = stable_id_for(binding.bookstack_user_id, &new_label);
+        match state.db.get_user_settings_by_stable_id(&new_stable_id).await {
+            Ok(Some(existing)) => existing, // re-attach onto previous personality
+            Ok(None) => UserSettings::default(),
+            Err(e) => {
+                return error_response(format!(
+                    "get_user_settings_by_stable_id failed: {e}"
+                ));
+            }
+        }
+    } else {
+        state
+            .db
+            .get_user_settings_by_stable_id(&binding.stable_id())
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    };
 
     apply_setup_form(&mut settings, &form, &raw_pairs);
 
-    if let Err(e) = state.db.save_user_settings(&token_id_hash, &settings).await {
+    let target_stable_id =
+        stable_id_for(binding.bookstack_user_id, &settings.account_label);
+
+    if label_changed {
+        // Repoint the binding *before* saving, so any subsequent reads
+        // (e.g. the inline migration step below, which calls
+        // get_user_settings via the binding chase) hit the new
+        // stable_id. created_at is preserved so the binding's age
+        // continues to mean "when did this token first authenticate."
+        let updated = TokenBinding {
+            token_id_hash: binding.token_id_hash.clone(),
+            bookstack_user_id: binding.bookstack_user_id,
+            account_label: settings.account_label.clone(),
+            created_at: binding.created_at,
+        };
+        if let Err(e) = state.db.set_token_binding(&updated).await {
+            return error_response(format!("Failed to update token binding: {e}"));
+        }
+    }
+
+    if let Err(e) = state
+        .db
+        .save_user_settings_by_stable_id(&target_stable_id, &settings)
+        .await
+    {
         return error_response(format!("Failed to save user settings: {e}"));
     }
 
@@ -220,7 +315,9 @@ pub async fn handle_setup_user_migrate_preview(
         plan: Some(plan),
     };
 
-    Html(render_setup_page(&settings, &migration)).into_response()
+    let existing_labels = labels_for_token(state.db.as_ref(), &token_id_hash).await;
+
+    Html(render_setup_page(&settings, &migration, &existing_labels)).into_response()
 }
 
 /// Apply the parsed wizard form to a `UserSettings` instance. Pure (no
@@ -241,7 +338,32 @@ pub fn apply_setup_form(
     settings.chosen_ai_identity = nonempty(&form.chosen_ai_identity);
     settings.journaling_enabled = checkbox(&form.journaling_enabled);
     settings.tool_overrides = parse_tool_overrides(raw_pairs);
+    settings.account_label = normalize_account_label(form.account_label.as_deref());
+    // `use_org_identity` defaults to true on a fresh form; checkbox()
+    // returns false when the box is absent in the POST body. To keep
+    // the default-true semantics, we OR in the form value: present
+    // (whether checked or not) means the form was submitted, so
+    // whatever the box says is authoritative. Since HTML forms only
+    // send unchecked checkboxes when explicitly named, absence here
+    // means "submitted with the box unchecked" → false.
+    settings.use_org_identity = checkbox(&form.use_org_identity);
     settings.setup_complete = true;
+}
+
+/// Normalize a user-typed `account_label` value to the canonical form
+/// stored on `UserSettings.account_label` and used in `stable_id_for`.
+///
+/// Rules: trim whitespace, fall back to `DEFAULT_ACCOUNT_LABEL` when
+/// empty, strip ASCII colons (the `stable_id` separator). We don't
+/// otherwise restrict the character set — users want to label
+/// personalities however they think; e.g. `"dtc"`, `"personal-laptop"`,
+/// `"Pia (work)"` are all acceptable.
+pub fn normalize_account_label(raw: Option<&str>) -> String {
+    let trimmed = raw.unwrap_or("").trim();
+    if trimmed.is_empty() {
+        return DEFAULT_ACCOUNT_LABEL.to_string();
+    }
+    trimmed.replace(':', "")
 }
 
 // =====================================================================
@@ -560,9 +682,14 @@ fn render_user_tool_overrides_section(s: &UserSettings) -> String {
     rows
 }
 
-fn render_setup_page(s: &UserSettings, migration: &MigrationView) -> String {
+fn render_setup_page(
+    s: &UserSettings,
+    migration: &MigrationView,
+    existing_labels: &[String],
+) -> String {
     let chosen = html_escape(s.chosen_ai_identity.as_deref().unwrap_or(""));
     let journaling_checked = if s.journaling_enabled { "checked" } else { "" };
+    let use_org_identity_checked = if s.use_org_identity { "checked" } else { "" };
     let tool_rows = render_user_tool_overrides_section(s);
     let already_done_banner = if s.setup_complete {
         r#"<div class="banner">You've already completed setup. Re-submitting will update your preferences.</div>"#
@@ -570,6 +697,42 @@ fn render_setup_page(s: &UserSettings, migration: &MigrationView) -> String {
         ""
     };
     let migration_section = render_migration_section(migration);
+
+    // Account label section: always-shown text input, with a `<datalist>`
+    // pre-populated from any existing labels for this BookStack user.
+    // Single-account users see one option ("default") and the field is
+    // mostly invisible. Multi-account users see all their personalities
+    // and can switch by typing/selecting one.
+    let account_label_value = html_escape(&s.account_label);
+    let account_label_datalist = if existing_labels.is_empty() {
+        String::new()
+    } else {
+        let opts: String = existing_labels
+            .iter()
+            .map(|l| format!("<option value=\"{}\">", html_escape(l)))
+            .collect::<Vec<_>>()
+            .join("");
+        format!("<datalist id=\"existing-account-labels\">{opts}</datalist>")
+    };
+    let datalist_attr = if existing_labels.is_empty() {
+        ""
+    } else {
+        " list=\"existing-account-labels\""
+    };
+    let account_label_help = if existing_labels.len() > 1 {
+        format!(
+            "Distinguishes which set of settings applies when the same BookStack user runs this MCP from multiple Anthropic accounts. \
+             Existing personalities for this BookStack user: <code>{}</code>. Type one to re-attach this token's settings to it, or type a new one to create a fresh personality. Leave as <code>default</code> if you only have one.",
+            existing_labels.iter()
+                .map(|l| html_escape(l))
+                .collect::<Vec<_>>()
+                .join("</code>, <code>")
+        )
+    } else {
+        "Distinguishes which set of settings applies when the same BookStack user runs this MCP from multiple Anthropic accounts. \
+         Leave as <code>default</code> if you only have one — you can always change this later."
+            .to_string()
+    };
 
     format!(
         r#"<!DOCTYPE html>
@@ -613,11 +776,18 @@ button {{ margin-top: 1em; padding: 0.6em 1.2em; font-size: 1em; cursor: pointer
 
   <h2>1. AI agent identity</h2>
   <label>Default AI agent name <input type="text" name="chosen_ai_identity" value="{chosen}" placeholder="e.g. pia"></label>
-  <p class="help">Optional. Your default AI agent name. Used for journal chapter naming and the briefing reminder.</p>
+  <p class="help">Optional. Your default AI agent name. Used for journal chapter naming and the briefing reminder. Leave blank to use the AI's default self.</p>
+
+  <label>Account label <input type="text" name="account_label" value="{account_label_value}" placeholder="default"{datalist_attr}></label>
+  {account_label_datalist}
+  <p class="help">{account_label_help}</p>
+
+  <label><input type="checkbox" name="use_org_identity" {use_org_identity_checked}> Use this instance's org identity</label>
+  <p class="help">When on, the briefing pulls in this instance's <code>org_identity_page_id</code> (if the admin set one). Turn off if your primary identity lives on a different MCP and this one's org identity shouldn't bind your session.</p>
 
   <h2>2. Journaling</h2>
-  <label><input type="checkbox" name="journaling_enabled" {journaling_checked}> Enable journaling reminders</label>
-  <p class="help">When on, the briefing reminds you to journal throughout the session.</p>
+  <label><input type="checkbox" name="journaling_enabled" {journaling_checked}> Enable journaling on this instance</label>
+  <p class="help">When on, the briefing reminds you to journal AND the <code>journal write</code> / <code>identity write</code> tools accept writes here. Multi-MCP setups: turn on for the primary, off for bootstrap-only sources.</p>
 
   <h2>3. Tool overrides</h2>
   <p class="help">Per-tool overrides for your account. <em>Use admin default</em> follows whatever the admin sets globally; <em>on</em> and <em>off</em> force the tool regardless of the global setting.</p>
@@ -636,7 +806,12 @@ button {{ margin-top: 1em; padding: 0.6em 1.2em; font-size: 1em; cursor: pointer
 </html>"#,
         already_done_banner = already_done_banner,
         chosen = chosen,
+        account_label_value = account_label_value,
+        account_label_datalist = account_label_datalist,
+        datalist_attr = datalist_attr,
+        account_label_help = account_label_help,
         journaling_checked = journaling_checked,
+        use_org_identity_checked = use_org_identity_checked,
         tool_rows = tool_rows,
         migration_section = migration_section,
     )
@@ -1483,6 +1658,8 @@ mod tests {
         let form = SetupForm {
             chosen_ai_identity: Some("  pia  ".to_string()),
             journaling_enabled: Some("on".to_string()),
+            account_label: None,
+            use_org_identity: Some("on".to_string()),
         };
         let pairs = vec![
             pair("tool_user_briefing", "on"),
@@ -1954,6 +2131,8 @@ mod tests {
         let setup_form = SetupForm {
             chosen_ai_identity: Some("pia".to_string()),
             journaling_enabled: Some("on".to_string()),
+            account_label: None,
+            use_org_identity: Some("on".to_string()),
         };
         apply_setup_form(&mut settings, &setup_form, &pairs);
         assert_eq!(settings.chosen_ai_identity.as_deref(), Some("pia"));
@@ -1970,7 +2149,7 @@ mod tests {
             form: MigrationFormFields::default(),
             plan: None,
         };
-        let html = render_setup_page(&s, &view);
+        let html = render_setup_page(&s, &view, &[]);
         assert!(
             html.contains("Migration unavailable"),
             "should explain why migration is off when sources errored"
@@ -1991,7 +2170,7 @@ mod tests {
             form: MigrationFormFields::default(),
             plan: None,
         };
-        let html = render_setup_page(&s, &view);
+        let html = render_setup_page(&s, &view, &[]);
         assert!(html.contains("value=\"100\""), "should include book 100 option");
         assert!(html.contains("Pia&#x27;s Old Journal"), "should html-escape names");
         assert!(html.contains("47 pages"));
@@ -2039,7 +2218,7 @@ mod tests {
                 "estimated_block_count": 1,
             }))),
         };
-        let html = render_setup_page(&s, &view);
+        let html = render_setup_page(&s, &view, &[]);
         // Dated row: checkbox is pre-checked.
         assert!(
             html.contains("name=\"migration_page_1\" value=\"on\" checked"),
@@ -2073,7 +2252,7 @@ mod tests {
             },
             plan: Some(Err("Missing required argument: entry_type".to_string())),
         };
-        let html = render_setup_page(&s, &view);
+        let html = render_setup_page(&s, &view, &[]);
         assert!(html.contains("Preview failed"));
         assert!(html.contains("entry_type"));
     }

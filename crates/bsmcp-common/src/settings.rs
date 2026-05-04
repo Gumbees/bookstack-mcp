@@ -143,6 +143,21 @@ pub struct UserSettings {
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub tool_overrides: std::collections::HashMap<String, bool>,
 
+    // --- Onboarding (Phase 2.4e) ---
+    //
+    // True once the user has completed the `/setup/user` onboarding wizard.
+    // Drives `meta.onboarding_pending` injection on every MCP response: the
+    // wizard link rides along on every tool call until this flips. Distinct
+    // from the briefing's "settings fields complete" heuristic — that one
+    // checks whether typed settings slots have values; this one is set
+    // exactly once when the user submits the wizard form.
+    /// True once the user has submitted the `/setup/user` onboarding form.
+    /// Until then, every MCP tool response carries `meta.onboarding_pending`
+    /// pointing at the wizard URL. Set by `setup_ui::handle_setup_post`;
+    /// never cleared except by manually editing the row.
+    #[serde(default)]
+    pub setup_complete: bool,
+
     /// v0.7.x leftover keys captured on deserialize. Round-trips through
     /// saves until the briefing builder explicitly clears them — that way an
     /// unrelated save path (oauth auto-populate, settings UI, dismiss tool)

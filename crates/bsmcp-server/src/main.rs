@@ -8,6 +8,7 @@ mod remember;
 mod semantic;
 mod session;
 mod settings_ui;
+mod setup_ui;
 mod sse;
 mod staging;
 mod summary;
@@ -281,6 +282,10 @@ async fn main() {
             "/settings/probe",
             get(settings_ui::handle_settings_probe_get).post(settings_ui::handle_settings_probe_post),
         )
+        .route(
+            "/setup/user",
+            get(setup_ui::handle_setup_user_get).post(setup_ui::handle_setup_user_post),
+        )
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }));
     if briefing_enabled {
         app = app.route(
@@ -297,6 +302,11 @@ async fn main() {
         eprintln!("Briefing: DISABLED (set BSMCP_BRIEFING_ENABLED=true to enable)");
     }
     eprintln!("Settings: UI active at GET/POST /settings");
+    if mcp::onboarding_enabled() {
+        eprintln!("Onboarding: wizard active at GET/POST /setup/user");
+    } else {
+        eprintln!("Onboarding: DISABLED (set BSMCP_ONBOARDING_ENABLED=true to enable)");
+    }
 
     // Staging upload endpoint for file uploads (50MB limit)
     app = app.route(

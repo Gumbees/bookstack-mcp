@@ -50,9 +50,11 @@ pub struct AuthorizeParams {
     state: Option<String>,
     code_challenge: Option<String>,
     code_challenge_method: Option<String>,
-    /// When set to "/settings", short-circuits the OAuth code flow: after validating
-    /// the BookStack token, the server issues a settings-session cookie and redirects
-    /// the browser directly to /settings. Used by the in-server settings UI.
+    /// When set to a recognized in-server browser path (`/settings`,
+    /// `/setup/user`), short-circuits the OAuth code flow: after validating
+    /// the BookStack token, the server issues a settings-session cookie and
+    /// redirects the browser directly to the return path. Used by the
+    /// in-server settings UI and the user-onboarding wizard.
     return_to: Option<String>,
 }
 
@@ -148,6 +150,25 @@ fn html_escape(s: &str) -> String {
 /// Returns true if the given path is a safe in-server redirect (no scheme/host).
 fn is_safe_internal_path(s: &str) -> bool {
     s.starts_with('/') && !s.starts_with("//") && !s.contains(':')
+}
+
+/// In-server browser paths the OAuth handler will short-circuit to (skip
+/// the OAuth code-exchange dance, issue a settings-session cookie, redirect
+/// directly). Kept as a closed allow-list so a malicious `?return_to=` can't
+/// turn the auth endpoint into an open redirector — `is_safe_internal_path`
+/// catches scheme/host injection, but this catches arbitrary internal paths
+/// (anything outside the allow-list goes through the normal OAuth code flow
+/// instead, which won't redirect a browser to an unknown URL).
+const COOKIE_FLOW_RETURN_PATHS: &[&str] = &["/settings", "/setup/user"];
+
+/// True when `return_to` matches a path the cookie-issuing flow should
+/// service directly. Reads tolerantly — leading/trailing whitespace stripped,
+/// trailing slash on `/setup/user/` collapsed.
+fn is_cookie_flow_return(p: Option<&str>) -> bool {
+    let Some(p) = p else { return false };
+    let trimmed = p.trim().trim_end_matches('/');
+    let normalized = if trimmed.is_empty() { "/" } else { trimmed };
+    COOKIE_FLOW_RETURN_PATHS.contains(&normalized)
 }
 
 fn render_login_form(
@@ -293,11 +314,8 @@ pub async fn handle_authorize(
     // Browser settings flow bypasses the OAuth code dance entirely — no PKCE required,
     // no response_type check. The form renders, the user enters their token, and on
     // success the server sets a session cookie and redirects to the return_to path.
-    let is_settings_flow = params
-        .return_to
-        .as_deref()
-        .map(|p| p == "/settings")
-        .unwrap_or(false);
+    // Allowed targets: /settings (admin) + /setup/user (onboarding wizard).
+    let is_settings_flow = is_cookie_flow_return(params.return_to.as_deref());
 
     if !is_settings_flow {
         if params.response_type != "code" {
@@ -386,11 +404,7 @@ pub async fn handle_authorize_submit(
         }
     }
 
-    let is_settings_flow = form
-        .return_to
-        .as_deref()
-        .map(|p| p == "/settings")
-        .unwrap_or(false);
+    let is_settings_flow = is_cookie_flow_return(form.return_to.as_deref());
 
     if !is_settings_flow && form.response_type != "code" {
         return oauth_error(
@@ -425,7 +439,9 @@ pub async fn handle_authorize_submit(
     try_auto_populate_bookstack_user_id(state.db.as_ref(), &bs_client, &form.token_id).await;
 
     // Browser settings flow: skip the OAuth code dance entirely. Issue a settings
-    // session, set the cookie, and redirect to the return path.
+    // session, set the cookie, and redirect to the return path. Both the admin
+    // /settings page and the onboarding /setup/user wizard land here; the
+    // redirect honors whichever return_to the form carried.
     if is_settings_flow {
         let session_id = crate::settings_ui::issue_settings_session(
             &state.settings_sessions,
@@ -434,12 +450,18 @@ pub async fn handle_authorize_submit(
         )
         .await;
         let cookie = crate::settings_ui::build_session_cookie(&session_id);
-        eprintln!("OAuth: issued settings-UI session for /settings flow");
+        let location = form
+            .return_to
+            .as_deref()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| "/settings".to_string());
+        eprintln!("OAuth: issued settings-UI session for cookie flow → {location}");
         return (
             StatusCode::FOUND,
             [
                 (header::SET_COOKIE, cookie),
-                (header::LOCATION, "/settings".to_string()),
+                (header::LOCATION, location),
             ],
         )
             .into_response();
@@ -830,4 +852,33 @@ fn oauth_error(status: StatusCode, error: &str, description: Option<&str>) -> Re
         body["error_description"] = json!(desc);
     }
     (status, Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cookie_flow_recognizes_settings_and_setup_user() {
+        assert!(is_cookie_flow_return(Some("/settings")));
+        assert!(is_cookie_flow_return(Some("/setup/user")));
+        // Trailing slash collapsed.
+        assert!(is_cookie_flow_return(Some("/setup/user/")));
+        // Surrounding whitespace tolerated.
+        assert!(is_cookie_flow_return(Some("  /settings  ")));
+    }
+
+    #[test]
+    fn cookie_flow_rejects_arbitrary_paths_and_open_redirects() {
+        // Outside the allow-list — these fall through to the normal
+        // OAuth code flow rather than getting a cookie issued + a
+        // redirect to whatever the caller asked for.
+        assert!(!is_cookie_flow_return(Some("/")));
+        assert!(!is_cookie_flow_return(Some("/admin")));
+        assert!(!is_cookie_flow_return(Some("/settings/probe")));
+        assert!(!is_cookie_flow_return(Some("https://evil.example/")));
+        assert!(!is_cookie_flow_return(Some("//evil.example/")));
+        assert!(!is_cookie_flow_return(None));
+        assert!(!is_cookie_flow_return(Some("")));
+    }
 }

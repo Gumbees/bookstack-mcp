@@ -16,8 +16,12 @@
 //! - `strict_setup` — when true and setup is incomplete, the response carries
 //!   `setup_required: true` at the top level. The actual error-envelope gating
 //!   on tool-call paths lives in `mcp.rs` (Agent E's scope). The
-//!   `setup_complete` heuristic here is intentionally minimal:
-//!   `globals.org_identity_page_id.is_some() && settings.user_id.is_some()`.
+//!   `settings_fields_complete` heuristic here is intentionally minimal —
+//!   it just asks whether `pending_user_fields` and `pending_global_fields`
+//!   are both empty. Distinct from `UserSettings.setup_complete` (the
+//!   onboarding-wizard flag, sub-PR 2.4e), which means "user submitted the
+//!   /setup/user form" — a one-bit, write-once flag rather than a derived
+//!   check across many fields.
 
 use serde_json::{json, Value};
 
@@ -321,8 +325,8 @@ pub async fn read(ctx: &Context) -> Value {
     // boolean is on AND setup is incomplete. The actual error-envelope
     // gating on tool-call paths is Agent E's wiring in mcp.rs; this field
     // is the signal Agent E will read.
-    let setup_complete = setup_complete(&ctx.settings, &globals);
-    let setup_required = globals.strict_setup && !setup_complete;
+    let fields_complete = settings_fields_complete(&ctx.settings, &globals);
+    let setup_required = globals.strict_setup && !fields_complete;
 
     let mut payload = serde_json::Map::new();
     payload.insert("setup_required".to_string(), json!(setup_required));
@@ -397,11 +401,20 @@ pub fn select_journaling_reminder(
     })
 }
 
-/// "Setup is done" = no pending user or global fields. Mirrors the same
-/// definition used by `pending_user_fields` / `pending_global_fields` so the
-/// `setup_required` flag (gated by `globals.strict_setup`) and the
-/// `setup_nudge` block agree on what "done" means.
-fn setup_complete(s: &UserSettings, g: &GlobalSettings) -> bool {
+/// "Settings fields are filled in" = no pending user or global fields.
+/// Mirrors the same definition used by `pending_user_fields` /
+/// `pending_global_fields` so the `setup_required` flag (gated by
+/// `globals.strict_setup`) and the `setup_nudge` block agree on what
+/// "done" means.
+///
+/// This is a *derived* check across the typed setup slots — distinct from
+/// `UserSettings.setup_complete`, which is a stored one-bit flag set by
+/// the `/setup/user` onboarding wizard (sub-PR 2.4e). A user can have
+/// `setup_complete = true` while still having pending settings fields
+/// (they ran the wizard but skipped optional inputs), and vice versa
+/// (an admin pre-filled their settings via API but they never opened
+/// the wizard).
+fn settings_fields_complete(s: &UserSettings, g: &GlobalSettings) -> bool {
     pending_user_fields(s).is_empty() && pending_global_fields(g).is_empty()
 }
 

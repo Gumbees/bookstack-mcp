@@ -214,6 +214,12 @@ fn build_briefing_meta_body(args: &Value, request_id: Option<&Value>) -> Value {
 /// - `briefing_pending` — `{message, briefing}` where `briefing` is the
 ///   complete briefing payload. After this attaches once, the session flag
 ///   flips and subsequent calls skip it.
+///
+/// Until the user completes the `/setup/user` wizard, every call also gets:
+/// - `onboarding_pending` — `{message, url}`. Unlike `briefing_pending`
+///   this is NOT one-shot: it rides on every response until
+///   `UserSettings.setup_complete` flips. Gated by `BSMCP_ONBOARDING_ENABLED`
+///   (default on); see `is_onboarding_visible`.
 async fn build_response_meta(
     args: &Value,
     request_id: Option<&Value>,
@@ -249,6 +255,10 @@ async fn build_response_meta(
             "message": "You didn't run your briefing yet, here it is..",
             "briefing": briefing_payload,
         });
+    }
+
+    if is_onboarding_visible(onboarding_enabled(), settings.setup_complete) {
+        meta["onboarding_pending"] = build_onboarding_pending_meta();
     }
 
     meta
@@ -2540,6 +2550,64 @@ fn briefing_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Whether the user-onboarding flow is enabled (Phase 2.4e). Reads
+/// `BSMCP_ONBOARDING_ENABLED`; defaults true. When off:
+/// - `meta.onboarding_pending` is never injected.
+/// - `GET/POST /setup/user` return 404.
+///
+/// Boolean parse: `false`/`0`/`no`/`off` (case-insensitive) = off; any
+/// other value (including absent) = on. Mirrors `briefing_enabled` so
+/// operators get one consistent toggle shape across the surface.
+pub fn onboarding_enabled() -> bool {
+    parse_onboarding_env(std::env::var("BSMCP_ONBOARDING_ENABLED").ok().as_deref())
+}
+
+/// Pure parse of the `BSMCP_ONBOARDING_ENABLED` env var. Extracted so the
+/// env-parse cases are testable without touching process env. `None`
+/// (absent) → true; "false"/"0"/"no"/"off" (any case, trimmed) → false;
+/// everything else → true.
+pub fn parse_onboarding_env(raw: Option<&str>) -> bool {
+    match raw {
+        None => true,
+        Some(s) => {
+            let v = s.trim().to_lowercase();
+            !(v == "false" || v == "0" || v == "no" || v == "off")
+        }
+    }
+}
+
+/// Decide whether `meta.onboarding_pending` should ride along on this
+/// MCP response. Pure helper — no I/O. The injection happens iff:
+/// - the env flag is on (operator hasn't disabled the surface), and
+/// - the user hasn't yet completed the onboarding wizard.
+///
+/// See `build_response_meta` for the corresponding write side.
+pub fn is_onboarding_visible(env_enabled: bool, setup_complete: bool) -> bool {
+    env_enabled && !setup_complete
+}
+
+/// Build the `meta.onboarding_pending` payload. Public-domain-aware:
+/// returns the absolute URL when `BSMCP_PUBLIC_DOMAIN` is set, otherwise
+/// a relative `/setup/user` path so the AI can still render a clickable
+/// link inside its own UI.
+pub fn build_onboarding_pending_meta() -> Value {
+    let url = match std::env::var("BSMCP_PUBLIC_DOMAIN") {
+        Ok(d) => {
+            let d = d.trim().trim_end_matches('/');
+            if d.is_empty() {
+                "/setup/user".to_string()
+            } else {
+                format!("https://{d}/setup/user")
+            }
+        }
+        Err(_) => "/setup/user".to_string(),
+    };
+    json!({
+        "message": "Welcome to bookstack-mcp. Please complete user setup.",
+        "url": url,
+    })
+}
+
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {
     json!({
         "name": name,
@@ -2680,5 +2748,116 @@ mod tests {
             v["error"]["message"].as_str().unwrap_or("").contains("journal"),
             "message should mention the tool name"
         );
+    }
+
+    // --- Onboarding (Phase 2.4e) ---
+
+    #[test]
+    fn parse_onboarding_env_absent_defaults_on() {
+        assert!(parse_onboarding_env(None));
+    }
+
+    #[test]
+    fn parse_onboarding_env_truthy_values() {
+        for v in ["1", "yes", "true", "on", "TRUE", "  yes  ", "anything"] {
+            assert!(
+                parse_onboarding_env(Some(v)),
+                "expected {v:?} to parse as on"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_onboarding_env_falsy_values() {
+        for v in ["0", "no", "false", "off", "FALSE", "  Off  "] {
+            assert!(
+                !parse_onboarding_env(Some(v)),
+                "expected {v:?} to parse as off"
+            );
+        }
+    }
+
+    #[test]
+    fn is_onboarding_visible_matrix() {
+        // env on + setup not complete → visible
+        assert!(is_onboarding_visible(true, false));
+        // env on + setup complete → hidden (user finished the wizard)
+        assert!(!is_onboarding_visible(true, true));
+        // env off + setup not complete → hidden (operator killed the surface)
+        assert!(!is_onboarding_visible(false, false));
+        // env off + setup complete → hidden (both reasons)
+        assert!(!is_onboarding_visible(false, true));
+    }
+
+    /// Composition test mirroring the conditional in `build_response_meta`:
+    /// the same is-visible predicate the meta builder uses gates whether
+    /// the payload appears at all. This keeps the helper + the call-site
+    /// in lock-step without standing up the full async dependency graph
+    /// (db, client, semantic, session_store) just to assert the field's
+    /// presence.
+    #[test]
+    fn meta_onboarding_pending_shape_matches_visibility_helper() {
+        // Visible: env on + setup not complete → field present, full shape.
+        let visible = is_onboarding_visible(true, false);
+        assert!(visible);
+        let payload = build_onboarding_pending_meta();
+        assert!(payload.get("message").is_some(), "message field present");
+        assert!(payload.get("url").is_some(), "url field present");
+
+        // Hidden: setup complete → meta builder skips the injection entirely
+        // (no payload built). We assert at the predicate level since the
+        // payload itself is unconditional (it's the *visibility* that gates).
+        assert!(!is_onboarding_visible(true, true));
+        assert!(!is_onboarding_visible(false, false));
+        assert!(!is_onboarding_visible(false, true));
+    }
+
+    /// All env-touching `BSMCP_PUBLIC_DOMAIN` cases live in one test so
+    /// `cargo test` doesn't race them against each other when running the
+    /// in-process tests in parallel. We capture+restore the ambient value
+    /// at the boundaries so we don't pollute the test binary's env across
+    /// modules.
+    #[test]
+    fn build_onboarding_pending_meta_url_cases() {
+        let prev = std::env::var("BSMCP_PUBLIC_DOMAIN").ok();
+
+        // 1. Domain set → absolute https URL.
+        std::env::set_var("BSMCP_PUBLIC_DOMAIN", "mcp.example.com");
+        let payload = build_onboarding_pending_meta();
+        assert_eq!(
+            payload["url"].as_str(),
+            Some("https://mcp.example.com/setup/user")
+        );
+        assert!(payload["message"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("Welcome"));
+
+        // 2. Trailing slash collapsed.
+        std::env::set_var("BSMCP_PUBLIC_DOMAIN", "mcp.example.com/");
+        assert_eq!(
+            build_onboarding_pending_meta()["url"].as_str(),
+            Some("https://mcp.example.com/setup/user")
+        );
+
+        // 3. Blank/whitespace → relative fallback.
+        std::env::set_var("BSMCP_PUBLIC_DOMAIN", "   ");
+        assert_eq!(
+            build_onboarding_pending_meta()["url"].as_str(),
+            Some("/setup/user")
+        );
+
+        // 4. Unset → relative fallback.
+        std::env::remove_var("BSMCP_PUBLIC_DOMAIN");
+        assert_eq!(
+            build_onboarding_pending_meta()["url"].as_str(),
+            Some("/setup/user")
+        );
+
+        // Restore.
+        match prev {
+            Some(v) => std::env::set_var("BSMCP_PUBLIC_DOMAIN", v),
+            None => std::env::remove_var("BSMCP_PUBLIC_DOMAIN"),
+        }
     }
 }

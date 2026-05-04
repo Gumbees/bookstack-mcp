@@ -81,15 +81,26 @@ pub async fn issue_settings_session(
 }
 
 pub fn build_session_cookie(session_id: &str) -> String {
+    // Path=/ so a single cookie covers both /settings (admin) and /setup/user
+    // (the onboarding wizard, sub-PR 2.4e). Earlier revisions scoped this
+    // narrowly to /settings; widening it to / is safe because the cookie is
+    // HttpOnly + SameSite=Lax + Secure, and the only consumers of the
+    // bsmcp_settings_session cookie are first-party browser routes on this
+    // server.
     format!(
-        "{name}={id}; Path=/settings; HttpOnly; SameSite=Lax; Max-Age={ttl}; Secure",
+        "{name}={id}; Path=/; HttpOnly; SameSite=Lax; Max-Age={ttl}; Secure",
         name = SETTINGS_COOKIE_NAME,
         id = session_id,
         ttl = SETTINGS_SESSION_TTL.as_secs(),
     )
 }
 
-async fn resolve_session(
+/// Look up the (token_id, token_secret) for the cookie attached to the
+/// incoming request. Returns `None` if the cookie is absent, points at a
+/// missing/expired session, or fails to parse. Public so sibling modules
+/// (notably `setup_ui` for the onboarding wizard) can share the same
+/// session store without duplicating the cookie-parsing logic.
+pub async fn resolve_session_creds(
     headers: &HeaderMap,
     store: &SettingsSessionStore,
 ) -> Option<(String, String)> {
@@ -111,7 +122,7 @@ pub async fn has_valid_session(
     headers: &HeaderMap,
     store: &SettingsSessionStore,
 ) -> bool {
-    resolve_session(headers, store).await.is_some()
+    resolve_session_creds(headers, store).await.is_some()
 }
 
 fn html_escape(s: &str) -> String {
@@ -128,7 +139,7 @@ pub async fn handle_settings_get(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
-    let (token_id, token_secret) = match resolve_session(&headers, &state.settings_sessions).await {
+    let (token_id, token_secret) = match resolve_session_creds(&headers, &state.settings_sessions).await {
         Some(creds) => creds,
         None => return Redirect::to("/authorize?response_type=code&client_id=settings-ui&redirect_uri=/settings&code_challenge=&code_challenge_method=&return_to=/settings").into_response(),
     };
@@ -248,7 +259,7 @@ pub async fn handle_settings_post(
     let raw_pairs: Vec<(String, String)> =
         serde_urlencoded::from_str(body_str).unwrap_or_default();
 
-    let (token_id, token_secret) = match resolve_session(&headers, &state.settings_sessions).await {
+    let (token_id, token_secret) = match resolve_session_creds(&headers, &state.settings_sessions).await {
         Some(creds) => creds,
         None => return Redirect::to("/authorize?response_type=code&client_id=settings-ui&redirect_uri=/settings&code_challenge=&code_challenge_method=&return_to=/settings").into_response(),
     };

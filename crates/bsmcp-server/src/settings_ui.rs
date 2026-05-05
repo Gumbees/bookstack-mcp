@@ -15,16 +15,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{RawForm, State};
+use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::Form;
 use serde::Deserialize;
 use tokio::sync::RwLock;
 use zeroize::Zeroize;
 
 use bsmcp_common::settings::{hash_token_id, GlobalSettings, KbScope, UserSettings};
 
-use crate::mcp;
 use crate::sse::AppState;
 
 pub const SETTINGS_COOKIE_NAME: &str = "bsmcp_settings_session";
@@ -81,26 +81,15 @@ pub async fn issue_settings_session(
 }
 
 pub fn build_session_cookie(session_id: &str) -> String {
-    // Path=/ so a single cookie covers both /settings (admin) and /setup/user
-    // (the onboarding wizard, sub-PR 2.4e). Earlier revisions scoped this
-    // narrowly to /settings; widening it to / is safe because the cookie is
-    // HttpOnly + SameSite=Lax + Secure, and the only consumers of the
-    // bsmcp_settings_session cookie are first-party browser routes on this
-    // server.
     format!(
-        "{name}={id}; Path=/; HttpOnly; SameSite=Lax; Max-Age={ttl}; Secure",
+        "{name}={id}; Path=/settings; HttpOnly; SameSite=Lax; Max-Age={ttl}; Secure",
         name = SETTINGS_COOKIE_NAME,
         id = session_id,
         ttl = SETTINGS_SESSION_TTL.as_secs(),
     )
 }
 
-/// Look up the (token_id, token_secret) for the cookie attached to the
-/// incoming request. Returns `None` if the cookie is absent, points at a
-/// missing/expired session, or fails to parse. Public so sibling modules
-/// (notably `setup_ui` for the onboarding wizard) can share the same
-/// session store without duplicating the cookie-parsing logic.
-pub async fn resolve_session_creds(
+async fn resolve_session(
     headers: &HeaderMap,
     store: &SettingsSessionStore,
 ) -> Option<(String, String)> {
@@ -122,7 +111,7 @@ pub async fn has_valid_session(
     headers: &HeaderMap,
     store: &SettingsSessionStore,
 ) -> bool {
-    resolve_session_creds(headers, store).await.is_some()
+    resolve_session(headers, store).await.is_some()
 }
 
 fn html_escape(s: &str) -> String {
@@ -139,7 +128,7 @@ pub async fn handle_settings_get(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
-    let (token_id, token_secret) = match resolve_session_creds(&headers, &state.settings_sessions).await {
+    let (token_id, _token_secret) = match resolve_session(&headers, &state.settings_sessions).await {
         Some(creds) => creds,
         None => return Redirect::to("/authorize?response_type=code&client_id=settings-ui&redirect_uri=/settings&code_challenge=&code_challenge_method=&return_to=/settings").into_response(),
     };
@@ -154,36 +143,7 @@ pub async fn handle_settings_get(
         .unwrap_or_default();
     let globals = state.db.get_global_settings().await.unwrap_or_default();
 
-    // Best-effort: resolve the User Journals shelf name so the form can show
-    // "Currently set to: <name> (<id>)". Failures are silent — the form still
-    // renders without the summary line.
-    let user_journals_shelf_summary = match globals.user_journals_shelf_id {
-        Some(id) => {
-            let bs_client = bsmcp_common::bookstack::BookStackClient::new(
-                &state.bookstack_url,
-                &token_id,
-                &token_secret,
-                state.http_client.clone(),
-            );
-            bs_client
-                .get_shelf(id)
-                .await
-                .ok()
-                .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
-                .map(|name| format!(" Currently set to: {} ({})", name, id))
-                .unwrap_or_default()
-        }
-        None => String::new(),
-    };
-
-    let tool_defaults_section = render_tool_defaults_section(&globals, &settings);
-    Html(render_settings_page(
-        &settings,
-        &globals,
-        &user_journals_shelf_summary,
-        &tool_defaults_section,
-    ))
-    .into_response()
+    Html(render_settings_page(&settings, &globals)).into_response()
 }
 
 #[derive(Deserialize, Default)]
@@ -244,22 +204,9 @@ pub struct SettingsForm {
 pub async fn handle_settings_post(
     State(state): State<AppState>,
     headers: HeaderMap,
-    RawForm(body): RawForm,
+    Form(form): Form<SettingsForm>,
 ) -> Response {
-    // Parse the urlencoded body into both:
-    //   1. The typed `SettingsForm` (the long-standing per-user / per-global
-    //      fields). serde_urlencoded handles this directly.
-    //   2. A flat (key, value) list, so we can pluck out the
-    //      dynamically-named `tool_default_<name>` checkboxes added in
-    //      Phase 2.4d. serde_urlencoded can't deserialize variable-name
-    //      fields into a typed struct, so the extra pass over the raw
-    //      bytes is unavoidable.
-    let body_str = std::str::from_utf8(&body).unwrap_or("");
-    let form: SettingsForm = serde_urlencoded::from_str(body_str).unwrap_or_default();
-    let raw_pairs: Vec<(String, String)> =
-        serde_urlencoded::from_str(body_str).unwrap_or_default();
-
-    let (token_id, token_secret) = match resolve_session_creds(&headers, &state.settings_sessions).await {
+    let (token_id, token_secret) = match resolve_session(&headers, &state.settings_sessions).await {
         Some(creds) => creds,
         None => return Redirect::to("/authorize?response_type=code&client_id=settings-ui&redirect_uri=/settings&code_challenge=&code_challenge_method=&return_to=/settings").into_response(),
     };
@@ -313,7 +260,6 @@ pub async fn handle_settings_post(
         globals.strict_setup = checkbox(&form.strict_setup);
         globals.hive_shelf_id = parse_optional_i64(&form.hive_shelf_id);
         globals.user_journals_shelf_id = parse_optional_i64(&form.user_journals_shelf_id);
-        globals.tool_defaults = parse_tool_defaults(&raw_pairs);
         if let Err(e) = state.db.save_global_settings(&globals, &token_id_hash).await {
             return error_response(format!("Failed to save global settings: {e}"));
         }
@@ -380,47 +326,6 @@ fn checkbox(v: &Option<String>) -> bool {
     matches!(v.as_deref(), Some("on") | Some("true") | Some("1"))
 }
 
-/// Phase 2.4d. Pull the per-tool admin defaults out of the raw form pairs.
-/// The form emits a `tool_listed_<name>` marker for every tool present
-/// (so a missing checkbox is distinguishable from a tool that wasn't
-/// rendered) plus an optional `tool_default_<name>=on` for each checked
-/// one. Returns an explicit on/off entry for every listed tool — absent
-/// keys mean "no admin default set" and `is_tool_enabled` will fall
-/// through to the on-by-default branch.
-///
-/// This keeps the on-disk shape clean: we don't need to write `true` for
-/// every tool just to say "it's on by default." The map only ever
-/// captures the admin's explicit overrides.
-fn parse_tool_defaults(
-    pairs: &[(String, String)],
-) -> std::collections::HashMap<String, bool> {
-    use std::collections::{HashMap, HashSet};
-
-    let mut listed: HashSet<String> = HashSet::new();
-    let mut on: HashSet<String> = HashSet::new();
-    for (k, v) in pairs {
-        if let Some(name) = k.strip_prefix("tool_listed_") {
-            if !name.is_empty() {
-                listed.insert(name.to_string());
-            }
-        } else if let Some(name) = k.strip_prefix("tool_default_") {
-            if !name.is_empty() && matches!(v.as_str(), "on" | "true" | "1") {
-                on.insert(name.to_string());
-            }
-        }
-    }
-
-    // Keep only "off" explicit overrides; leave "on" tools out of the
-    // map entirely so the default-ON contract holds without any storage.
-    // (If we wrote `true` for every listed tool we'd grow the map every
-    // settings save with no semantic difference from leaving it empty.)
-    listed
-        .into_iter()
-        .filter(|name| !on.contains(name))
-        .map(|name| (name, false))
-        .collect::<HashMap<_, _>>()
-}
-
 fn now_unix() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -462,64 +367,7 @@ fn render_kb_scope_picker(name: &str, label: &str, scope: &Option<KbScope>) -> S
     )
 }
 
-/// Phase 2.4d. Build the "Tool defaults (admin only)" section. Sources
-/// the tool list from `mcp::all_tool_names()` so the form stays in sync
-/// with whatever the server actually advertises — no hardcoded list.
-/// Each row carries a hidden `tool_listed_<name>` marker so the POST
-/// handler can distinguish "checkbox unchecked" from "tool not in form."
-///
-/// TODO(2.4e onboarding): the per-user override UI for these same tools
-/// lives in the onboarding setup page, not here. Users will be able to
-/// flip individual tools on or off (over the admin default) from there;
-/// `UserSettings.tool_overrides` already wires it up end-to-end. Linked
-/// from the "(your override: ...)" annotation on each row.
-fn render_tool_defaults_section(g: &GlobalSettings, s: &UserSettings) -> String {
-    let mut rows = String::new();
-    for name in mcp::all_tool_names() {
-        // Effective admin default: explicit value if set, else on.
-        let admin_on = g.tool_defaults.get(&name).copied().unwrap_or(true);
-        // Best-effort note when the calling user has overridden the
-        // global default in their per-user settings. Visible only to
-        // the user themselves (we don't render other users' overrides);
-        // the user-facing override UI lands in sub-PR 2.4e on the
-        // onboarding setup page.
-        let user_override_note = match s.tool_overrides.get(&name) {
-            Some(true) => " <span class=\"note\">(your override: ON)</span>",
-            Some(false) => " <span class=\"note\">(your override: OFF)</span>",
-            None => "",
-        };
-        let escaped_name = html_escape(&name);
-        let checked = if admin_on { " checked" } else { "" };
-        rows.push_str(&format!(
-            "<label class=\"tool-row\"><input type=\"hidden\" name=\"tool_listed_{name}\" value=\"1\">\
-             <input type=\"checkbox\" name=\"tool_default_{name}\"{checked}> \
-             <code>{escaped_name}</code>{user_override_note}</label>\n",
-            name = escaped_name,
-            checked = checked,
-            escaped_name = escaped_name,
-            user_override_note = user_override_note,
-        ));
-    }
-
-    format!(
-        r#"
-  <h2>Tool defaults (admin only)</h2>
-  <p class="help">Per-tool admin default. Unchecked = disabled by default for all users (a user can still re-enable in their own settings via <code>/setup/user</code>). Checked = on. Tools not listed at all default ON.</p>
-  <p class="help"><strong>Memory-protocol tools ship default OFF on a fresh install</strong> (<code>briefing</code>, <code>journal</code>, <code>identity</code>, <code>reminders</code>, <code>events</code>, <code>sessions</code>, <code>migrate</code>, <code>user</code>, <code>config</code>, <code>directory</code>, <code>session_event</code>, <code>dismiss_setup_nudge</code>) so the AI sees just KB CRUD + semantic search until you opt in. Toggle them on here for everyone, or let users enable per-account in <code>/setup/user</code>. Note: disabling <code>briefing</code> kills <code>meta.briefing</code> auto-injection on every tool response, so the AI loses session context — re-enable if you want the AI to know what time it is.</p>
-  <div class="tool-defaults">
-    {rows}
-  </div>
-"#,
-        rows = rows
-    )
-}
-
-fn render_settings_page(
-    s: &UserSettings,
-    g: &GlobalSettings,
-    user_journals_shelf_summary: &str,
-    tool_defaults_section: &str,
-) -> String {
+fn render_settings_page(s: &UserSettings, g: &GlobalSettings) -> String {
     let domains = s.domains.join(", ");
     let system_prompt = s.system_prompt_page_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
     let org_domains = g.org_domains.join(", ");
@@ -550,9 +398,6 @@ textarea {{ min-height: 4em; }}
 button {{ margin-top: 1.5em; padding: 0.6em 1.2em; font-size: 1em; cursor: pointer; }}
 .scope-picker {{ margin: 0.8em 0; display: grid; grid-template-columns: 1fr auto; gap: 0.5em; align-items: end; }}
 .scope-picker label {{ grid-column: 1 / -1; }}
-.tool-defaults {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 0.3em 1em; margin: 0.5em 0; }}
-.tool-defaults .tool-row {{ display: flex; align-items: center; gap: 0.4em; font-weight: normal; margin: 0; }}
-.tool-defaults code {{ font-size: 0.9em; }}
 </style>
 </head>
 <body>
@@ -590,9 +435,8 @@ button {{ margin-top: 1.5em; padding: 0.6em 1.2em; font-size: 1em; cursor: point
   <label><input type="checkbox" name="full_content_in_briefing" {fc_checked}> full_content_in_briefing</label>
   <label><input type="checkbox" name="strict_setup" {ss_checked}> strict_setup (block tools until configured)</label>
   <label>hive_shelf_id <input type="number" name="hive_shelf_id" value="{hive_shelf_id}"></label>
-  <label>User Journals shelf <input type="number" name="user_journals_shelf_id" value="{user_journals_shelf_id}"></label>
-  <p class="help">BookStack shelf where each user's personal Journal book lives. Required to enable remember_user_journal / remember_agent_journal.{user_journals_shelf_summary}</p>
-{tool_defaults_section}
+  <label>user_journals_shelf_id <input type="number" name="user_journals_shelf_id" value="{user_journals_shelf_id}"></label>
+
   <button type="submit">Save</button>
 </form>
 </body>
@@ -618,91 +462,5 @@ button {{ margin-top: 1.5em; padding: 0.6em 1.2em; font-size: 1em; cursor: point
         ss_checked = if g.strict_setup { "checked" } else { "" },
         hive_shelf_id = g.hive_shelf_id.map(|i| i.to_string()).unwrap_or_default(),
         user_journals_shelf_id = g.user_journals_shelf_id.map(|i| i.to_string()).unwrap_or_default(),
-        user_journals_shelf_summary = html_escape(user_journals_shelf_summary),
-        tool_defaults_section = tool_defaults_section,
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn pair(k: &str, v: &str) -> (String, String) {
-        (k.to_string(), v.to_string())
-    }
-
-    #[test]
-    fn parse_tool_defaults_marks_unchecked_listed_tools_as_off() {
-        // Form rendered three tools, user unchecked one.
-        let pairs = vec![
-            pair("tool_listed_briefing", "1"),
-            pair("tool_default_briefing", "on"),
-            pair("tool_listed_journal", "1"),
-            pair("tool_default_journal", "on"),
-            pair("tool_listed_identity", "1"),
-            // identity intentionally not checked
-        ];
-        let map = parse_tool_defaults(&pairs);
-        assert_eq!(map.get("identity"), Some(&false));
-        // Checked tools left out (default-ON, no need to store true).
-        assert!(!map.contains_key("briefing"));
-        assert!(!map.contains_key("journal"));
-    }
-
-    #[test]
-    fn parse_tool_defaults_ignores_unrelated_pairs() {
-        let pairs = vec![
-            pair("label", "DTC"),
-            pair("guide_page_id", "42"),
-            pair("tool_listed_journal", "1"),
-            // No tool_default_journal — unchecked, so journal=false.
-        ];
-        let map = parse_tool_defaults(&pairs);
-        assert_eq!(map, [("journal".to_string(), false)].into_iter().collect());
-    }
-
-    #[test]
-    fn parse_tool_defaults_empty_when_no_listed_keys() {
-        // No `tool_listed_*` keys = admin section absent. Result is empty
-        // even if a stray `tool_default_*` shows up.
-        let pairs = vec![pair("tool_default_journal", "on")];
-        let map = parse_tool_defaults(&pairs);
-        assert!(map.is_empty());
-    }
-
-    #[test]
-    fn render_tool_defaults_section_lists_every_advertised_tool() {
-        let g = GlobalSettings::default();
-        let s = UserSettings::default();
-        let html = render_tool_defaults_section(&g, &s);
-        for name in mcp::all_tool_names() {
-            assert!(
-                html.contains(&format!("tool_listed_{name}")),
-                "missing hidden marker for {name}"
-            );
-        }
-    }
-
-    #[test]
-    fn render_tool_defaults_section_marks_admin_off_unchecked() {
-        let mut g = GlobalSettings::default();
-        // Use a known stable tool name from the catalog.
-        g.tool_defaults.insert("search_content".to_string(), false);
-        let s = UserSettings::default();
-        let html = render_tool_defaults_section(&g, &s);
-
-        // The search_content checkbox row should NOT carry " checked".
-        // Find the row by its hidden marker, then walk backwards a
-        // small window to confirm the checkbox is absent of "checked".
-        let marker = "tool_listed_search_content";
-        let pos = html.find(marker).expect("search_content row missing");
-        // The label spans a single line; the checkbox lives within
-        // ~200 chars after the marker.
-        let window_end = (pos + 400).min(html.len());
-        let window = &html[pos..window_end];
-        assert!(
-            !window.contains("type=\"checkbox\" name=\"tool_default_search_content\" checked"),
-            "search_content should be unchecked when admin set it false"
-        );
-    }
 }

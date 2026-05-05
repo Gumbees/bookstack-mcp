@@ -8,9 +8,7 @@ use pulldown_cmark::{html, Options, Parser};
 
 use bsmcp_common::bookstack::{self, BookStackClient, ContentType, ExportFormat};
 use bsmcp_common::db::DbBackend;
-use bsmcp_common::settings::is_tool_enabled;
 use crate::briefing;
-use crate::directory::DirectoryService;
 use crate::semantic::{trim_match, SemanticState};
 use crate::session::{self, SessionStore};
 
@@ -22,10 +20,9 @@ const PROTOCOL_VERSION: &str = "2025-03-26";
 pub struct BriefingDeps {
     pub db: Arc<dyn DbBackend>,
     pub semantic: Option<Arc<SemanticState>>,
-    /// Drives the per-session meta-injection: first call in a session gets
-    /// the full briefing under `meta.briefing_pending`, every call gets the
-    /// directory snapshot or its `{version, hash}` pointer under
-    /// `meta.directory`.
+    /// Drives the `meta.briefing` auto-injection: tracks per-`(token_hash,
+    /// session_id)` state so the first tool call in a session gets the full
+    /// briefing payload and subsequent calls get sticky-only.
     pub session_store: SessionStore,
     pub token_id: String,
     /// Token-hash for session-store lookups (avoids redundant SHA-256 work
@@ -33,14 +30,10 @@ pub struct BriefingDeps {
     pub token_id_hash: String,
     /// Optional client-supplied session id. Streamable HTTP carries it in
     /// the `Mcp-Session-Id` header; SSE carries it as the `?sessionId=`
-    /// query param. When absent, `session_key` falls back to a stable
-    /// `no-session` slot per token so the user still gets a single coarse
-    /// session.
+    /// query param. When absent, `session_key` falls back to a per-hour
+    /// bucket per token so the user still gets a coarse "first call this
+    /// hour" notion.
     pub session_id: Option<String>,
-    /// Directory cache. Sourced from `AppState`; passed through every
-    /// remember dispatch + auto-attached to every MCP response's
-    /// `meta.directory`.
-    pub directory: Arc<DirectoryService>,
 }
 
 pub async fn handle_request(
@@ -78,80 +71,16 @@ pub async fn handle_request(
             })))
         }
         "notifications/initialized" => None,
-        "tools/list" => {
-            // Filter the tool list by per-user + global enable/disable
-            // settings. Both lookups are cheap (one row each, server-side
-            // only) and the filter is best-effort: if either lookup
-            // errors out we fall back to the unfiltered list rather than
-            // hand the client an empty or partial response.
-            //
-            // The token_id_hash is always present in BriefingDeps for
-            // authenticated transports — sse.rs and the streamable
-            // handler both populate it. There's no anonymous tools/list
-            // entry point in this server today; if one is added later,
-            // it should call `tool_definitions(...)` directly without the
-            // filter.
-            let user_settings = deps
-                .db
-                .get_user_settings(&deps.token_id_hash)
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            let global_settings = deps
-                .db
-                .get_global_settings()
-                .await
-                .unwrap_or_default();
-            let tools = filter_tools_by_enabled(
-                tool_definitions(semantic.is_some()),
-                &user_settings,
-                &global_settings,
-            );
-            Some(json_rpc_result(id, json!({ "tools": tools })))
-        }
+        "tools/list" => Some(json_rpc_result(id, json!({ "tools": tool_definitions(semantic.is_some()) }))),
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-
-            // Decide pre-tool whether to attach `meta.briefing_pending`. The
-            // session record_call flip happens BEFORE execute_tool so that
-            // an explicit `briefing` call in the same JSON-RPC
-            // request won't double-set the flag (mark_compacted resets it).
-            //
-            // Phase 2.4d: also short-circuit when the `briefing` tool itself
-            // is disabled for this caller (per-user override or admin
-            // default). User opted out — skip the work. Deliberately don't
-            // record_call in that branch so that re-enabling briefing later
-            // restores the first-call full-injection behavior.
-            let briefing_tool_enabled = {
-                let user_settings = deps
-                    .db
-                    .get_user_settings(&deps.token_id_hash)
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-                let global_settings = deps
-                    .db
-                    .get_global_settings()
-                    .await
-                    .unwrap_or_default();
-                is_tool_enabled("briefing", &user_settings, &global_settings)
-            };
-            let attach_briefing_pending = name != "briefing"
-                && briefing_enabled()
-                && briefing_tool_enabled
-                && {
-                    let key = session::session_key(
-                        &deps.token_id_hash,
-                        deps.session_id.as_deref(),
-                    );
-                    session::record_call(&deps.session_store, &key).await
-                };
-
             let result = execute_tool(name, &args, client, semantic, staging, deps).await;
 
+            // Build the tool-result object first so we can decorate it with
+            // `meta.briefing`. The meta-injection runs for every tool except
+            // `briefing` itself (where the response IS the briefing — duplicating
+            // it under meta would be wasteful).
             let mut tool_result = match result {
                 Ok(text) => json!({
                     "content": [{ "type": "text", "text": text }],
@@ -162,20 +91,30 @@ pub async fn handle_request(
                 }),
             };
 
-            // Build the per-response meta envelope: always-present time +
-            // directory pointer/full + first-call briefing_pending. Time
-            // and directory ride on every response (cheap); briefing_pending
-            // only on the first non-briefing call per session.
-            let meta = build_response_meta(
-                &args,
-                id,
-                attach_briefing_pending,
-                client,
-                deps,
-            )
-            .await;
-            if let Value::Object(ref mut m) = tool_result {
-                m.insert("meta".to_string(), meta);
+            if name != "briefing" && briefing_enabled() {
+                // Calling `briefing` explicitly resets the session via task 5;
+                // for every other tool, record_call decides full-vs-sticky.
+                let key = session::session_key(&deps.token_id_hash, deps.session_id.as_deref());
+                let was_first = session::record_call(&deps.session_store, &key).await;
+                let body_for_briefing = build_briefing_meta_body(&args, id);
+                let meta_briefing = briefing::build_meta_briefing(
+                    body_for_briefing,
+                    &deps.token_id,
+                    client,
+                    deps.db.clone(),
+                    deps.semantic.clone(),
+                    was_first,
+                )
+                .await;
+
+                if let Value::Object(ref mut m) = tool_result {
+                    let meta_entry = m
+                        .entry("meta".to_string())
+                        .or_insert_with(|| json!({}));
+                    if let Value::Object(ref mut meta) = meta_entry {
+                        meta.insert("briefing".to_string(), meta_briefing);
+                    }
+                }
             }
 
             Some(json_rpc_result(id, tool_result))
@@ -202,175 +141,6 @@ fn build_briefing_meta_body(args: &Value, request_id: Option<&Value>) -> Value {
     body
 }
 
-/// Build the `meta` block decorating every MCP `tools/call` response.
-///
-/// Always present:
-/// - `time` — `{ iso, tz, unix }` in the user's timezone (UTC if unset).
-/// - `directory` — full snapshot if the session hasn't seen the current
-///   `version` yet, otherwise a `{version, hash, built_at, shape: "pointer"}`
-///   stub the AI can ignore.
-///
-/// First non-briefing tool call per session also gets:
-/// - `briefing_pending` — `{message, briefing}` where `briefing` is the
-///   complete briefing payload. After this attaches once, the session flag
-///   flips and subsequent calls skip it.
-///
-/// Until the user completes the `/setup/user` wizard, every call also gets:
-/// - `onboarding_pending` — `{message, url}`. Unlike `briefing_pending`
-///   this is NOT one-shot: it rides on every response until
-///   `UserSettings.setup_complete` flips. Gated by `BSMCP_ONBOARDING_ENABLED`
-///   (default on); see `is_onboarding_visible`.
-///
-/// For BookStack admins on a freshly-installed instance, every call also
-/// gets:
-/// - `admin_onboarding_pending` — `{message, url}`. Same shape as
-///   `onboarding_pending` but pointed at `/setup/admin`. "Run once"
-///   semantics — the first admin to submit the wizard flips the org-wide
-///   `GlobalSettings.admin_setup_complete` flag and the nudge stops for
-///   every admin. `BSMCP_FORCE_ADMIN_SETUP=1` env override re-arms the
-///   nudge for ops recovery without touching the DB.
-async fn build_response_meta(
-    args: &Value,
-    request_id: Option<&Value>,
-    attach_briefing_pending: bool,
-    client: &BookStackClient,
-    deps: &BriefingDeps,
-) -> Value {
-    let mut settings = deps
-        .db
-        .get_user_settings(&deps.token_id_hash)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-
-    let mut meta = json!({
-        "time": build_response_time_block(&settings),
-        "directory": build_response_directory_block(deps).await,
-    });
-
-    if attach_briefing_pending {
-        let body = build_briefing_meta_body(args, request_id);
-        let briefing_payload = briefing::build_meta_briefing(
-            body,
-            &deps.token_id,
-            client,
-            deps.db.clone(),
-            deps.semantic.clone(),
-            true,
-        )
-        .await;
-        meta["briefing_pending"] = json!({
-            "message": "You didn't run your briefing yet, here it is..",
-            "briefing": briefing_payload,
-        });
-    }
-
-    if is_onboarding_visible(onboarding_enabled(), settings.setup_complete) {
-        meta["onboarding_pending"] = build_onboarding_pending_meta();
-    }
-
-    // Admin onboarding nudge. Independent from the per-user `setup_complete`
-    // gate above: a single agent who is both a first-time user AND a
-    // BookStack admin can see BOTH `onboarding_pending` and
-    // `admin_onboarding_pending` on the same response (different keys, no
-    // conflict).
-    //
-    // The admin-status check has to do real work (refresh the cache when
-    // stale, hit BookStack's `/api/users/{id}` endpoint). To stay fast on
-    // the hot path we:
-    //   1. Skip entirely when env or global flag already says "no".
-    //   2. Use the user's existing cached bit via `resolve_is_admin_cached`.
-    //      That helper refreshes opportunistically when stale — the brief
-    //      asks for a "background" refresh, but the cache TTL is 24h so
-    //      paying one BookStack round-trip per day per user is acceptable
-    //      and keeps the implementation synchronous and deterministic.
-    //   3. If admin status can't be determined (no bookstack_user_id, or
-    //      the BookStack call errored with no stale cache to fall back
-    //      on), `resolve_is_admin_cached` returns None — we treat that as
-    //      "not admin" so non-admins never get nagged.
-    let global_settings = deps.db.get_global_settings().await.unwrap_or_default();
-    let force_override = crate::setup_ui::force_admin_setup_env();
-    let effective_complete = crate::setup_ui::effective_admin_setup_complete(
-        global_settings.admin_setup_complete,
-        force_override,
-    );
-    if onboarding_enabled() && !effective_complete {
-        let user_is_admin = crate::setup_ui::resolve_is_admin_cached(
-            &deps.token_id_hash,
-            &mut settings,
-            client,
-            deps.db.clone(),
-        )
-        .await
-        .unwrap_or(false);
-        if crate::setup_ui::is_admin_onboarding_visible(true, false, user_is_admin) {
-            meta["admin_onboarding_pending"] = build_admin_onboarding_pending_meta();
-        }
-    }
-
-    meta
-}
-
-/// Compact time block: ISO-8601 with explicit offset, IANA tz name, unix
-/// seconds. Distinct from `briefing::envelope::build_time_block` (which
-/// emits a verbose, multi-field block tuned for the briefing payload).
-fn build_response_time_block(settings: &bsmcp_common::settings::UserSettings) -> Value {
-    let now = chrono::Utc::now();
-    let unix = now.timestamp();
-    let (iso, tz_name) = match settings
-        .timezone
-        .as_deref()
-        .and_then(|s| s.parse::<chrono_tz::Tz>().ok())
-    {
-        Some(tz) => {
-            let local = now.with_timezone(&tz);
-            (
-                local.format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
-                tz.name().to_string(),
-            )
-        }
-        None => (now.format("%Y-%m-%dT%H:%M:%S+00:00").to_string(), "UTC".to_string()),
-    };
-    json!({ "iso": iso, "tz": tz_name, "unix": unix })
-}
-
-/// Directory pointer-or-full block. Bumps the session's
-/// `last_directory_version` when attaching the full snapshot so the next
-/// call gets the cheap pointer.
-async fn build_response_directory_block(deps: &BriefingDeps) -> Value {
-    let snapshot = deps.directory.current().await;
-    let key = session::session_key(&deps.token_id_hash, deps.session_id.as_deref());
-    let needs_full = session::take_directory_version(
-        &deps.session_store,
-        &key,
-        snapshot.version,
-    )
-    .await;
-    if needs_full {
-        // Full attach. Returning the snapshot verbatim — the receiving AI
-        // pulls `version` and `content_hash` from it.
-        serde_json::to_value(&*snapshot).unwrap_or_else(|_| {
-            json!({
-                "version": snapshot.version,
-                "content_hash": snapshot.content_hash,
-                "built_at": snapshot.built_at,
-                "shape": "error_serializing",
-            })
-        })
-    } else {
-        // Pointer. Includes built_at so the AI can tell how stale the
-        // cache the server is holding is, without paying for the full
-        // tree. (See sub-PR 2.2 report for the rationale.)
-        json!({
-            "version": snapshot.version,
-            "hash": snapshot.content_hash,
-            "built_at": snapshot.built_at,
-            "shape": "pointer",
-        })
-    }
-}
-
 fn json_rpc_result(id: Option<&Value>, result: Value) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -395,39 +165,12 @@ async fn execute_tool(
     staging: &crate::staging::StagingStore,
     deps: &BriefingDeps,
 ) -> Result<String, String> {
-    // Per-user + global tool enable/disable guard. Defense-in-depth:
-    // tools/list already filters disabled tools out of the catalog, but a
-    // determined client could still issue a call by name. Refuse cleanly
-    // with a structured `tool_disabled` error rather than silently running
-    // the work.
-    //
-    // Lookups are best-effort: if either fails we default to enabled
-    // (matches the helper's "absent = on" semantics) — same posture the
-    // `tools/list` filter takes when the DB is unhappy.
-    let user_settings = deps
-        .db
-        .get_user_settings(&deps.token_id_hash)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let global_settings = deps
-        .db
-        .get_global_settings()
-        .await
-        .unwrap_or_default();
-    if !is_tool_enabled(name, &user_settings, &global_settings) {
-        return Err(tool_disabled_error(name));
-    }
-
-    // `briefing` is the top-level entry into the briefing subsystem
-    // (besides auto-injection on every other tool's response meta). The
-    // memory-protocol tools (`briefing` / `user` / `config` / `directory`
-    // / `identity`) are first-class primitives — no `remember_` prefix.
+    // The `briefing` tool is the only top-level entry into the briefing
+    // subsystem (besides auto-injection on every other tool's response meta).
     if name == "briefing" {
         if !briefing_enabled() {
             return Err(
-                "briefing disabled (BSMCP_BRIEFING_ENABLED=false on this server)".to_string(),
+                "Briefing disabled (BSMCP_BRIEFING_ENABLED=false on this server)".to_string(),
             );
         }
         let mut body = args.clone();
@@ -439,20 +182,14 @@ async fn execute_tool(
         if let Value::Object(ref mut map) = body {
             map.remove("action");
         }
-        // Mark the session as having received its briefing in-band so the
-        // next non-briefing tool call doesn't re-emit it under
-        // `meta.briefing_pending`. The post-compaction reset (which sets
-        // `needs_full_briefing = true` again) lives in the
-        // `session_event action=compacted` tool, NOT here — calling
-        // briefing manually means "I want it now", not "I just lost
-        // context".
-        //
+        // Calling `briefing` explicitly resets the session for the next
+        // response — useful after the AI gets compacted by its harness.
         // Honor the tool's own `session_id` arg if present (lets a client
-        // without HTTP-header session_id support still drive its session
-        // state explicitly); otherwise fall back to the transport-layer id.
+        // without HTTP-header session_id support still get sticky-vs-full
+        // behavior); otherwise fall back to the transport-layer id.
         let effective_sid = arg_session_id.as_deref().or(deps.session_id.as_deref());
         let key = session::session_key(&deps.token_id_hash, effective_sid);
-        session::mark_briefing_delivered(&deps.session_store, &key).await;
+        session::mark_compacted(&deps.session_store, &key).await;
 
         let envelope = briefing::read(
             body,
@@ -460,33 +197,6 @@ async fn execute_tool(
             client,
             deps.db.clone(),
             deps.semantic.clone(),
-        )
-        .await;
-        return Ok(serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| envelope.to_string()));
-    }
-
-    // `user` / `config` / `directory` / `identity` route through the
-    // `/remember/v1/{resource}/{action}` dispatcher. The MCP arg shape is
-    // FLAT: `action` plus the resource-specific fields at the top level.
-    // We pull `action` out and re-collect everything else into the `body`
-    // map the dispatcher expects.
-    if let Some(resource) = remember_resource(name) {
-        if !briefing_enabled() {
-            return Err(format!(
-                "{name} disabled (BSMCP_BRIEFING_ENABLED=false on this server)"
-            ));
-        }
-        let action = arg_str(args, "action")?;
-        let body = flatten_remember_args(args);
-        let envelope = crate::remember::dispatch(
-            resource,
-            &action,
-            body,
-            &deps.token_id,
-            client,
-            deps.db.clone(),
-            deps.semantic.clone(),
-            Some(deps.directory.clone()),
         )
         .await;
         return Ok(serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| envelope.to_string()));
@@ -1726,7 +1436,7 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool, su
          `user_prompt`. It returns time, system_prompt_additions (guide page, org_identity, \
          org_required_instructions, org_ai_usage_policy, user-supplied pages, owned-domains), \
          kb_semantic_matches against the prompt, and a `setup_nudge` block when settings are \
-         incomplete. Equivalent to POST /briefing/v1/read or POST /remember/v1/briefing/read.\n\n\
+         incomplete. Equivalent to POST /briefing/v1/read.\n\n\
          The briefing payload is also auto-injected as `meta.briefing` on every other tool \
          response — full content on the first call per session, sticky-only (time + setup \
          summary) thereafter. After your harness compacts you and you lose context, call \
@@ -1946,58 +1656,6 @@ async fn build_structure(client: &BookStackClient) -> Option<String> {
 }
 
 // --- Tool definitions ---
-
-/// All tool names this server can advertise — the union of every tool
-/// `tool_definitions` would emit with semantic search enabled. Single
-/// source of truth for the settings UI's per-tool toggle list (Phase 2.4d)
-/// and any future code that needs to enumerate the catalog. Order matches
-/// `tool_definitions(true)` so the UI lays toggles out the same way the
-/// MCP `tools/list` reply does.
-pub fn all_tool_names() -> Vec<String> {
-    tool_definitions(true)
-        .into_iter()
-        .filter_map(|t| t.get("name").and_then(|v| v.as_str()).map(String::from))
-        .collect()
-}
-
-/// Filter a `tool_definitions(...)` Vec down to the tools enabled for the
-/// given (user, global) settings pair. Used by the MCP `tools/list`
-/// handler so the catalog the AI sees matches what `execute_tool` will
-/// actually run. Tools without a `name` field are kept (defensive — the
-/// shape only ever omits `name` if `tool_definitions` itself is broken).
-fn filter_tools_by_enabled(
-    tools: Vec<Value>,
-    user: &bsmcp_common::settings::UserSettings,
-    global: &bsmcp_common::settings::GlobalSettings,
-) -> Vec<Value> {
-    tools
-        .into_iter()
-        .filter(|t| {
-            t.get("name")
-                .and_then(|v| v.as_str())
-                .map(|n| is_tool_enabled(n, user, global))
-                .unwrap_or(true)
-        })
-        .collect()
-}
-
-/// Render the structured error returned by `execute_tool` when a tool is
-/// disabled. Matches the brief's contract — JSON-encoded so the upstream
-/// `Err -> "Error: {e}"` envelope still surfaces an inspectable shape to
-/// the client.
-fn tool_disabled_error(name: &str) -> String {
-    let payload = json!({
-        "error": {
-            "code": "tool_disabled",
-            "message": format!(
-                "Tool '{name}' is disabled in your settings or by the admin"
-            ),
-        }
-    });
-    serde_json::to_string(&payload).unwrap_or_else(|_| {
-        format!("tool_disabled: '{name}' is disabled in your settings or by the admin")
-    })
-}
 
 pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
     let mut tools = vec![
@@ -2397,282 +2055,6 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             }),
         }));
         tools.push(tool(
-            "user",
-            "Read or write the per-user UserSettings row. `action: 'read'` returns the current settings (no secrets). `action: 'write'` requires a `patch` object alongside `action` and merges it into existing settings — keys not provided are preserved. Use this to set label, role, user_id, bookstack_user_id, domains, system_prompt_page_ids, timezone, semantic_against_full_kb.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["read", "write"],
-                        "description": "Operation to perform"
-                    },
-                    "patch": {
-                        "type": "object",
-                        "description": "For `write`: the {field: value, ...} object to merge into UserSettings."
-                    }
-                },
-                "required": ["action"]
-            }),
-        ));
-        tools.push(tool(
-            "config",
-            "Read or write the per-user config_extras K/V store, or dismiss the briefing's setup_nudge. `action: 'read'` returns the current config. `action: 'write'` accepts a top-level `config: {key: value, ...}` (string values, pass null to delete a key) and merges into existing extras. `action: 'dismiss_setup_nudge'` accepts a top-level `days: int` (1..=365) and snoozes the briefing nudge.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["read", "write", "dismiss_setup_nudge"],
-                        "description": "Operation to perform"
-                    },
-                    "config": {
-                        "type": "object",
-                        "description": "For `write`: the {key: value, ...} object to merge into config_extras."
-                    },
-                    "days": {
-                        "type": "integer",
-                        "description": "For `dismiss_setup_nudge`: how many days to suppress the nudge (1..=365).",
-                        "minimum": 1,
-                        "maximum": 365
-                    }
-                },
-                "required": ["action"]
-            }),
-        ));
-        tools.push(tool(
-            "directory",
-            "Return the in-memory directory tree (shelves -> books -> chapters -> pages, plus orphan books) with names, slugs, ids, and page updated_at timestamps. Built from the index DB, refreshed automatically on BookStack webhook events. The same snapshot auto-attaches to every MCP tool response under `meta.directory` (full first call per session, then a `{version, hash}` pointer); call this tool to force a re-pull.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["read"],
-                        "description": "Only `read` is supported."
-                    }
-                },
-                "required": ["action"]
-            }),
-        ));
-        tools.push(tool(
-            "identity",
-            "Read or write the user-identity narrative or a per-agent AI-identity narrative. Layout: a single `User Identity` chapter+page (target='user') and one `AI Identity: {agent_name}` chapter+page per agent (target='agent'), all inside the user's per-user Journal book. Pages are raw markdown the AI writes wholesale — no append-only, no time-stamped sections. Bootstrap fires on first read or first write when the chapter/page is missing; the seed contains name+email frontmatter and a 'replace this content' marker the AI overwrites on its first `write`. Returns `{content, page_id, chapter_id, bootstrapped}` on read; `{page_id, chapter_id, bytes_written}` on write. `agent_name` is normalized to lowercase ASCII alphanumerics + dashes/underscores; whitespace becomes a dash.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["read", "write"],
-                        "description": "Operation to perform"
-                    },
-                    "target": {
-                        "type": "string",
-                        "enum": ["user", "agent"],
-                        "description": "Whose identity to read/write. `user` = the human's identity narrative (one per user). `agent` = the named AI agent's identity (one per (user, agent_name) pair)."
-                    },
-                    "agent_name": {
-                        "type": "string",
-                        "description": "Required when target='agent'. Free-form name; normalized to lowercase ASCII alphanumerics + dashes/underscores (whitespace -> dash). Rejected if normalization yields empty or contains other characters."
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "Required when action='write'. Raw markdown body — overwrites the page wholesale. Do NOT include the page title as an H1; BookStack renders the page name as an H1 automatically."
-                    }
-                },
-                "required": ["action", "target"]
-            }),
-        ));
-        tools.push(tool(
-            "journal",
-            "Append-only structured journal entries on the user's per-user Journal book. Layout: monthly chapter `{YYYY-MM}-{name}` containing daily page `{YYYY-MM-DD}-{name}`, where `name` is the user's first name (entry_type='user') or the normalized agent name (entry_type='agent'). `action: 'write'` appends a `## YYYY-MM-DD HH:MM:SS TZ` section to the daily page (creates chapter+page on demand if missing). `action: 'read'` returns the daily page's full markdown body, defaulting to today in user TZ; pass `date: 'YYYY-MM-DD'` to read a specific day. Read is passive: missing pages return `{exists: false, content: null}` instead of bootstrapping. `agent_name` normalization matches the identity tool: lowercase ASCII alphanumerics + dashes/underscores; whitespace becomes a dash.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["read", "write"],
-                        "description": "Operation to perform"
-                    },
-                    "entry_type": {
-                        "type": "string",
-                        "enum": ["user", "agent"],
-                        "description": "Whose journal to read/write. `user` = the human's daily journal. `agent` = the named AI agent's daily journal."
-                    },
-                    "agent_name": {
-                        "type": "string",
-                        "description": "Required when entry_type='agent'. Free-form name; normalized to lowercase ASCII alphanumerics + dashes/underscores (whitespace -> dash)."
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "Required when action='write'. Markdown body for the new section. Appended below any prior sections on the same daily page — never overwrites."
-                    },
-                    "date": {
-                        "type": "string",
-                        "description": "Optional for action='read'. Format YYYY-MM-DD. Defaults to today in the user's timezone."
-                    }
-                },
-                "required": ["action", "entry_type"]
-            }),
-        ));
-        tools.push(tool(
-            "migrate",
-            "Import legacy journal content into the v1.0.0 per-user-Journal-book layout. Three actions: \
-             `list_sources` (returns the books on the User Journals shelf the calling user can see, with `owned` and `page_count`), \
-             `plan` (DRY RUN — walks the source `book_id`, parses each page name for `YYYY-MM-DD` (with H1 fallback), and returns the projected target chapter+page names per the v1.0.0 layout), \
-             `execute` (imports the chosen pages — for each source page, fetches its markdown body and appends a single `## Imported from {source_name} — {original_updated_at}` section to the per-day target page; one block per source page, content verbatim). \
-             `entry_type='user'` imports under the user's first name; `entry_type='agent'` imports under the normalized `agent_name`. The optional `pages` array on `execute` lets you pick a subset of source page IDs from the plan; omit it to import every dated page in the source book. Page-name date parsing tolerates `YYYY-MM-DD`, `YYYY-MM-DD-anything`, `YYYY-MM-DD anything`, `YYYY-MM-DD_anything`. Anything not matched is reported in `undated_pages` for the wizard to handle.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["list_sources", "plan", "execute"],
-                        "description": "Operation to perform"
-                    },
-                    "book_id": {
-                        "type": "integer",
-                        "description": "Source book to walk. Required for `plan` and `execute`."
-                    },
-                    "entry_type": {
-                        "type": "string",
-                        "enum": ["user", "agent"],
-                        "description": "Whose journal layout to import into. Required for `plan` and `execute`. `user` = first-name chapters; `agent` = normalized-agent-name chapters."
-                    },
-                    "agent_name": {
-                        "type": "string",
-                        "description": "Required when entry_type='agent'. Normalized like the journal/identity tools (lowercase ASCII alphanumerics + dashes/underscores; whitespace -> dash)."
-                    },
-                    "pages": {
-                        "type": "array",
-                        "items": { "type": "integer" },
-                        "description": "Optional for `execute`. Subset of source `source_page_id` values from the `plan` response. Defaults to every dated page (plus any with a `page_date_overrides` entry) when omitted; an explicit empty array is a safe no-op."
-                    },
-                    "page_date_overrides": {
-                        "type": "object",
-                        "description": "Optional for `execute`. Object mapping `\"<source_page_id>\"` (string keys) to `\"YYYY-MM-DD\"`. Used to give undated pages a date the user picked manually. Override wins over both name-prefix and H1 fallback.",
-                        "additionalProperties": { "type": "string" }
-                    }
-                },
-                "required": ["action"]
-            }),
-        ));
-        tools.push(tool(
-            "reminders",
-            "Simple labeled task list living on monthly pages inside the user's per-user Journal book. Layout: singleton `Reminders` chapter, monthly pages `{YYYY-MM}-Reminders` with `## 🟢 Open` and `## ✅ Done` sections. Bullet shape `- [ ] {priority_emoji?} {created} — {action} _[{label}: {natural_key}]_`. Four actions: `create` (appends a bullet under Open; auto-slugifies `natural_key` from text if absent; returns the assembled `reminder_id` = `{label}:{natural_key}`), `list` (filterable by `owner` + `status`), `complete` (flips `[ ]` → `[x]`, stamps ` · done {ts}`, moves bullet to Done section), `delete` (removes the bullet). Cross-month operations are out of scope — complete/delete look at the current month's page.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["create", "list", "complete", "delete"],
-                        "description": "Operation to perform"
-                    },
-                    "text": {
-                        "type": "string",
-                        "description": "Required for `create`. The reminder body, rendered after the timestamp. e.g. 'rotate the CF AI Gateway token'."
-                    },
-                    "label": {
-                        "type": "string",
-                        "description": "Required for `create`. Owner — `user` or a normalized agent name (lowercase ASCII alphanumerics + dashes/underscores; whitespace -> dash). Becomes the first half of the `reminder_id`."
-                    },
-                    "priority": {
-                        "type": "string",
-                        "enum": ["today", "this-week", "whenever"],
-                        "description": "Optional for `create`. Maps to a priority emoji in the bullet (🔥 / ⚡ / 🌱). Omit for no emoji."
-                    },
-                    "natural_key": {
-                        "type": "string",
-                        "description": "Optional for `create`. Stable slug used as the `reminder_id` second half. Auto-derived from `text` when absent."
-                    },
-                    "owner": {
-                        "type": "string",
-                        "description": "Optional filter for `list`. Pass `user` or an agent name to limit results to that label."
-                    },
-                    "status": {
-                        "type": "string",
-                        "enum": ["open", "done", "all"],
-                        "description": "Optional filter for `list`. Defaults to `all`."
-                    },
-                    "reminder_id": {
-                        "type": "string",
-                        "description": "Required for `complete` and `delete`. Format `{label}:{natural_key}` — exactly what `create` returned."
-                    }
-                },
-                "required": ["action"]
-            }),
-        ));
-        tools.push(tool(
-            "events",
-            "Future-scheduled calendar items living on monthly pages inside the user's per-user Journal book. Layout: singleton `Events` chapter, monthly pages `{YYYY-MM}-Events` (page month matches the event's scheduled month, not the creation month), single section `## 📅 Scheduled`. Bullet shape `- {scheduled_at} — {title} _[{label}: {natural_key}]_` (no checkbox — events are scheduled or cancelled, and cancellation removes the bullet). Three actions: `create` (auto-routes to the right monthly page based on `scheduled_at`), `list` (current month, optional `label` filter), `cancel` (removes bullet from current month's page). Cross-month list/cancel is out of scope.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["create", "list", "cancel"],
-                        "description": "Operation to perform"
-                    },
-                    "title": {
-                        "type": "string",
-                        "description": "Required for `create`. Free-form event title."
-                    },
-                    "scheduled_at": {
-                        "type": "string",
-                        "description": "Required for `create`. Accepts `YYYY-MM-DD`, `YYYY-MM-DD HH:MM`, `YYYY-MM-DD HH:MM TZ`, or RFC 3339. Bare date/time without TZ assumes the user's saved timezone (default UTC)."
-                    },
-                    "label": {
-                        "type": "string",
-                        "description": "Optional for `create` (defaults to `user`) and `list` (filter). `user` or a normalized agent name."
-                    },
-                    "natural_key": {
-                        "type": "string",
-                        "description": "Optional for `create`. Stable slug used as the `event_id` second half. Auto-derived from `title` when absent."
-                    },
-                    "event_id": {
-                        "type": "string",
-                        "description": "Required for `cancel`. Format `{label}:{natural_key}` — exactly what `create` returned."
-                    }
-                },
-                "required": ["action"]
-            }),
-        ));
-        tools.push(tool(
-            "sessions",
-            "Capture AI sessions (forager, Claude Code hooks, external clients) into the user's per-user Journal book. Layout: per-agent chapter `Sessions: {agent_name}`; one page per session named `{YYYY-MM-DD}-{title|session_id_short}`; each `append` adds a new `## Block N — {ts}` markdown block to the bottom of that page. The `sessions` DB table indexes session_id → page_id so resume flows don't re-walk BookStack. Three actions: `append` (creates page on first call, appends blocks on resume; gated on `journaling_enabled = true`), `list` (paged by `last_appended_at DESC`, optional `agent_name` filter), `read` (returns the full transcript markdown). Search is deferred to Phase 6's precision_search. The same flow is reachable via HTTP for non-MCP clients (forager): `POST /sessions/v1/append`, `GET /sessions/v1/list`, `GET /sessions/v1/{session_id}`.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["append", "list", "read"],
-                        "description": "Operation to perform"
-                    },
-                    "session_id": {
-                        "type": "string",
-                        "description": "Required for `append` and `read`. Opaque, caller-chosen (UUID, ULID, etc.). The first append for a given session_id creates the page; subsequent appends resume on the same page."
-                    },
-                    "agent_name": {
-                        "type": "string",
-                        "description": "Required for `append`. Optional filter for `list`. Free-form name; normalized to lowercase ASCII alphanumerics + dashes/underscores (whitespace -> dash)."
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "Required for `append`. Markdown body of the new block. Appended below any prior blocks on the same session page."
-                    },
-                    "title": {
-                        "type": "string",
-                        "description": "Optional for `append` (only honored on first call for a session). Used in the page name when present, else page falls back to `{date}-{session_id_short}`."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Optional for `list`. Defaults to 50, clamped 1..=500."
-                    }
-                },
-                "required": ["action"]
-            }),
-        ));
-        tools.push(tool(
             "session_event",
             "Signal a session-level event. Currently supported: `action: 'compacted'` resets the briefing-injection state so the next tool response includes the full briefing again. Useful after the AI gets compacted by its harness and loses context.",
             json!({
@@ -2708,45 +2090,6 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
     tools
 }
 
-/// Map an MCP tool name to its `/remember/v1/{resource}` resource, if any.
-/// Returns `None` for tools that aren't memory-protocol dispatchers (or for
-/// `briefing`, which is handled separately so it can run the
-/// session-compaction reset before delegating).
-fn remember_resource(tool_name: &str) -> Option<&'static str> {
-    match tool_name {
-        "user" => Some("user"),
-        "config" => Some("config"),
-        "directory" => Some("directory"),
-        "identity" => Some("identity"),
-        "journal" => Some("journal"),
-        "migrate" => Some("migrate"),
-        "reminders" => Some("reminders"),
-        "events" => Some("events"),
-        "sessions" => Some("sessions"),
-        _ => None,
-    }
-}
-
-/// Flatten the MCP memory-protocol tool arguments into the body map the
-/// dispatcher expects. The MCP arg shape is `{action, key1, key2, ...}`
-/// (flat, easier for AI to call); the dispatcher's body map is just the
-/// resource-specific fields without the `action` envelope. So we drop
-/// `action` and re-wrap. Non-object args (shouldn't happen — `args` always
-/// arrives as an object) collapse to an empty body.
-fn flatten_remember_args(args: &Value) -> Value {
-    let Some(map) = args.as_object() else {
-        return json!({});
-    };
-    let mut body = serde_json::Map::with_capacity(map.len());
-    for (k, v) in map {
-        if k == "action" {
-            continue;
-        }
-        body.insert(k.clone(), v.clone());
-    }
-    Value::Object(body)
-}
-
 /// Whether the briefing surface is enabled. Reads BSMCP_BRIEFING_ENABLED;
 /// defaults true.
 fn briefing_enabled() -> bool {
@@ -2757,83 +2100,6 @@ fn briefing_enabled() -> bool {
             !(v == "false" || v == "0" || v == "no" || v == "off")
         })
         .unwrap_or(true)
-}
-
-/// Whether the user-onboarding flow is enabled (Phase 2.4e). Reads
-/// `BSMCP_ONBOARDING_ENABLED`; defaults true. When off:
-/// - `meta.onboarding_pending` is never injected.
-/// - `GET/POST /setup/user` return 404.
-///
-/// Boolean parse: `false`/`0`/`no`/`off` (case-insensitive) = off; any
-/// other value (including absent) = on. Mirrors `briefing_enabled` so
-/// operators get one consistent toggle shape across the surface.
-pub fn onboarding_enabled() -> bool {
-    parse_onboarding_env(std::env::var("BSMCP_ONBOARDING_ENABLED").ok().as_deref())
-}
-
-/// Pure parse of the `BSMCP_ONBOARDING_ENABLED` env var. Extracted so the
-/// env-parse cases are testable without touching process env. `None`
-/// (absent) → true; "false"/"0"/"no"/"off" (any case, trimmed) → false;
-/// everything else → true.
-pub fn parse_onboarding_env(raw: Option<&str>) -> bool {
-    match raw {
-        None => true,
-        Some(s) => {
-            let v = s.trim().to_lowercase();
-            !(v == "false" || v == "0" || v == "no" || v == "off")
-        }
-    }
-}
-
-/// Decide whether `meta.onboarding_pending` should ride along on this
-/// MCP response. Pure helper — no I/O. The injection happens iff:
-/// - the env flag is on (operator hasn't disabled the surface), and
-/// - the user hasn't yet completed the onboarding wizard.
-///
-/// See `build_response_meta` for the corresponding write side.
-pub fn is_onboarding_visible(env_enabled: bool, setup_complete: bool) -> bool {
-    env_enabled && !setup_complete
-}
-
-/// Build the `meta.onboarding_pending` payload. Public-domain-aware:
-/// returns the absolute URL when `BSMCP_PUBLIC_DOMAIN` is set, otherwise
-/// a relative `/setup/user` path so the AI can still render a clickable
-/// link inside its own UI.
-pub fn build_onboarding_pending_meta() -> Value {
-    let url = onboarding_url("/setup/user");
-    json!({
-        "message": "Welcome to bookstack-mcp. Please complete user setup.",
-        "url": url,
-    })
-}
-
-/// Build the `meta.admin_onboarding_pending` payload. Same domain /
-/// relative-fallback rules as `build_onboarding_pending_meta` but points
-/// at `/setup/admin` and uses the admin-flavored message string.
-pub fn build_admin_onboarding_pending_meta() -> Value {
-    let url = onboarding_url("/setup/admin");
-    json!({
-        "message": "First-time admin setup pending. Please complete org configuration.",
-        "url": url,
-    })
-}
-
-/// Shared URL builder: resolves `BSMCP_PUBLIC_DOMAIN` to an absolute
-/// `https://{domain}{path}` when set + non-empty, else returns the path
-/// itself so the AI still has a clickable in-app link. Trailing slashes
-/// on the env value are collapsed.
-fn onboarding_url(path: &str) -> String {
-    match std::env::var("BSMCP_PUBLIC_DOMAIN") {
-        Ok(d) => {
-            let d = d.trim().trim_end_matches('/');
-            if d.is_empty() {
-                path.to_string()
-            } else {
-                format!("https://{d}{path}")
-            }
-        }
-        Err(_) => path.to_string(),
-    }
 }
 
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {
@@ -2888,228 +2154,4 @@ fn update_schema(id_name: &str, fields: &[&str]) -> Value {
         "properties": props,
         "required": [id_name]
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bsmcp_common::settings::{GlobalSettings, UserSettings};
-
-    fn names_of(tools: &[Value]) -> Vec<String> {
-        tools
-            .iter()
-            .filter_map(|t| t.get("name").and_then(|v| v.as_str()).map(String::from))
-            .collect()
-    }
-
-    #[test]
-    fn all_tool_names_matches_definitions() {
-        let names = all_tool_names();
-        let from_defs = names_of(&tool_definitions(true));
-        assert_eq!(names, from_defs, "all_tool_names diverged from tool_definitions");
-        assert!(names.contains(&"search_content".to_string()));
-        assert!(names.contains(&"briefing".to_string()));
-        assert!(!names.is_empty());
-    }
-
-    #[test]
-    fn filter_keeps_everything_when_settings_empty() {
-        let tools = tool_definitions(false);
-        let user = UserSettings::default();
-        let global = GlobalSettings::default();
-        let filtered = filter_tools_by_enabled(tools.clone(), &user, &global);
-        assert_eq!(names_of(&tools), names_of(&filtered));
-    }
-
-    #[test]
-    fn filter_drops_globally_disabled_tools() {
-        let tools = tool_definitions(false);
-        let user = UserSettings::default();
-        let mut global = GlobalSettings::default();
-        global.tool_defaults.insert("search_content".to_string(), false);
-        let filtered = filter_tools_by_enabled(tools, &user, &global);
-        let names = names_of(&filtered);
-        assert!(!names.contains(&"search_content".to_string()));
-        // Other tools survive.
-        assert!(names.contains(&"list_books".to_string()));
-    }
-
-    #[test]
-    fn filter_user_override_on_keeps_globally_disabled_tool() {
-        let tools = tool_definitions(false);
-        let mut user = UserSettings::default();
-        user.tool_overrides.insert("search_content".to_string(), true);
-        let mut global = GlobalSettings::default();
-        global.tool_defaults.insert("search_content".to_string(), false);
-        let filtered = filter_tools_by_enabled(tools, &user, &global);
-        let names = names_of(&filtered);
-        assert!(
-            names.contains(&"search_content".to_string()),
-            "user override should override global"
-        );
-    }
-
-    #[test]
-    fn filter_user_override_off_drops_default_on_tool() {
-        let tools = tool_definitions(false);
-        let mut user = UserSettings::default();
-        user.tool_overrides.insert("list_books".to_string(), false);
-        let global = GlobalSettings::default();
-        let filtered = filter_tools_by_enabled(tools, &user, &global);
-        let names = names_of(&filtered);
-        assert!(
-            !names.contains(&"list_books".to_string()),
-            "user opt-out should suppress the tool"
-        );
-    }
-
-    #[test]
-    fn tool_disabled_error_is_structured_json_with_code() {
-        let s = tool_disabled_error("journal");
-        let v: Value = serde_json::from_str(&s).expect("valid JSON");
-        assert_eq!(
-            v["error"]["code"].as_str(),
-            Some("tool_disabled"),
-            "expected tool_disabled code, got {v}"
-        );
-        assert!(
-            v["error"]["message"].as_str().unwrap_or("").contains("journal"),
-            "message should mention the tool name"
-        );
-    }
-
-    // --- Onboarding (Phase 2.4e) ---
-
-    #[test]
-    fn parse_onboarding_env_absent_defaults_on() {
-        assert!(parse_onboarding_env(None));
-    }
-
-    #[test]
-    fn parse_onboarding_env_truthy_values() {
-        for v in ["1", "yes", "true", "on", "TRUE", "  yes  ", "anything"] {
-            assert!(
-                parse_onboarding_env(Some(v)),
-                "expected {v:?} to parse as on"
-            );
-        }
-    }
-
-    #[test]
-    fn parse_onboarding_env_falsy_values() {
-        for v in ["0", "no", "false", "off", "FALSE", "  Off  "] {
-            assert!(
-                !parse_onboarding_env(Some(v)),
-                "expected {v:?} to parse as off"
-            );
-        }
-    }
-
-    #[test]
-    fn is_onboarding_visible_matrix() {
-        // env on + setup not complete → visible
-        assert!(is_onboarding_visible(true, false));
-        // env on + setup complete → hidden (user finished the wizard)
-        assert!(!is_onboarding_visible(true, true));
-        // env off + setup not complete → hidden (operator killed the surface)
-        assert!(!is_onboarding_visible(false, false));
-        // env off + setup complete → hidden (both reasons)
-        assert!(!is_onboarding_visible(false, true));
-    }
-
-    /// Composition test mirroring the conditional in `build_response_meta`:
-    /// the same is-visible predicate the meta builder uses gates whether
-    /// the payload appears at all. This keeps the helper + the call-site
-    /// in lock-step without standing up the full async dependency graph
-    /// (db, client, semantic, session_store) just to assert the field's
-    /// presence.
-    #[test]
-    fn meta_onboarding_pending_shape_matches_visibility_helper() {
-        // Visible: env on + setup not complete → field present, full shape.
-        let visible = is_onboarding_visible(true, false);
-        assert!(visible);
-        let payload = build_onboarding_pending_meta();
-        assert!(payload.get("message").is_some(), "message field present");
-        assert!(payload.get("url").is_some(), "url field present");
-
-        // Hidden: setup complete → meta builder skips the injection entirely
-        // (no payload built). We assert at the predicate level since the
-        // payload itself is unconditional (it's the *visibility* that gates).
-        assert!(!is_onboarding_visible(true, true));
-        assert!(!is_onboarding_visible(false, false));
-        assert!(!is_onboarding_visible(false, true));
-    }
-
-    /// All env-touching `BSMCP_PUBLIC_DOMAIN` cases live in one test so
-    /// `cargo test` doesn't race them against each other when running the
-    /// in-process tests in parallel. We capture+restore the ambient value
-    /// at the boundaries so we don't pollute the test binary's env across
-    /// modules. Covers BOTH `build_onboarding_pending_meta` (user) and
-    /// `build_admin_onboarding_pending_meta` (admin) so any divergence
-    /// between the two URL paths surfaces here.
-    #[test]
-    fn build_onboarding_pending_meta_url_cases() {
-        let prev = std::env::var("BSMCP_PUBLIC_DOMAIN").ok();
-
-        // 1. Domain set → absolute https URL.
-        std::env::set_var("BSMCP_PUBLIC_DOMAIN", "mcp.example.com");
-        let payload = build_onboarding_pending_meta();
-        assert_eq!(
-            payload["url"].as_str(),
-            Some("https://mcp.example.com/setup/user")
-        );
-        assert!(payload["message"]
-            .as_str()
-            .unwrap_or("")
-            .starts_with("Welcome"));
-        // Admin variant.
-        let admin_payload = build_admin_onboarding_pending_meta();
-        assert_eq!(
-            admin_payload["url"].as_str(),
-            Some("https://mcp.example.com/setup/admin")
-        );
-        assert!(admin_payload["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("admin setup"));
-
-        // 2. Trailing slash collapsed.
-        std::env::set_var("BSMCP_PUBLIC_DOMAIN", "mcp.example.com/");
-        assert_eq!(
-            build_onboarding_pending_meta()["url"].as_str(),
-            Some("https://mcp.example.com/setup/user")
-        );
-        assert_eq!(
-            build_admin_onboarding_pending_meta()["url"].as_str(),
-            Some("https://mcp.example.com/setup/admin")
-        );
-
-        // 3. Blank/whitespace → relative fallback.
-        std::env::set_var("BSMCP_PUBLIC_DOMAIN", "   ");
-        assert_eq!(
-            build_onboarding_pending_meta()["url"].as_str(),
-            Some("/setup/user")
-        );
-        assert_eq!(
-            build_admin_onboarding_pending_meta()["url"].as_str(),
-            Some("/setup/admin")
-        );
-
-        // 4. Unset → relative fallback.
-        std::env::remove_var("BSMCP_PUBLIC_DOMAIN");
-        assert_eq!(
-            build_onboarding_pending_meta()["url"].as_str(),
-            Some("/setup/user")
-        );
-        assert_eq!(
-            build_admin_onboarding_pending_meta()["url"].as_str(),
-            Some("/setup/admin")
-        );
-
-        // Restore.
-        match prev {
-            Some(v) => std::env::set_var("BSMCP_PUBLIC_DOMAIN", v),
-            None => std::env::remove_var("BSMCP_PUBLIC_DOMAIN"),
-        }
-    }
 }

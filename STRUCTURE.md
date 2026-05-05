@@ -1,6 +1,6 @@
 # Repository Structure
 
-_Auto-generated on 2026-05-04 20:21 UTC from commit `0e43753`._
+_Auto-generated on 2026-05-02 01:17 UTC from commit `6b68333`._
 
 ```
 .
@@ -14,7 +14,6 @@ _Auto-generated on 2026-05-04 20:21 UTC from commit `0e43753`._
 │   │   │   ├── db.rs
 │   │   │   ├── index.rs
 │   │   │   ├── lib.rs
-│   │   │   ├── rate_limit.rs
 │   │   │   ├── settings.rs
 │   │   │   ├── types.rs
 │   │   │   └── vector.rs
@@ -36,8 +35,6 @@ _Auto-generated on 2026-05-04 20:21 UTC from commit `0e43753`._
 │   ├── bsmcp-server
 │   │   ├── src
 │   │   │   ├── briefing
-│   │   │   ├── remember
-│   │   │   ├── directory.rs
 │   │   │   ├── llm.rs
 │   │   │   ├── main.rs
 │   │   │   ├── mcp.rs
@@ -46,7 +43,6 @@ _Auto-generated on 2026-05-04 20:21 UTC from commit `0e43753`._
 │   │   │   ├── semantic.rs
 │   │   │   ├── session.rs
 │   │   │   ├── settings_ui.rs
-│   │   │   ├── setup_ui.rs
 │   │   │   ├── sse.rs
 │   │   │   ├── staging.rs
 │   │   │   └── summary.rs
@@ -74,5 +70,5 @@ _Auto-generated on 2026-05-04 20:21 UTC from commit `0e43753`._
 ├── STRUCTURE.md
 └── entrypoint.sh
 
-18 directories, 52 files
+17 directories, 49 files
 ```

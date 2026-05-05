@@ -11,11 +11,9 @@ use sha2::Digest;
 use zeroize::Zeroizing;
 
 use bsmcp_common::config::{access_token_ttl, refresh_token_ttl};
-use bsmcp_common::db::{stable_id_for, DbBackend, IndexDb, SemanticDb, SessionRow, TokenBinding};
+use bsmcp_common::db::{DbBackend, IndexDb, SemanticDb};
 use bsmcp_common::index::*;
-use bsmcp_common::settings::{
-    memory_protocol_tool_defaults_seed, GlobalSettings, UserSettings, DEFAULT_ACCOUNT_LABEL,
-};
+use bsmcp_common::settings::{GlobalSettings, UserSettings};
 use bsmcp_common::types::*;
 use bsmcp_common::vector;
 
@@ -29,7 +27,7 @@ pub struct SqliteDb {
 
 impl SqliteDb {
     pub fn open(path: &Path, encryption_key: &str) -> Self {
-        let mut conn = Connection::open(path).expect("Failed to open SQLite database");
+        let conn = Connection::open(path).expect("Failed to open SQLite database");
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
@@ -48,51 +46,11 @@ impl SqliteDb {
                  created_at INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_refresh_tokens_created ON refresh_tokens(created_at);
-             /* user_settings is keyed by `stable_id` (= bookstack_user_id +
-                ':' + account_label). For installs upgrading from the
-                token_id_hash-keyed shape, the Rust-side rekey migration
-                further down handles the transition. New installs land here
-                directly. */
              CREATE TABLE IF NOT EXISTS user_settings (
-                 stable_id TEXT PRIMARY KEY,
+                 token_id_hash TEXT PRIMARY KEY,
                  settings_json TEXT NOT NULL,
                  updated_at INTEGER NOT NULL
              );
-             /* token_bindings maps each BookStack API token's hash to its
-                stable identity. One row per token. The user_settings row
-                lives at the bound stable_id, so when a token rotates the
-                user attaches the new token's binding to the same stable_id
-                via /setup/user and keeps every saved setting. */
-             CREATE TABLE IF NOT EXISTS token_bindings (
-                 token_id_hash TEXT PRIMARY KEY,
-                 bookstack_user_id INTEGER NOT NULL,
-                 account_label TEXT NOT NULL DEFAULT 'default',
-                 created_at INTEGER NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS idx_token_bindings_user
-                 ON token_bindings(bookstack_user_id);
-             /* sessions index — one row per AI session captured to
-                BookStack via the `sessions` MCP tool / HTTP surface.
-                The actual transcript lives on a BookStack page; this
-                table is the (session_id -> page) lookup plus enough
-                metadata to render the list call without re-walking
-                BookStack. */
-             CREATE TABLE IF NOT EXISTS sessions (
-                 session_id TEXT PRIMARY KEY,
-                 token_id_hash TEXT NOT NULL,
-                 agent_name TEXT NOT NULL,
-                 bookstack_page_id INTEGER NOT NULL,
-                 chapter_id INTEGER NOT NULL,
-                 book_id INTEGER NOT NULL,
-                 started_at INTEGER NOT NULL,
-                 last_appended_at INTEGER NOT NULL,
-                 block_count INTEGER NOT NULL DEFAULT 0,
-                 title TEXT
-             );
-             CREATE INDEX IF NOT EXISTS idx_sessions_token_recent
-                 ON sessions(token_id_hash, last_appended_at DESC);
-             CREATE INDEX IF NOT EXISTS idx_sessions_token_agent
-                 ON sessions(token_id_hash, agent_name);
              CREATE TABLE IF NOT EXISTS global_settings (
                  id INTEGER PRIMARY KEY CHECK (id = 1),
                  hive_shelf_id INTEGER,
@@ -109,9 +67,7 @@ impl SqliteDb {
                  best_practices_scope TEXT,
                  friendly_structure INTEGER NOT NULL DEFAULT 1,
                  full_content_in_briefing INTEGER NOT NULL DEFAULT 0,
-                 strict_setup INTEGER NOT NULL DEFAULT 0,
-                 tool_defaults TEXT,
-                 admin_setup_complete INTEGER NOT NULL DEFAULT 0
+                 strict_setup INTEGER NOT NULL DEFAULT 0
              );
              INSERT OR IGNORE INTO global_settings (id, updated_at) VALUES (1, 0);
              DROP TABLE IF EXISTS registrations;
@@ -238,13 +194,6 @@ impl SqliteDb {
             "ALTER TABLE global_settings ADD COLUMN friendly_structure INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE global_settings ADD COLUMN full_content_in_briefing INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE global_settings ADD COLUMN strict_setup INTEGER NOT NULL DEFAULT 0",
-            // Phase 2.4d — per-tool admin defaults. Stored as JSON text
-            // (HashMap<String, bool>); empty / NULL decodes to an empty
-            // map. Same pattern as `org_domains`.
-            "ALTER TABLE global_settings ADD COLUMN tool_defaults TEXT",
-            // Phase 2.4f — admin onboarding "run once" flag. Single bit.
-            // 0 = not yet completed, 1 = some admin has finished /setup/admin.
-            "ALTER TABLE global_settings ADD COLUMN admin_setup_complete INTEGER NOT NULL DEFAULT 0",
         ] {
             conn.execute_batch(sql).ok();
         }
@@ -287,21 +236,6 @@ impl SqliteDb {
             "UPDATE index_jobs SET status = 'failed' \
              WHERE status = 'error' AND resolved_status IS NULL",
         ).ok();
-
-        // Rekey user_settings from token_id_hash to stable_id. Idempotent:
-        // detects the old shape via PRAGMA table_info and only runs when
-        // a `token_id_hash` column is present on user_settings (the old
-        // PK). Fresh installs see the new shape from the CREATE TABLE
-        // above and skip this block entirely.
-        rekey_user_settings_to_stable_id(&mut conn);
-
-        // Memory-protocol tools default-OFF on fresh installs.
-        // Idempotent: only seeds when the row's `set_by_token_hash` is
-        // NULL (no admin has touched it) AND `tool_defaults` is NULL
-        // (no seed already in place). Existing installs that already
-        // have a populated row are untouched, preserving whatever the
-        // admin configured.
-        seed_memory_protocol_tool_defaults(&conn);
 
         let hash = sha2::Sha256::digest(encryption_key.as_bytes());
         let mut key = Zeroizing::new([0u8; 32]);
@@ -367,185 +301,6 @@ impl SqliteDb {
             }
         }
     }
-}
-
-/// Map a `sessions` row to `SessionRow`. Reused by both list_sessions
-/// query paths (with and without `agent_name` filter).
-fn session_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
-    Ok(SessionRow {
-        session_id: row.get(0)?,
-        token_id_hash: row.get(1)?,
-        agent_name: row.get(2)?,
-        bookstack_page_id: row.get(3)?,
-        chapter_id: row.get(4)?,
-        book_id: row.get(5)?,
-        started_at: row.get(6)?,
-        last_appended_at: row.get(7)?,
-        block_count: row.get(8)?,
-        title: row.get(9)?,
-    })
-}
-
-/// One-time seed of `GlobalSettings.tool_defaults` so memory-protocol
-/// tools (briefing, journal, identity, reminders, events, sessions, …)
-/// land default-OFF on a fresh install. Lets the AI pick up KB CRUD +
-/// semantic search out of the box without surfacing a wall of memory
-/// tools that all error until the admin configures
-/// `user_journals_shelf_id` etc.
-///
-/// Guard: only fires when `set_by_token_hash IS NULL AND tool_defaults
-/// IS NULL` — i.e., no admin has written a global-settings row through
-/// /settings yet AND no seed is already in place. Existing installs
-/// (admin already touched the row, or any explicit `tool_defaults` is
-/// set) are left untouched.
-fn seed_memory_protocol_tool_defaults(conn: &Connection) {
-    let seed = memory_protocol_tool_defaults_seed();
-    let json = match serde_json::to_string(&seed) {
-        Ok(s) => s,
-        Err(_) => return, // unreachable; HashMap<String, bool> always serializes
-    };
-    conn.execute(
-        "UPDATE global_settings
-            SET tool_defaults = ?1
-          WHERE id = 1
-            AND tool_defaults IS NULL
-            AND set_by_token_hash IS NULL",
-        params![json],
-    )
-    .ok();
-}
-
-/// One-time rekey of `user_settings` from the v0.x token_id_hash PK to the
-/// v1.0.0 stable_id PK (`{bookstack_user_id}:{account_label}`).
-///
-/// Idempotent: detects the live schema via `PRAGMA table_info` and only
-/// runs when `token_id_hash` is still the primary key. Fresh installs see
-/// the new shape from `CREATE TABLE` in `open` and skip this entirely.
-///
-/// Migration shape:
-/// 1. RENAME existing user_settings → user_settings_legacy_token_keyed.
-/// 2. CREATE the new user_settings (stable_id PK).
-/// 3. Walk legacy rows, parse JSON, build stable_id from
-///    `bookstack_user_id` + `account_label`. Rows with NULL
-///    `bookstack_user_id` are dropped (the user has never authenticated
-///    far enough for oauth.rs to backfill the field — they re-onboard).
-/// 4. Insert into the new user_settings + write a `token_bindings` entry
-///    so the old `token_id_hash` keeps resolving to the same identity.
-/// 5. DROP user_settings_legacy_token_keyed.
-///
-/// Wrapped in a single transaction so a crash mid-migration leaves the
-/// old shape intact.
-fn rekey_user_settings_to_stable_id(conn: &mut Connection) {
-    let has_old_pk: bool = {
-        let mut stmt = match conn.prepare("PRAGMA table_info(user_settings)") {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        let mut rows = match stmt.query([]) {
-            Ok(r) => r,
-            Err(_) => return,
-        };
-        let mut found_old = false;
-        while let Ok(Some(row)) = rows.next() {
-            let name: String = row.get(1).unwrap_or_default();
-            let pk: i64 = row.get(5).unwrap_or(0);
-            if name == "token_id_hash" && pk == 1 {
-                found_old = true;
-                break;
-            }
-        }
-        found_old
-    };
-
-    if !has_old_pk {
-        return;
-    }
-
-    let tx = conn
-        .transaction()
-        .expect("Failed to start user_settings rekey transaction");
-
-    tx.execute_batch(
-        "ALTER TABLE user_settings RENAME TO user_settings_legacy_token_keyed;
-         CREATE TABLE user_settings (
-             stable_id TEXT PRIMARY KEY,
-             settings_json TEXT NOT NULL,
-             updated_at INTEGER NOT NULL
-         );",
-    )
-    .expect("Failed to rename / create user_settings during rekey");
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-
-    let legacy_rows: Vec<(String, String, i64)> = {
-        let mut stmt = tx
-            .prepare(
-                "SELECT token_id_hash, settings_json, updated_at \
-                 FROM user_settings_legacy_token_keyed",
-            )
-            .expect("Failed to prepare legacy select during rekey");
-        stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-            ))
-        })
-        .expect("Failed to query legacy rows during rekey")
-        .filter_map(Result::ok)
-        .collect()
-    };
-
-    for (token_id_hash, settings_json, updated_at) in legacy_rows {
-        let parsed: serde_json::Value = match serde_json::from_str(&settings_json) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let bookstack_user_id = match parsed
-            .get("bookstack_user_id")
-            .and_then(|v| v.as_i64())
-        {
-            Some(id) => id,
-            None => continue,
-        };
-        let account_label = parsed
-            .get("account_label")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-            .unwrap_or_else(|| DEFAULT_ACCOUNT_LABEL.to_string());
-        let stable_id = stable_id_for(bookstack_user_id, &account_label);
-
-        // Highest updated_at wins per stable_id when multiple legacy rows
-        // collapse onto the same identity (shouldn't happen in practice
-        // since each token had its own row, but defensive).
-        tx.execute(
-            "INSERT INTO user_settings (stable_id, settings_json, updated_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(stable_id) DO UPDATE SET
-                settings_json = excluded.settings_json,
-                updated_at = excluded.updated_at
-             WHERE excluded.updated_at > user_settings.updated_at",
-            params![stable_id, settings_json, updated_at],
-        )
-        .ok();
-
-        tx.execute(
-            "INSERT OR IGNORE INTO token_bindings
-                (token_id_hash, bookstack_user_id, account_label, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![token_id_hash, bookstack_user_id, account_label, now],
-        )
-        .ok();
-    }
-
-    tx.execute_batch("DROP TABLE user_settings_legacy_token_keyed")
-        .expect("Failed to drop legacy user_settings table after rekey");
-
-    tx.commit()
-        .expect("Failed to commit user_settings rekey transaction");
 }
 
 #[async_trait]
@@ -722,104 +477,14 @@ impl DbBackend for SqliteDb {
         .map_err(|e| format!("Task failed: {e}"))?
     }
 
-    async fn get_token_binding(&self, token_id_hash: &str)
-        -> Result<Option<TokenBinding>, String>
-    {
+    async fn get_user_settings(&self, token_id_hash: &str) -> Result<Option<UserSettings>, String> {
         let conn = self.conn.clone();
         let token_id_hash = token_id_hash.to_string();
-        tokio::task::spawn_blocking(move || -> Result<Option<TokenBinding>, String> {
-            let conn = conn.lock().unwrap();
-            let row = conn.query_row(
-                "SELECT bookstack_user_id, account_label, created_at
-                 FROM token_bindings WHERE token_id_hash = ?1",
-                params![token_id_hash],
-                |row| {
-                    Ok(TokenBinding {
-                        token_id_hash: token_id_hash.clone(),
-                        bookstack_user_id: row.get(0)?,
-                        account_label: row.get(1)?,
-                        created_at: row.get(2)?,
-                    })
-                },
-            ).ok();
-            Ok(row)
-        })
-        .await
-        .map_err(|e| format!("Task failed: {e}"))?
-    }
-
-    async fn set_token_binding(&self, binding: &TokenBinding) -> Result<(), String> {
-        let conn = self.conn.clone();
-        let token_id_hash = binding.token_id_hash.clone();
-        let bookstack_user_id = binding.bookstack_user_id;
-        let account_label = binding.account_label.clone();
-        let created_at = binding.created_at;
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
-            // Upsert: existing rows keep their original `created_at`, only
-            // bookstack_user_id and account_label are mutable post-insert.
-            conn.execute(
-                "INSERT INTO token_bindings
-                    (token_id_hash, bookstack_user_id, account_label, created_at)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(token_id_hash) DO UPDATE SET
-                    bookstack_user_id = excluded.bookstack_user_id,
-                    account_label = excluded.account_label",
-                params![token_id_hash, bookstack_user_id, account_label, created_at],
-            ).map_err(|e| format!("set_token_binding: {e}"))?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| format!("Task failed: {e}"))?
-    }
-
-    async fn delete_token_binding(&self, token_id_hash: &str) -> Result<(), String> {
-        let conn = self.conn.clone();
-        let token_id_hash = token_id_hash.to_string();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
-            conn.execute(
-                "DELETE FROM token_bindings WHERE token_id_hash = ?1",
-                params![token_id_hash],
-            ).ok();
-            Ok(())
-        })
-        .await
-        .map_err(|e| format!("Task failed: {e}"))?
-    }
-
-    async fn list_account_labels_for_user(&self, bookstack_user_id: i64)
-        -> Result<Vec<String>, String>
-    {
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<String>, String> {
-            let conn = conn.lock().unwrap();
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT account_label FROM token_bindings
-                 WHERE bookstack_user_id = ?1
-                 ORDER BY account_label",
-            ).map_err(|e| format!("list_account_labels prepare: {e}"))?;
-            let labels: Vec<String> = stmt
-                .query_map(params![bookstack_user_id], |row| row.get(0))
-                .map_err(|e| format!("list_account_labels query: {e}"))?
-                .filter_map(Result::ok)
-                .collect();
-            Ok(labels)
-        })
-        .await
-        .map_err(|e| format!("Task failed: {e}"))?
-    }
-
-    async fn get_user_settings_by_stable_id(&self, stable_id: &str)
-        -> Result<Option<UserSettings>, String>
-    {
-        let conn = self.conn.clone();
-        let stable_id = stable_id.to_string();
         tokio::task::spawn_blocking(move || -> Result<Option<UserSettings>, String> {
             let conn = conn.lock().unwrap();
             let json: Option<String> = conn.query_row(
-                "SELECT settings_json FROM user_settings WHERE stable_id = ?1",
-                params![stable_id],
+                "SELECT settings_json FROM user_settings WHERE token_id_hash = ?1",
+                params![token_id_hash],
                 |row| row.get(0),
             ).ok();
             match json {
@@ -833,173 +498,22 @@ impl DbBackend for SqliteDb {
         .map_err(|e| format!("Task failed: {e}"))?
     }
 
-    async fn save_user_settings_by_stable_id(
-        &self,
-        stable_id: &str,
-        settings: &UserSettings,
-    ) -> Result<(), String> {
+    async fn save_user_settings(&self, token_id_hash: &str, settings: &UserSettings) -> Result<(), String> {
         let conn = self.conn.clone();
-        let stable_id = stable_id.to_string();
+        let token_id_hash = token_id_hash.to_string();
         let json = serde_json::to_string(settings)
             .map_err(|e| format!("user_settings serialize: {e}"))?;
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             conn.execute(
-                "INSERT INTO user_settings (stable_id, settings_json, updated_at)
+                "INSERT INTO user_settings (token_id_hash, settings_json, updated_at)
                  VALUES (?1, ?2, ?3)
-                 ON CONFLICT(stable_id) DO UPDATE SET
+                 ON CONFLICT(token_id_hash) DO UPDATE SET
                     settings_json = excluded.settings_json,
                     updated_at = excluded.updated_at",
-                params![stable_id, json, SqliteDb::now_secs()],
-            ).map_err(|e| format!("save_user_settings_by_stable_id: {e}"))?;
+                params![token_id_hash, json, SqliteDb::now_secs()],
+            ).map_err(|e| format!("save_user_settings: {e}"))?;
             Ok(())
-        })
-        .await
-        .map_err(|e| format!("Task failed: {e}"))?
-    }
-
-    async fn get_user_settings(&self, token_id_hash: &str)
-        -> Result<Option<UserSettings>, String>
-    {
-        match self.get_token_binding(token_id_hash).await? {
-            Some(binding) => self
-                .get_user_settings_by_stable_id(&binding.stable_id())
-                .await,
-            None => Ok(None),
-        }
-    }
-
-    async fn save_user_settings(&self, token_id_hash: &str, settings: &UserSettings)
-        -> Result<(), String>
-    {
-        match self.get_token_binding(token_id_hash).await? {
-            Some(binding) => self
-                .save_user_settings_by_stable_id(&binding.stable_id(), settings)
-                .await,
-            None => Err(format!(
-                "save_user_settings: no token binding for token_id_hash; \
-                 call set_token_binding before save"
-            )),
-        }
-    }
-
-    async fn get_session(&self, session_id: &str) -> Result<Option<SessionRow>, String> {
-        let conn = self.conn.clone();
-        let session_id = session_id.to_string();
-        tokio::task::spawn_blocking(move || -> Result<Option<SessionRow>, String> {
-            let conn = conn.lock().unwrap();
-            let row = conn.query_row(
-                "SELECT session_id, token_id_hash, agent_name,
-                        bookstack_page_id, chapter_id, book_id,
-                        started_at, last_appended_at, block_count, title
-                   FROM sessions WHERE session_id = ?1",
-                params![session_id],
-                |r| {
-                    Ok(SessionRow {
-                        session_id: r.get(0)?,
-                        token_id_hash: r.get(1)?,
-                        agent_name: r.get(2)?,
-                        bookstack_page_id: r.get(3)?,
-                        chapter_id: r.get(4)?,
-                        book_id: r.get(5)?,
-                        started_at: r.get(6)?,
-                        last_appended_at: r.get(7)?,
-                        block_count: r.get(8)?,
-                        title: r.get(9)?,
-                    })
-                },
-            ).ok();
-            Ok(row)
-        })
-        .await
-        .map_err(|e| format!("Task failed: {e}"))?
-    }
-
-    async fn upsert_session(&self, row: &SessionRow) -> Result<(), String> {
-        let conn = self.conn.clone();
-        let row = row.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
-            conn.execute(
-                "INSERT INTO sessions
-                    (session_id, token_id_hash, agent_name,
-                     bookstack_page_id, chapter_id, book_id,
-                     started_at, last_appended_at, block_count, title)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                 ON CONFLICT(session_id) DO UPDATE SET
-                    token_id_hash = excluded.token_id_hash,
-                    agent_name = excluded.agent_name,
-                    bookstack_page_id = excluded.bookstack_page_id,
-                    chapter_id = excluded.chapter_id,
-                    book_id = excluded.book_id,
-                    last_appended_at = excluded.last_appended_at,
-                    block_count = excluded.block_count,
-                    title = excluded.title",
-                params![
-                    row.session_id,
-                    row.token_id_hash,
-                    row.agent_name,
-                    row.bookstack_page_id,
-                    row.chapter_id,
-                    row.book_id,
-                    row.started_at,
-                    row.last_appended_at,
-                    row.block_count,
-                    row.title,
-                ],
-            ).map_err(|e| format!("upsert_session: {e}"))?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| format!("Task failed: {e}"))?
-    }
-
-    async fn list_sessions(
-        &self,
-        token_id_hash: &str,
-        agent_name: Option<&str>,
-        limit: i64,
-    ) -> Result<Vec<SessionRow>, String> {
-        let conn = self.conn.clone();
-        let token_id_hash = token_id_hash.to_string();
-        let agent_name = agent_name.map(|s| s.to_string());
-        let limit = limit.max(1);
-        tokio::task::spawn_blocking(move || -> Result<Vec<SessionRow>, String> {
-            let conn = conn.lock().unwrap();
-            let rows: Vec<SessionRow> = if let Some(agent) = agent_name {
-                let mut stmt = conn.prepare(
-                    "SELECT session_id, token_id_hash, agent_name,
-                            bookstack_page_id, chapter_id, book_id,
-                            started_at, last_appended_at, block_count, title
-                       FROM sessions
-                      WHERE token_id_hash = ?1 AND agent_name = ?2
-                      ORDER BY last_appended_at DESC
-                      LIMIT ?3",
-                ).map_err(|e| format!("list_sessions prepare: {e}"))?;
-                let collected: Vec<SessionRow> = stmt
-                    .query_map(params![token_id_hash, agent, limit], session_row_from)
-                    .map_err(|e| format!("list_sessions query: {e}"))?
-                    .filter_map(Result::ok)
-                    .collect();
-                collected
-            } else {
-                let mut stmt = conn.prepare(
-                    "SELECT session_id, token_id_hash, agent_name,
-                            bookstack_page_id, chapter_id, book_id,
-                            started_at, last_appended_at, block_count, title
-                       FROM sessions
-                      WHERE token_id_hash = ?1
-                      ORDER BY last_appended_at DESC
-                      LIMIT ?2",
-                ).map_err(|e| format!("list_sessions prepare: {e}"))?;
-                let collected: Vec<SessionRow> = stmt
-                    .query_map(params![token_id_hash, limit], session_row_from)
-                    .map_err(|e| format!("list_sessions query: {e}"))?
-                    .filter_map(Result::ok)
-                    .collect();
-                collected
-            };
-            Ok(rows)
         })
         .await
         .map_err(|e| format!("Task failed: {e}"))?
@@ -1016,8 +530,7 @@ impl DbBackend for SqliteDb {
                         org_identity_page_id, org_domains,
                         set_by_token_hash, updated_at,
                         guide_page_id, policies_scope, sops_scope, best_practices_scope,
-                        friendly_structure, full_content_in_briefing, strict_setup,
-                        tool_defaults, admin_setup_complete
+                        friendly_structure, full_content_in_briefing, strict_setup
                  FROM global_settings WHERE id = 1",
                 [],
                 |row| Ok(GlobalSettings {
@@ -1036,8 +549,6 @@ impl DbBackend for SqliteDb {
                     friendly_structure: row.get::<_, i64>(12)? != 0,
                     full_content_in_briefing: row.get::<_, i64>(13)? != 0,
                     strict_setup: row.get::<_, i64>(14)? != 0,
-                    tool_defaults: decode_bool_map(row.get::<_, Option<String>>(15)?),
-                    admin_setup_complete: row.get::<_, i64>(16)? != 0,
                 }),
             ).unwrap_or_default();
             Ok(row)
@@ -1078,9 +589,7 @@ impl DbBackend for SqliteDb {
                      best_practices_scope = ?12,
                      friendly_structure = ?13,
                      full_content_in_briefing = ?14,
-                     strict_setup = ?15,
-                     tool_defaults = ?16,
-                     admin_setup_complete = ?17
+                     strict_setup = ?15
                  WHERE id = 1",
                 params![
                     s.hive_shelf_id,
@@ -1098,8 +607,6 @@ impl DbBackend for SqliteDb {
                     if s.friendly_structure { 1i64 } else { 0i64 },
                     if s.full_content_in_briefing { 1i64 } else { 0i64 },
                     if s.strict_setup { 1i64 } else { 0i64 },
-                    encode_bool_map(&s.tool_defaults),
-                    if s.admin_setup_complete { 1i64 } else { 0i64 },
                 ],
             ).map_err(|e| format!("save_global_settings: {e}"))?;
             Ok(())
@@ -2417,20 +1924,6 @@ fn decode_kb_scope(value: Option<String>) -> Option<bsmcp_common::settings::KbSc
     }
 }
 
-/// Encode a HashMap<String, bool> as a JSON object string. Returns None
-/// when the map is empty so the column round-trips as NULL — matches the
-/// `org_domains` / `policies_scope` pattern.
-fn encode_bool_map(map: &std::collections::HashMap<String, bool>) -> Option<String> {
-    if map.is_empty() { None } else { serde_json::to_string(map).ok() }
-}
-
-fn decode_bool_map(value: Option<String>) -> std::collections::HashMap<String, bool> {
-    match value {
-        Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_default(),
-        _ => std::collections::HashMap::new(),
-    }
-}
-
 // --- IndexDb impl ---
 //
 // Phase 4a — structural index of BookStack content + page cache + the
@@ -2497,30 +1990,6 @@ impl IndexDb for SqliteDb {
                 params![shelf_id],
             ).map_err(|e| format!("soft_delete_indexed_shelf: {e}"))?;
             Ok(())
-        }).await.map_err(|e| format!("Task failed: {e}"))?
-    }
-
-    async fn list_indexed_shelves(&self) -> Result<Vec<IndexedShelf>, String> {
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
-            let mut stmt = conn.prepare(
-                "SELECT shelf_id, name, slug, shelf_kind, indexed_at, deleted
-                 FROM bookstack_shelves WHERE deleted = 0
-                 ORDER BY name"
-            ).map_err(|e| format!("list_indexed_shelves prepare: {e}"))?;
-            let rows = stmt.query_map([], |r| {
-                let kind_str: String = r.get(3)?;
-                Ok(IndexedShelf {
-                    shelf_id: r.get(0)?,
-                    name: r.get(1)?,
-                    slug: r.get(2)?,
-                    shelf_kind: kind_str.parse().unwrap_or(ShelfKind::Unclassified),
-                    indexed_at: r.get(4)?,
-                    deleted: r.get::<_, i64>(5)? != 0,
-                })
-            }).map_err(|e| format!("list_indexed_shelves query: {e}"))?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("list_indexed_shelves collect: {e}"))
         }).await.map_err(|e| format!("Task failed: {e}"))?
     }
 
@@ -2639,32 +2108,6 @@ impl IndexDb for SqliteDb {
                 params![book_id],
             ).map_err(|e| format!("soft_delete_indexed_book: {e}"))?;
             Ok(())
-        }).await.map_err(|e| format!("Task failed: {e}"))?
-    }
-
-    async fn list_indexed_orphan_books(&self) -> Result<Vec<IndexedBook>, String> {
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
-            let mut stmt = conn.prepare(
-                "SELECT book_id, name, slug, shelf_id, identity_ouid, book_kind, indexed_at, deleted
-                 FROM bookstack_books WHERE shelf_id IS NULL AND deleted = 0
-                 ORDER BY name"
-            ).map_err(|e| format!("list_indexed_orphan_books prepare: {e}"))?;
-            let rows = stmt.query_map([], |r| {
-                let kind_str: String = r.get(5)?;
-                Ok(IndexedBook {
-                    book_id: r.get(0)?,
-                    name: r.get(1)?,
-                    slug: r.get(2)?,
-                    shelf_id: r.get(3)?,
-                    identity_ouid: r.get(4)?,
-                    book_kind: kind_str.parse().unwrap_or(BookKind::Unclassified),
-                    indexed_at: r.get(6)?,
-                    deleted: r.get::<_, i64>(7)? != 0,
-                })
-            }).map_err(|e| format!("list_indexed_orphan_books query: {e}"))?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("list_indexed_orphan_books collect: {e}"))
         }).await.map_err(|e| format!("Task failed: {e}"))?
     }
 

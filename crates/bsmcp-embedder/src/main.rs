@@ -1,5 +1,6 @@
 mod embed;
 mod pipeline;
+mod rerank;
 
 use std::env;
 use std::fs;
@@ -20,17 +21,24 @@ use bsmcp_common::config::DbBackendType;
 use bsmcp_common::db::SemanticDb;
 
 use embed::Embedder;
+use rerank::Reranker;
 
 const DEFAULT_LOCAL_MODEL: &str = "BAAI/bge-base-en-v1.5";
 const DEFAULT_OLLAMA_MODEL: &str = "nomic-embed-text";
 const DEFAULT_OPENAI_MODEL: &str = "text-embedding-3-small";
 const DEFAULT_VOYAGE_MODEL: &str = "voyage-3-lite";
 
+const DEFAULT_LOCAL_RERANK_MODEL: &str = "BAAI/bge-reranker-v2-m3";
+const DEFAULT_VOYAGE_RERANK_MODEL: &str = "rerank-2";
+
 struct AppState {
     embedder: Arc<dyn Embedder>,
     model_name: String,
     provider_name: String,
     db: Arc<dyn SemanticDb>,
+    /// Reranker is optional — `BSMCP_RERANK_PROVIDER=none` (the default) leaves
+    /// it unconfigured and `/rerank` returns 503.
+    reranker: Option<Arc<dyn Reranker>>,
 }
 
 /// Load or generate a persistent worker UUID from a file in the data directory.
@@ -51,6 +59,16 @@ fn load_or_create_worker_id(data_dir: &Path) -> String {
 #[derive(Deserialize)]
 struct EmbedRequest {
     texts: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct RerankRequest {
+    query: String,
+    documents: Vec<String>,
+    /// Optional cap; server returns at most this many sorted-by-score hits.
+    /// Omit to receive all hits in input order (caller does its own cut).
+    #[serde(default)]
+    top_k: Option<usize>,
 }
 
 #[tokio::main]
@@ -203,6 +221,9 @@ async fn main() {
 
     eprintln!("Embedder: provider={provider}, model={model_name}, dims={dims}");
 
+    // Optional reranker. None when BSMCP_RERANK_PROVIDER is unset, "none", or empty.
+    let reranker: Option<Arc<dyn Reranker>> = init_reranker().await;
+
     // Start HTTP server for /embed endpoint
     let host = env::var("BSMCP_EMBED_HOST").unwrap_or_else(|_| "0.0.0.0".into());
     let port: u16 = env::var("BSMCP_EMBED_PORT")
@@ -215,10 +236,12 @@ async fn main() {
         model_name: model_name.clone(),
         provider_name: provider.clone(),
         db: db.clone(),
+        reranker: reranker.clone(),
     });
 
     let app = Router::new()
         .route("/embed", axum::routing::post(handle_embed))
+        .route("/rerank", axum::routing::post(handle_rerank))
         .route("/health", get(handle_health))
         .with_state(state);
 
@@ -292,11 +315,18 @@ async fn handle_health(
 ) -> impl IntoResponse {
     let dims = state.embedder.dims();
     let stats = state.db.get_stats().await.ok();
+    let reranker = state.reranker.as_ref().map(|r| {
+        json!({
+            "provider": r.provider_name(),
+            "model": r.model_name(),
+        })
+    });
     Json(json!({
         "status": "ok",
         "provider": state.provider_name,
         "model": state.model_name,
         "dimensions": dims,
+        "reranker": reranker,
         "stats": stats.map(|s| json!({
             "total_pages": s.total_pages,
             "total_chunks": s.total_chunks,
@@ -309,6 +339,153 @@ async fn handle_health(
             })),
         })),
     }))
+}
+
+async fn handle_rerank(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RerankRequest>,
+) -> impl IntoResponse {
+    let Some(reranker) = state.reranker.as_ref() else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Reranker disabled (BSMCP_RERANK_PROVIDER unset or 'none')"})),
+        )
+            .into_response();
+    };
+
+    if req.query.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"error": "query must not be empty"})),
+        )
+            .into_response();
+    }
+    if req.documents.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"error": "documents array must not be empty"})),
+        )
+            .into_response();
+    }
+    if req.documents.len() > 200 {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"error": "maximum 200 documents per rerank request"})),
+        )
+            .into_response();
+    }
+
+    match reranker.rerank(req.query, req.documents).await {
+        Ok(mut hits) => {
+            // Sort descending by score. Stable so ties keep input order.
+            hits.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            if let Some(k) = req.top_k {
+                hits.truncate(k);
+            }
+            Json(json!({
+                "results": hits,
+                "provider": reranker.provider_name(),
+                "model": reranker.model_name(),
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Rerank failed: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// Build a `Reranker` from `BSMCP_RERANK_*` env vars. Returns `None` when
+/// the provider is unset, "none", or empty — `/rerank` then returns 503.
+async fn init_reranker() -> Option<Arc<dyn Reranker>> {
+    let provider = env::var("BSMCP_RERANK_PROVIDER")
+        .unwrap_or_default()
+        .to_lowercase();
+    if provider.is_empty() || provider == "none" {
+        eprintln!("Reranker: disabled (BSMCP_RERANK_PROVIDER unset or 'none')");
+        return None;
+    }
+
+    match provider.as_str() {
+        "local" => {
+            let model_path =
+                env::var("BSMCP_MODEL_PATH").unwrap_or_else(|_| "/data/models".into());
+            let model_name = env::var("BSMCP_RERANK_MODEL")
+                .unwrap_or_else(|_| DEFAULT_LOCAL_RERANK_MODEL.into());
+            eprintln!("Reranker: loading local cross-encoder {model_name} (cache={model_path})...");
+            match pipeline::RerankModel::new(&model_name, &model_path) {
+                Ok(m) => {
+                    eprintln!("Reranker: local model ready");
+                    Some(Arc::new(rerank::LocalReranker::new(Arc::new(m))) as Arc<dyn Reranker>)
+                }
+                Err(e) => {
+                    eprintln!("Reranker: local init failed: {e} — /rerank disabled");
+                    None
+                }
+            }
+        }
+        "voyage" => {
+            let api_key = match env::var("BSMCP_RERANK_API_KEY") {
+                Ok(k) if !k.is_empty() => k,
+                _ => {
+                    eprintln!("Reranker: BSMCP_RERANK_API_KEY required for voyage — /rerank disabled");
+                    return None;
+                }
+            };
+            let model = env::var("BSMCP_RERANK_MODEL")
+                .unwrap_or_else(|_| DEFAULT_VOYAGE_RERANK_MODEL.into());
+            let base_url = env::var("BSMCP_RERANK_API_URL")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "https://api.voyageai.com".into());
+            eprintln!("Reranker: Voyage AI provider (model={model}, url={base_url})");
+            Some(Arc::new(rerank::VoyageReranker::new(&api_key, &model, &base_url))
+                as Arc<dyn Reranker>)
+        }
+        "openai" => {
+            let api_key = match env::var("BSMCP_RERANK_API_KEY") {
+                Ok(k) if !k.is_empty() => k,
+                _ => {
+                    eprintln!("Reranker: BSMCP_RERANK_API_KEY required for openai — /rerank disabled");
+                    return None;
+                }
+            };
+            let model = match env::var("BSMCP_RERANK_MODEL") {
+                Ok(m) if !m.is_empty() => m,
+                _ => {
+                    eprintln!(
+                        "Reranker: BSMCP_RERANK_MODEL required for openai (no upstream default) — /rerank disabled"
+                    );
+                    return None;
+                }
+            };
+            let base_url = match env::var("BSMCP_RERANK_API_URL") {
+                Ok(u) if !u.is_empty() => u,
+                _ => {
+                    eprintln!(
+                        "Reranker: BSMCP_RERANK_API_URL required for openai (OpenAI itself \
+                         has no rerank API yet; point at any compatible endpoint) — /rerank disabled"
+                    );
+                    return None;
+                }
+            };
+            eprintln!("Reranker: OpenAI-compatible provider (model={model}, url={base_url})");
+            Some(Arc::new(rerank::OpenAIReranker::new(&api_key, &model, &base_url))
+                as Arc<dyn Reranker>)
+        }
+        other => {
+            eprintln!(
+                "Reranker: unknown provider '{other}' (expected: local|voyage|openai|none) — /rerank disabled"
+            );
+            None
+        }
+    }
 }
 
 /// Background job queue worker. Polls for pending embed jobs and processes them.

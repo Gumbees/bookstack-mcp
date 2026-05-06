@@ -9,7 +9,8 @@ An MCP (Model Context Protocol) server that gives Claude full access to a [BookS
 - **Semantic vector search** — natural language search across all content via embeddings (optional). Hybrid (vector + keyword) with Markov-blanket re-ranking. Per-page access control is enforced via BookStack's API on every result.
 - **Settings UI (`/settings`)** — browser-based admin configuration page (token-gated via the same `/authorize` flow). Surfaces only the global server fields the index worker needs (`hive_shelf_id`, `user_journals_shelf_id`).
 - **Pluggable database** — SQLite for simple deployments, PostgreSQL + pgvector for production
-- **Separate embedder** — background embedding service with pluggable backends (local ONNX, Ollama, OpenAI)
+- **Separate embedder** — background embedding service with pluggable backends (local ONNX, Ollama, OpenAI, Voyage)
+- **Cross-encoder reranker (optional)** — embedder exposes `POST /rerank` when `BSMCP_RERANK_PROVIDER` is configured. Three providers: `local` (in-process ONNX cross-encoder via fastembed, default `BAAI/bge-reranker-v2-m3`), `voyage` (Voyage's `/v1/rerank`), `openai` (any OpenAI-shape rerank endpoint — covers Voyage/Jina/Cohere-via-shim/self-hosted). Off by default; consumed by the `semantic_search` tool's opt-in `mode: "precision"` cascade.
 - **Server-side markdown to HTML conversion** — send markdown, server converts before sending to BookStack
 - **Staging upload flow** — upload local images and attachments through a two-step staging endpoint without exposing local paths to the container ([see below](#uploading-local-files-images--attachments))
 - **OAuth 2.1 support** — use as a Claude.ai or Claude Desktop custom connector without config files
@@ -158,6 +159,10 @@ The server is pure Rust + bundled SQLite and builds cleanly on any target the Ru
 | `BSMCP_EMBED_ON_STARTUP` | No | `false` | `true` = auto-embed on startup, `clean` = clear all embeddings first |
 | `BSMCP_EMBED_HOST` | No | `0.0.0.0` | Embedder listen address |
 | `BSMCP_EMBED_PORT` | No | `8081` | Embedder listen port |
+| `BSMCP_RERANK_PROVIDER` | No | (unset) | Cross-encoder rerank provider: `local`, `voyage`, `openai`, `none`. Off by default; enables `POST /rerank` on the embedder. |
+| `BSMCP_RERANK_MODEL` | If reranker on | (per provider) | Reranker model. Defaults: `BAAI/bge-reranker-v2-m3` (local), `rerank-2` (voyage). Required for `openai`. |
+| `BSMCP_RERANK_API_KEY` | If voyage/openai | - | API key for external rerank provider. |
+| `BSMCP_RERANK_API_URL` | If openai | (per provider) | Base URL. Voyage defaults to `https://api.voyageai.com`; openai requires explicit URL. |
 
 See `.env.example` for the full list with comments.
 

@@ -1,6 +1,6 @@
 # Repository Structure
 
-_Auto-generated on 2026-05-04 20:21 UTC from commit `0e43753`._
+_Auto-generated on 2026-05-06 20:47 UTC from commit `3549ef0`._
 
 ```
 .
@@ -36,8 +36,6 @@ _Auto-generated on 2026-05-04 20:21 UTC from commit `0e43753`._
 │   ├── bsmcp-server
 │   │   ├── src
 │   │   │   ├── briefing
-│   │   │   ├── remember
-│   │   │   ├── directory.rs
 │   │   │   ├── llm.rs
 │   │   │   ├── main.rs
 │   │   │   ├── mcp.rs
@@ -46,7 +44,6 @@ _Auto-generated on 2026-05-04 20:21 UTC from commit `0e43753`._
 │   │   │   ├── semantic.rs
 │   │   │   ├── session.rs
 │   │   │   ├── settings_ui.rs
-│   │   │   ├── setup_ui.rs
 │   │   │   ├── sse.rs
 │   │   │   ├── staging.rs
 │   │   │   └── summary.rs
@@ -69,10 +66,9 @@ _Auto-generated on 2026-05-04 20:21 UTC from commit `0e43753`._
 ├── Cargo.toml
 ├── DEVELOPMENT.md
 ├── README.md
-├── RFC-identity-book-restructure.md
 ├── SBOM.md
 ├── STRUCTURE.md
 └── entrypoint.sh
 
-18 directories, 52 files
+17 directories, 49 files
 ```

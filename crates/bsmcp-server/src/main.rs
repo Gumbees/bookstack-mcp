@@ -1,14 +1,11 @@
 mod briefing;
-mod directory;
 mod llm;
 mod mcp;
 mod migrate;
 mod oauth;
-mod remember;
 mod semantic;
 mod session;
 mod settings_ui;
-mod setup_ui;
 mod sse;
 mod staging;
 mod summary;
@@ -282,43 +279,17 @@ async fn main() {
             "/settings/probe",
             get(settings_ui::handle_settings_probe_get).post(settings_ui::handle_settings_probe_post),
         )
-        .route(
-            "/setup/user",
-            get(setup_ui::handle_setup_user_get).post(setup_ui::handle_setup_user_post),
-        )
-        .route(
-            "/setup/user/migrate/preview",
-            axum::routing::post(setup_ui::handle_setup_user_migrate_preview),
-        )
-        .route(
-            "/setup/admin",
-            get(setup_ui::handle_setup_admin_get).post(setup_ui::handle_setup_admin_post),
-        )
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }));
     if briefing_enabled {
         app = app.route(
             "/briefing/v1/read",
             axum::routing::post(handle_briefing_http),
         );
-        app = app.route(
-            "/remember/v1/{resource}/{action}",
-            axum::routing::post(handle_remember_http),
-        );
         eprintln!("Briefing: HTTP endpoint active at POST /briefing/v1/read");
-        eprintln!("Remember: HTTP endpoint active at POST /remember/v1/{{resource}}/{{action}}");
     } else {
         eprintln!("Briefing: DISABLED (set BSMCP_BRIEFING_ENABLED=true to enable)");
     }
     eprintln!("Settings: UI active at GET/POST /settings");
-    if mcp::onboarding_enabled() {
-        eprintln!("Onboarding: user wizard active at GET/POST /setup/user");
-        eprintln!("Onboarding: admin wizard active at GET/POST /setup/admin");
-        if setup_ui::force_admin_setup_env() {
-            eprintln!("Onboarding: BSMCP_FORCE_ADMIN_SETUP=1 — admin nudge re-armed regardless of stored flag");
-        }
-    } else {
-        eprintln!("Onboarding: DISABLED (set BSMCP_ONBOARDING_ENABLED=true to enable)");
-    }
 
     // Staging upload endpoint for file uploads (50MB limit)
     app = app.route(
@@ -414,57 +385,6 @@ async fn handle_briefing_http(
     (StatusCode::OK, Json(envelope)).into_response()
 }
 
-/// HTTP handler for `POST /remember/v1/{resource}/{action}`. Same auth +
-/// body parsing as `handle_briefing_http`; routes through
-/// `crate::remember::dispatch`.
-async fn handle_remember_http(
-    State(state): State<sse::AppState>,
-    Path((resource, action)): Path<(String, String)>,
-    headers: HeaderMap,
-    body: String,
-) -> impl IntoResponse {
-    let (token_id, token_secret) = match sse::resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await {
-        Ok(c) => c,
-        Err(resp) => return resp,
-    };
-
-    let body_value: serde_json::Value = if body.is_empty() {
-        serde_json::Value::Object(Default::default())
-    } else {
-        match serde_json::from_str(&body) {
-            Ok(v) => v,
-            Err(_) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"ok": false, "error": {"code": "invalid_argument", "message": "request body must be JSON"}})),
-                )
-                    .into_response();
-            }
-        }
-    };
-
-    let client = bsmcp_common::bookstack::BookStackClient::new(
-        &state.bookstack_url,
-        &token_id,
-        &token_secret,
-        state.http_client.clone(),
-    );
-
-    let envelope = remember::dispatch(
-        &resource,
-        &action,
-        body_value,
-        &token_id,
-        &client,
-        state.db.clone(),
-        state.semantic.clone(),
-        Some(state.directory.clone()),
-    )
-    .await;
-
-    (StatusCode::OK, Json(envelope)).into_response()
-}
-
 /// Webhook handler for BookStack page change events.
 async fn handle_webhook(
     State(state): State<sse::AppState>,
@@ -512,57 +432,7 @@ async fn handle_webhook(
         eprintln!("IndexWorker: webhook enqueue failed (non-fatal): {e}");
     }
 
-    // Directory cache invalidation: any tree-affecting event swaps in a
-    // fresh snapshot in the background. Sits at the routing layer (not the
-    // semantic layer) because the directory is independent of semantic
-    // search and ships even when semantic is disabled.
-    maybe_invalidate_directory(&payload, &state);
-
     StatusCode::ACCEPTED.into_response()
-}
-
-/// Trigger a directory rebuild when the webhook payload describes a
-/// tree-affecting change. The tree changes on shelf / book / chapter / page
-/// create / update / delete / restore / move events. We can't tell from the
-/// payload whether a `page_update` was a name change vs a content edit, so
-/// we err on the side of invalidating — the rebuild is cheap (DB row reads,
-/// no BookStack API calls).
-fn maybe_invalidate_directory(payload: &serde_json::Value, state: &sse::AppState) {
-    let event = payload
-        .get("event")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let affects_tree = matches!(
-        event,
-        // Pages
-        "page_create"
-            | "page_update"
-            | "page_delete"
-            | "page_restore"
-            | "page_move"
-            // Chapters
-            | "chapter_create"
-            | "chapter_update"
-            | "chapter_delete"
-            | "chapter_restore"
-            | "chapter_move"
-            // Books
-            | "book_create"
-            | "book_update"
-            | "book_delete"
-            | "book_restore"
-            | "book_sort"
-            | "book_create_from_chapter"
-            // Shelves (BookStack uses `bookshelf_*` event names)
-            | "bookshelf_create"
-            | "bookshelf_update"
-            | "bookshelf_delete"
-            | "bookshelf_restore"
-            | "bookshelf_create_from_book"
-    );
-    if affects_tree {
-        state.directory.invalidate();
-    }
 }
 
 /// Mirror the event-dispatch logic in semantic::handle_webhook for the

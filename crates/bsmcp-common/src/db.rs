@@ -3,66 +3,8 @@ use std::path::Path;
 use async_trait::async_trait;
 
 use crate::index::*;
-use crate::settings::{GlobalSettings, UserSettings, DEFAULT_ACCOUNT_LABEL};
+use crate::settings::{GlobalSettings, UserSettings};
 use crate::types::*;
-
-/// One row per AI session captured to BookStack via the `sessions`
-/// MCP tool / HTTP surface (`POST /sessions/v1/append`).
-///
-/// Sessions live as plain BookStack pages inside chapter
-/// `Sessions: {agent_name}` in the user's per-user Journal book; this
-/// row is the lookup index — `session_id` → page id, plus enough
-/// metadata to render the wizard / list call without re-walking
-/// BookStack.
-#[derive(Clone, Debug)]
-pub struct SessionRow {
-    pub session_id: String,
-    pub token_id_hash: String,
-    pub agent_name: String,
-    pub bookstack_page_id: i64,
-    pub chapter_id: i64,
-    pub book_id: i64,
-    pub started_at: i64,
-    pub last_appended_at: i64,
-    pub block_count: i64,
-    pub title: Option<String>,
-}
-
-/// Maps a BookStack API token hash to its stable identity.
-///
-/// One token's hash is one binding; rotating the token issues a new
-/// binding (the wizard offers reusing an existing `(bookstack_user_id,
-/// account_label)` pair so `user_settings` survives the rotation).
-#[derive(Clone, Debug)]
-pub struct TokenBinding {
-    pub token_id_hash: String,
-    pub bookstack_user_id: i64,
-    pub account_label: String,
-    /// Unix epoch seconds the binding was first created.
-    pub created_at: i64,
-}
-
-impl TokenBinding {
-    /// Build the canonical `stable_id` string used as the `user_settings`
-    /// primary key — `"{bookstack_user_id}:{account_label}"`.
-    pub fn stable_id(&self) -> String {
-        stable_id_for(self.bookstack_user_id, &self.account_label)
-    }
-}
-
-/// Build a `stable_id` from `(bookstack_user_id, account_label)`. This
-/// is the canonical primary key for `user_settings` rows post-rekey.
-/// `account_label` is trimmed and falls back to `DEFAULT_ACCOUNT_LABEL`
-/// when empty so callers can pass through user input safely.
-pub fn stable_id_for(bookstack_user_id: i64, account_label: &str) -> String {
-    let label = account_label.trim();
-    let label = if label.is_empty() {
-        DEFAULT_ACCOUNT_LABEL
-    } else {
-        label
-    };
-    format!("{}:{}", bookstack_user_id, label)
-}
 
 /// Core database operations (auth tokens, backups, user settings).
 #[async_trait]
@@ -90,104 +32,16 @@ pub trait DbBackend: Send + Sync + 'static {
     /// Create a database backup. SQLite: VACUUM INTO. Postgres: no-op (use pg_dump).
     async fn backup(&self, path: &Path) -> Result<(), String>;
 
-    // --- Token bindings (token rotation survival) ---
-    //
-    // A binding is `token_id_hash → (bookstack_user_id, account_label)`.
-    // Settings live against the `(bookstack_user_id, account_label)` pair
-    // (the "stable identity"), not against the rotating token hash, so a
-    // user who rotates their BookStack API token can attach the new
-    // token's binding to the same stable identity and keep all their
-    // settings.
+    // --- User settings (Hive memory flow config) ---
 
-    /// Look up the binding for a token hash. Returns `Ok(None)` when the
-    /// token has never authenticated against this server before — the
-    /// auth flow is responsible for creating the binding (default label
-    /// `"default"`) when this returns `None`.
-    async fn get_token_binding(&self, token_id_hash: &str)
-        -> Result<Option<TokenBinding>, String>;
+    /// Load user settings keyed by `token_id_hash` (SHA-256 of raw token_id).
+    /// Returns Ok(None) when no row exists for this user. Default settings are
+    /// applied by the caller (UserSettings::default()) so v1 callers and
+    /// pre-existing users behave identically.
+    async fn get_user_settings(&self, token_id_hash: &str) -> Result<Option<UserSettings>, String>;
 
-    /// Upsert a binding. Replaces any existing binding for the same
-    /// `token_id_hash`. The `created_at` field is honored on insert and
-    /// preserved on update.
-    async fn set_token_binding(&self, binding: &TokenBinding) -> Result<(), String>;
-
-    /// Delete a binding. Used on token revocation. Does not touch the
-    /// `user_settings` row at the bound stable identity — those live on
-    /// for any other token still bound to the same stable identity.
-    async fn delete_token_binding(&self, token_id_hash: &str) -> Result<(), String>;
-
-    /// List the distinct `account_label` values currently bound for a
-    /// given `bookstack_user_id`. Drives the `/setup/user` "pick
-    /// existing personality" prompt when a fresh token authenticates and
-    /// the user already has settings rows for this BookStack user.
-    async fn list_account_labels_for_user(&self, bookstack_user_id: i64)
-        -> Result<Vec<String>, String>;
-
-    // --- User settings (per stable identity) ---
-
-    /// Load user settings keyed by stable identity. Returns `Ok(None)`
-    /// when no row exists for this identity yet — the caller (briefing
-    /// builder, settings UI, etc.) substitutes `UserSettings::default()`
-    /// so v1 and pre-rekey callers behave identically.
-    ///
-    /// `stable_id` should be built via [`stable_id_for`] from the bound
-    /// `(bookstack_user_id, account_label)` pair.
-    async fn get_user_settings_by_stable_id(&self, stable_id: &str)
-        -> Result<Option<UserSettings>, String>;
-
-    /// Upsert user settings at a stable identity. Replaces the entire
-    /// row.
-    async fn save_user_settings_by_stable_id(
-        &self,
-        stable_id: &str,
-        settings: &UserSettings,
-    ) -> Result<(), String>;
-
-    // --- User settings (by token, convenience wrappers) ---
-
-    /// Load user settings for the holder of `token_id_hash` by chasing
-    /// the binding. Returns `Ok(None)` when either no binding exists or
-    /// no settings row exists at the bound stable identity.
-    ///
-    /// Backward-compatible signature for callers that already have a
-    /// token hash in hand and don't want to thread bindings through
-    /// themselves; the binding chase is cheap (indexed lookup).
-    async fn get_user_settings(&self, token_id_hash: &str)
-        -> Result<Option<UserSettings>, String>;
-
-    /// Upsert user settings for the holder of `token_id_hash`. Resolves
-    /// the binding to find the stable identity and writes there.
-    /// Returns an error when no binding exists — callers must establish
-    /// a binding (via [`Self::set_token_binding`]) before saving.
-    async fn save_user_settings(&self, token_id_hash: &str, settings: &UserSettings)
-        -> Result<(), String>;
-
-    // --- Sessions (Phase 2.8 — forager / Claude Code session capture) ---
-    //
-    // One row per captured session. The session's actual transcript
-    // lives on a BookStack page inside chapter `Sessions: {agent_name}`
-    // in the user's per-user Journal book; this row is the index.
-    // `session_id` is opaque (forager picks it).
-
-    /// Look up a session by its `session_id`. `Ok(None)` when the row
-    /// doesn't exist (the caller is expected to create one via
-    /// `upsert_session` after find-or-create-ing the BookStack page).
-    async fn get_session(&self, session_id: &str) -> Result<Option<SessionRow>, String>;
-
-    /// Upsert a session row. Replaces the entire row keyed by
-    /// `session_id`; callers should preserve `started_at` and bump
-    /// `last_appended_at` + `block_count` on each append.
-    async fn upsert_session(&self, row: &SessionRow) -> Result<(), String>;
-
-    /// List sessions for a user (all if `agent_name` is None) ordered
-    /// by `last_appended_at DESC`. Used by `sessions list` and
-    /// `GET /sessions/v1/list`.
-    async fn list_sessions(
-        &self,
-        token_id_hash: &str,
-        agent_name: Option<&str>,
-        limit: i64,
-    ) -> Result<Vec<SessionRow>, String>;
+    /// Upsert user settings for `token_id_hash`. Replaces the entire row.
+    async fn save_user_settings(&self, token_id_hash: &str, settings: &UserSettings) -> Result<(), String>;
 
     // --- Global settings (server-instance-wide) ---
 
@@ -421,9 +275,6 @@ pub trait IndexDb: Send + Sync + 'static {
 
     async fn upsert_indexed_shelf(&self, shelf: &IndexedShelf) -> Result<(), String>;
     async fn get_indexed_shelf(&self, shelf_id: i64) -> Result<Option<IndexedShelf>, String>;
-    /// All non-deleted shelves, sorted by name. Used by the directory cache
-    /// (sub-PR 2.2) to walk the full tree without reading global config.
-    async fn list_indexed_shelves(&self) -> Result<Vec<IndexedShelf>, String>;
     async fn soft_delete_indexed_shelf(&self, shelf_id: i64) -> Result<(), String>;
 
     // --- Books ---
@@ -435,10 +286,6 @@ pub trait IndexDb: Send + Sync + 'static {
         &self,
         identity_ouid: &str,
     ) -> Result<Vec<IndexedBook>, String>;
-    /// All non-deleted books with NULL shelf_id, sorted by name. Used by the
-    /// directory cache to surface books that aren't on any shelf so they
-    /// don't disappear from the tree.
-    async fn list_indexed_orphan_books(&self) -> Result<Vec<IndexedBook>, String>;
     async fn soft_delete_indexed_book(&self, book_id: i64) -> Result<(), String>;
 
     // --- Chapters ---

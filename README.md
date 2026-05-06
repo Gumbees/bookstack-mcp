@@ -7,8 +7,8 @@ An MCP (Model Context Protocol) server that gives Claude full access to a [BookS
 - Full CRUD on all core BookStack resources (shelves, books, chapters, pages, attachments)
 - Full-text search with BookStack query operators
 - **Semantic vector search** — natural language search across all content via embeddings (optional). Hybrid (vector + keyword) with Markov-blanket re-ranking; ACL-filtered when the caller's BookStack user ID is configured.
-- **Memory protocol** — server-side reconstitution + memory CRUD that replaces the multi-call AI bootstrap with one structured `briefing` pull. Nine MCP tools cover identity, journals, per-user/global config, the directory tree, the migrate flow, and session-state signals. Auto-provisions per-user identity + journal structure on first call. Stable identity per `(bookstack_user_id, account_label)` survives BookStack API token rotation; multi-Anthropic-account users distinguish personalities with the `account_label` field.
-- **Settings UI (`/settings`)** — browser-based admin/user configuration page (token-gated via the same `/authorize` flow). Pick book/chapter IDs from dropdowns populated by BookStack; toggle semantic-search scopes; one-shot admin-only globals (Hive shelf, User Journals shelf, org identity page, org domains).
+- **Briefing flow (`POST /briefing/v1/read` + `briefing` MCP tool)** — server-side per-session reconstitution. Returns time, `system_prompt_additions` (guide page, org identity, org required instructions, AI-usage policy, user system_prompt_page_ids, owned-domains block), `setup_nudge` when settings are incomplete, and `kb_semantic_matches` against the user prompt. Auto-injected as `meta.briefing` on every other tool response — full content first call per session, sticky bits thereafter. **No personal-memory primitives** (journals, identities, etc.) — this server is a BookStack bridge, not a memory backend.
+- **Settings UI (`/settings`)** — browser-based admin/user configuration page (token-gated via the same `/authorize` flow). Per-user fields for label/role/timezone/owned-domains/system_prompt_page_ids; admin globals for guide page, org identity, org_required_instructions / org_ai_usage_policy page lists, typed scope slots (policies/sops/best_practices), and org domains.
 - **Pluggable database** — SQLite for simple deployments, PostgreSQL + pgvector for production
 - **Separate embedder** — background embedding service with pluggable backends (local ONNX, Ollama, OpenAI)
 - **Server-side markdown to HTML conversion** — send markdown, server converts before sending to BookStack
@@ -42,12 +42,13 @@ docker/
 
 The MCP server handles all client-facing protocol, OAuth, and search. The embedder runs separately, polling a database-backed job queue to embed pages and serving a `/embed` HTTP endpoint for query-time embedding. The embedder supports three backends: local ONNX models (fastembed), Ollama, or OpenAI-compatible APIs.
 
-## Available Tools (59 BookStack + 9 memory protocol + 3 semantic = 71)
+## Available Tools (59 BookStack + 1 briefing + 3 semantic = 63)
 
 | Category | Tools |
 |----------|-------|
 | **Search** | `search_content` |
 | **Semantic** | `semantic_search`, `reembed`, `embedding_status` |
+| **Briefing** | `briefing` (single tool — per-session reconstitution + auto-injected as `meta.briefing` on every other tool response) |
 | **Shelves** | `list_shelves`, `get_shelf`, `create_shelf`, `update_shelf`, `delete_shelf` |
 | **Books** | `list_books`, `get_book`, `create_book`, `update_book`, `delete_book` |
 | **Chapters** | `list_chapters`, `get_chapter`, `create_chapter`, `update_chapter`, `delete_chapter` |
@@ -64,13 +65,10 @@ The MCP server handles all client-facing protocol, OAuth, and search. The embedd
 | **Images** | `list_images`, `get_image`, `upload_image`, `update_image`, `delete_image` |
 | **Permissions** | `get_content_permissions`, `update_content_permissions` |
 | **Roles** | `list_roles`, `get_role` |
-| **Memory protocol** | `briefing`, `user`, `config`, `directory`, `identity`, `journal`, `migrate`, `session_event`, `dismiss_setup_nudge` |
 
-Semantic tools (`semantic_search`, `reembed`, `embedding_status`) only appear when `BSMCP_SEMANTIC_SEARCH=true` and an embedder is running. Without semantic search: 59 BookStack + 9 memory protocol = 68 tools.
+Semantic tools (`semantic_search`, `reembed`, `embedding_status`) only appear when `BSMCP_SEMANTIC_SEARCH=true` and an embedder is running. Without semantic search: 60 tools (59 BookStack + 1 briefing).
 
-Memory-protocol tools require per-user / global settings. The `briefing` tool (and `meta.briefing` on every other tool response) carries a `setup_nudge` listing pending fields; configure via the `/setup/user` wizard, the `/settings` UI, or `user action=write` / `config action=write`. The `setup_nudge` is dismissable for N days via `config action=dismiss_setup_nudge` or the dedicated `dismiss_setup_nudge` tool.
-
-Per-user memory tools survive BookStack API token rotation: settings live at the stable identity `(bookstack_user_id, account_label)`, and the `token_bindings` table maps each rotating token hash onto an identity. A user running this MCP with multiple Anthropic accounts against the same BookStack user distinguishes personalities by `account_label` (defaults to `"default"`). The `/setup/user` wizard offers re-attaching to an existing label on a fresh token's first authentication.
+The `briefing` tool returns a `setup_nudge` listing pending settings fields with the exact path to fix them; configure via the `/settings` UI. Personal-memory primitives (journals, identities, reminders, events, sessions) are intentionally NOT in scope and live in dedicated downstream tools.
 
 ## Setup
 
@@ -272,7 +270,46 @@ The token ID and secret come from your BookStack API token (created under **My A
 
 All schema migrations are automatic on startup (CREATE TABLE IF NOT EXISTS, ALTER TABLE for new columns). No manual SQL is needed.
 
-### From v0.7.3 to v0.7.4 (this release)
+> **Heads up about the historical entries below.** v0.8.0 removed the `/remember` protocol and its 12 `remember_*` MCP tools (the personal-memory layer moved to memberberry.ai); v0.9.0 reverted v1.0.0's brief re-introduction of those primitives. The pre-v0.8.0 entries (v0.7.x and earlier) describe functionality that no longer ships — they're kept for upgrade-path archaeology, not as a current feature list.
+
+### From v0.8.0 to v0.9.0 (this release)
+
+#### What's new
+
+- **v1.0.0 rollback.** The Phase 2 re-introduction of personal-memory MCP tools (`user`, `config`, `directory`, `identity`, `journal`, `migrate`, `reminders`, `events`, `sessions`, `session_event`, `dismiss_setup_nudge`) is gone. The single `briefing` tool from v0.8.0 stays. The codebase is back to v0.8.0's posture plus the issue #54 rate-limiter / job-lifecycle infrastructure.
+- **DB tables `token_bindings` and `sessions` are no longer created** on fresh installs. Existing v1.0.0 deployments upgrading to v0.9.0 keep the on-disk tables (inert; `DROP TABLE` manually if cleanup matters).
+- **`UserSettings` shed the per-account-settings + journal-resolver fields** added in v1.0.0 (`account_label`, `use_org_identity`, `journaling_enabled`, `chosen_ai_identity`, `setup_complete`, `tool_overrides`, `user_journal_book_id`, `cached_user_email*`, `cached_first_name*`, `cached_is_admin*`). The `extras` JSON catch-all silently preserves any leftover keys until the briefing's migration handler clears them.
+- **`GlobalSettings.tool_defaults` and `admin_setup_complete` dropped** — admin-only defaults followed the per-tool toggle infrastructure into the bin.
+- **`/setup/user` and `/setup/admin` browser wizards removed.** The `/settings` page is the only browser-side configuration surface.
+- **`oauth.rs::ensure_token_binding` reverted to v0.8.0's `try_auto_populate_bookstack_user_id` shape.** Tokens key the `user_settings` row directly via `token_id_hash` again; no binding indirection.
+
+#### What survives from the v0.8.0 → v1.0.0 era
+
+- Rate limiter + job lifecycle (`bsmcp_common::rate_limit`, `embed_jobs` / `index_jobs` lifecycle columns, `/jobs/{embed,index}/{id}/cancel` endpoints, the lifecycle housekeeper in `bsmcp-worker`). Issue #54 work is general infra and is kept verbatim.
+
+#### What's automatic
+
+- **No DB migration ships for v1.0.0 → v0.9.0 downgraders.** `CREATE TABLE IF NOT EXISTS` won't re-shape the v1.0.0 `user_settings` PK (`stable_id` → `token_id_hash`). If a clean reset is needed, drop the table manually before first start, or wait for a follow-up one-shot migration.
+- v0.8.0 → v0.9.0 is a no-op schema-wise.
+
+### From v0.7.4 to v0.8.0
+
+#### What's new
+
+- **Personal-memory layer moved to memberberry.ai.** All 12 `remember_*` MCP tools (`remember_briefing` / `remember_journal` / `remember_collage` / `remember_shared_collage` / `remember_user_journal` / `remember_whoami` / `remember_user` / `remember_identity` / `remember_directory` / `remember_config` / `remember_audit` / `remember_search`) no longer ship. The `POST /remember/v1/{resource}/{action}` HTTP namespace is gone.
+- **Single `briefing` MCP tool** replaces the 12 remember tools. Same response shape as the old `remember_briefing action=read`, no `action` arg. HTTP form: `POST /briefing/v1/read`.
+- **`meta.briefing` auto-injection** on every MCP tool response — full content on the first call per `(token_hash, session_id)`, sticky bits (time + setup summary) thereafter. Calling `briefing` explicitly resets the session for the next response — useful after the AI's harness compacts the conversation.
+- **Typed setup slots on global settings** — `guide_page_id`, `org_identity_page_id`, `policies_scope`, `sops_scope`, `best_practices_scope`, plus org-wide booleans `friendly_structure`, `full_content_in_briefing`, `strict_setup`. Idempotent `ALTER TABLE ADD COLUMN` migrations on first startup.
+- **Removed:** `default_ai_identity_*` global columns (dropped via `ALTER TABLE DROP COLUMN`), `remember_audit` table (`DROP TABLE IF EXISTS`), and most per-user pointer fields from `UserSettings` (`ai_*_book_id`, `user_journal_book_id`, `recent_*_count`, etc.). The settings UI shrank ~1,300 lines to match.
+
+#### What's automatic
+
+- Idempotent `ALTER TABLE ADD COLUMN` for the new global slots.
+- `ALTER TABLE DROP COLUMN [IF EXISTS]` for `default_ai_identity_*` (Postgres native; SQLite swallows duplicate-drop errors via `.ok()`, requires SQLite ≥ 3.35).
+- `DROP TABLE IF EXISTS remember_audit` on startup.
+- `user_settings` is a JSON blob — old keys are silently ignored on read and dropped on next save.
+
+### From v0.7.3 to v0.7.4
 
 #### What's new
 
@@ -296,10 +333,10 @@ All schema migrations are automatic on startup (CREATE TABLE IF NOT EXISTS, ALTE
 
 #### What's new
 
-- **Briefing latency cut** — book-scoped semantic-search candidate filtering, parallel KB fetches, batched DB lookups. `briefing` is significantly faster on instances with large embedded corpora.
+- **Briefing latency cut** — book-scoped semantic-search candidate filtering, parallel KB fetches, batched DB lookups. `remember_briefing` is significantly faster on instances with large embedded corpora.
 - **`kb_semantic_matches` reshape** — now an envelope `{enabled, reason, detail, results}` so consumers can branch on `enabled` rather than guessing whether an empty list means opt-out vs. zero hits.
 - **Permission ACL filtering** for semantic search — set `bookstack_user_id` in user settings to enable role-based filtering at the candidate-pool layer (much faster than the per-page HTTP fallback).
-- **Per-user identity auto-provisioning** — first call to `user action=read` creates the per-user Identity book + Identity page + journal-agent page if missing, returning what was created in `auto_provisioned`.
+- **Per-user identity auto-provisioning** — first call to `remember_user action=read` creates the per-user Identity book + Identity page + journal-agent page if missing, returning what was created in `auto_provisioned`.
 - **Global org settings** — admin-only `org_identity_page_id`, `org_domains`, `org_required_instructions_page_ids`, `org_ai_usage_policy_page_ids` shared across every user on the instance. First-write-wins for the structural IDs.
 - **Owner-only journal pages** — auto-applied content permission lock so journal entries are visible only to the owning agent/user.
 
@@ -307,7 +344,7 @@ All schema migrations are automatic on startup (CREATE TABLE IF NOT EXISTS, ALTE
 
 #### What's new
 
-- **`/remember` protocol** — server-side reconstitution + memory CRUD. 12 MCP tools: `briefing`, `remember_whoami`, `user`, `config`, `remember_identity`, `directory`, `remember_journal`, `remember_collage`, `remember_shared_collage`, `remember_user_journal`, `remember_audit`, `remember_search`. HTTP form: `POST /remember/v1/{resource}/{action}`.
+- **`/remember` protocol** — server-side reconstitution + memory CRUD. 12 MCP tools: `remember_briefing`, `remember_whoami`, `remember_user`, `remember_config`, `remember_identity`, `remember_directory`, `remember_journal`, `remember_collage`, `remember_shared_collage`, `remember_user_journal`, `remember_audit`, `remember_search`. HTTP form: `POST /remember/v1/{resource}/{action}`.
 - **`/settings` UI** — browser-based configuration page, token-gated via `/authorize`. Settings session cookie stored server-side (in-memory, 8h TTL).
 - **YAML-frontmatter provenance** — every collection write stamps `written_by`, `ai_identity_ouid`, `user_id`, `written_at`, `trace_id`, `resource`, `key`, `supersedes_page` at the top of the page body. Invisible in BookStack's renderer; readable by tools.
 - **Soft delete** — `remember_*_collection action=delete` prepends `[archived]` to the page name and stamps `deleted: true` in frontmatter rather than hard-deleting.

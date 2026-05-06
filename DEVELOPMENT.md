@@ -37,7 +37,7 @@ Then:
 ```bash
 cargo run -p bsmcp-server
 cargo run -p bsmcp-embedder  # optional, for semantic search
-cargo run -p bsmcp-worker    # optional, for v1.0.0 reconciliation index
+cargo run -p bsmcp-worker    # optional, for the reconciliation index
 ```
 
 ## Docker Compose
@@ -121,7 +121,7 @@ What counts as "changed paths":
 | `bsmcp-embedder` | `crates/bsmcp-embedder/`, `crates/bsmcp-common/`, `crates/bsmcp-db-sqlite/`, `crates/bsmcp-db-postgres/`, `Cargo.toml`, `Cargo.lock`, `docker/Dockerfile.embedder`, `entrypoint.sh` |
 | `bsmcp-worker` | `crates/bsmcp-worker/`, `crates/bsmcp-common/`, `crates/bsmcp-db-sqlite/`, `crates/bsmcp-db-postgres/`, `Cargo.toml`, `Cargo.lock`, `docker/Dockerfile.worker`, `entrypoint.sh` |
 
-Note that PRs touching `crates/bsmcp-server/` only — like most v1.0.0 phase work — skip the embedder rebuild entirely. That's the change that takes a typical PR from ~25 min of multi-arch build time down to ~10 min.
+Note that PRs touching `crates/bsmcp-server/` only — typical for server-side work — skip the embedder rebuild entirely. That's the change that takes a typical PR from ~25 min of multi-arch build time down to ~10 min.
 
 Override with `scripts/publish-pr-image.sh both --force` if you need to force a full rebuild (e.g., to validate a Dockerfile change that the path filter would otherwise miss).
 

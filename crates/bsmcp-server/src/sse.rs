@@ -53,12 +53,6 @@ pub struct AppState {
     /// stub errors per #36). Webhook handler enqueues page:{id} index jobs
     /// here when BookStack page events arrive.
     pub index_db: Arc<dyn bsmcp_common::db::IndexDb>,
-    /// In-memory directory tree cache. Built from `index_db` rows; webhook
-    /// handler invalidates on any tree-affecting BookStack event. Served by
-    /// the `remember/directory read` endpoint and auto-attached to every
-    /// MCP tool response's `meta.directory` (full first time per session,
-    /// `{version, hash}` pointer thereafter).
-    pub directory: Arc<crate::directory::DirectoryService>,
 }
 
 pub(crate) struct RateLimit {
@@ -121,7 +115,6 @@ impl AppState {
             .timeout(Duration::from_secs(60))
             .build()
             .expect("Failed to build HTTP client");
-        let directory = crate::directory::DirectoryService::new(index_db.clone());
         Self {
             bookstack_url: bookstack_url.trim_end_matches('/').to_string(),
             http_client,
@@ -141,7 +134,6 @@ impl AppState {
             settings_sessions: crate::settings_ui::new_settings_store(),
             briefing_sessions: crate::session::new_store(),
             index_db,
-            directory,
         }
     }
 
@@ -298,11 +290,6 @@ pub async fn handle_sse(
         );
     }
 
-    // First-bind on the SSE GET path. Idempotent — short-circuits when
-    // a binding already exists. Captures the BookStack user_id +
-    // account_label so settings can be written via the binding.
-    let _ = crate::oauth::ensure_token_binding(state.db.as_ref(), &client, &token_id).await;
-
     let session_id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(32);
 
@@ -444,7 +431,6 @@ pub async fn handle_message(
         token_id_hash,
         // SSE 2024-11-05: the session_id IS the `?sessionId=` query param.
         session_id: Some(session_id.clone()),
-        directory: state.directory.clone(),
     };
     let response = mcp::handle_request(&request, &client, semantic, &state.summary_cache, &state.staging, &briefing_deps).await;
 
@@ -515,12 +501,6 @@ pub async fn handle_streamable(
                 &state.known_urls,
             );
         }
-
-        // First-bind on Streamable HTTP `initialize` (the only method
-        // guaranteed to run before any tool call per MCP 2025-03-26).
-        // Idempotent — short-circuits when a binding already exists.
-        let _ =
-            crate::oauth::ensure_token_binding(state.db.as_ref(), &client, &token_id).await;
     }
 
     if request.get("id").is_none() {
@@ -548,7 +528,6 @@ pub async fn handle_streamable(
         token_id: token_id.clone(),
         token_id_hash,
         session_id: incoming_session_id.clone(),
-        directory: state.directory.clone(),
     };
     let response = mcp::handle_request(&request, &client, semantic, &state.summary_cache, &state.staging, &briefing_deps).await;
 

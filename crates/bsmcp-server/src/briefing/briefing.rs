@@ -16,12 +16,8 @@
 //! - `strict_setup` — when true and setup is incomplete, the response carries
 //!   `setup_required: true` at the top level. The actual error-envelope gating
 //!   on tool-call paths lives in `mcp.rs` (Agent E's scope). The
-//!   `settings_fields_complete` heuristic here is intentionally minimal —
-//!   it just asks whether `pending_user_fields` and `pending_global_fields`
-//!   are both empty. Distinct from `UserSettings.setup_complete` (the
-//!   onboarding-wizard flag, sub-PR 2.4e), which means "user submitted the
-//!   /setup/user form" — a one-bit, write-once flag rather than a derived
-//!   check across many fields.
+//!   `setup_complete` heuristic here is intentionally minimal:
+//!   `globals.org_identity_page_id.is_some() && settings.user_id.is_some()`.
 
 use serde_json::{json, Value};
 
@@ -216,15 +212,10 @@ pub async fn read(ctx: &Context) -> Value {
         full_content,
         friendly,
     );
-    // org_identity is gated by the per-user `use_org_identity` opt-out.
-    // Default-on: admin-configured org identities apply. Users who don't
-    // want this instance's canonical identity bound to their session flip
-    // it false and the org_identity entry is omitted entirely.
-    let org_identity_page_ids: Vec<i64> = if ctx.settings.use_org_identity {
-        globals.org_identity_page_id.map(|id| vec![id]).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let org_identity_page_ids: Vec<i64> = globals
+        .org_identity_page_id
+        .map(|id| vec![id])
+        .unwrap_or_default();
     let org_identity_fut = fetch_pages_with_source(
         &ctx.client,
         &org_identity_page_ids,
@@ -330,8 +321,8 @@ pub async fn read(ctx: &Context) -> Value {
     // boolean is on AND setup is incomplete. The actual error-envelope
     // gating on tool-call paths is Agent E's wiring in mcp.rs; this field
     // is the signal Agent E will read.
-    let fields_complete = settings_fields_complete(&ctx.settings, &globals);
-    let setup_required = globals.strict_setup && !fields_complete;
+    let setup_complete = setup_complete(&ctx.settings, &globals);
+    let setup_required = globals.strict_setup && !setup_complete;
 
     let mut payload = serde_json::Map::new();
     payload.insert("setup_required".to_string(), json!(setup_required));
@@ -360,66 +351,14 @@ pub async fn read(ctx: &Context) -> Value {
         }),
     );
 
-    // Journaling reminder. Off entirely when the user hasn't opted in.
-    // When opted in, prefer the per-call `agent_name` (the AI's harness
-    // pushes its identity on each briefing call when it knows it), then
-    // the user's saved `chosen_ai_identity`. With neither, fall back to
-    // a generic phrasing.
-    let body_agent_name = ctx
-        .body
-        .get("agent_name")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    if let Some(reminder) = select_journaling_reminder(
-        ctx.settings.journaling_enabled,
-        body_agent_name.as_deref(),
-        ctx.settings.chosen_ai_identity.as_deref(),
-    ) {
-        payload.insert("journaling_reminder".to_string(), json!(reminder));
-    }
-
     Value::Object(payload)
 }
 
-/// Select the journaling reminder string for this briefing call. Returns
-/// `None` when journaling is disabled (no field appended). Returns the
-/// generic "remember to journal throughout the session" when on but no
-/// agent name is available; appends ` {name}` when one is.
-///
-/// `body_agent_name` (per-call) takes precedence over `chosen_ai_identity`
-/// (user-saved). Both are trimmed; empty strings count as absent.
-pub fn select_journaling_reminder(
-    enabled: bool,
-    body_agent_name: Option<&str>,
-    chosen_ai_identity: Option<&str>,
-) -> Option<String> {
-    if !enabled {
-        return None;
-    }
-    let agent = body_agent_name
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .or_else(|| chosen_ai_identity.map(str::trim).filter(|s| !s.is_empty()));
-    Some(match agent {
-        Some(name) => format!("remember to journal throughout the session {name}"),
-        None => "remember to journal throughout the session".to_string(),
-    })
-}
-
-/// "Settings fields are filled in" = no pending user or global fields.
-/// Mirrors the same definition used by `pending_user_fields` /
-/// `pending_global_fields` so the `setup_required` flag (gated by
-/// `globals.strict_setup`) and the `setup_nudge` block agree on what
-/// "done" means.
-///
-/// This is a *derived* check across the typed setup slots — distinct from
-/// `UserSettings.setup_complete`, which is a stored one-bit flag set by
-/// the `/setup/user` onboarding wizard (sub-PR 2.4e). A user can have
-/// `setup_complete = true` while still having pending settings fields
-/// (they ran the wizard but skipped optional inputs), and vice versa
-/// (an admin pre-filled their settings via API but they never opened
-/// the wizard).
-fn settings_fields_complete(s: &UserSettings, g: &GlobalSettings) -> bool {
+/// "Setup is done" = no pending user or global fields. Mirrors the same
+/// definition used by `pending_user_fields` / `pending_global_fields` so the
+/// `setup_required` flag (gated by `globals.strict_setup`) and the
+/// `setup_nudge` block agree on what "done" means.
+fn setup_complete(s: &UserSettings, g: &GlobalSettings) -> bool {
     pending_user_fields(s).is_empty() && pending_global_fields(g).is_empty()
 }
 
@@ -781,12 +720,13 @@ fn pending_global_fields(g: &bsmcp_common::settings::GlobalSettings) -> Vec<Valu
             "admin_only": true,
         }));
     }
-    // org_identity_page_id is intentionally NOT pending. "No org identity"
-    // is a first-class admin choice, not an unfinished setup step — some
-    // orgs don't have a canonical identity manifest, and per-user
-    // `use_org_identity = false` already lets users opt out when one is
-    // set. Keeping it on the pending list would nag admins into picking a
-    // page that doesn't apply.
+    if g.org_identity_page_id.is_none() {
+        out.push(json!({
+            "field": "org_identity_page_id",
+            "why": "Single page describing the organization. Pulled into every briefing's system_prompt_additions. Admin-only.",
+            "admin_only": true,
+        }));
+    }
     if g.org_domains.is_empty() {
         out.push(json!({
             "field": "org_domains",
@@ -822,62 +762,4 @@ fn format_domains_block(domains: &[String]) -> String {
          redact, share, or treat content as trusted.)\n",
     );
     s
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // --- journaling reminder selection ---
-
-    #[test]
-    fn journaling_reminder_disabled_returns_none() {
-        assert!(select_journaling_reminder(false, None, None).is_none());
-        assert!(select_journaling_reminder(false, Some("claude"), None).is_none());
-        assert!(select_journaling_reminder(false, None, Some("claude")).is_none());
-    }
-
-    #[test]
-    fn journaling_reminder_with_per_call_agent_name_uses_it() {
-        let r = select_journaling_reminder(true, Some("claude"), None).unwrap();
-        assert_eq!(r, "remember to journal throughout the session claude");
-    }
-
-    #[test]
-    fn journaling_reminder_per_call_overrides_chosen_identity() {
-        // Per-call name wins — the AI knows its identity for THIS call.
-        let r = select_journaling_reminder(true, Some("opus"), Some("claude")).unwrap();
-        assert_eq!(r, "remember to journal throughout the session opus");
-    }
-
-    #[test]
-    fn journaling_reminder_falls_back_to_chosen_identity() {
-        let r = select_journaling_reminder(true, None, Some("claude")).unwrap();
-        assert_eq!(r, "remember to journal throughout the session claude");
-    }
-
-    #[test]
-    fn journaling_reminder_generic_when_neither_name_available() {
-        let r = select_journaling_reminder(true, None, None).unwrap();
-        assert_eq!(r, "remember to journal throughout the session");
-    }
-
-    #[test]
-    fn journaling_reminder_treats_empty_strings_as_absent() {
-        // Whitespace-only agent name → fall back as if missing.
-        let r = select_journaling_reminder(true, Some("   "), Some("claude")).unwrap();
-        assert_eq!(r, "remember to journal throughout the session claude");
-
-        let r = select_journaling_reminder(true, Some(""), None).unwrap();
-        assert_eq!(r, "remember to journal throughout the session");
-
-        let r = select_journaling_reminder(true, None, Some("")).unwrap();
-        assert_eq!(r, "remember to journal throughout the session");
-    }
-
-    #[test]
-    fn journaling_reminder_trims_agent_names() {
-        let r = select_journaling_reminder(true, Some("  claude  "), None).unwrap();
-        assert_eq!(r, "remember to journal throughout the session claude");
-    }
 }

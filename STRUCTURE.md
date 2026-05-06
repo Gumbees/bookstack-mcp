@@ -1,6 +1,6 @@
 # Repository Structure
 
-_Auto-generated on 2026-05-05 12:10 UTC from commit `4e0c23a`._
+_Auto-generated on 2026-05-06 19:30 UTC from commit `88166bf`._
 
 ```
 .
@@ -66,10 +66,9 @@ _Auto-generated on 2026-05-05 12:10 UTC from commit `4e0c23a`._
 ├── Cargo.toml
 ├── DEVELOPMENT.md
 ├── README.md
-├── RFC-identity-book-restructure.md
 ├── SBOM.md
 ├── STRUCTURE.md
 └── entrypoint.sh
 
-17 directories, 50 files
+17 directories, 49 files
 ```

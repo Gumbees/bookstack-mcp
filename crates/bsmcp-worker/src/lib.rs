@@ -535,7 +535,7 @@ impl IndexWorker {
                 _ => {}
             }
             idx += 1;
-            if idx % YIELD_EVERY == 0 {
+            if idx.is_multiple_of(YIELD_EVERY) {
                 tokio::task::yield_now().await;
             }
         }
@@ -599,7 +599,7 @@ impl IndexWorker {
                 count += 1;
             }
             idx += 1;
-            if idx % YIELD_EVERY == 0 {
+            if idx.is_multiple_of(YIELD_EVERY) {
                 tokio::task::yield_now().await;
             }
         }

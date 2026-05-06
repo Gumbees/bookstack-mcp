@@ -868,7 +868,7 @@ impl SemanticDb for SqliteDb {
         let ids = page_ids.to_vec();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+            let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(",");
             let sql = format!("SELECT page_id, book_id FROM pages WHERE page_id IN ({placeholders})");
             let mut stmt = conn.prepare(&sql).map_err(|e| format!("Prepare failed: {e}"))?;
             let params_vec: Vec<&dyn rusqlite::ToSql> =
@@ -893,7 +893,7 @@ impl SemanticDb for SqliteDb {
         let ids = page_ids.to_vec();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+            let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(",");
             let sql = format!(
                 "SELECT page_id, book_id, chapter_id, name, slug, content_hash, updated_at
                  FROM pages WHERE page_id IN ({placeholders})"
@@ -1568,14 +1568,14 @@ impl SemanticDb for SqliteDb {
             let need_pages_join = book_filter.is_some() || role_filter.is_some();
 
             if let Some(ref ids) = book_filter {
-                let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+                let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(",");
                 where_clauses.push(format!("p.book_id IN ({placeholders})"));
                 for id in ids {
                     params_dyn.push(Box::new(*id));
                 }
             }
             if let Some(ref roles) = role_filter {
-                let placeholders = std::iter::repeat("?").take(roles.len()).collect::<Vec<_>>().join(",");
+                let placeholders = std::iter::repeat_n("?", roles.len()).collect::<Vec<_>>().join(",");
                 where_clauses.push(format!(
                     "(p.acl_computed_at IS NULL
                       OR COALESCE(p.acl_default_open, 0) = 1
@@ -2922,8 +2922,7 @@ mod lifecycle_tests {
                 .as_nanos()
         );
         let path = dir.join(unique);
-        let db = SqliteDb::open(&path, "test-encryption-key-thirty-two-chars-long");
-        db
+        SqliteDb::open(&path, "test-encryption-key-thirty-two-chars-long")
     }
 
     #[tokio::test]

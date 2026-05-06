@@ -270,7 +270,46 @@ The token ID and secret come from your BookStack API token (created under **My A
 
 All schema migrations are automatic on startup (CREATE TABLE IF NOT EXISTS, ALTER TABLE for new columns). No manual SQL is needed.
 
-### From v0.7.3 to v0.7.4 (this release)
+> **Heads up about the historical entries below.** v0.8.0 removed the `/remember` protocol and its 12 `remember_*` MCP tools (the personal-memory layer moved to memberberry.ai); v0.9.0 reverted v1.0.0's brief re-introduction of those primitives. The pre-v0.8.0 entries (v0.7.x and earlier) describe functionality that no longer ships — they're kept for upgrade-path archaeology, not as a current feature list.
+
+### From v0.8.0 to v0.9.0 (this release)
+
+#### What's new
+
+- **v1.0.0 rollback.** The Phase 2 re-introduction of personal-memory MCP tools (`user`, `config`, `directory`, `identity`, `journal`, `migrate`, `reminders`, `events`, `sessions`, `session_event`, `dismiss_setup_nudge`) is gone. The single `briefing` tool from v0.8.0 stays. The codebase is back to v0.8.0's posture plus the issue #54 rate-limiter / job-lifecycle infrastructure.
+- **DB tables `token_bindings` and `sessions` are no longer created** on fresh installs. Existing v1.0.0 deployments upgrading to v0.9.0 keep the on-disk tables (inert; `DROP TABLE` manually if cleanup matters).
+- **`UserSettings` shed the per-account-settings + journal-resolver fields** added in v1.0.0 (`account_label`, `use_org_identity`, `journaling_enabled`, `chosen_ai_identity`, `setup_complete`, `tool_overrides`, `user_journal_book_id`, `cached_user_email*`, `cached_first_name*`, `cached_is_admin*`). The `extras` JSON catch-all silently preserves any leftover keys until the briefing's migration handler clears them.
+- **`GlobalSettings.tool_defaults` and `admin_setup_complete` dropped** — admin-only defaults followed the per-tool toggle infrastructure into the bin.
+- **`/setup/user` and `/setup/admin` browser wizards removed.** The `/settings` page is the only browser-side configuration surface.
+- **`oauth.rs::ensure_token_binding` reverted to v0.8.0's `try_auto_populate_bookstack_user_id` shape.** Tokens key the `user_settings` row directly via `token_id_hash` again; no binding indirection.
+
+#### What survives from the v0.8.0 → v1.0.0 era
+
+- Rate limiter + job lifecycle (`bsmcp_common::rate_limit`, `embed_jobs` / `index_jobs` lifecycle columns, `/jobs/{embed,index}/{id}/cancel` endpoints, the lifecycle housekeeper in `bsmcp-worker`). Issue #54 work is general infra and is kept verbatim.
+
+#### What's automatic
+
+- **No DB migration ships for v1.0.0 → v0.9.0 downgraders.** `CREATE TABLE IF NOT EXISTS` won't re-shape the v1.0.0 `user_settings` PK (`stable_id` → `token_id_hash`). If a clean reset is needed, drop the table manually before first start, or wait for a follow-up one-shot migration.
+- v0.8.0 → v0.9.0 is a no-op schema-wise.
+
+### From v0.7.4 to v0.8.0
+
+#### What's new
+
+- **Personal-memory layer moved to memberberry.ai.** All 12 `remember_*` MCP tools (`remember_briefing` / `remember_journal` / `remember_collage` / `remember_shared_collage` / `remember_user_journal` / `remember_whoami` / `remember_user` / `remember_identity` / `remember_directory` / `remember_config` / `remember_audit` / `remember_search`) no longer ship. The `POST /remember/v1/{resource}/{action}` HTTP namespace is gone.
+- **Single `briefing` MCP tool** replaces the 12 remember tools. Same response shape as the old `remember_briefing action=read`, no `action` arg. HTTP form: `POST /briefing/v1/read`.
+- **`meta.briefing` auto-injection** on every MCP tool response — full content on the first call per `(token_hash, session_id)`, sticky bits (time + setup summary) thereafter. Calling `briefing` explicitly resets the session for the next response — useful after the AI's harness compacts the conversation.
+- **Typed setup slots on global settings** — `guide_page_id`, `org_identity_page_id`, `policies_scope`, `sops_scope`, `best_practices_scope`, plus org-wide booleans `friendly_structure`, `full_content_in_briefing`, `strict_setup`. Idempotent `ALTER TABLE ADD COLUMN` migrations on first startup.
+- **Removed:** `default_ai_identity_*` global columns (dropped via `ALTER TABLE DROP COLUMN`), `remember_audit` table (`DROP TABLE IF EXISTS`), and most per-user pointer fields from `UserSettings` (`ai_*_book_id`, `user_journal_book_id`, `recent_*_count`, etc.). The settings UI shrank ~1,300 lines to match.
+
+#### What's automatic
+
+- Idempotent `ALTER TABLE ADD COLUMN` for the new global slots.
+- `ALTER TABLE DROP COLUMN [IF EXISTS]` for `default_ai_identity_*` (Postgres native; SQLite swallows duplicate-drop errors via `.ok()`, requires SQLite ≥ 3.35).
+- `DROP TABLE IF EXISTS remember_audit` on startup.
+- `user_settings` is a JSON blob — old keys are silently ignored on read and dropped on next save.
+
+### From v0.7.3 to v0.7.4
 
 #### What's new
 

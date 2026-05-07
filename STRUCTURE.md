@@ -1,6 +1,6 @@
 # Repository Structure
 
-_Auto-generated on 2026-04-28 08:47 UTC from commit `4f40ab9`._
+_Auto-generated on 2026-05-07 00:21 UTC from commit `928c25b`._
 
 ```
 .
@@ -14,6 +14,7 @@ _Auto-generated on 2026-04-28 08:47 UTC from commit `4f40ab9`._
 │   │   │   ├── db.rs
 │   │   │   ├── index.rs
 │   │   │   ├── lib.rs
+│   │   │   ├── rate_limit.rs
 │   │   │   ├── settings.rs
 │   │   │   ├── types.rs
 │   │   │   └── vector.rs
@@ -34,13 +35,14 @@ _Auto-generated on 2026-04-28 08:47 UTC from commit `4f40ab9`._
 │   │   └── Cargo.toml
 │   ├── bsmcp-server
 │   │   ├── src
-│   │   │   ├── remember
+│   │   │   ├── briefing
 │   │   │   ├── llm.rs
 │   │   │   ├── main.rs
 │   │   │   ├── mcp.rs
 │   │   │   ├── migrate.rs
 │   │   │   ├── oauth.rs
 │   │   │   ├── semantic.rs
+│   │   │   ├── session.rs
 │   │   │   ├── settings_ui.rs
 │   │   │   ├── sse.rs
 │   │   │   ├── staging.rs
@@ -64,10 +66,9 @@ _Auto-generated on 2026-04-28 08:47 UTC from commit `4f40ab9`._
 ├── Cargo.toml
 ├── DEVELOPMENT.md
 ├── README.md
-├── RFC-identity-book-restructure.md
 ├── SBOM.md
 ├── STRUCTURE.md
 └── entrypoint.sh
 
-17 directories, 48 files
+17 directories, 49 files
 ```

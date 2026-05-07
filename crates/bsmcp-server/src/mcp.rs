@@ -8,19 +8,32 @@ use pulldown_cmark::{html, Options, Parser};
 
 use bsmcp_common::bookstack::{self, BookStackClient, ContentType, ExportFormat};
 use bsmcp_common::db::DbBackend;
-use crate::remember;
+use crate::briefing;
 use crate::semantic::{trim_match, SemanticState};
+use crate::session::{self, SessionStore};
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
 
-/// Dependencies the `remember_*` tools need beyond the BookStack client.
-/// Bundled into one struct to keep `handle_request` / `execute_tool` signatures
-/// from sprouting more positional args.
-pub struct RememberDeps {
+/// Dependencies the `briefing` and other server-tier tools need beyond the
+/// BookStack client. Bundled into one struct to keep `handle_request` /
+/// `execute_tool` signatures from sprouting more positional args.
+pub struct BriefingDeps {
     pub db: Arc<dyn DbBackend>,
-    pub index_db: Arc<dyn bsmcp_common::db::IndexDb>,
     pub semantic: Option<Arc<SemanticState>>,
+    /// Drives the `meta.briefing` auto-injection: tracks per-`(token_hash,
+    /// session_id)` state so the first tool call in a session gets the full
+    /// briefing payload and subsequent calls get sticky-only.
+    pub session_store: SessionStore,
     pub token_id: String,
+    /// Token-hash for session-store lookups (avoids redundant SHA-256 work
+    /// on the meta-injection hot path).
+    pub token_id_hash: String,
+    /// Optional client-supplied session id. Streamable HTTP carries it in
+    /// the `Mcp-Session-Id` header; SSE carries it as the `?sessionId=`
+    /// query param. When absent, `session_key` falls back to a per-hour
+    /// bucket per token so the user still gets a coarse "first call this
+    /// hour" notion.
+    pub session_id: Option<String>,
 }
 
 pub async fn handle_request(
@@ -29,7 +42,7 @@ pub async fn handle_request(
     semantic: Option<&SemanticState>,
     summary_cache: &crate::summary::SummaryCache,
     staging: &crate::staging::StagingStore,
-    remember_deps: &RememberDeps,
+    deps: &BriefingDeps,
 ) -> Option<Value> {
     let id = request.get("id");
 
@@ -62,19 +75,70 @@ pub async fn handle_request(
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let result = execute_tool(name, &args, client, semantic, staging, remember_deps).await;
-            match result {
-                Ok(text) => Some(json_rpc_result(id, json!({
+            let result = execute_tool(name, &args, client, semantic, staging, deps).await;
+
+            // Build the tool-result object first so we can decorate it with
+            // `meta.briefing`. The meta-injection runs for every tool except
+            // `briefing` itself (where the response IS the briefing — duplicating
+            // it under meta would be wasteful).
+            let mut tool_result = match result {
+                Ok(text) => json!({
                     "content": [{ "type": "text", "text": text }],
-                }))),
-                Err(e) => Some(json_rpc_result(id, json!({
+                }),
+                Err(e) => json!({
                     "content": [{ "type": "text", "text": format!("Error: {e}") }],
                     "isError": true,
-                }))),
+                }),
+            };
+
+            if name != "briefing" && briefing_enabled() {
+                // Calling `briefing` explicitly resets the session via task 5;
+                // for every other tool, record_call decides full-vs-sticky.
+                let key = session::session_key(&deps.token_id_hash, deps.session_id.as_deref());
+                let was_first = session::record_call(&deps.session_store, &key).await;
+                let body_for_briefing = build_briefing_meta_body(&args, id);
+                let meta_briefing = briefing::build_meta_briefing(
+                    body_for_briefing,
+                    &deps.token_id,
+                    client,
+                    deps.db.clone(),
+                    deps.semantic.clone(),
+                    was_first,
+                )
+                .await;
+
+                if let Value::Object(ref mut m) = tool_result {
+                    let meta_entry = m
+                        .entry("meta".to_string())
+                        .or_insert_with(|| json!({}));
+                    if let Value::Object(ref mut meta) = meta_entry {
+                        meta.insert("briefing".to_string(), meta_briefing);
+                    }
+                }
             }
+
+            Some(json_rpc_result(id, tool_result))
         }
         _ => Some(json_rpc_error(id, -32601, "Method not found")),
     }
+}
+
+/// Build the minimal body passed to `briefing::build_meta_briefing` for the
+/// auto-injection path. Forwards `client_timezone` if the caller happened to
+/// thread one through (so timezone refresh keeps working from any tool, not
+/// just the explicit `briefing` call) and a `trace_id` derived from the
+/// JSON-RPC request id — and nothing else; the full tool-call args would
+/// just bloat the briefing call.
+fn build_briefing_meta_body(args: &Value, request_id: Option<&Value>) -> Value {
+    let mut body = json!({});
+    if let Some(tz) = args.get("client_timezone").and_then(|v| v.as_str()) {
+        body["client_timezone"] = json!(tz);
+    }
+    let trace_id = request_id
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    body["trace_id"] = json!(trace_id);
+    body
 }
 
 fn json_rpc_result(id: Option<&Value>, result: Value) -> Value {
@@ -99,34 +163,40 @@ async fn execute_tool(
     client: &BookStackClient,
     semantic: Option<&SemanticState>,
     staging: &crate::staging::StagingStore,
-    remember_deps: &RememberDeps,
+    deps: &BriefingDeps,
 ) -> Result<String, String> {
-    // Remember tools share one dispatch path: tool name = "remember_{resource}",
-    // action carried as an arg. Keeps the MCP tool count manageable.
-    if let Some(resource) = name.strip_prefix("remember_") {
-        if !remember_enabled() {
-            // Defensive: a stale client could have cached the tool list
-            // before BSMCP_REMEMBER_ENABLED was set to false. Reject
-            // explicitly so the caller knows it's not a "tool not found"
-            // case but a deliberate disable.
+    // The `briefing` tool is the only top-level entry into the briefing
+    // subsystem (besides auto-injection on every other tool's response meta).
+    if name == "briefing" {
+        if !briefing_enabled() {
             return Err(
-                "Hive memory disabled (BSMCP_REMEMBER_ENABLED=false on this server)".to_string(),
+                "Briefing disabled (BSMCP_BRIEFING_ENABLED=false on this server)".to_string(),
             );
         }
-        let action = arg_str_default(args, "action", "read");
         let mut body = args.clone();
+        let arg_session_id = body
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty());
         if let Value::Object(ref mut map) = body {
             map.remove("action");
         }
-        let envelope = remember::dispatch(
-            resource,
-            &action,
+        // Calling `briefing` explicitly resets the session for the next
+        // response — useful after the AI gets compacted by its harness.
+        // Honor the tool's own `session_id` arg if present (lets a client
+        // without HTTP-header session_id support still get sticky-vs-full
+        // behavior); otherwise fall back to the transport-layer id.
+        let effective_sid = arg_session_id.as_deref().or(deps.session_id.as_deref());
+        let key = session::session_key(&deps.token_id_hash, effective_sid);
+        session::mark_compacted(&deps.session_store, &key).await;
+
+        let envelope = briefing::read(
             body,
-            &remember_deps.token_id,
+            &deps.token_id,
             client,
-            remember_deps.db.clone(),
-            remember_deps.index_db.clone(),
-            remember_deps.semantic.clone(),
+            deps.db.clone(),
+            deps.semantic.clone(),
         )
         .await;
         return Ok(serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| envelope.to_string()));
@@ -791,6 +861,69 @@ async fn execute_tool(
             format_json(&client.get_role(id).await?)
         }
 
+        // Session — let the AI signal session-level events (compaction, etc.)
+        "session_event" => {
+            if !briefing_enabled() {
+                return Err(
+                    "session_event is unavailable when the briefing surface is disabled \
+                     (BSMCP_BRIEFING_ENABLED=false on this server)"
+                        .to_string(),
+                );
+            }
+            let action = arg_str(args, "action")?;
+            match action.as_str() {
+                "compacted" => {
+                    let key = session::session_key(&deps.token_id_hash, deps.session_id.as_deref());
+                    session::mark_compacted(&deps.session_store, &key).await;
+                    format_json(&json!({
+                        "ok": true,
+                        "action": "compacted",
+                        "note": "Next tool response will inject the full briefing again.",
+                    }))
+                }
+                other => Err(format!(
+                    "Unknown session_event action: {other}. Supported: compacted"
+                )),
+            }
+        }
+
+        // Dismiss the briefing setup_nudge for N days
+        "dismiss_setup_nudge" => {
+            if !briefing_enabled() {
+                return Err(
+                    "dismiss_setup_nudge is unavailable when the briefing surface is disabled \
+                     (BSMCP_BRIEFING_ENABLED=false on this server)"
+                        .to_string(),
+                );
+            }
+            let days = arg_i64_required(args, "days")?.clamp(1, 365);
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let dismissed_until = now_unix + days * 86400;
+            let mut settings = deps
+                .db
+                .get_user_settings(&deps.token_id_hash)
+                .await
+                .map_err(|e| format!("get_user_settings failed: {e}"))?
+                .unwrap_or_default();
+            settings.settings_nudge_dismissed_until = Some(dismissed_until);
+            deps.db
+                .save_user_settings(&deps.token_id_hash, &settings)
+                .await
+                .map_err(|e| format!("save_user_settings failed: {e}"))?;
+            let until_human = chrono::DateTime::<chrono::Utc>::from_timestamp(dismissed_until, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                .unwrap_or_else(|| dismissed_until.to_string());
+            format_json(&json!({
+                "ok": true,
+                "dismissed_until": dismissed_until,
+                "until_human": until_human,
+                "days": days,
+            }))
+        }
+
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -1232,7 +1365,7 @@ fn replace_section_html(html: &str, heading: &str, new_content: &str, page_id: i
 
         if rest.len() > 2 {
             let level_char = rest.as_bytes()[2];
-            if level_char >= b'1' && level_char <= b'6' {
+            if (b'1'..=b'6').contains(&level_char) {
                 let level = (level_char - b'0') as usize;
                 let close_tag = format!("</h{}>", level);
                 if let Some(close_pos) = rest.find(&close_tag) {
@@ -1268,7 +1401,7 @@ fn replace_section_html(html: &str, heading: &str, new_content: &str, page_id: i
 
         if rest.len() > 2 {
             let level_char = rest.as_bytes()[2];
-            if level_char >= b'1' && level_char <= b'6' {
+            if (b'1'..=b'6').contains(&level_char) {
                 let level = (level_char - b'0') as usize;
                 if level <= heading_level {
                     end_pos = abs_pos;
@@ -1297,19 +1430,25 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool, su
 
     let mut instructions = String::new();
 
-    // Hive memory flow — surface this FIRST so it lands before any other guidance.
+    // Briefing flow — surface this FIRST so it lands before any other guidance.
     instructions.push_str(
-        "It's a best practice to always use remember/briefing at the beginning of any session. \
-         The briefing returns the agent's identity manifest, recent journal entries, active topics, \
-         org-required instructions and AI usage policy, and semantic matches against the user's \
-         first message — one structured pull instead of many tool calls. \
-         Call the `remember_briefing` MCP tool (or POST /remember/v1/briefing/read) with the user's \
-         opening message as `user_prompt`.\n\n\
-         If the briefing response includes a `setup_nudge` field, the user hasn't configured their \
-         Hive yet. Walk them through the `suggested_workflow` in that nudge — use search_content + \
-         remember_directory to discover existing structure, propose moves with move_book_to_shelf / \
-         move_chapter / move_page, and lock in the IDs with `remember_config action=write`. The \
-         user can snooze the reminder via `remember_config action=dismiss_setup_nudge days=N`.\n\n"
+        "Call the `briefing` tool at session start with the user's opening message as \
+         `user_prompt`. It returns time, system_prompt_additions (guide page, org_identity, \
+         org_required_instructions, org_ai_usage_policy, user-supplied pages, owned-domains), \
+         kb_semantic_matches against the prompt, and a `setup_nudge` block when settings are \
+         incomplete. Equivalent to POST /briefing/v1/read.\n\n\
+         The briefing payload is also auto-injected as `meta.briefing` on every other tool \
+         response — full content on the first call per session, sticky-only (time + setup \
+         summary) thereafter. After your harness compacts you and you lose context, call \
+         `session_event { action: \"compacted\" }` to force the next tool response to carry \
+         the full briefing again.\n\n\
+         If `setup_nudge` is present, the user's Hive isn't fully configured. The settings \
+         live behind the `/settings` browser UI (token-gated) — point the user there and walk \
+         them through the pending fields. Use `search_content` + the briefing's `setup_nudge` \
+         block to help them locate existing structure. Per-user fields can be set by any \
+         authenticated user; global fields (org_identity, guide_page, scopes) require a \
+         BookStack admin. If the user wants the warnings to stop temporarily, call \
+         `dismiss_setup_nudge { days: N }` (1..=365).\n\n"
     );
 
     if !instance_name.is_empty() {
@@ -1897,230 +2036,70 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             })));
     }
 
-    // Remember protocol tools — one per resource. The `action` arg picks the
-    // operation (read | write | search | delete depending on resource).
-    // All return the same JSON envelope: { ok, data, meta, error }.
-    // Gated by BSMCP_REMEMBER_ENABLED (default true). When false, the
-    // server runs as a plain BookStack proxy with no Hive memory surface.
-    if remember_enabled() {
-        add_remember_tools(&mut tools);
+    // Briefing tool — the only top-level briefing entry point. The briefing
+    // payload also auto-injects into `meta.briefing` on every other tool's
+    // response (full content first call per session, sticky bits thereafter).
+    // `session_event` and `dismiss_setup_nudge` ride alongside it — they only
+    // make sense when the briefing surface is enabled.
+    if briefing_enabled() {
+        tools.push(json!({
+            "name": "briefing",
+            "description": "Reconstitution shell — returns time, system_prompt_additions (guide page, org_identity, org_required_instructions, org_ai_usage_policy, user system_prompt_page_ids, owned-domains synthetic block), kb_semantic_matches against the user_prompt, setup_nudge when settings are incomplete, and a thin config echo. Auto-injected into meta.briefing on every MCP tool response (full content first call, sticky bits thereafter); call this tool explicitly after compaction to reset to first-call form.",
+            "inputSchema": json!({
+                "type": "object",
+                "properties": {
+                    "user_prompt": { "type": "string", "description": "First user message — drives semantic prioritization" },
+                    "client_timezone": { "type": "string", "description": "Optional IANA timezone (e.g. \"America/New_York\"). Cached server-side." },
+                    "session_id": { "type": "string", "description": "Optional client-supplied session id. Normally taken from the Mcp-Session-Id header; pass it here for clients that can't set the header." }
+                }
+            }),
+        }));
+        tools.push(tool(
+            "session_event",
+            "Signal a session-level event. Currently supported: `action: 'compacted'` resets the briefing-injection state so the next tool response includes the full briefing again. Useful after the AI gets compacted by its harness and loses context.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["compacted"],
+                        "description": "Event kind. Only 'compacted' is supported today."
+                    }
+                },
+                "required": ["action"]
+            }),
+        ));
+        tools.push(tool(
+            "dismiss_setup_nudge",
+            "Dismiss the briefing's setup_nudge for N days (1..=365). Useful when the user knows the configuration warnings and wants quiet sessions. Reappears automatically after N days.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "days": {
+                        "type": "integer",
+                        "description": "How many days to suppress the setup_nudge. Clamped to 1..=365.",
+                        "minimum": 1,
+                        "maximum": 365
+                    }
+                },
+                "required": ["days"]
+            }),
+        ));
     }
 
     tools
 }
 
-/// Whether the Hive memory surface is enabled. Reads BSMCP_REMEMBER_ENABLED;
-/// defaults true. Same parsing as the HTTP-route gate in main.rs so the
-/// MCP and HTTP surfaces flip together.
-fn remember_enabled() -> bool {
-    std::env::var("BSMCP_REMEMBER_ENABLED")
+/// Whether the briefing surface is enabled. Reads BSMCP_BRIEFING_ENABLED;
+/// defaults true.
+fn briefing_enabled() -> bool {
+    std::env::var("BSMCP_BRIEFING_ENABLED")
         .ok()
         .map(|v| {
             let v = v.trim().to_lowercase();
             !(v == "false" || v == "0" || v == "no" || v == "off")
         })
         .unwrap_or(true)
-}
-
-fn add_remember_tools(tools: &mut Vec<Value>) {
-    fn remember_tool(resource: &str, description: &str, actions: &[&str], extra_props: Value) -> Value {
-        let mut props = json!({
-            "action": {
-                "type": "string",
-                "enum": actions,
-                "description": "Operation to perform on this resource",
-                "default": actions.first().copied().unwrap_or("read"),
-            },
-            // client_timezone is accepted by EVERY remember endpoint, not
-            // just briefing. The server caches it in user_settings and
-            // refreshes whenever the cache is stale (>4h) or the value
-            // changes. Pass it whenever `meta.time.timezone_refresh_due`
-            // was true on a previous response.
-            "client_timezone": {
-                "type": "string",
-                "description": "Optional IANA timezone (e.g. \"America/New_York\"). Cached server-side; refresh when `meta.time.timezone_refresh_due` is true. Detect via your client's local time API.",
-            },
-        });
-        if let Value::Object(extra) = extra_props {
-            if let Value::Object(ref mut p) = props {
-                for (k, v) in extra { p.insert(k, v); }
-            }
-        }
-        // Every remember_* tool ends with the same setup pointer so the AI
-        // knows what to do when a call returns settings_not_configured.
-        // The pointer is identical across tools intentionally — repeating it
-        // beats hoping the AI noticed it once on a different tool.
-        let full_description = format!(
-            "{description}\n\nSETUP: All remember_* tools require user/global settings. \
-             If this returns `settings_not_configured`, the response includes a \
-             structured `error.fix` block with the exact MCP call to make. \
-             Run `remember_briefing action=read` first — its `setup_nudge` enumerates \
-             every pending field and `meta.setup_incomplete` flags partial config on \
-             every response. \
-             TIME: every response carries `meta.time` with now_unix/now_utc/now_local/now_human \
-             and `timezone_refresh_due`. Pass `client_timezone` on any call to refresh."
-        );
-        tool(
-            &format!("remember_{resource}"),
-            &full_description,
-            json!({ "type": "object", "properties": props }),
-        )
-    }
-
-    let common_collection_props = json!({
-        "id": { "type": ["integer", "string"], "description": "BookStack page ID (for read/write/delete by id)" },
-        "key": { "type": "string", "description": "Natural key (date YYYY-MM-DD for journals, slug for topics, lowercase name for subagents)" },
-        "body": { "type": "string", "description": "Markdown body for write/append/update_section/append_section" },
-        "section": { "type": "string", "description": "H2 heading text for update_section / append_section. Match is exact (whitespace-trimmed). If the section doesn't exist it gets appended." },
-        "timestamp": { "type": "boolean", "description": "When true on action=append, prefix the appended chunk with a `## HH:MM TZ` heading using the user's local timezone — useful for multi-append-per-day journal entries.", "default": false },
-        "query": { "type": "string", "description": "Search query for action=search" },
-        "limit": { "type": "integer", "default": 25 },
-        "offset": { "type": "integer", "default": 0 },
-        "reason": { "type": "string", "description": "Optional reason for delete (recorded in tombstone)" },
-        "trace_id": { "type": "string", "description": "Optional correlation ID for the audit log" },
-    });
-
-    // Singletons
-    tools.push(remember_tool(
-        "briefing",
-        "Reconstitution dossier — one structured pull replacing the multi-call AI bootstrap. Returns identity manifest, user identity, recent journals, active topics, semantic matches against the user_prompt, and config metadata. The full setup_nudge surfaces here when settings are incomplete.",
-        &["read"],
-        json!({
-            "user_prompt": { "type": "string", "description": "First user message — drives semantic prioritization" },
-            "recent_journal_count": { "type": "integer", "description": "Override the configured recent_journal_count" },
-            "active_collage_count": { "type": "integer", "description": "Override the configured active_collage_count" },
-        }),
-    ));
-
-    tools.push(remember_tool(
-        "whoami",
-        "AI agent identity. read returns the manifest page + subagent list + book/chapter pointers. \
-         write replaces the manifest page body (frontmatter auto-stamped) — destructive. \
-         update_section replaces just the named H2 section's body, preserving every other section. \
-         append_section appends to the named section's body (creates the section if missing). \
-         Prefer update_section / append_section over write for incremental edits — write is full-replace and rarely what you want.",
-        &["read", "write", "update_section", "append_section"],
-        json!({
-            "body": { "type": "string", "description": "New manifest markdown for write, OR section content for update_section/append_section" },
-            "section": { "type": "string", "description": "H2 heading text for update_section / append_section. Match is exact (whitespace-trimmed). If the section doesn't exist it gets appended." },
-        }),
-    ));
-
-    tools.push(remember_tool(
-        "user",
-        "Human user identity. read auto-provisions missing structure (per-user Identity book on the user-journals shelf, Identity page, Agent: {user_id}-journal-agent page, journal book) when `user_id` is set, returning what was created in `auto_provisioned`. \
-         write replaces the user identity page body — destructive. \
-         update_section replaces just the named H2 section, preserving every other section. \
-         append_section appends to the named section's body (creates the section if missing). \
-         IMPORTANT: as you work with the user, learn what they care about, how they prefer to collaborate, and update the identity page to reflect that — the briefing surfaces a refresh reminder after 30 days of inactivity. Prefer update_section / append_section over write for incremental edits.",
-        &["read", "write", "update_section", "append_section"],
-        json!({
-            "body": { "type": "string", "description": "New user identity markdown for write, OR section content for update_section/append_section" },
-            "section": { "type": "string", "description": "H2 heading text for update_section / append_section. Match is exact (whitespace-trimmed). If the section doesn't exist it gets appended." },
-        }),
-    ));
-
-    tools.push(remember_tool(
-        "config",
-        "Per-user settings AND (admin-only) global shelves. read returns both `{settings, global_settings}`. write accepts `settings` (per-user — any user) and/or `global_settings` (admin-only, server-side first-write-wins for shelf and org_identity_page IDs; org_domains and org-default identity are tunable). \
-         Per-user fields the AI typically maintains: `domains` (list of strings — owned domains for ours/external classification), `bookstack_user_id` (numeric BookStack user id, enables ACL-filtered semantic search), `user_id` (stable identifier, drives auto-provisioning naming), plus the ai_*/user_* book/page IDs. \
-         Admin-only globals: `hive_shelf_id`, `user_journals_shelf_id`, `org_identity_page_id` (first-write-wins), `org_domains` (replaces on write), and the org-default identity fields. \
-         dismiss_setup_nudge snoozes the briefing's setup reminder for `days` days (default 7, max 365).",
-        &["read", "write", "dismiss_setup_nudge"],
-        json!({
-            "settings": { "type": "object", "description": "Full UserSettings object for per-user write" },
-            "global_settings": { "type": "object", "description": "GlobalSettings object (admin-only). Only null fields are written; set fields are preserved (except org_domains which replaces)." },
-            "days": { "type": "integer", "description": "For dismiss_setup_nudge: how many days to snooze (default 7, max 365)" },
-        }),
-    ));
-
-    // Collections
-    tools.push(remember_tool(
-        "journal",
-        "AI agent's daily journal entries (book of pages, monthly chapters auto-managed). Key = date YYYY-MM-DD; defaults to today on write if omitted.",
-        &["read", "write", "append", "update_section", "append_section", "search", "delete"],
-        common_collection_props.clone(),
-    ));
-
-    tools.push(remember_tool(
-        "collage",
-        "AI agent's active topics. Key = topic slug. Pages live directly in the configured Topics book.",
-        &["read", "write", "append", "update_section", "append_section", "search", "delete"],
-        common_collection_props.clone(),
-    ));
-
-    tools.push(remember_tool(
-        "shared_collage",
-        "Cross-agent shared topics. Same shape as collage but a different parent book.",
-        &["read", "write", "append", "update_section", "append_section", "search", "delete"],
-        common_collection_props.clone(),
-    ));
-
-    tools.push(remember_tool(
-        "user_journal",
-        "Human user's journal (when configured by the user). Key = date YYYY-MM-DD with monthly chapters auto-managed.",
-        &["read", "write", "append", "update_section", "append_section", "search", "delete"],
-        common_collection_props.clone(),
-    ));
-
-    // Audit (read only)
-    tools.push(remember_tool(
-        "audit",
-        "Read the server-side audit log of every /remember write performed by this user. Always scoped to the calling user.",
-        &["read"],
-        json!({
-            "limit": { "type": "integer", "default": 50 },
-            "offset": { "type": "integer", "default": 0 },
-            "since_unix": { "type": "integer", "description": "Only return entries with occurred_at >= this unix timestamp" },
-        }),
-    ));
-
-    // Cross-resource search
-    tools.push(remember_tool(
-        "search",
-        "Cross-resource semantic + keyword search across multiple Hive scopes (journal, collage, shared_collage, user_journal) in one call. Returns results partitioned by scope.",
-        &["read"],
-        json!({
-            "query": { "type": "string", "description": "Search query (required)" },
-            "scopes": { "type": "array", "items": { "type": "string" }, "description": "Resource names to include (e.g., ['journal','collage']). Defaults to all configured." },
-            "limit": { "type": "integer", "default": 10, "description": "Per-scope result cap" },
-        }),
-    ));
-
-    // Identity discovery + creation
-    tools.push(remember_tool(
-        "identity",
-        "List or create AI identities under the global Hive shelf. action=list enumerates existing identities (book + manifest page + OUID per agent). action=create scaffolds a new Identity book + manifest page from a prompt template.",
-        &["list", "create"],
-        json!({
-            "name": { "type": "string", "description": "Display name for the new agent (e.g., 'Pia')" },
-            "ouid": { "type": "string", "description": "Optional stable OUID; a UUID is generated if omitted" },
-            "prompt_template": { "type": "string", "default": "default", "description": "Template name for the manifest body. Currently 'default' is the only built-in." },
-            "custom_prompt": { "type": "string", "description": "Override the template entirely with this markdown" },
-            "additional_details": {
-                "type": "object",
-                "description": "Free-form details merged into the default template (role, focus_areas, voice, notes, etc.)",
-            },
-        }),
-    ));
-
-    // Directory (cross-shelf discovery)
-    tools.push(remember_tool(
-        "directory",
-        "Discover globally-shared resources by kind. action=read with kind='identities' lists books on the Hive shelf; kind='user_journals' lists books on the User Journals shelf. The calling user's BookStack permissions filter what is visible.",
-        &["read"],
-        json!({
-            "kind": { "type": "string", "enum": ["identities", "user_journals"], "description": "Which global shelf to enumerate" },
-        }),
-    ));
-
-    // Migrate (Phase 7 v1.0.0 chapter restructure)
-    tools.push(remember_tool(
-        "migrate",
-        "Migrate an AI identity from the legacy book layout to the v1.0.0 chapter structure. action=plan dry-runs and returns the proposed steps. action=apply executes the plan: scaffolds Agents/Journal chapters, moves loose Agent: pages into the Agents chapter, moves legacy journal book pages into the Journal chapter, runs the year-rollover sweep, and clears the legacy ai_hive_journal_book_id pointer. Idempotent — safe to re-run after partial failures. action=status returns a per-check breakdown of whether the identity is fully migrated.",
-        &["plan", "apply", "status"],
-        json!({}),
-    ));
 }
 
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {

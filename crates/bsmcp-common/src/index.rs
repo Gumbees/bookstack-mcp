@@ -245,6 +245,10 @@ pub struct IndexJob {
     pub progress: i64,
     pub total: i64,
     pub error: Option<String>,
+    pub resolved_status: Option<String>,
+    pub prev_status: Option<String>,
+    pub resolved_at: Option<i64>,
+    pub retry_of: Option<i64>,
 }
 
 // --- Classification ---

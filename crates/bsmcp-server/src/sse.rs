@@ -46,6 +46,9 @@ pub struct AppState {
     pub summary_cache: crate::summary::SummaryCache,
     pub staging: crate::staging::StagingStore,
     pub settings_sessions: crate::settings_ui::SettingsSessionStore,
+    /// Per-`(token_hash, session_id)` briefing state — drives the full-vs-sticky
+    /// auto-injection of `meta.briefing` on every MCP tool response.
+    pub briefing_sessions: crate::session::SessionStore,
     /// Index db is always present (sqlite has full impl, postgres returns
     /// stub errors per #36). Webhook handler enqueues page:{id} index jobs
     /// here when BookStack page events arrive.
@@ -97,6 +100,7 @@ impl Drop for Session {
 }
 
 impl AppState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         bookstack_url: String,
         db: Arc<dyn DbBackend>,
@@ -129,6 +133,7 @@ impl AppState {
             summary_cache,
             staging: crate::staging::new_staging_store(),
             settings_sessions: crate::settings_ui::new_settings_store(),
+            briefing_sessions: crate::session::new_store(),
             index_db,
         }
     }
@@ -418,13 +423,17 @@ pub async fn handle_message(
     };
 
     let semantic = state.semantic.as_deref();
-    let remember_deps = mcp::RememberDeps {
+    let token_id_hash = bsmcp_common::settings::hash_token_id(&token_id);
+    let briefing_deps = mcp::BriefingDeps {
         db: state.db.clone(),
-        index_db: state.index_db.clone(),
         semantic: state.semantic.clone(),
+        session_store: state.briefing_sessions.clone(),
         token_id: token_id.clone(),
+        token_id_hash,
+        // SSE 2024-11-05: the session_id IS the `?sessionId=` query param.
+        session_id: Some(session_id.clone()),
     };
-    let response = mcp::handle_request(&request, &client, semantic, &state.summary_cache, &state.staging, &remember_deps).await;
+    let response = mcp::handle_request(&request, &client, semantic, &state.summary_cache, &state.staging, &briefing_deps).await;
 
     if let Some(response) = response {
         let data = serde_json::to_string(&response).unwrap_or_default();
@@ -500,21 +509,31 @@ pub async fn handle_streamable(
     }
 
     let semantic = state.semantic.as_deref();
-    let remember_deps = mcp::RememberDeps {
+    let token_id_hash = bsmcp_common::settings::hash_token_id(&token_id);
+
+    // Streamable HTTP 2025-03-26: the `Mcp-Session-Id` header is minted on
+    // initialize (below) and echoed by the client on every subsequent
+    // request. We pull it here so the meta.briefing injector can key its
+    // first-call-vs-sticky decision on `(token_hash, session_id)`. Falls
+    // back to the per-hour bucket per token_hash when absent.
+    let incoming_session_id = headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
+
+    let briefing_deps = mcp::BriefingDeps {
         db: state.db.clone(),
-        index_db: state.index_db.clone(),
         semantic: state.semantic.clone(),
+        session_store: state.briefing_sessions.clone(),
         token_id: token_id.clone(),
+        token_id_hash,
+        session_id: incoming_session_id.clone(),
     };
-    let response = mcp::handle_request(&request, &client, semantic, &state.summary_cache, &state.staging, &remember_deps).await;
+    let response = mcp::handle_request(&request, &client, semantic, &state.summary_cache, &state.staging, &briefing_deps).await;
 
     match response {
         Some(resp) => {
-            let incoming_session_id = headers
-                .get("mcp-session-id")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
-
             let mut http_resp = Json(resp).into_response();
 
             if method == "initialize" {

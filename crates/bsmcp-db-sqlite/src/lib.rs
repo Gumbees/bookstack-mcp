@@ -51,35 +51,23 @@ impl SqliteDb {
                  settings_json TEXT NOT NULL,
                  updated_at INTEGER NOT NULL
              );
-             CREATE TABLE IF NOT EXISTS remember_audit (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 token_id_hash TEXT NOT NULL,
-                 ai_identity_ouid TEXT,
-                 user_id TEXT,
-                 resource TEXT NOT NULL,
-                 action TEXT NOT NULL,
-                 target_page_id INTEGER,
-                 target_key TEXT,
-                 success INTEGER NOT NULL,
-                 error TEXT,
-                 trace_id TEXT,
-                 occurred_at INTEGER NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS idx_audit_user_time ON remember_audit(token_id_hash, occurred_at DESC);
-             CREATE INDEX IF NOT EXISTS idx_audit_resource_time ON remember_audit(resource, occurred_at DESC);
              CREATE TABLE IF NOT EXISTS global_settings (
                  id INTEGER PRIMARY KEY CHECK (id = 1),
                  hive_shelf_id INTEGER,
                  user_journals_shelf_id INTEGER,
-                 default_ai_identity_page_id INTEGER,
-                 default_ai_identity_name TEXT,
-                 default_ai_identity_ouid TEXT,
                  org_required_instructions_page_ids TEXT,
                  org_ai_usage_policy_page_ids TEXT,
                  org_identity_page_id INTEGER,
                  org_domains TEXT,
                  set_by_token_hash TEXT,
-                 updated_at INTEGER NOT NULL DEFAULT 0
+                 updated_at INTEGER NOT NULL DEFAULT 0,
+                 guide_page_id INTEGER,
+                 policies_scope TEXT,
+                 sops_scope TEXT,
+                 best_practices_scope TEXT,
+                 friendly_structure INTEGER NOT NULL DEFAULT 1,
+                 full_content_in_briefing INTEGER NOT NULL DEFAULT 0,
+                 strict_setup INTEGER NOT NULL DEFAULT 0
              );
              INSERT OR IGNORE INTO global_settings (id, updated_at) VALUES (1, 0);
              DROP TABLE IF EXISTS registrations;
@@ -170,7 +158,11 @@ impl SqliteDb {
                  finished_at INTEGER,
                  progress INTEGER NOT NULL DEFAULT 0,
                  total INTEGER NOT NULL DEFAULT 0,
-                 error TEXT
+                 error TEXT,
+                 resolved_status TEXT,
+                 prev_status TEXT,
+                 resolved_at INTEGER,
+                 retry_of INTEGER
              );
              CREATE INDEX IF NOT EXISTS idx_index_jobs_pending ON index_jobs(status) WHERE status = 'pending';
              /* Singleton bookkeeping for the indexer (last_full_walk_at,
@@ -190,16 +182,109 @@ impl SqliteDb {
         // rows with values in those columns are simply ignored — the columns
         // remain on disk but are not read by the application.
         for sql in [
-            "ALTER TABLE global_settings ADD COLUMN default_ai_identity_page_id INTEGER",
-            "ALTER TABLE global_settings ADD COLUMN default_ai_identity_name TEXT",
-            "ALTER TABLE global_settings ADD COLUMN default_ai_identity_ouid TEXT",
             "ALTER TABLE global_settings ADD COLUMN org_required_instructions_page_ids TEXT",
             "ALTER TABLE global_settings ADD COLUMN org_ai_usage_policy_page_ids TEXT",
             "ALTER TABLE global_settings ADD COLUMN org_identity_page_id INTEGER",
             "ALTER TABLE global_settings ADD COLUMN org_domains TEXT",
+            // v0.8.0 typed slots + org-wide booleans.
+            "ALTER TABLE global_settings ADD COLUMN guide_page_id INTEGER",
+            "ALTER TABLE global_settings ADD COLUMN policies_scope TEXT",
+            "ALTER TABLE global_settings ADD COLUMN sops_scope TEXT",
+            "ALTER TABLE global_settings ADD COLUMN best_practices_scope TEXT",
+            "ALTER TABLE global_settings ADD COLUMN friendly_structure INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE global_settings ADD COLUMN full_content_in_briefing INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE global_settings ADD COLUMN strict_setup INTEGER NOT NULL DEFAULT 0",
         ] {
             conn.execute_batch(sql).ok();
         }
+
+        // v0.8.0 cleanup migrations. SQLite 3.35+ supports `DROP COLUMN`;
+        // older builds will silently no-op via `.ok()` and leave the orphan
+        // column on disk — same end state as before this block existed.
+        // Idempotent on rerun: the second invocation hits "no such column"
+        // and is also swallowed.
+        for sql in [
+            // remember_audit + indexes — fully retired in v0.8.0; no consumers.
+            "DROP INDEX IF EXISTS idx_audit_user_time",
+            "DROP INDEX IF EXISTS idx_audit_resource_time",
+            "DROP TABLE IF EXISTS remember_audit",
+            // default_ai_identity_* — orphaned when the personal-memory
+            // layer moved to memberberry.ai. Drop, don't preserve.
+            "ALTER TABLE global_settings DROP COLUMN default_ai_identity_page_id",
+            "ALTER TABLE global_settings DROP COLUMN default_ai_identity_name",
+            "ALTER TABLE global_settings DROP COLUMN default_ai_identity_ouid",
+        ] {
+            conn.execute_batch(sql).ok();
+        }
+
+        // v0.9.0 cleanup migrations — drop the v1.0.0 memory-protocol
+        // surface that PR #66 reverted. Idempotent on rerun.
+        //
+        //   1. `token_bindings` (per-account-settings stable identity)
+        //      and `sessions` (Phase 2.8 session capture index) are
+        //      fully retired; consumers are gone, no data to preserve.
+        //   2. `user_settings` was reshaped between versions: v1.0.0
+        //      keyed by `stable_id` (FK to token_bindings.stable_id);
+        //      v0.9.0 reverts to PK `token_id_hash`. The earlier
+        //      `CREATE TABLE IF NOT EXISTS user_settings` was a no-op
+        //      on v1.0.0 instances (table already existed with the old
+        //      PK), so we detect the v1.0.0 column shape here and
+        //      rebuild from scratch.
+        //
+        // v1.0.0 deployments were mostly single-tenant test instances
+        // per the PR #66 rollback plan — wholesale reset of
+        // user_settings is acceptable; /settings reconfigures on first
+        // post-upgrade login.
+        for sql in [
+            "DROP TABLE IF EXISTS token_bindings",
+            "DROP TABLE IF EXISTS sessions",
+        ] {
+            conn.execute_batch(sql).ok();
+        }
+
+        let stable_id_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('user_settings') WHERE name = 'stable_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if stable_id_count > 0 {
+            eprintln!(
+                "v0.9.0 migration: user_settings has v1.0.0 stable_id PK — \
+                 dropping and recreating with token_id_hash PK \
+                 (existing user_settings rows discarded; reconfigure via /settings)"
+            );
+            conn.execute_batch(
+                "DROP TABLE user_settings;
+                 CREATE TABLE user_settings (
+                     token_id_hash TEXT PRIMARY KEY,
+                     settings_json TEXT NOT NULL,
+                     updated_at INTEGER NOT NULL
+                 );",
+            )
+            .ok();
+        }
+
+        // Issue #54 — job lifecycle columns on index_jobs. The matching
+        // embed_jobs migration runs in init_semantic_tables. SQLite has no
+        // ADD COLUMN IF NOT EXISTS, so the duplicate-column error is
+        // swallowed via .ok() (same pattern as the v0.8.0 block above).
+        for sql in [
+            "ALTER TABLE index_jobs ADD COLUMN resolved_status TEXT",
+            "ALTER TABLE index_jobs ADD COLUMN prev_status TEXT",
+            "ALTER TABLE index_jobs ADD COLUMN resolved_at INTEGER",
+            "ALTER TABLE index_jobs ADD COLUMN retry_of INTEGER",
+        ] {
+            conn.execute_batch(sql).ok();
+        }
+        // Migrate any pre-#54 rows that used `status='error'` on this queue.
+        // The embed_jobs equivalent runs in init_semantic_tables. Leaves
+        // resolved_status NULL so the reconciler picks them up.
+        conn.execute_batch(
+            "UPDATE index_jobs SET status = 'failed' \
+             WHERE status = 'error' AND resolved_status IS NULL",
+        ).ok();
 
         let hash = sha2::Sha256::digest(encryption_key.as_bytes());
         let mut key = Zeroizing::new([0u8; 32]);
@@ -483,61 +568,36 @@ impl DbBackend for SqliteDb {
         .map_err(|e| format!("Task failed: {e}"))?
     }
 
-    async fn insert_audit_entry(&self, entry: &AuditEntryInsert) -> Result<i64, String> {
-        let conn = self.conn.clone();
-        let entry = entry.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
-            conn.execute(
-                "INSERT INTO remember_audit
-                    (token_id_hash, ai_identity_ouid, user_id, resource, action,
-                     target_page_id, target_key, success, error, trace_id, occurred_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![
-                    entry.token_id_hash,
-                    entry.ai_identity_ouid,
-                    entry.user_id,
-                    entry.resource,
-                    entry.action,
-                    entry.target_page_id,
-                    entry.target_key,
-                    if entry.success { 1 } else { 0 },
-                    entry.error,
-                    entry.trace_id,
-                    SqliteDb::now_secs(),
-                ],
-            ).map_err(|e| format!("insert_audit_entry: {e}"))?;
-            Ok(conn.last_insert_rowid())
-        })
-        .await
-        .map_err(|e| format!("Task failed: {e}"))?
-    }
-
     async fn get_global_settings(&self) -> Result<GlobalSettings, String> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<GlobalSettings, String> {
             let conn = conn.lock().unwrap();
             let row = conn.query_row(
                 "SELECT hive_shelf_id, user_journals_shelf_id,
-                        default_ai_identity_page_id, default_ai_identity_name, default_ai_identity_ouid,
                         org_required_instructions_page_ids,
                         org_ai_usage_policy_page_ids,
                         org_identity_page_id, org_domains,
-                        set_by_token_hash, updated_at
+                        set_by_token_hash, updated_at,
+                        guide_page_id, policies_scope, sops_scope, best_practices_scope,
+                        friendly_structure, full_content_in_briefing, strict_setup
                  FROM global_settings WHERE id = 1",
                 [],
                 |row| Ok(GlobalSettings {
                     hive_shelf_id: row.get::<_, Option<i64>>(0)?,
                     user_journals_shelf_id: row.get::<_, Option<i64>>(1)?,
-                    default_ai_identity_page_id: row.get::<_, Option<i64>>(2)?,
-                    default_ai_identity_name: row.get::<_, Option<String>>(3)?,
-                    default_ai_identity_ouid: row.get::<_, Option<String>>(4)?,
-                    org_required_instructions_page_ids: decode_id_list(row.get::<_, Option<String>>(5)?),
-                    org_ai_usage_policy_page_ids: decode_id_list(row.get::<_, Option<String>>(6)?),
-                    org_identity_page_id: row.get::<_, Option<i64>>(7)?,
-                    org_domains: decode_str_list(row.get::<_, Option<String>>(8)?),
-                    set_by_token_hash: row.get::<_, Option<String>>(9)?,
-                    updated_at: row.get::<_, i64>(10)?,
+                    org_required_instructions_page_ids: decode_id_list(row.get::<_, Option<String>>(2)?),
+                    org_ai_usage_policy_page_ids: decode_id_list(row.get::<_, Option<String>>(3)?),
+                    org_identity_page_id: row.get::<_, Option<i64>>(4)?,
+                    org_domains: decode_str_list(row.get::<_, Option<String>>(5)?),
+                    set_by_token_hash: row.get::<_, Option<String>>(6)?,
+                    updated_at: row.get::<_, i64>(7)?,
+                    guide_page_id: row.get::<_, Option<i64>>(8)?,
+                    policies_scope: decode_kb_scope(row.get::<_, Option<String>>(9)?),
+                    sops_scope: decode_kb_scope(row.get::<_, Option<String>>(10)?),
+                    best_practices_scope: decode_kb_scope(row.get::<_, Option<String>>(11)?),
+                    friendly_structure: row.get::<_, i64>(12)? != 0,
+                    full_content_in_briefing: row.get::<_, i64>(13)? != 0,
+                    strict_setup: row.get::<_, i64>(14)? != 0,
                 }),
             ).unwrap_or_default();
             Ok(row)
@@ -566,72 +626,39 @@ impl DbBackend for SqliteDb {
                 "UPDATE global_settings
                  SET hive_shelf_id = ?1,
                      user_journals_shelf_id = ?2,
-                     default_ai_identity_page_id = ?3,
-                     default_ai_identity_name = ?4,
-                     default_ai_identity_ouid = ?5,
-                     org_required_instructions_page_ids = ?6,
-                     org_ai_usage_policy_page_ids = ?7,
-                     org_identity_page_id = ?8,
-                     org_domains = ?9,
-                     set_by_token_hash = ?10,
-                     updated_at = ?11
+                     org_required_instructions_page_ids = ?3,
+                     org_ai_usage_policy_page_ids = ?4,
+                     org_identity_page_id = ?5,
+                     org_domains = ?6,
+                     set_by_token_hash = ?7,
+                     updated_at = ?8,
+                     guide_page_id = ?9,
+                     policies_scope = ?10,
+                     sops_scope = ?11,
+                     best_practices_scope = ?12,
+                     friendly_structure = ?13,
+                     full_content_in_briefing = ?14,
+                     strict_setup = ?15
                  WHERE id = 1",
                 params![
                     s.hive_shelf_id,
                     s.user_journals_shelf_id,
-                    s.default_ai_identity_page_id,
-                    s.default_ai_identity_name,
-                    s.default_ai_identity_ouid,
                     encode_id_list(&s.org_required_instructions_page_ids),
                     encode_id_list(&s.org_ai_usage_policy_page_ids),
                     s.org_identity_page_id,
                     encode_str_list(&s.org_domains),
                     final_setter,
                     SqliteDb::now_secs(),
+                    s.guide_page_id,
+                    encode_kb_scope(s.policies_scope.as_ref()),
+                    encode_kb_scope(s.sops_scope.as_ref()),
+                    encode_kb_scope(s.best_practices_scope.as_ref()),
+                    if s.friendly_structure { 1i64 } else { 0i64 },
+                    if s.full_content_in_briefing { 1i64 } else { 0i64 },
+                    if s.strict_setup { 1i64 } else { 0i64 },
                 ],
             ).map_err(|e| format!("save_global_settings: {e}"))?;
             Ok(())
-        })
-        .await
-        .map_err(|e| format!("Task failed: {e}"))?
-    }
-
-    async fn list_audit_entries(
-        &self,
-        token_id_hash: &str,
-        limit: i64,
-        offset: i64,
-        since_unix: Option<i64>,
-    ) -> Result<Vec<AuditEntry>, String> {
-        let conn = self.conn.clone();
-        let token_id_hash = token_id_hash.to_string();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
-            let sql = "SELECT id, token_id_hash, ai_identity_ouid, user_id, resource, action,
-                              target_page_id, target_key, success, error, trace_id, occurred_at
-                       FROM remember_audit
-                       WHERE token_id_hash = ?1 AND occurred_at >= ?2
-                       ORDER BY occurred_at DESC
-                       LIMIT ?3 OFFSET ?4";
-            let mut stmt = conn.prepare(sql).map_err(|e| format!("audit prepare: {e}"))?;
-            let rows = stmt.query_map(
-                params![token_id_hash, since_unix.unwrap_or(0), limit, offset],
-                |row| Ok(AuditEntry {
-                    id: row.get(0)?,
-                    token_id_hash: row.get(1)?,
-                    ai_identity_ouid: row.get(2)?,
-                    user_id: row.get(3)?,
-                    resource: row.get(4)?,
-                    action: row.get(5)?,
-                    target_page_id: row.get(6)?,
-                    target_key: row.get(7)?,
-                    success: { let n: i64 = row.get(8)?; n != 0 },
-                    error: row.get(9)?,
-                    trace_id: row.get(10)?,
-                    occurred_at: row.get(11)?,
-                }),
-            ).map_err(|e| format!("audit query: {e}"))?;
-            Ok(rows.filter_map(|r| r.ok()).collect())
         })
         .await
         .map_err(|e| format!("Task failed: {e}"))?
@@ -718,7 +745,11 @@ impl SemanticDb for SqliteDb {
                     started_at INTEGER,
                     finished_at INTEGER,
                     error TEXT,
-                    worker_id TEXT
+                    worker_id TEXT,
+                    resolved_status TEXT,
+                    prev_status TEXT,
+                    resolved_at INTEGER,
+                    retry_of INTEGER
                 );",
             )
             .map_err(|e| format!("Failed to initialize semantic tables: {e}"))?;
@@ -726,6 +757,23 @@ impl SemanticDb for SqliteDb {
             // Migration: add worker_id column if missing (existing databases)
             conn.execute_batch(
                 "ALTER TABLE embed_jobs ADD COLUMN worker_id TEXT;"
+            ).ok();
+
+            // Issue #54 — job lifecycle columns. SQLite swallows duplicate-
+            // column errors via .ok(); same pattern as the v0.8.0 block.
+            for sql in [
+                "ALTER TABLE embed_jobs ADD COLUMN resolved_status TEXT",
+                "ALTER TABLE embed_jobs ADD COLUMN prev_status TEXT",
+                "ALTER TABLE embed_jobs ADD COLUMN resolved_at INTEGER",
+                "ALTER TABLE embed_jobs ADD COLUMN retry_of INTEGER",
+            ] {
+                conn.execute_batch(sql).ok();
+            }
+            // Migrate v0.7.x rows that used 'error' as the failed sentinel.
+            // resolved_status stays NULL so the reconciler picks them up.
+            conn.execute_batch(
+                "UPDATE embed_jobs SET status = 'failed' \
+                 WHERE status = 'error' AND resolved_status IS NULL",
             ).ok();
 
             // Metadata key-value store (v0.5.0+)
@@ -869,7 +917,7 @@ impl SemanticDb for SqliteDb {
         let ids = page_ids.to_vec();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+            let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(",");
             let sql = format!("SELECT page_id, book_id FROM pages WHERE page_id IN ({placeholders})");
             let mut stmt = conn.prepare(&sql).map_err(|e| format!("Prepare failed: {e}"))?;
             let params_vec: Vec<&dyn rusqlite::ToSql> =
@@ -894,7 +942,7 @@ impl SemanticDb for SqliteDb {
         let ids = page_ids.to_vec();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+            let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(",");
             let sql = format!(
                 "SELECT page_id, book_id, chapter_id, name, slug, content_hash, updated_at
                  FROM pages WHERE page_id IN ({placeholders})"
@@ -1111,9 +1159,16 @@ impl SemanticDb for SqliteDb {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
 
-            // Check for existing active job with same scope — return it instead of creating duplicate
+            // Dedup: pending/running collapse onto the existing job. Failed
+            // jobs that haven't been touched by the reconciler also count as
+            // active so a webhook firing mid-retry-window doesn't double-
+            // enqueue. Closed jobs never count.
             let existing: Option<i64> = conn.query_row(
-                "SELECT id FROM embed_jobs WHERE scope = ?1 AND status IN ('pending', 'running') ORDER BY id DESC LIMIT 1",
+                "SELECT id FROM embed_jobs \
+                 WHERE scope = ?1 \
+                   AND (status IN ('pending', 'running') \
+                        OR (status = 'failed' AND resolved_status IS NULL)) \
+                 ORDER BY id DESC LIMIT 1",
                 params![scope],
                 |row| row.get(0),
             ).ok();
@@ -1138,26 +1193,17 @@ impl SemanticDb for SqliteDb {
             let cutoff = SqliteDb::now_secs() - stale_secs;
             let now = SqliteDb::now_secs();
 
-            // Supersede stale jobs that have a newer job with the same scope
-            let superseded = conn.execute(
-                "UPDATE embed_jobs SET status = 'error', finished_at = ?1, error = 'superseded'
-                 WHERE status = 'running' AND started_at < ?2
-                   AND EXISTS (
-                       SELECT 1 FROM embed_jobs e2
-                       WHERE e2.scope = embed_jobs.scope AND e2.id > embed_jobs.id
-                         AND e2.status IN ('pending', 'running')
-                   )",
+            // Stale running jobs flip to failed-open; the reconciler decides
+            // whether to retry, supersede, or give up. resolved_status stays
+            // NULL until the reconciler touches it.
+            let failed = conn.execute(
+                "UPDATE embed_jobs \
+                 SET status = 'failed', finished_at = ?1, error = 'timeout' \
+                 WHERE status = 'running' AND started_at < ?2",
                 params![now, cutoff],
-            ).map_err(|e| format!("expire_stale_jobs (supersede) failed: {e}"))?;
+            ).map_err(|e| format!("expire_stale_jobs failed: {e}"))?;
 
-            // Reset remaining stale jobs (no newer sibling) back to pending
-            let reset = conn.execute(
-                "UPDATE embed_jobs SET status = 'pending', started_at = NULL
-                 WHERE status = 'running' AND started_at < ?1",
-                params![cutoff],
-            ).map_err(|e| format!("expire_stale_jobs (reset) failed: {e}"))?;
-
-            Ok(superseded + reset)
+            Ok(failed)
         })
         .await
         .map_err(|e| format!("Task failed: {e}"))?
@@ -1183,20 +1229,9 @@ impl SemanticDb for SqliteDb {
             ).ok();
 
             let job = conn.query_row(
-                "SELECT id, scope, status, total_pages, done_pages, started_at, finished_at, error, worker_id
-                 FROM embed_jobs WHERE id = ?1",
+                EMBED_JOB_SELECT_BY_ID,
                 params![id],
-                |row| Ok(EmbedJob {
-                    id: row.get(0)?,
-                    scope: row.get(1)?,
-                    status: row.get(2)?,
-                    total_pages: row.get(3)?,
-                    done_pages: row.get(4)?,
-                    started_at: row.get(5)?,
-                    finished_at: row.get(6)?,
-                    error: row.get(7)?,
-                    worker_id: row.get(8)?,
-                }),
+                embed_job_from_row,
             ).ok();
 
             Ok(job)
@@ -1212,26 +1247,17 @@ impl SemanticDb for SqliteDb {
             let conn = conn.lock().unwrap();
             let now = SqliteDb::now_secs();
 
-            // Mark duplicate-scope orphans as superseded (keep only the newest per scope)
-            let superseded = conn.execute(
-                "UPDATE embed_jobs SET status = 'error', finished_at = ?1, error = 'superseded'
-                 WHERE status = 'running' AND (worker_id = ?2 OR worker_id IS NULL)
-                   AND EXISTS (
-                       SELECT 1 FROM embed_jobs e2
-                       WHERE e2.scope = embed_jobs.scope AND e2.id > embed_jobs.id
-                         AND e2.status = 'running' AND (e2.worker_id = ?2 OR e2.worker_id IS NULL)
-                   )",
+            // Process restart: jobs left running by this worker (or orphans
+            // pre-0.3.1) flip to failed-open. resolved_status stays NULL so
+            // the reconciler picks them up.
+            let failed = conn.execute(
+                "UPDATE embed_jobs \
+                 SET status = 'failed', finished_at = ?1, error = 'worker_restart' \
+                 WHERE status = 'running' AND (worker_id = ?2 OR worker_id IS NULL)",
                 params![now, worker_id],
-            ).map_err(|e| format!("recover_worker_jobs (supersede) failed: {e}"))?;
+            ).map_err(|e| format!("recover_worker_jobs failed: {e}"))?;
 
-            // Reset remaining jobs owned by this worker or orphaned from pre-0.3.1
-            let reset = conn.execute(
-                "UPDATE embed_jobs SET status = 'pending', started_at = NULL, worker_id = NULL
-                 WHERE status = 'running' AND (worker_id = ?1 OR worker_id IS NULL)",
-                params![worker_id],
-            ).map_err(|e| format!("recover_worker_jobs (reset) failed: {e}"))?;
-
-            Ok(superseded + reset)
+            Ok(failed)
         })
         .await
         .map_err(|e| format!("Task failed: {e}"))?
@@ -1256,11 +1282,29 @@ impl SemanticDb for SqliteDb {
         let error = error.map(|s| s.to_string());
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            let status = if error.is_some() { "error" } else { "completed" };
-            conn.execute(
-                "UPDATE embed_jobs SET status = ?1, finished_at = ?2, error = ?3 WHERE id = ?4",
-                params![status, SqliteDb::now_secs(), error, job_id],
-            ).ok();
+            let now = SqliteDb::now_secs();
+            if error.is_some() {
+                // Failed-open: resolved_status stays NULL until the
+                // reconciler closes us with superseded/retried/gave_up.
+                // Status guard makes this idempotent — if the user cancelled
+                // the job mid-flight, the cancel wins and this is a no-op.
+                conn.execute(
+                    "UPDATE embed_jobs SET status = 'failed', finished_at = ?1, error = ?2 \
+                     WHERE id = ?3 AND status IN ('pending', 'running')",
+                    params![now, error, job_id],
+                ).ok();
+            } else {
+                // Status guard: a cancel that arrived after the pipeline's
+                // last should_stop_embed_job poll but before this write must
+                // not be silently overwritten back to 'succeeded'.
+                conn.execute(
+                    "UPDATE embed_jobs SET status = 'succeeded', finished_at = ?1, \
+                                          resolved_status = 'succeeded', resolved_at = ?1, \
+                                          error = NULL \
+                     WHERE id = ?2 AND status IN ('pending', 'running')",
+                    params![now, job_id],
+                ).ok();
+            }
             Ok(())
         })
         .await
@@ -1272,20 +1316,9 @@ impl SemanticDb for SqliteDb {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             Ok(conn.query_row(
-                "SELECT id, scope, status, total_pages, done_pages, started_at, finished_at, error, worker_id
-                 FROM embed_jobs ORDER BY id DESC LIMIT 1",
+                concatcp_embed_select("ORDER BY id DESC LIMIT 1").as_str(),
                 [],
-                |row| Ok(EmbedJob {
-                    id: row.get(0)?,
-                    scope: row.get(1)?,
-                    status: row.get(2)?,
-                    total_pages: row.get(3)?,
-                    done_pages: row.get(4)?,
-                    started_at: row.get(5)?,
-                    finished_at: row.get(6)?,
-                    error: row.get(7)?,
-                    worker_id: row.get(8)?,
-                }),
+                embed_job_from_row,
             ).ok())
         })
         .await
@@ -1303,20 +1336,9 @@ impl SemanticDb for SqliteDb {
                 .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
                 .unwrap_or(0);
             let latest_job = conn.query_row(
-                "SELECT id, scope, status, total_pages, done_pages, started_at, finished_at, error, worker_id
-                 FROM embed_jobs ORDER BY id DESC LIMIT 1",
+                concatcp_embed_select("ORDER BY id DESC LIMIT 1").as_str(),
                 [],
-                |row| Ok(EmbedJob {
-                    id: row.get(0)?,
-                    scope: row.get(1)?,
-                    status: row.get(2)?,
-                    total_pages: row.get(3)?,
-                    done_pages: row.get(4)?,
-                    started_at: row.get(5)?,
-                    finished_at: row.get(6)?,
-                    error: row.get(7)?,
-                    worker_id: row.get(8)?,
-                }),
+                embed_job_from_row,
             ).ok();
             Ok(EmbedStats { total_pages, total_chunks, latest_job })
         })
@@ -1330,39 +1352,232 @@ impl SemanticDb for SqliteDb {
             let conn = conn.lock().unwrap();
             let mut jobs = Vec::new();
 
-            // Active jobs (pending/running)
-            let mut stmt = conn.prepare(
-                "SELECT id, scope, status, total_pages, done_pages, started_at, finished_at, error, worker_id
-                 FROM embed_jobs WHERE status IN ('pending', 'running') ORDER BY id ASC"
-            ).map_err(|e| format!("list_jobs prepare failed: {e}"))?;
-            let active = stmt.query_map([], |row| Ok(EmbedJob {
-                id: row.get(0)?, scope: row.get(1)?, status: row.get(2)?,
-                total_pages: row.get(3)?, done_pages: row.get(4)?,
-                started_at: row.get(5)?, finished_at: row.get(6)?,
-                error: row.get(7)?, worker_id: row.get(8)?,
-            })).map_err(|e| format!("list_jobs query failed: {e}"))?;
+            let active_sql = concatcp_embed_select(
+                "WHERE status IN ('pending', 'running', 'failed') ORDER BY id ASC",
+            );
+            let mut stmt = conn.prepare(&active_sql)
+                .map_err(|e| format!("list_jobs prepare failed: {e}"))?;
+            let active = stmt.query_map([], embed_job_from_row)
+                .map_err(|e| format!("list_jobs query failed: {e}"))?;
             for job in active.flatten() {
                 jobs.push(job);
             }
 
-            // Recent completed/failed
-            let mut stmt = conn.prepare(
+            let completed_sql = concatcp_embed_select(
                 &format!(
-                    "SELECT id, scope, status, total_pages, done_pages, started_at, finished_at, error, worker_id
-                     FROM embed_jobs WHERE status NOT IN ('pending', 'running') ORDER BY id DESC LIMIT {recent}"
-                )
-            ).map_err(|e| format!("list_jobs prepare failed: {e}"))?;
-            let completed = stmt.query_map([], |row| Ok(EmbedJob {
-                id: row.get(0)?, scope: row.get(1)?, status: row.get(2)?,
-                total_pages: row.get(3)?, done_pages: row.get(4)?,
-                started_at: row.get(5)?, finished_at: row.get(6)?,
-                error: row.get(7)?, worker_id: row.get(8)?,
-            })).map_err(|e| format!("list_jobs query failed: {e}"))?;
+                    "WHERE status NOT IN ('pending', 'running', 'failed') ORDER BY id DESC LIMIT {recent}"
+                ),
+            );
+            let mut stmt = conn.prepare(&completed_sql)
+                .map_err(|e| format!("list_jobs prepare failed: {e}"))?;
+            let completed = stmt.query_map([], embed_job_from_row)
+                .map_err(|e| format!("list_jobs query failed: {e}"))?;
             for job in completed.flatten() {
                 jobs.push(job);
             }
 
             Ok(jobs)
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn cancel_embed_job(&self, job_id: i64) -> Result<(), String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let now = SqliteDb::now_secs();
+            conn.execute(
+                "UPDATE embed_jobs \
+                 SET status = 'cancelled', resolved_status = 'cancelled', \
+                     resolved_at = ?1, finished_at = ?1 \
+                 WHERE id = ?2 AND status IN ('pending', 'running')",
+                params![now, job_id],
+            ).map_err(|e| format!("cancel_embed_job: {e}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn should_stop_embed_job(&self, job_id: i64) -> Result<bool, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let status: Option<String> = conn.query_row(
+                "SELECT status FROM embed_jobs WHERE id = ?1",
+                params![job_id],
+                |row| row.get(0),
+            ).ok();
+            Ok(matches!(status.as_deref(), Some(s) if s != "running"))
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn fail_embed_job(&self, job_id: i64, reason: &str) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let reason = reason.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let now = SqliteDb::now_secs();
+            conn.execute(
+                "UPDATE embed_jobs \
+                 SET status = 'failed', finished_at = ?1, error = ?2 \
+                 WHERE id = ?3 AND status IN ('pending', 'running')",
+                params![now, reason, job_id],
+            ).map_err(|e| format!("fail_embed_job: {e}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn list_failed_open_embed_jobs(&self) -> Result<Vec<EmbedJob>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let sql = concatcp_embed_select("WHERE status = 'failed' ORDER BY id ASC");
+            let mut stmt = conn.prepare(&sql)
+                .map_err(|e| format!("list_failed_open_embed_jobs prepare: {e}"))?;
+            let rows = stmt.query_map([], embed_job_from_row)
+                .map_err(|e| format!("list_failed_open_embed_jobs query: {e}"))?;
+            Ok(rows.filter_map(|r| r.ok()).collect())
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn has_successor_embed_job(&self, scope: &str, excluded_id: i64) -> Result<bool, String> {
+        let conn = self.conn.clone();
+        let scope = scope.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM embed_jobs \
+                 WHERE scope = ?1 AND id > ?2 \
+                   AND status IN ('pending','running','succeeded','cancelled','closed')",
+                params![scope, excluded_id],
+                |row| row.get(0),
+            ).unwrap_or(0);
+            Ok(count > 0)
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn embed_job_retry_chain_len(&self, job_id: i64) -> Result<usize, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            // Walk retry_of back to the root, counting links. Bound the walk
+            // to 1024 so a corrupt cycle can't pin the worker.
+            let mut len = 1usize;
+            let mut current = job_id;
+            for _ in 0..1024 {
+                let parent: Option<i64> = conn.query_row(
+                    "SELECT retry_of FROM embed_jobs WHERE id = ?1",
+                    params![current],
+                    |row| row.get(0),
+                ).ok().flatten();
+                match parent {
+                    Some(p) => {
+                        len += 1;
+                        current = p;
+                    }
+                    None => break,
+                }
+            }
+            Ok(len)
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn close_embed_job(
+        &self,
+        job_id: i64,
+        resolved_status: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let resolved = resolved_status.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            if let Some(rs) = resolved {
+                conn.execute(
+                    "UPDATE embed_jobs \
+                     SET prev_status = status, status = 'closed', resolved_status = ?1 \
+                     WHERE id = ?2 AND status != 'closed'",
+                    params![rs, job_id],
+                ).map_err(|e| format!("close_embed_job: {e}"))?;
+            } else {
+                conn.execute(
+                    "UPDATE embed_jobs \
+                     SET prev_status = status, status = 'closed' \
+                     WHERE id = ?1 AND status != 'closed'",
+                    params![job_id],
+                ).map_err(|e| format!("close_embed_job: {e}"))?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn create_retry_embed_job(&self, scope: &str, retry_of: i64) -> Result<i64, String> {
+        let conn = self.conn.clone();
+        let scope = scope.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO embed_jobs (scope, status, retry_of) VALUES (?1, 'pending', ?2)",
+                params![scope, retry_of],
+            ).map_err(|e| format!("create_retry_embed_job: {e}"))?;
+            Ok(conn.last_insert_rowid())
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn list_archivable_embed_jobs(
+        &self,
+        older_than_secs: i64,
+    ) -> Result<Vec<i64>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let cutoff = SqliteDb::now_secs() - older_than_secs;
+            let mut stmt = conn.prepare(
+                "SELECT id FROM embed_jobs \
+                 WHERE status IN ('succeeded', 'cancelled') AND resolved_at IS NOT NULL \
+                   AND resolved_at <= ?1 \
+                 ORDER BY id ASC"
+            ).map_err(|e| format!("list_archivable_embed_jobs prepare: {e}"))?;
+            let rows: Vec<i64> = stmt.query_map(params![cutoff], |row| row.get(0))
+                .map_err(|e| format!("list_archivable_embed_jobs query: {e}"))?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(rows)
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn list_running_embed_jobs_started_before(
+        &self,
+        started_before_secs: i64,
+    ) -> Result<Vec<EmbedJob>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let sql = concatcp_embed_select(
+                "WHERE status = 'running' AND started_at IS NOT NULL AND started_at < ?1",
+            );
+            let mut stmt = conn.prepare(&sql)
+                .map_err(|e| format!("list_running_embed_jobs_started_before prepare: {e}"))?;
+            let rows = stmt.query_map(params![started_before_secs], embed_job_from_row)
+                .map_err(|e| format!("list_running_embed_jobs_started_before query: {e}"))?;
+            Ok(rows.filter_map(|r| r.ok()).collect())
         })
         .await
         .map_err(|e| format!("Task failed: {e}"))?
@@ -1402,14 +1617,14 @@ impl SemanticDb for SqliteDb {
             let need_pages_join = book_filter.is_some() || role_filter.is_some();
 
             if let Some(ref ids) = book_filter {
-                let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+                let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(",");
                 where_clauses.push(format!("p.book_id IN ({placeholders})"));
                 for id in ids {
                     params_dyn.push(Box::new(*id));
                 }
             }
             if let Some(ref roles) = role_filter {
-                let placeholders = std::iter::repeat("?").take(roles.len()).collect::<Vec<_>>().join(",");
+                let placeholders = std::iter::repeat_n("?", roles.len()).collect::<Vec<_>>().join(",");
                 where_clauses.push(format!(
                     "(p.acl_computed_at IS NULL
                       OR COALESCE(p.acl_default_open, 0) = 1
@@ -1742,6 +1957,19 @@ fn decode_str_list(value: Option<String>) -> Vec<String> {
     match value {
         Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_default(),
         _ => Vec::new(),
+    }
+}
+
+/// Encode a KbScope as a JSON object string. Returns None when scope is
+/// None so the column round-trips as NULL.
+fn encode_kb_scope(scope: Option<&bsmcp_common::settings::KbScope>) -> Option<String> {
+    scope.and_then(|s| serde_json::to_string(s).ok())
+}
+
+fn decode_kb_scope(value: Option<String>) -> Option<bsmcp_common::settings::KbScope> {
+    match value {
+        Some(s) if !s.is_empty() => serde_json::from_str(&s).ok(),
+        _ => None,
     }
 }
 
@@ -2209,11 +2437,14 @@ impl IndexDb for SqliteDb {
         let triggered_by = triggered_by.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            // Dedup on scope (mirrors create_embed_job): if a pending or
-            // running job with the same scope exists, return that one.
+            // Dedup: pending/running collapse onto the existing job. Failed
+            // jobs not yet touched by the reconciler also count as active so
+            // a webhook firing mid-retry-window doesn't double-enqueue.
             let existing: Result<i64, _> = conn.query_row(
                 "SELECT id FROM index_jobs
-                 WHERE scope = ?1 AND status IN ('pending', 'running')
+                 WHERE scope = ?1
+                   AND (status IN ('pending', 'running')
+                        OR (status = 'failed' AND resolved_status IS NULL))
                  ORDER BY id DESC LIMIT 1",
                 params![scope],
                 |r| r.get(0),
@@ -2235,11 +2466,12 @@ impl IndexDb for SqliteDb {
         tokio::task::spawn_blocking(move || {
             let mut conn = conn.lock().unwrap();
             let tx = conn.transaction().map_err(|e| format!("claim_next_index_job tx: {e}"))?;
+            let claim_sql = concatcp_index_select(
+                "WHERE status = 'pending' ORDER BY id ASC LIMIT 1",
+            );
             let job: Option<IndexJob> = {
-                let mut stmt = tx.prepare(
-                    "SELECT id, scope, kind, status, triggered_by, started_at, finished_at, progress, total, error
-                     FROM index_jobs WHERE status = 'pending' ORDER BY id ASC LIMIT 1"
-                ).map_err(|e| format!("claim_next_index_job prepare: {e}"))?;
+                let mut stmt = tx.prepare(&claim_sql)
+                    .map_err(|e| format!("claim_next_index_job prepare: {e}"))?;
                 let row = stmt.query_row([], index_job_from_row);
                 match row {
                     Ok(j) => Some(j),
@@ -2282,11 +2514,27 @@ impl IndexDb for SqliteDb {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-            let status = if error.is_some() { "failed" } else { "completed" };
-            conn.execute(
-                "UPDATE index_jobs SET status = ?1, finished_at = ?2, error = ?3 WHERE id = ?4",
-                params![status, now, error, job_id],
-            ).map_err(|e| format!("complete_index_job: {e}"))?;
+            if error.is_some() {
+                // Status guard makes this idempotent — a cancel that landed
+                // between the worker's last should_stop_index_job poll and
+                // this write must not be silently overwritten.
+                conn.execute(
+                    "UPDATE index_jobs \
+                     SET status = 'failed', finished_at = ?1, error = ?2 \
+                     WHERE id = ?3 AND status IN ('pending', 'running')",
+                    params![now, error, job_id],
+                ).map_err(|e| format!("complete_index_job: {e}"))?;
+            } else {
+                // Same guard on the success branch — a cancel-then-success
+                // race must leave the row in 'cancelled', not flip it back.
+                conn.execute(
+                    "UPDATE index_jobs \
+                     SET status = 'succeeded', finished_at = ?1, \
+                         resolved_status = 'succeeded', resolved_at = ?1, error = NULL \
+                     WHERE id = ?2 AND status IN ('pending', 'running')",
+                    params![now, job_id],
+                ).map_err(|e| format!("complete_index_job: {e}"))?;
+            }
             Ok(())
         }).await.map_err(|e| format!("Task failed: {e}"))?
     }
@@ -2295,10 +2543,11 @@ impl IndexDb for SqliteDb {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            let mut stmt = conn.prepare(
-                "SELECT id, scope, kind, status, triggered_by, started_at, finished_at, progress, total, error
-                 FROM index_jobs WHERE status = 'pending' ORDER BY id ASC LIMIT ?1"
-            ).map_err(|e| format!("list_pending_index_jobs prepare: {e}"))?;
+            let sql = concatcp_index_select(
+                "WHERE status = 'pending' ORDER BY id ASC LIMIT ?1",
+            );
+            let mut stmt = conn.prepare(&sql)
+                .map_err(|e| format!("list_pending_index_jobs prepare: {e}"))?;
             let rows = stmt.query_map(params![limit], index_job_from_row)
                 .map_err(|e| format!("list_pending_index_jobs query: {e}"))?;
             rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("list_pending_index_jobs collect: {e}"))
@@ -2309,16 +2558,234 @@ impl IndexDb for SqliteDb {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            let mut stmt = conn.prepare(
-                "SELECT id, scope, kind, status, triggered_by, started_at, finished_at, progress, total, error
-                 FROM index_jobs ORDER BY id DESC LIMIT 1"
-            ).map_err(|e| format!("get_latest_index_job prepare: {e}"))?;
+            let sql = concatcp_index_select("ORDER BY id DESC LIMIT 1");
+            let mut stmt = conn.prepare(&sql)
+                .map_err(|e| format!("get_latest_index_job prepare: {e}"))?;
             let row = stmt.query_row([], index_job_from_row);
             match row {
                 Ok(j) => Ok(Some(j)),
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
                 Err(e) => Err(format!("get_latest_index_job: {e}")),
             }
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn cancel_index_job(&self, job_id: i64) -> Result<(), String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+            conn.execute(
+                "UPDATE index_jobs \
+                 SET status = 'cancelled', resolved_status = 'cancelled', \
+                     resolved_at = ?1, finished_at = ?1 \
+                 WHERE id = ?2 AND status IN ('pending', 'running')",
+                params![now, job_id],
+            ).map_err(|e| format!("cancel_index_job: {e}"))?;
+            Ok(())
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn should_stop_index_job(&self, job_id: i64) -> Result<bool, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let status: Option<String> = conn.query_row(
+                "SELECT status FROM index_jobs WHERE id = ?1",
+                params![job_id],
+                |row| row.get(0),
+            ).ok();
+            Ok(matches!(status.as_deref(), Some(s) if s != "running"))
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn fail_index_job(&self, job_id: i64, reason: &str) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let reason = reason.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+            conn.execute(
+                "UPDATE index_jobs \
+                 SET status = 'failed', finished_at = ?1, error = ?2 \
+                 WHERE id = ?3 AND status IN ('pending', 'running')",
+                params![now, reason, job_id],
+            ).map_err(|e| format!("fail_index_job: {e}"))?;
+            Ok(())
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn list_failed_open_index_jobs(&self) -> Result<Vec<IndexJob>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let sql = concatcp_index_select("WHERE status = 'failed' ORDER BY id ASC");
+            let mut stmt = conn.prepare(&sql)
+                .map_err(|e| format!("list_failed_open_index_jobs prepare: {e}"))?;
+            let rows = stmt.query_map([], index_job_from_row)
+                .map_err(|e| format!("list_failed_open_index_jobs query: {e}"))?;
+            Ok(rows.filter_map(|r| r.ok()).collect())
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn has_successor_index_job(&self, scope: &str, excluded_id: i64) -> Result<bool, String> {
+        let conn = self.conn.clone();
+        let scope = scope.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM index_jobs \
+                 WHERE scope = ?1 AND id > ?2 \
+                   AND status IN ('pending','running','succeeded','cancelled','closed')",
+                params![scope, excluded_id],
+                |row| row.get(0),
+            ).unwrap_or(0);
+            Ok(count > 0)
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn index_job_retry_chain_len(&self, job_id: i64) -> Result<usize, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut len = 1usize;
+            let mut current = job_id;
+            for _ in 0..1024 {
+                let parent: Option<i64> = conn.query_row(
+                    "SELECT retry_of FROM index_jobs WHERE id = ?1",
+                    params![current],
+                    |row| row.get(0),
+                ).ok().flatten();
+                match parent {
+                    Some(p) => {
+                        len += 1;
+                        current = p;
+                    }
+                    None => break,
+                }
+            }
+            Ok(len)
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn close_index_job(
+        &self,
+        job_id: i64,
+        resolved_status: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let resolved = resolved_status.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            if let Some(rs) = resolved {
+                conn.execute(
+                    "UPDATE index_jobs \
+                     SET prev_status = status, status = 'closed', resolved_status = ?1 \
+                     WHERE id = ?2 AND status != 'closed'",
+                    params![rs, job_id],
+                ).map_err(|e| format!("close_index_job: {e}"))?;
+            } else {
+                conn.execute(
+                    "UPDATE index_jobs \
+                     SET prev_status = status, status = 'closed' \
+                     WHERE id = ?1 AND status != 'closed'",
+                    params![job_id],
+                ).map_err(|e| format!("close_index_job: {e}"))?;
+            }
+            Ok(())
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn create_retry_index_job(
+        &self,
+        scope: &str,
+        kind: &str,
+        retry_of: i64,
+    ) -> Result<i64, String> {
+        let conn = self.conn.clone();
+        let scope = scope.to_string();
+        let kind = kind.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO index_jobs (scope, kind, status, triggered_by, retry_of) \
+                 VALUES (?1, ?2, 'pending', 'reconciler', ?3)",
+                params![scope, kind, retry_of],
+            ).map_err(|e| format!("create_retry_index_job: {e}"))?;
+            Ok(conn.last_insert_rowid())
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn list_archivable_index_jobs(
+        &self,
+        older_than_secs: i64,
+    ) -> Result<Vec<i64>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+            let cutoff = now - older_than_secs;
+            let mut stmt = conn.prepare(
+                "SELECT id FROM index_jobs \
+                 WHERE status IN ('succeeded', 'cancelled') AND resolved_at IS NOT NULL \
+                   AND resolved_at <= ?1 \
+                 ORDER BY id ASC",
+            ).map_err(|e| format!("list_archivable_index_jobs prepare: {e}"))?;
+            let rows: Vec<i64> = stmt.query_map(params![cutoff], |row| row.get(0))
+                .map_err(|e| format!("list_archivable_index_jobs query: {e}"))?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(rows)
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn list_running_index_jobs_started_before(
+        &self,
+        started_before_secs: i64,
+    ) -> Result<Vec<IndexJob>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let sql = concatcp_index_select(
+                "WHERE status = 'running' AND started_at IS NOT NULL AND started_at < ?1",
+            );
+            let mut stmt = conn.prepare(&sql)
+                .map_err(|e| format!("list_running_index_jobs prepare: {e}"))?;
+            let rows = stmt.query_map(params![started_before_secs], index_job_from_row)
+                .map_err(|e| format!("list_running_index_jobs query: {e}"))?;
+            Ok(rows.filter_map(|r| r.ok()).collect())
+        }).await.map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn list_index_jobs(&self, recent: usize) -> Result<Vec<IndexJob>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut jobs = Vec::new();
+            let active_sql = concatcp_index_select(
+                "WHERE status IN ('pending', 'running', 'failed') ORDER BY id ASC",
+            );
+            let mut stmt = conn.prepare(&active_sql)
+                .map_err(|e| format!("list_index_jobs prepare: {e}"))?;
+            let active = stmt.query_map([], index_job_from_row)
+                .map_err(|e| format!("list_index_jobs query: {e}"))?;
+            for j in active.flatten() {
+                jobs.push(j);
+            }
+            let completed_sql = concatcp_index_select(
+                &format!(
+                    "WHERE status NOT IN ('pending', 'running', 'failed') \
+                     ORDER BY id DESC LIMIT {recent}"
+                ),
+            );
+            let mut stmt = conn.prepare(&completed_sql)
+                .map_err(|e| format!("list_index_jobs prepare: {e}"))?;
+            let completed = stmt.query_map([], index_job_from_row)
+                .map_err(|e| format!("list_index_jobs query: {e}"))?;
+            for j in completed.flatten() {
+                jobs.push(j);
+            }
+            Ok(jobs)
         }).await.map_err(|e| format!("Task failed: {e}"))?
     }
 
@@ -2426,7 +2893,49 @@ fn index_job_from_row(r: &rusqlite::Row) -> rusqlite::Result<IndexJob> {
         progress: r.get(7)?,
         total: r.get(8)?,
         error: r.get(9)?,
+        resolved_status: r.get(10)?,
+        prev_status: r.get(11)?,
+        resolved_at: r.get(12)?,
+        retry_of: r.get(13)?,
     })
+}
+
+const INDEX_JOB_COLS: &str =
+    "id, scope, kind, status, triggered_by, started_at, finished_at, progress, total, error, \
+     resolved_status, prev_status, resolved_at, retry_of";
+
+fn concatcp_index_select(tail: &str) -> String {
+    format!("SELECT {INDEX_JOB_COLS} FROM index_jobs {tail}")
+}
+
+fn embed_job_from_row(r: &rusqlite::Row) -> rusqlite::Result<EmbedJob> {
+    Ok(EmbedJob {
+        id: r.get(0)?,
+        scope: r.get(1)?,
+        status: r.get(2)?,
+        total_pages: r.get(3)?,
+        done_pages: r.get(4)?,
+        started_at: r.get(5)?,
+        finished_at: r.get(6)?,
+        error: r.get(7)?,
+        worker_id: r.get(8)?,
+        resolved_status: r.get(9)?,
+        prev_status: r.get(10)?,
+        resolved_at: r.get(11)?,
+        retry_of: r.get(12)?,
+    })
+}
+
+const EMBED_JOB_COLS: &str =
+    "id, scope, status, total_pages, done_pages, started_at, finished_at, error, worker_id, \
+     resolved_status, prev_status, resolved_at, retry_of";
+
+const EMBED_JOB_SELECT_BY_ID: &str = "SELECT id, scope, status, total_pages, done_pages, started_at, \
+     finished_at, error, worker_id, resolved_status, prev_status, resolved_at, retry_of \
+     FROM embed_jobs WHERE id = ?1";
+
+fn concatcp_embed_select(tail: &str) -> String {
+    format!("SELECT {EMBED_JOB_COLS} FROM embed_jobs {tail}")
 }
 
 /// Convert unix days (since epoch) to (year, month, day).
@@ -2443,4 +2952,353 @@ fn unix_days_to_ymd(days: i64) -> (i64, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use bsmcp_common::db::{IndexDb, SemanticDb};
+    use std::env;
+
+    fn temp_db() -> SqliteDb {
+        let dir = env::temp_dir();
+        let unique = format!(
+            "bsmcp-test-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = dir.join(unique);
+        SqliteDb::open(&path, "test-encryption-key-thirty-two-chars-long")
+    }
+
+    /// v1.0.0 → v0.9.0 migration: simulate a v1.0.0-shape database
+    /// (user_settings keyed by stable_id, plus token_bindings and sessions
+    /// tables) and assert that opening it under v0.9.0 drops the orphan
+    /// tables and rebuilds user_settings with the token_id_hash PK.
+    #[test]
+    fn v090_migration_drops_v100_orphans_and_rebuilds_user_settings() {
+        let dir = env::temp_dir();
+        let unique = format!(
+            "bsmcp-test-mig-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = dir.join(&unique);
+
+        // Initial open creates the v0.9.0 schema.
+        let _ = SqliteDb::open(&path, "test-encryption-key-thirty-two-chars-long");
+
+        // Replace user_settings with the v1.0.0 shape and add the orphan
+        // companion tables to mimic what's on disk for a v1.0.0 deployer
+        // upgrading to v0.9.0.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE user_settings;
+             CREATE TABLE user_settings (
+                 stable_id TEXT PRIMARY KEY,
+                 token_id_hash TEXT NOT NULL,
+                 settings_json TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE token_bindings (
+                 stable_id TEXT PRIMARY KEY,
+                 token_id_hash TEXT NOT NULL UNIQUE,
+                 created_at INTEGER NOT NULL
+             );
+             CREATE TABLE sessions (
+                 session_id TEXT PRIMARY KEY,
+                 stable_id TEXT NOT NULL,
+                 started_at INTEGER NOT NULL
+             );
+             INSERT INTO user_settings VALUES ('stable-1', 'hash-1', '{}', 0);
+             INSERT INTO token_bindings VALUES ('stable-1', 'hash-1', 0);
+             INSERT INTO sessions VALUES ('sess-1', 'stable-1', 0);",
+        )
+        .unwrap();
+        drop(conn);
+
+        // Reopen — init runs the migration.
+        let _ = SqliteDb::open(&path, "test-encryption-key-thirty-two-chars-long");
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+
+        let token_bindings_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='token_bindings'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(token_bindings_exists, 0, "token_bindings should be dropped");
+
+        let sessions_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sessions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sessions_exists, 0, "sessions should be dropped");
+
+        let stable_id_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('user_settings') WHERE name = 'stable_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stable_id_count, 0, "user_settings.stable_id column should be gone");
+
+        let pk_col: String = conn
+            .query_row(
+                "SELECT name FROM pragma_table_info('user_settings') WHERE pk > 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pk_col, "token_id_hash", "user_settings PK should be token_id_hash");
+
+        let row_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM user_settings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(row_count, 0, "wholesale reset: rows discarded per the migration contract");
+
+        drop(conn);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn embed_retry_chain_walks_to_root() {
+        let db = temp_db();
+        db.init_semantic_tables().await.unwrap();
+
+        // Original job → fail → retry once → fail → retry again. Chain is 3.
+        let (root, _) = SemanticDb::create_embed_job(&db, "page:42").await.unwrap();
+        SemanticDb::fail_embed_job(&db, root, "boom").await.unwrap();
+        let r1 = SemanticDb::create_retry_embed_job(&db, "page:42", root).await.unwrap();
+        SemanticDb::fail_embed_job(&db, r1, "boom2").await.unwrap();
+        let r2 = SemanticDb::create_retry_embed_job(&db, "page:42", r1).await.unwrap();
+
+        assert_eq!(SemanticDb::embed_job_retry_chain_len(&db, root).await.unwrap(), 1);
+        assert_eq!(SemanticDb::embed_job_retry_chain_len(&db, r1).await.unwrap(), 2);
+        assert_eq!(SemanticDb::embed_job_retry_chain_len(&db, r2).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn embed_failed_with_successor_is_supersedable() {
+        let db = temp_db();
+        db.init_semantic_tables().await.unwrap();
+
+        let (j1, _) = SemanticDb::create_embed_job(&db, "page:7").await.unwrap();
+        SemanticDb::fail_embed_job(&db, j1, "boom").await.unwrap();
+        // Once j1 is failed-open, a fresh create with the same scope dedups
+        // back onto j1. To create a successor we need to first close j1
+        // (mirrors what the reconciler does on supersedence).
+        SemanticDb::close_embed_job(&db, j1, Some("retried")).await.unwrap();
+        let (j2, is_new) = SemanticDb::create_embed_job(&db, "page:7").await.unwrap();
+        assert!(is_new);
+        assert!(j2 > j1);
+
+        assert!(
+            SemanticDb::has_successor_embed_job(&db, "page:7", j1).await.unwrap()
+        );
+        // j2 has no successor.
+        assert!(!SemanticDb::has_successor_embed_job(&db, "page:7", j2).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn embed_dedup_widens_to_failed_open() {
+        let db = temp_db();
+        db.init_semantic_tables().await.unwrap();
+
+        let (j1, is_new1) = SemanticDb::create_embed_job(&db, "page:9").await.unwrap();
+        assert!(is_new1);
+        SemanticDb::fail_embed_job(&db, j1, "boom").await.unwrap();
+        // Failed-open should still dedup onto j1 — webhook firing
+        // mid-retry-window mustn't double-enqueue.
+        let (j_dup, is_new2) = SemanticDb::create_embed_job(&db, "page:9").await.unwrap();
+        assert!(!is_new2);
+        assert_eq!(j_dup, j1);
+
+        // Once the reconciler closes the failed job, a fresh create succeeds.
+        SemanticDb::close_embed_job(&db, j1, Some("retried")).await.unwrap();
+        let (j_new, is_new3) = SemanticDb::create_embed_job(&db, "page:9").await.unwrap();
+        assert!(is_new3);
+        assert!(j_new > j1);
+    }
+
+    #[tokio::test]
+    async fn embed_close_preserves_or_overwrites_resolved_status() {
+        let db = temp_db();
+        db.init_semantic_tables().await.unwrap();
+
+        let (j, _) = SemanticDb::create_embed_job(&db, "page:1").await.unwrap();
+        SemanticDb::complete_job(&db, j, None).await.unwrap();
+        // Archiver path: pass None → preserve the existing 'succeeded'.
+        SemanticDb::close_embed_job(&db, j, None).await.unwrap();
+        let job = {
+            let jobs = SemanticDb::list_jobs(&db, 5).await.unwrap();
+            jobs.into_iter().find(|j2| j2.id == j).unwrap()
+        };
+        assert_eq!(job.status, "closed");
+        assert_eq!(job.resolved_status.as_deref(), Some("succeeded"));
+        assert_eq!(job.prev_status.as_deref(), Some("succeeded"));
+    }
+
+    #[tokio::test]
+    async fn embed_archiver_finds_old_succeeded_jobs() {
+        let db = temp_db();
+        db.init_semantic_tables().await.unwrap();
+
+        let (j, _) = SemanticDb::create_embed_job(&db, "page:5").await.unwrap();
+        SemanticDb::complete_job(&db, j, None).await.unwrap();
+        // Old enough? With grace=0, anything resolved at-or-before now is archivable.
+        let archivable = SemanticDb::list_archivable_embed_jobs(&db, 0).await.unwrap();
+        assert!(archivable.contains(&j), "expected {j} in {:?}", archivable);
+    }
+
+    #[tokio::test]
+    async fn index_retry_chain_walks_to_root() {
+        let db = temp_db();
+
+        let (root, _) = IndexDb::create_index_job(&db, "page:42", "both", "test").await.unwrap();
+        IndexDb::fail_index_job(&db, root, "boom").await.unwrap();
+        let r1 = IndexDb::create_retry_index_job(&db, "page:42", "both", root).await.unwrap();
+        IndexDb::fail_index_job(&db, r1, "boom2").await.unwrap();
+        let r2 = IndexDb::create_retry_index_job(&db, "page:42", "both", r1).await.unwrap();
+
+        assert_eq!(IndexDb::index_job_retry_chain_len(&db, root).await.unwrap(), 1);
+        assert_eq!(IndexDb::index_job_retry_chain_len(&db, r1).await.unwrap(), 2);
+        assert_eq!(IndexDb::index_job_retry_chain_len(&db, r2).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn index_dedup_widens_to_failed_open() {
+        let db = temp_db();
+
+        let (j1, is_new1) = IndexDb::create_index_job(&db, "page:9", "both", "test").await.unwrap();
+        assert!(is_new1);
+        IndexDb::fail_index_job(&db, j1, "boom").await.unwrap();
+        let (j_dup, is_new2) = IndexDb::create_index_job(&db, "page:9", "both", "test").await.unwrap();
+        assert!(!is_new2);
+        assert_eq!(j_dup, j1);
+    }
+
+    #[tokio::test]
+    async fn index_should_stop_returns_true_for_cancelled() {
+        let db = temp_db();
+
+        let (j, _) = IndexDb::create_index_job(&db, "all", "both", "test").await.unwrap();
+        // Pending = not running, so should_stop returns true. That's fine —
+        // it's the worker's check at yield points; a cancelled-while-pending
+        // job is still "stop".
+        assert!(IndexDb::should_stop_index_job(&db, j).await.unwrap());
+
+        // Claim it → running → should_stop returns false.
+        let claimed = IndexDb::claim_next_index_job(&db).await.unwrap().unwrap();
+        assert_eq!(claimed.id, j);
+        assert!(!IndexDb::should_stop_index_job(&db, j).await.unwrap());
+
+        // Cancel → should_stop returns true.
+        IndexDb::cancel_index_job(&db, j).await.unwrap();
+        assert!(IndexDb::should_stop_index_job(&db, j).await.unwrap());
+    }
+
+    // Cancel race: pipeline finishes its current page after a cancel landed
+    // but before the next should_stop poll. complete_job must not flip
+    // 'cancelled' back to 'succeeded' (or 'failed' on the error branch).
+    #[tokio::test]
+    async fn complete_job_does_not_overwrite_cancelled() {
+        let db = temp_db();
+        db.init_semantic_tables().await.unwrap();
+
+        let (job_id, _) = SemanticDb::create_embed_job(&db, "page:1").await.unwrap();
+        // Claim → running.
+        let claimed = SemanticDb::claim_next_job(&db, "worker-x").await.unwrap().unwrap();
+        assert_eq!(claimed.id, job_id);
+        // User cancels mid-flight.
+        SemanticDb::cancel_embed_job(&db, job_id).await.unwrap();
+        // Pipeline finishes its in-flight page and tries to mark complete.
+        SemanticDb::complete_job(&db, job_id, None).await.unwrap();
+
+        let job = SemanticDb::list_jobs(&db, 5)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|j| j.id == job_id)
+            .expect("job should still exist");
+        assert_eq!(job.status, "cancelled");
+        assert_eq!(job.resolved_status.as_deref(), Some("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn complete_job_failure_does_not_overwrite_cancelled() {
+        let db = temp_db();
+        db.init_semantic_tables().await.unwrap();
+
+        let (job_id, _) = SemanticDb::create_embed_job(&db, "page:2").await.unwrap();
+        SemanticDb::claim_next_job(&db, "worker-x").await.unwrap().unwrap();
+        SemanticDb::cancel_embed_job(&db, job_id).await.unwrap();
+        // Pipeline's in-flight page errored — but the job has already been
+        // cancelled, so the failure must not flip it back.
+        SemanticDb::complete_job(&db, job_id, Some("boom")).await.unwrap();
+
+        let job = SemanticDb::list_jobs(&db, 5)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|j| j.id == job_id)
+            .expect("job should still exist");
+        assert_eq!(job.status, "cancelled");
+        assert_eq!(job.resolved_status.as_deref(), Some("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn complete_index_job_does_not_overwrite_cancelled() {
+        let db = temp_db();
+
+        let (job_id, _) = IndexDb::create_index_job(&db, "page:3", "both", "test")
+            .await
+            .unwrap();
+        let claimed = IndexDb::claim_next_index_job(&db).await.unwrap().unwrap();
+        assert_eq!(claimed.id, job_id);
+        IndexDb::cancel_index_job(&db, job_id).await.unwrap();
+        IndexDb::complete_index_job(&db, job_id, None).await.unwrap();
+
+        let job = IndexDb::list_index_jobs(&db, 5)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|j| j.id == job_id)
+            .expect("job should still exist");
+        assert_eq!(job.status, "cancelled");
+        assert_eq!(job.resolved_status.as_deref(), Some("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn complete_index_job_failure_does_not_overwrite_cancelled() {
+        let db = temp_db();
+
+        let (job_id, _) = IndexDb::create_index_job(&db, "page:4", "both", "test")
+            .await
+            .unwrap();
+        IndexDb::claim_next_index_job(&db).await.unwrap().unwrap();
+        IndexDb::cancel_index_job(&db, job_id).await.unwrap();
+        IndexDb::complete_index_job(&db, job_id, Some("boom")).await.unwrap();
+
+        let job = IndexDb::list_index_jobs(&db, 5)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|j| j.id == job_id)
+            .expect("job should still exist");
+        assert_eq!(job.status, "cancelled");
+        assert_eq!(job.resolved_status.as_deref(), Some("cancelled"));
+    }
 }

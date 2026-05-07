@@ -314,6 +314,7 @@ impl SemanticState {
     /// `user_role_ids`: when `Some(&[..])`, applies a role-level ACL filter
     /// to candidates via `page_view_acl`. Pages whose ACL hasn't been
     /// computed are still included (the HTTP fallback below verifies them).
+    #[allow(clippy::too_many_arguments)]
     pub async fn search(
         &self,
         query: &str,
@@ -706,9 +707,14 @@ impl SemanticState {
         }))
     }
 
-    /// List all active (pending/running) jobs plus recent completed/failed jobs.
+    /// List all active (pending/running/failed-open) jobs plus recent terminal jobs.
     pub async fn list_jobs(&self, recent: usize) -> Result<Vec<bsmcp_common::types::EmbedJob>, String> {
         self.db.list_jobs(recent).await
+    }
+
+    /// Cancel a pending or running embed job. Idempotent on terminal jobs.
+    pub async fn cancel_embed_job(&self, job_id: i64) -> Result<(), String> {
+        self.db.cancel_embed_job(job_id).await
     }
 
     /// Handle BookStack webhook for content changes.

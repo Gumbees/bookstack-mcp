@@ -172,6 +172,44 @@ impl PostgresDb {
             sqlx::query(sql).execute(&pool).await.ok();
         }
 
+        // v0.9.0 cleanup migrations — drop the v1.0.0 memory-protocol
+        // surface that PR #66 reverted. Same logic as the SQLite backend;
+        // see the comment block there for the rationale. Idempotent.
+        for sql in [
+            "DROP TABLE IF EXISTS token_bindings CASCADE",
+            "DROP TABLE IF EXISTS sessions CASCADE",
+        ] {
+            sqlx::query(sql).execute(&pool).await.ok();
+        }
+
+        let stable_id_exists: bool = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'user_settings' AND column_name = 'stable_id'
+            )",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(false);
+
+        if stable_id_exists {
+            eprintln!(
+                "v0.9.0 migration: user_settings has v1.0.0 stable_id PK — \
+                 dropping and recreating with token_id_hash PK \
+                 (existing user_settings rows discarded; reconfigure via /settings)"
+            );
+            for sql in [
+                "DROP TABLE user_settings",
+                "CREATE TABLE user_settings (
+                    token_id_hash TEXT PRIMARY KEY,
+                    settings_json TEXT NOT NULL,
+                    updated_at BIGINT NOT NULL
+                )",
+            ] {
+                sqlx::query(sql).execute(&pool).await.ok();
+            }
+        }
+
         sqlx::query("INSERT INTO global_settings (id, updated_at) VALUES (1, 0) ON CONFLICT (id) DO NOTHING")
             .execute(&pool).await.ok();
 

@@ -217,6 +217,55 @@ impl SqliteDb {
             conn.execute_batch(sql).ok();
         }
 
+        // v0.9.0 cleanup migrations — drop the v1.0.0 memory-protocol
+        // surface that PR #66 reverted. Idempotent on rerun.
+        //
+        //   1. `token_bindings` (per-account-settings stable identity)
+        //      and `sessions` (Phase 2.8 session capture index) are
+        //      fully retired; consumers are gone, no data to preserve.
+        //   2. `user_settings` was reshaped between versions: v1.0.0
+        //      keyed by `stable_id` (FK to token_bindings.stable_id);
+        //      v0.9.0 reverts to PK `token_id_hash`. The earlier
+        //      `CREATE TABLE IF NOT EXISTS user_settings` was a no-op
+        //      on v1.0.0 instances (table already existed with the old
+        //      PK), so we detect the v1.0.0 column shape here and
+        //      rebuild from scratch.
+        //
+        // v1.0.0 deployments were mostly single-tenant test instances
+        // per the PR #66 rollback plan — wholesale reset of
+        // user_settings is acceptable; /settings reconfigures on first
+        // post-upgrade login.
+        for sql in [
+            "DROP TABLE IF EXISTS token_bindings",
+            "DROP TABLE IF EXISTS sessions",
+        ] {
+            conn.execute_batch(sql).ok();
+        }
+
+        let stable_id_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('user_settings') WHERE name = 'stable_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if stable_id_count > 0 {
+            eprintln!(
+                "v0.9.0 migration: user_settings has v1.0.0 stable_id PK — \
+                 dropping and recreating with token_id_hash PK \
+                 (existing user_settings rows discarded; reconfigure via /settings)"
+            );
+            conn.execute_batch(
+                "DROP TABLE user_settings;
+                 CREATE TABLE user_settings (
+                     token_id_hash TEXT PRIMARY KEY,
+                     settings_json TEXT NOT NULL,
+                     updated_at INTEGER NOT NULL
+                 );",
+            )
+            .ok();
+        }
+
         // Issue #54 — job lifecycle columns on index_jobs. The matching
         // embed_jobs migration runs in init_semantic_tables. SQLite has no
         // ADD COLUMN IF NOT EXISTS, so the duplicate-column error is
@@ -2923,6 +2972,105 @@ mod lifecycle_tests {
         );
         let path = dir.join(unique);
         SqliteDb::open(&path, "test-encryption-key-thirty-two-chars-long")
+    }
+
+    /// v1.0.0 → v0.9.0 migration: simulate a v1.0.0-shape database
+    /// (user_settings keyed by stable_id, plus token_bindings and sessions
+    /// tables) and assert that opening it under v0.9.0 drops the orphan
+    /// tables and rebuilds user_settings with the token_id_hash PK.
+    #[test]
+    fn v090_migration_drops_v100_orphans_and_rebuilds_user_settings() {
+        let dir = env::temp_dir();
+        let unique = format!(
+            "bsmcp-test-mig-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = dir.join(&unique);
+
+        // Initial open creates the v0.9.0 schema.
+        let _ = SqliteDb::open(&path, "test-encryption-key-thirty-two-chars-long");
+
+        // Replace user_settings with the v1.0.0 shape and add the orphan
+        // companion tables to mimic what's on disk for a v1.0.0 deployer
+        // upgrading to v0.9.0.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE user_settings;
+             CREATE TABLE user_settings (
+                 stable_id TEXT PRIMARY KEY,
+                 token_id_hash TEXT NOT NULL,
+                 settings_json TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE token_bindings (
+                 stable_id TEXT PRIMARY KEY,
+                 token_id_hash TEXT NOT NULL UNIQUE,
+                 created_at INTEGER NOT NULL
+             );
+             CREATE TABLE sessions (
+                 session_id TEXT PRIMARY KEY,
+                 stable_id TEXT NOT NULL,
+                 started_at INTEGER NOT NULL
+             );
+             INSERT INTO user_settings VALUES ('stable-1', 'hash-1', '{}', 0);
+             INSERT INTO token_bindings VALUES ('stable-1', 'hash-1', 0);
+             INSERT INTO sessions VALUES ('sess-1', 'stable-1', 0);",
+        )
+        .unwrap();
+        drop(conn);
+
+        // Reopen — init runs the migration.
+        let _ = SqliteDb::open(&path, "test-encryption-key-thirty-two-chars-long");
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+
+        let token_bindings_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='token_bindings'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(token_bindings_exists, 0, "token_bindings should be dropped");
+
+        let sessions_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sessions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sessions_exists, 0, "sessions should be dropped");
+
+        let stable_id_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('user_settings') WHERE name = 'stable_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stable_id_count, 0, "user_settings.stable_id column should be gone");
+
+        let pk_col: String = conn
+            .query_row(
+                "SELECT name FROM pragma_table_info('user_settings') WHERE pk > 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pk_col, "token_id_hash", "user_settings PK should be token_id_hash");
+
+        let row_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM user_settings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(row_count, 0, "wholesale reset: rows discarded per the migration contract");
+
+        drop(conn);
+        std::fs::remove_file(&path).ok();
     }
 
     #[tokio::test]

@@ -13,6 +13,10 @@
 //!                 first call per session, sticky bits thereafter — handled
 //!                 by `crate::session`).
 
+// `briefing/briefing.rs` holds the actual builder. Renaming would touch every
+// import; the inception is intentional as a sub-module within the briefing
+// namespace.
+#[allow(clippy::module_inception)]
 pub mod briefing;
 pub mod envelope;
 pub mod frontmatter;

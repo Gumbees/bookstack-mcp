@@ -1365,7 +1365,7 @@ fn replace_section_html(html: &str, heading: &str, new_content: &str, page_id: i
 
         if rest.len() > 2 {
             let level_char = rest.as_bytes()[2];
-            if level_char >= b'1' && level_char <= b'6' {
+            if (b'1'..=b'6').contains(&level_char) {
                 let level = (level_char - b'0') as usize;
                 let close_tag = format!("</h{}>", level);
                 if let Some(close_pos) = rest.find(&close_tag) {
@@ -1401,7 +1401,7 @@ fn replace_section_html(html: &str, heading: &str, new_content: &str, page_id: i
 
         if rest.len() > 2 {
             let level_char = rest.as_bytes()[2];
-            if level_char >= b'1' && level_char <= b'6' {
+            if (b'1'..=b'6').contains(&level_char) {
                 let level = (level_char - b'0') as usize;
                 if level <= heading_level {
                     end_pos = abs_pos;

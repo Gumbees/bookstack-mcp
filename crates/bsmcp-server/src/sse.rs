@@ -100,6 +100,7 @@ impl Drop for Session {
 }
 
 impl AppState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         bookstack_url: String,
         db: Arc<dyn DbBackend>,

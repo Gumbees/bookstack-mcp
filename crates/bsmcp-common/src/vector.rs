@@ -65,7 +65,7 @@ mod tests {
 
     #[test]
     fn test_blob_roundtrip() {
-        let embedding = vec![1.0f32, -2.5, 0.0, 3.14159, f32::MAX, f32::MIN];
+        let embedding = vec![1.0f32, -2.5, 0.0, std::f32::consts::PI, f32::MAX, f32::MIN];
         let blob = embedding_to_blob(&embedding);
         let recovered = blob_to_embedding(&blob);
         assert_eq!(embedding, recovered);

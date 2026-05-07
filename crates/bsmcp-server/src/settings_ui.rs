@@ -304,7 +304,7 @@ fn parse_id_list(v: &Option<String>) -> Vec<i64> {
 
 fn parse_string_list(v: &Option<String>) -> Vec<String> {
     let Some(s) = v.as_deref() else { return Vec::new(); };
-    s.split(|c: char| c == ',' || c == '\n')
+    s.split([',', '\n'])
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .map(String::from)

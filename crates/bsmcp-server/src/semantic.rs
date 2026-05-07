@@ -314,6 +314,7 @@ impl SemanticState {
     /// `user_role_ids`: when `Some(&[..])`, applies a role-level ACL filter
     /// to candidates via `page_view_acl`. Pages whose ACL hasn't been
     /// computed are still included (the HTTP fallback below verifies them).
+    #[allow(clippy::too_many_arguments)]
     pub async fn search(
         &self,
         query: &str,

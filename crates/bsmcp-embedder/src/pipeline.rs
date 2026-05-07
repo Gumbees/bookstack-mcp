@@ -241,6 +241,10 @@ pub const DEFAULT_FAILURE_THRESHOLD: usize = 10;
 pub const DEFAULT_CONSECUTIVE_ABORT: usize = 10;
 
 /// Run the embedding pipeline for a job.
+// Tunables (delay/batch/abort thresholds) are pulled in from main rather
+// than reread from env each call. Bundling them into a config struct would
+// hide the call site, so the tradeoff favors keeping the explicit signature.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_pipeline(
     db: &Arc<dyn SemanticDb>,
     embedder: &Arc<dyn Embedder>,

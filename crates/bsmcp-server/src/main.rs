@@ -54,11 +54,12 @@ async fn main() {
 
     // Select database backend
     let backend_type = DbBackendType::from_env();
-    let (db, semantic_db, index_db): (
+    type DbHandles = (
         Arc<dyn DbBackend>,
         Option<Arc<dyn SemanticDb>>,
         Arc<dyn IndexDb>,
-    ) = match backend_type {
+    );
+    let (db, semantic_db, index_db): DbHandles = match backend_type {
         DbBackendType::Sqlite => {
             let db_path = env::var("BSMCP_DB_PATH")
                 .map(PathBuf::from)

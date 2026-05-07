@@ -274,12 +274,20 @@ impl IndexWorker {
             "all" => self.walk_all(job.id).await,
             "delta" => self.walk_delta(job.id).await,
             scope if scope.starts_with("page:") => {
-                let id: i64 = scope
-                    .strip_prefix("page:")
-                    .ok_or("invalid page scope")?
-                    .parse()
-                    .map_err(|e| format!("invalid page scope id: {e}"))?;
+                let id = parse_scope_id(scope, "page:")?;
                 self.reconcile_page(id).await
+            }
+            scope if scope.starts_with("chapter:") => {
+                let id = parse_scope_id(scope, "chapter:")?;
+                self.reconcile_chapter(id).await
+            }
+            scope if scope.starts_with("book:") => {
+                let id = parse_scope_id(scope, "book:")?;
+                self.reconcile_book(id).await
+            }
+            scope if scope.starts_with("shelf:") => {
+                let id = parse_scope_id(scope, "shelf:")?;
+                self.reconcile_shelf(id).await
             }
             other => Err(format!("unknown scope: {other}")),
         }
@@ -527,7 +535,7 @@ impl IndexWorker {
                 _ => {}
             }
             idx += 1;
-            if idx % YIELD_EVERY == 0 {
+            if idx.is_multiple_of(YIELD_EVERY) {
                 tokio::task::yield_now().await;
             }
         }
@@ -591,7 +599,7 @@ impl IndexWorker {
                 count += 1;
             }
             idx += 1;
-            if idx % YIELD_EVERY == 0 {
+            if idx.is_multiple_of(YIELD_EVERY) {
                 tokio::task::yield_now().await;
             }
         }
@@ -603,6 +611,11 @@ impl IndexWorker {
     /// upserts the page row + cache row in one transaction. Used by:
     ///   - Phase 4c webhook handler (page event → enqueue page:{id} job)
     ///   - Phase 4c periodic delta walk (each delta page goes through here)
+    ///
+    /// If the parent book is missing from the index (initial walk hasn't
+    /// reached it yet, or the index is partially-stale), this cascades a
+    /// `book:{id}` reconcile job and fails the page job retryably so the
+    /// #54 retry-chain reconciler picks it back up after the parent lands.
     async fn reconcile_page(&self, page_id: i64) -> Result<(), String> {
         let page = self.bs_client.get_page(page_id).await?;
         let book_id = page
@@ -614,11 +627,18 @@ impl IndexWorker {
             .and_then(|v| v.as_i64())
             .filter(|&id| id != 0);
 
-        let parent_book = self.index_db.get_indexed_book(book_id).await?.ok_or_else(|| {
-            format!(
-                "parent book {book_id} not in index — initial full walk hasn't covered it yet"
-            )
-        })?;
+        let parent_book = match self.index_db.get_indexed_book(book_id).await? {
+            Some(b) => b,
+            None => {
+                return cascade_missing_parent(
+                    &self.index_db,
+                    &format!("book:{book_id}"),
+                    &format!("cascade_from_page:{page_id}"),
+                    &format!("page {page_id} parent book {book_id}"),
+                )
+                .await;
+            }
+        };
         let parent_chapter = if let Some(cid) = chapter_id {
             self.index_db.get_indexed_chapter(cid).await?
         } else {
@@ -642,6 +662,155 @@ impl IndexWorker {
             parent_book.identity_ouid.as_deref(),
         )
         .await
+    }
+
+    /// Single-chapter reconcile keyed off chapter id. Cascades a `book:{id}`
+    /// job (and fails retryably) when the parent book is missing from the
+    /// index — same self-heal shape as `reconcile_page`. Upserts only the
+    /// chapter row; descendant pages are reached by the next full/delta walk
+    /// or by their own `page:{id}` jobs.
+    async fn reconcile_chapter(&self, chapter_id: i64) -> Result<(), String> {
+        let chapter = self.bs_client.get_chapter(chapter_id).await?;
+        let book_id = chapter
+            .get("book_id")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| format!("chapter {chapter_id} has no book_id"))?;
+
+        let parent_book = match self.index_db.get_indexed_book(book_id).await? {
+            Some(b) => b,
+            None => {
+                return cascade_missing_parent(
+                    &self.index_db,
+                    &format!("book:{book_id}"),
+                    &format!("cascade_from_chapter:{chapter_id}"),
+                    &format!("chapter {chapter_id} parent book {book_id}"),
+                )
+                .await;
+            }
+        };
+
+        let name = string_field(&chapter, "name");
+        let slug = string_field(&chapter, "slug");
+        let (chapter_kind, archive_year) = classify_chapter(&name, parent_book.book_kind);
+        self.index_db
+            .upsert_indexed_chapter(&IndexedChapter {
+                chapter_id,
+                book_id,
+                name,
+                slug,
+                identity_ouid: parent_book.identity_ouid.clone(),
+                chapter_kind,
+                archive_year,
+                indexed_at: current_unix(),
+                deleted: false,
+            })
+            .await
+    }
+
+    /// Single-book reconcile keyed off book id. When a configured global
+    /// shelf claims this book and that shelf isn't in the index yet,
+    /// cascades a `shelf:{id}` job and fails retryably. Otherwise upserts
+    /// the book row (and the manifest-derived identity_ouid for Identity
+    /// books). Descendants are not touched — the full walk or their own
+    /// per-id jobs handle that.
+    async fn reconcile_book(&self, book_id: i64) -> Result<(), String> {
+        let book = self.bs_client.get_book(book_id).await?;
+        // Best-effort shelf attribution: BookStack's `/api/books/{id}` does
+        // not return the parent shelf, so we probe each globally-configured
+        // shelf for this book id. If neither contains it (or globals are
+        // empty), the book is reconciled with shelf_id=None — the same
+        // shape `walk_book` uses when it can't classify a parent.
+        let globals = self.db.get_global_settings().await.unwrap_or_default();
+        let candidate_shelves: Vec<i64> =
+            [globals.hive_shelf_id, globals.user_journals_shelf_id]
+                .into_iter()
+                .flatten()
+                .collect();
+        let mut shelf_id: Option<i64> = None;
+        for sid in &candidate_shelves {
+            let shelf = match self.bs_client.get_shelf(*sid).await {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "IndexWorker: reconcile_book({book_id}) get_shelf({sid}) failed (non-fatal): {e}"
+                    );
+                    continue;
+                }
+            };
+            let contains = shelf
+                .get("books")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|b| b.get("id").and_then(|v| v.as_i64()))
+                        .any(|bid| bid == book_id)
+                })
+                .unwrap_or(false);
+            if contains {
+                shelf_id = Some(*sid);
+                break;
+            }
+        }
+
+        if let Some(sid) = shelf_id {
+            if self.index_db.get_indexed_shelf(sid).await?.is_none() {
+                return cascade_missing_parent(
+                    &self.index_db,
+                    &format!("shelf:{sid}"),
+                    &format!("cascade_from_book:{book_id}"),
+                    &format!("book {book_id} parent shelf {sid}"),
+                )
+                .await;
+            }
+        }
+
+        let shelf_kind = classify_shelf(
+            shelf_id.unwrap_or(0),
+            globals.hive_shelf_id,
+            globals.user_journals_shelf_id,
+        );
+        let name = string_field(&book, "name");
+        let slug = string_field(&book, "slug");
+        let book_kind = classify_book(&name, shelf_kind);
+        let identity_ouid = if matches!(book_kind, BookKind::Identity | BookKind::UserIdentity) {
+            self.find_book_identity_ouid(&book).await
+        } else {
+            None
+        };
+        self.index_db
+            .upsert_indexed_book(&IndexedBook {
+                book_id,
+                name,
+                slug,
+                shelf_id,
+                identity_ouid,
+                book_kind,
+                indexed_at: current_unix(),
+                deleted: false,
+            })
+            .await
+    }
+
+    /// Single-shelf reconcile keyed off shelf id. Top of the cascade
+    /// chain — no parent to check. Upserts only the shelf row.
+    async fn reconcile_shelf(&self, shelf_id: i64) -> Result<(), String> {
+        let shelf = self.bs_client.get_shelf(shelf_id).await?;
+        let globals = self.db.get_global_settings().await.unwrap_or_default();
+        let shelf_kind = classify_shelf(
+            shelf_id,
+            globals.hive_shelf_id,
+            globals.user_journals_shelf_id,
+        );
+        self.index_db
+            .upsert_indexed_shelf(&IndexedShelf {
+                shelf_id,
+                name: string_field(&shelf, "name"),
+                slug: string_field(&shelf, "slug"),
+                shelf_kind,
+                indexed_at: current_unix(),
+                deleted: false,
+            })
+            .await
     }
 
     /// Same as `reconcile_page` but takes parent classification + ouid from
@@ -852,6 +1021,53 @@ pub async fn reconcile_failed_embed_jobs(db: &Arc<dyn SemanticDb>, max_chain: us
 }
 
 // --- helpers ---
+
+/// Parse a scoped job id like "page:123" into the trailing integer.
+/// Used by `process_job` to dispatch per-id reconcile scopes.
+fn parse_scope_id(scope: &str, prefix: &str) -> Result<i64, String> {
+    scope
+        .strip_prefix(prefix)
+        .ok_or_else(|| format!("invalid scope: {scope}"))?
+        .parse()
+        .map_err(|e| format!("invalid scope id in {scope}: {e}"))
+}
+
+/// Self-heal entrypoint for missing-parent cases in `reconcile_page`,
+/// `reconcile_chapter`, and `reconcile_book`. Idempotently enqueues a
+/// reconcile job for the missing parent (the existing `create_index_job`
+/// dedup collapses pending/running/failed-open same-scope jobs onto one),
+/// emits a single log line, and returns a retryable error so the #54
+/// retry-chain reconciler picks the original job back up after the parent
+/// lands. The retry job created by that reconciler runs the same scope
+/// again, by which time the parent is in the index.
+///
+/// `parent_scope` — e.g. `"book:2113"` — must be a valid scope string the
+/// worker's `process_job` dispatch table understands. `triggered_by` is
+/// stored on the enqueued job for provenance (e.g. `"cascade_from_page:2116"`).
+/// `subject` is a short human-readable noun phrase ("page 2116 parent book 2113")
+/// used only in the returned error / log message.
+async fn cascade_missing_parent(
+    index_db: &Arc<dyn IndexDb>,
+    parent_scope: &str,
+    triggered_by: &str,
+    subject: &str,
+) -> Result<(), String> {
+    let (job_id, is_new) = index_db
+        .create_index_job(parent_scope, "both", triggered_by)
+        .await?;
+    if is_new {
+        eprintln!(
+            "IndexWorker: {subject} missing in index — enqueued cascade job {job_id} for {parent_scope} ({triggered_by})"
+        );
+    } else {
+        eprintln!(
+            "IndexWorker: {subject} missing in index — coalesced onto existing cascade job {job_id} for {parent_scope}"
+        );
+    }
+    Err(format!(
+        "{subject} not in index — enqueued {parent_scope} (job {job_id}); will retry"
+    ))
+}
 
 fn current_unix() -> i64 {
     SystemTime::now()
@@ -1094,5 +1310,114 @@ mod reconcile_tests {
         let j2_after = listed.iter().find(|j| j.id == j2).unwrap();
         assert_eq!(j2_after.status, "closed");
         assert_eq!(j2_after.resolved_status.as_deref(), Some("gave_up"));
+    }
+
+    /// Issue #72 — cascade-on-missing-parent.
+    ///
+    /// Concurrent page-level reconciles for two different pages whose
+    /// shared parent book is not yet indexed must coalesce onto a single
+    /// `book:N` cascade job (not one per child) and the original page
+    /// reconciles must surface a retryable error so the #54 reconciler
+    /// picks them up after the cascade book job lands.
+    ///
+    /// We test the helper directly rather than `reconcile_page` end-to-end
+    /// because `BookStackClient` is a concrete reqwest-backed struct with
+    /// no test stub — building one would balloon scope. The helper carries
+    /// 100% of the cascade behavior (idempotency + retryable error + log
+    /// line); the per-method call sites are thin wrappers around it.
+    #[tokio::test]
+    async fn cascade_missing_parent_coalesces_concurrent_children() {
+        let db = temp_db();
+        // Two different child pages discover the same missing parent book.
+        let r1 = cascade_missing_parent(
+            &db,
+            "book:2113",
+            "cascade_from_page:2116",
+            "page 2116 parent book 2113",
+        )
+        .await;
+        let r2 = cascade_missing_parent(
+            &db,
+            "book:2113",
+            "cascade_from_page:2117",
+            "page 2117 parent book 2113",
+        )
+        .await;
+        // Both children must surface a retryable error mentioning the
+        // cascade scope so the #54 reconciler treats them as failed-open.
+        let e1 = r1.expect_err("first child must fail-retryable");
+        let e2 = r2.expect_err("second child must fail-retryable");
+        assert!(e1.contains("book:2113"), "err mentions cascade scope: {e1}");
+        assert!(e2.contains("book:2113"), "err mentions cascade scope: {e2}");
+
+        // Exactly one pending `book:2113` job exists — no duplicates.
+        let pending = db.list_pending_index_jobs(50).await.unwrap();
+        let book_jobs: Vec<_> = pending.iter().filter(|j| j.scope == "book:2113").collect();
+        assert_eq!(
+            book_jobs.len(),
+            1,
+            "concurrent children must coalesce onto one cascade job, got {book_jobs:?}"
+        );
+
+        // Provenance: the surviving cascade job records the FIRST child's
+        // trigger string (subsequent children are no-ops via dedup, so
+        // their `triggered_by` is intentionally not preserved).
+        let cascade = book_jobs[0];
+        assert_eq!(cascade.triggered_by, "cascade_from_page:2116");
+        assert_eq!(cascade.kind, "both");
+        assert_eq!(cascade.status, "pending");
+    }
+
+    /// A second cascade for the same parent after the first has already
+    /// transitioned through `failed` (waiting on the reconciler) must
+    /// still coalesce — `create_index_job`'s dedup rule covers
+    /// failed-without-resolved-status as an active state.
+    #[tokio::test]
+    async fn cascade_coalesces_against_failed_open_parent_job() {
+        let db = temp_db();
+        cascade_missing_parent(
+            &db,
+            "book:9000",
+            "cascade_from_page:1",
+            "page 1 parent book 9000",
+        )
+        .await
+        .unwrap_err();
+        let pending_before = db.list_pending_index_jobs(50).await.unwrap();
+        let parent_id = pending_before
+            .iter()
+            .find(|j| j.scope == "book:9000")
+            .map(|j| j.id)
+            .expect("first cascade enqueued");
+        // Simulate the cascade job itself failing once (e.g. transient
+        // BookStack 5xx) — it's now failed-open, the reconciler hasn't
+        // run yet. A second child cascading the same parent must NOT
+        // double-enqueue.
+        db.fail_index_job(parent_id, "transient").await.unwrap();
+        cascade_missing_parent(
+            &db,
+            "book:9000",
+            "cascade_from_page:2",
+            "page 2 parent book 9000",
+        )
+        .await
+        .unwrap_err();
+        let all_jobs = db.list_index_jobs(50).await.unwrap();
+        let book_jobs: Vec<_> = all_jobs.iter().filter(|j| j.scope == "book:9000").collect();
+        assert_eq!(
+            book_jobs.len(),
+            1,
+            "failed-open parent job must absorb subsequent cascades, got {book_jobs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_scope_id_round_trip() {
+        assert_eq!(parse_scope_id("page:42", "page:").unwrap(), 42);
+        assert_eq!(parse_scope_id("chapter:7", "chapter:").unwrap(), 7);
+        assert_eq!(parse_scope_id("book:2113", "book:").unwrap(), 2113);
+        assert_eq!(parse_scope_id("shelf:927", "shelf:").unwrap(), 927);
+        assert!(parse_scope_id("page:nope", "page:").is_err());
+        assert!(parse_scope_id("all", "page:").is_err());
     }
 }

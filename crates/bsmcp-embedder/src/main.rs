@@ -227,7 +227,7 @@ async fn main() {
     // Worker identity — persistent UUID for job ownership
     let model_path = env::var("BSMCP_MODEL_PATH").unwrap_or_else(|_| "/data/models".into());
     let worker_data_dir = PathBuf::from(
-        env::var("BSMCP_EMBED_DATA_DIR").unwrap_or_else(|_| model_path)
+        env::var("BSMCP_EMBED_DATA_DIR").unwrap_or(model_path)
     );
     let worker_id = load_or_create_worker_id(&worker_data_dir);
     eprintln!("Embedder: worker_id={worker_id}");

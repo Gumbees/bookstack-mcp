@@ -252,56 +252,6 @@ impl SemanticState {
         accessible
     }
 
-    /// Resolve the calling user's BookStack roles. Cached per token (15 min
-    /// TTL) so the role list is fetched once per session.
-    ///
-    /// Returns `None` (skip ACL filtering, fall back to HTTP per-page check)
-    /// when we can't determine the user's roles — e.g. settings haven't stamped
-    /// `bookstack_user_id` yet, or `/api/users/{id}` returned an error.
-    pub async fn resolve_user_roles(
-        &self,
-        token_id_hash: &str,
-        bookstack_user_id: Option<i64>,
-        client: &BookStackClient,
-    ) -> Option<Vec<i64>> {
-        // 15-minute cache window — short enough that a role grant or revoke
-        // applied during a working session takes effect on the next search,
-        // long enough to amortize the user fetch across the cache TTL.
-        const ROLE_CACHE_TTL_SECS: i64 = 15 * 60;
-
-        if let Ok(Some((_uid, roles))) = self
-            .db
-            .get_cached_user_roles(token_id_hash, ROLE_CACHE_TTL_SECS)
-            .await
-        {
-            return Some(roles);
-        }
-
-        let user_id = bookstack_user_id?;
-        let user = match client.get_user(user_id).await {
-            Ok(u) => u,
-            Err(e) => {
-                eprintln!("ACL: failed to fetch /api/users/{user_id} for role resolution: {e}");
-                return None;
-            }
-        };
-        let roles: Vec<i64> = user
-            .get("roles")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|r| r.get("id").and_then(|i| i.as_i64())).collect())
-            .unwrap_or_default();
-        if roles.is_empty() {
-            // Empty roles list means BookStack returned the user but they're
-            // role-less — skip ACL filtering rather than blocking everything.
-            eprintln!("ACL: user {user_id} has no roles; skipping ACL filter for this session");
-            return None;
-        }
-        if let Err(e) = self.db.set_cached_user_roles(token_id_hash, user_id, &roles).await {
-            eprintln!("ACL: failed to cache user roles (non-fatal): {e}");
-        }
-        Some(roles)
-    }
-
     /// Hybrid search: vector + keyword + blanket re-ranking.
     ///
     /// `book_filter`: when `Some(&[..])`, restricts the vector pass to chunks
@@ -310,10 +260,6 @@ impl SemanticState {
     /// just smaller from the outset, which proportionally shrinks the
     /// permission filter and per-result fan-out. `None` keeps the old
     /// whole-corpus behavior.
-    ///
-    /// `user_role_ids`: when `Some(&[..])`, applies a role-level ACL filter
-    /// to candidates via `page_view_acl`. Pages whose ACL hasn't been
-    /// computed are still included (the HTTP fallback below verifies them).
     #[allow(clippy::too_many_arguments)]
     pub async fn search(
         &self,
@@ -324,7 +270,6 @@ impl SemanticState {
         verbose: bool,
         client: &BookStackClient,
         book_filter: Option<&[i64]>,
-        user_role_ids: Option<&[i64]>,
     ) -> Result<Value, String> {
         let start = Instant::now();
 
@@ -335,9 +280,6 @@ impl SemanticState {
         let book_filter_owned: Option<Vec<i64>> = book_filter
             .filter(|s| !s.is_empty())
             .map(|s| s.to_vec());
-        let role_filter_owned: Option<Vec<i64>> = user_role_ids
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_vec());
         let vector_future = async {
             let query_vec = self.embed_query(query).await?;
             self.db
@@ -346,7 +288,6 @@ impl SemanticState {
                     limit * 2,
                     threshold,
                     book_filter_owned.as_deref(),
-                    role_filter_owned.as_deref(),
                 )
                 .await
         };
@@ -844,22 +785,6 @@ impl SemanticState {
             "permissions_update" => {
                 let (job_id, is_new) = self.db.create_embed_job("acl_reconcile").await?;
                 eprintln!("Semantic: permissions_update (item={item_id:?}) — queued ACL reconcile job {job_id} (new={is_new})");
-            }
-
-            // --- User events ---
-            // Role assignments live on the user, so updates can change which
-            // roles a token's owner holds. Drop their cached entry so the
-            // next semantic_search re-fetches `/api/users/{id}` and picks up
-            // the new role list.
-            "user_update" | "user_delete" => {
-                if let Some(uid) = item_id {
-                    let _ = self.db.delete_user_role_cache_by_bs_id(uid).await;
-                    eprintln!("Semantic: {event} — invalidated user_role_cache for bookstack_user_id={uid}");
-                }
-            }
-            "user_create" => {
-                // No-op — new users have no cache entry yet, no token mapping
-                // exists until they authorize through the OAuth flow.
             }
 
             _ => {

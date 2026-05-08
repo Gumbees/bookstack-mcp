@@ -1,6 +1,6 @@
 # Repository Structure
 
-_Auto-generated on 2026-05-07 00:13 UTC from commit `4466b43`._
+_Auto-generated on 2026-05-08 16:55 UTC from commit `7be349d`._
 
 ```
 .
@@ -35,18 +35,14 @@ _Auto-generated on 2026-05-07 00:13 UTC from commit `4466b43`._
 │   │   └── Cargo.toml
 │   ├── bsmcp-server
 │   │   ├── src
-│   │   │   ├── briefing
-│   │   │   ├── llm.rs
 │   │   │   ├── main.rs
 │   │   │   ├── mcp.rs
 │   │   │   ├── migrate.rs
 │   │   │   ├── oauth.rs
 │   │   │   ├── semantic.rs
-│   │   │   ├── session.rs
 │   │   │   ├── settings_ui.rs
 │   │   │   ├── sse.rs
-│   │   │   ├── staging.rs
-│   │   │   └── summary.rs
+│   │   │   └── staging.rs
 │   │   └── Cargo.toml
 │   └── bsmcp-worker
 │       ├── src
@@ -70,5 +66,5 @@ _Auto-generated on 2026-05-07 00:13 UTC from commit `4466b43`._
 ├── STRUCTURE.md
 └── entrypoint.sh
 
-17 directories, 49 files
+16 directories, 46 files
 ```

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 #
-# bsmcp-server — MCP protocol, OAuth, /remember, semantic search.
+# bsmcp-server — MCP protocol, OAuth, semantic search.
 #
 # This image has zero ONNX/fastembed dependencies (verified via
 # `cargo tree -p bsmcp-server`). It only needs bsmcp-common + the db

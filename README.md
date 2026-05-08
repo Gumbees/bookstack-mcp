@@ -6,18 +6,15 @@ An MCP (Model Context Protocol) server that gives Claude full access to a [BookS
 
 - Full CRUD on all core BookStack resources (shelves, books, chapters, pages, attachments)
 - Full-text search with BookStack query operators
-- **Semantic vector search** — natural language search across all content via embeddings (optional). Hybrid (vector + keyword) with Markov-blanket re-ranking; ACL-filtered when the caller's BookStack user ID is configured.
-- **Briefing flow (`POST /briefing/v1/read` + `briefing` MCP tool)** — server-side per-session reconstitution. Returns time, `system_prompt_additions` (guide page, org identity, org required instructions, AI-usage policy, user system_prompt_page_ids, owned-domains block), `setup_nudge` when settings are incomplete, and `kb_semantic_matches` against the user prompt. Auto-injected as `meta.briefing` on every other tool response — full content first call per session, sticky bits thereafter. **No personal-memory primitives** (journals, identities, etc.) — this server is a BookStack bridge, not a memory backend.
-- **Settings UI (`/settings`)** — browser-based admin/user configuration page (token-gated via the same `/authorize` flow). Per-user fields for label/role/timezone/owned-domains/system_prompt_page_ids; admin globals for guide page, org identity, org_required_instructions / org_ai_usage_policy page lists, typed scope slots (policies/sops/best_practices), and org domains.
+- **Semantic vector search** — natural language search across all content via embeddings (optional). Hybrid (vector + keyword) with Markov-blanket re-ranking. Per-page access control is enforced via BookStack's API on every result.
+- **Settings UI (`/settings`)** — browser-based admin configuration page (token-gated via the same `/authorize` flow). Surfaces only the global server fields the index worker needs (`hive_shelf_id`, `user_journals_shelf_id`).
 - **Pluggable database** — SQLite for simple deployments, PostgreSQL + pgvector for production
 - **Separate embedder** — background embedding service with pluggable backends (local ONNX, Ollama, OpenAI)
 - **Server-side markdown to HTML conversion** — send markdown, server converts before sending to BookStack
 - **Staging upload flow** — upload local images and attachments through a two-step staging endpoint without exposing local paths to the container ([see below](#uploading-local-files-images--attachments))
-- **Time-aware responses** — every briefing response (and every other MCP tool response, via `meta.briefing`) carries a `meta.time` block (now_unix/now_utc/now_local/now_human/timezone) sourced from a per-user cached IANA timezone. Lets agents reason about "yesterday" / "this morning" without re-deriving it.
 - **OAuth 2.1 support** — use as a Claude.ai or Claude Desktop custom connector without config files
 - **Encrypted token storage** — OAuth tokens encrypted at rest with AES-256-GCM
 - **Dual transport** — SSE (MCP 2024-11-05) and Streamable HTTP (MCP 2025-03-26)
-- **AI instance summary** — optional LLM-generated summary of your knowledge base included in MCP context
 - **Dynamic structure discovery** — AI automatically learns your BookStack hierarchy on connect
 - **Auto-migration** — seamlessly migrate from SQLite to PostgreSQL on startup
 - Multi-user support via per-session BookStack API tokens
@@ -42,13 +39,12 @@ docker/
 
 The MCP server handles all client-facing protocol, OAuth, and search. The embedder runs separately, polling a database-backed job queue to embed pages and serving a `/embed` HTTP endpoint for query-time embedding. The embedder supports three backends: local ONNX models (fastembed), Ollama, or OpenAI-compatible APIs.
 
-## Available Tools (59 BookStack + 1 briefing + 3 semantic = 63)
+## Available Tools (59 BookStack + 3 semantic = 62)
 
 | Category | Tools |
 |----------|-------|
 | **Search** | `search_content` |
 | **Semantic** | `semantic_search`, `reembed`, `embedding_status` |
-| **Briefing** | `briefing` (single tool — per-session reconstitution + auto-injected as `meta.briefing` on every other tool response) |
 | **Shelves** | `list_shelves`, `get_shelf`, `create_shelf`, `update_shelf`, `delete_shelf` |
 | **Books** | `list_books`, `get_book`, `create_book`, `update_book`, `delete_book` |
 | **Chapters** | `list_chapters`, `get_chapter`, `create_chapter`, `update_chapter`, `delete_chapter` |
@@ -66,9 +62,9 @@ The MCP server handles all client-facing protocol, OAuth, and search. The embedd
 | **Permissions** | `get_content_permissions`, `update_content_permissions` |
 | **Roles** | `list_roles`, `get_role` |
 
-Semantic tools (`semantic_search`, `reembed`, `embedding_status`) only appear when `BSMCP_SEMANTIC_SEARCH=true` and an embedder is running. Without semantic search: 60 tools (59 BookStack + 1 briefing).
+Semantic tools (`semantic_search`, `reembed`, `embedding_status`) only appear when `BSMCP_SEMANTIC_SEARCH=true` and an embedder is running. Without semantic search: 59 BookStack tools.
 
-The `briefing` tool returns a `setup_nudge` listing pending settings fields with the exact path to fix them; configure via the `/settings` UI. Personal-memory primitives (journals, identities, reminders, events, sessions) are intentionally NOT in scope and live in dedicated downstream tools.
+The server is a thin BookStack CRUD facade plus semantic-search enrichment, OAuth, audit, and the reconciliation worker. Personal-memory primitives (journals, identities, reminders) and the v0.8.0/v0.9.0 briefing surface have been removed in v0.10.0 — see the migration notes below.
 
 ## Setup
 
@@ -141,13 +137,6 @@ The server is pure Rust + bundled SQLite and builds cleanly on any target the Ru
 | `BSMCP_REFRESH_TOKEN_TTL` | No | `7776000` | Refresh token TTL in seconds (90d) |
 | `BSMCP_BACKUP_INTERVAL` | No | - | Hours between backups (0 = disabled) |
 | `BSMCP_BACKUP_PATH` | No | `/data/backups` | Backup directory |
-| `BSMCP_LLM_PROVIDER` | No | - | LLM for instance summary: `openrouter`, `anthropic`, `openai`, `ollama` |
-| `BSMCP_LLM_API_KEY` | No | - | API key for LLM provider (not needed for ollama) |
-| `BSMCP_LLM_MODEL` | No | (per provider) | Model ID for summary generation |
-| `BSMCP_LLM_API_URL` | No | (per provider) | Base URL for LLM API (useful for ollama on different host) |
-| `BSMCP_SUMMARY_INTERVAL` | No | `0` | Hours between summary regeneration (0 = only on first startup) |
-| `BSMCP_SUMMARY_TOKEN_ID` | No | - | BookStack token for summary (falls back to `BSMCP_EMBED_TOKEN_*`) |
-| `BSMCP_SUMMARY_TOKEN_SECRET` | No | - | BookStack token secret for summary |
 
 #### Embedder Variables
 
@@ -270,9 +259,48 @@ The token ID and secret come from your BookStack API token (created under **My A
 
 All schema migrations are automatic on startup (CREATE TABLE IF NOT EXISTS, ALTER TABLE for new columns). No manual SQL is needed.
 
-> **Heads up about the historical entries below.** v0.8.0 removed the `/remember` protocol and its 12 `remember_*` MCP tools (the personal-memory layer moved to memberberry.ai); v0.9.0 reverted v1.0.0's brief re-introduction of those primitives. The pre-v0.8.0 entries (v0.7.x and earlier) describe functionality that no longer ships — they're kept for upgrade-path archaeology, not as a current feature list.
+> **Heads up.** v0.10.0 strips the briefing layer + per-user settings — the server is now a thin BookStack CRUD facade plus semantic search, OAuth, audit, and the reconciliation worker. Older entries describe functionality that no longer ships and are kept only for upgrade-path archaeology.
 
-### From v0.8.0 to v0.9.0 (this release)
+### From v0.9.0 to v0.10.0 (this release)
+
+#### What's removed
+
+- **`briefing` MCP tool, `POST /briefing/v1/read` HTTP route, and the auto-injected `meta.briefing` envelope** are all gone. The single-call reconstitution shell from v0.8.0 / v0.9.0 turned out to fan out 5+ parallel BookStack page fetches per request and fail open on stale `system_prompt_page_ids` config. Removed wholesale.
+- **Per-user `UserSettings`** struct and the `user_settings` table (both Postgres and SQLite) — every consumer was the briefing path or related setup nudges. No per-user state to persist after the cut.
+- **Per-user role-level ACL filtering on semantic search and `tools/list`** — depended on `UserSettings.bookstack_user_id`. Semantic search becomes user-anonymous on the embedder side; per-page access control still runs through BookStack's API on every result.
+- **`user_role_cache` table** — fed only the per-user role-level filter.
+- **Briefing-only `GlobalSettings` fields** (`org_required_instructions_page_ids`, `org_ai_usage_policy_page_ids`, `org_identity_page_id`, `org_domains`, `guide_page_id`, `policies_scope`, `sops_scope`, `best_practices_scope`, `friendly_structure`, `full_content_in_briefing`, `strict_setup`) and the matching `/settings` UI sections.
+- **Instance summary subsystem** (Ollama caller + the `Summary: …` log lines + `BSMCP_LLM_*` / `BSMCP_SUMMARY_*` env vars).
+- **`session_event` and `dismiss_setup_nudge` MCP tools** (briefing-only).
+- **`try_auto_populate_bookstack_user_id` in the OAuth flow** — no settings row to populate.
+- **v0.7.x `extras` migration shims.**
+
+#### What survives
+
+- 59 BookStack CRUD tools (`create_*` / `update_*` / `delete_*` / `get_*` / `list_*` + `search_content`).
+- `semantic_search`, `reembed`, `embedding_status`.
+- `bsmcp-embedder` + `bsmcp-worker` images and the reconciler.
+- Rate limiter + audit log (#54 infra).
+- OAuth 2.1 / `/authorize` flow.
+- `/settings` admin UI for the surviving global server config (`hive_shelf_id`, `user_journals_shelf_id`).
+
+#### Tool count
+
+- With semantic search: **62 tools** (59 CRUD + 3 semantic). Without semantic: 59.
+
+#### What's automatic
+
+- `user_settings`, `user_role_cache`, `remember_audit`, `token_bindings`, `sessions` tables are dropped on first startup (idempotent).
+- Briefing-only `global_settings` columns are dropped via `ALTER TABLE DROP COLUMN` (Postgres native; SQLite ≥ 3.35).
+- Existing org-level page-id config is discarded — re-enter via the trimmed `/settings` page if any of the surviving fields apply.
+
+#### Breaking changes
+
+- Clients calling `briefing` or `/briefing/v1/read` get `tool not found` / `404`.
+- Tool responses no longer carry `meta.briefing`.
+- `tools/list` no longer filters by role.
+
+### From v0.8.0 to v0.9.0
 
 #### What's new
 

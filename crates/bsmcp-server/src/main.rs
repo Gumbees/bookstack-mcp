@@ -1,14 +1,10 @@
-mod briefing;
-mod llm;
 mod mcp;
 mod migrate;
 mod oauth;
 mod semantic;
-mod session;
 mod settings_ui;
 mod sse;
 mod staging;
-mod summary;
 
 use std::env;
 use std::net::SocketAddr;
@@ -192,46 +188,6 @@ async fn main() {
         None
     };
 
-    // Instance summary (optional — requires LLM API key + BookStack service token)
-    let summary_cache: summary::SummaryCache = Arc::new(tokio::sync::RwLock::new(None));
-    if let Some(llm_client) = llm::LlmClient::from_env() {
-        // Need a service-level BookStack client for reading content
-        let summary_token_id = env::var("BSMCP_SUMMARY_TOKEN_ID")
-            .or_else(|_| env::var("BSMCP_EMBED_TOKEN_ID"));
-        let summary_token_secret = env::var("BSMCP_SUMMARY_TOKEN_SECRET")
-            .or_else(|_| env::var("BSMCP_EMBED_TOKEN_SECRET"));
-
-        if let (Ok(tid), Ok(tsec)) = (summary_token_id, summary_token_secret) {
-            let bs_client = bsmcp_common::bookstack::BookStackClient::new(
-                &bookstack_url,
-                &tid,
-                &tsec,
-                reqwest::Client::new(),
-            );
-            // BSMCP_SUMMARY_INTERVAL: hours between regenerations (0 = only on startup if no cache)
-            let interval_hours: u64 = env::var("BSMCP_SUMMARY_INTERVAL")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            let interval_secs = interval_hours * 3600;
-
-            if interval_hours > 0 {
-                eprintln!("Summary: LLM configured ({:?}), regenerating every {interval_hours}h", llm_client.provider());
-            } else {
-                eprintln!("Summary: LLM configured ({:?}), one-time generation", llm_client.provider());
-            }
-            summary::spawn_summary_loop(
-                llm_client,
-                bs_client,
-                semantic_db.clone(),
-                summary_cache.clone(),
-                interval_secs,
-            );
-        } else {
-            eprintln!("Summary: LLM configured but no BookStack service token (set BSMCP_SUMMARY_TOKEN_ID/SECRET or BSMCP_EMBED_TOKEN_ID/SECRET)");
-        }
-    }
-
     // v1.1.0+: reconciliation worker runs in its own binary (`bsmcp-worker`).
     // The server's webhook handler still enqueues into `index_jobs`; the
     // worker process polls + executes those jobs against the same DB.
@@ -245,24 +201,10 @@ async fn main() {
         backup_interval_hours,
         backup_path,
         semantic,
-        summary_cache,
     );
     state.spawn_cleanup();
     state.spawn_backup();
     settings_ui::spawn_settings_cleanup(state.settings_sessions.clone());
-    session::spawn_cleanup(state.briefing_sessions.clone());
-
-    // BSMCP_BRIEFING_ENABLED gates the briefing subsystem — both the
-    // /briefing/v1/read HTTP endpoint and the auto-injected meta.briefing
-    // on every MCP tool response. Default true. Set to false to run
-    // bookstack-mcp purely as a BookStack proxy.
-    let briefing_enabled = env::var("BSMCP_BRIEFING_ENABLED")
-        .ok()
-        .map(|v| {
-            let v = v.trim().to_lowercase();
-            !(v == "false" || v == "0" || v == "no" || v == "off")
-        })
-        .unwrap_or(true);
 
     let mut app = Router::new()
         .route("/mcp/sse", get(sse::handle_sse).post(sse::handle_streamable))
@@ -281,15 +223,6 @@ async fn main() {
             get(settings_ui::handle_settings_probe_get).post(settings_ui::handle_settings_probe_post),
         )
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }));
-    if briefing_enabled {
-        app = app.route(
-            "/briefing/v1/read",
-            axum::routing::post(handle_briefing_http),
-        );
-        eprintln!("Briefing: HTTP endpoint active at POST /briefing/v1/read");
-    } else {
-        eprintln!("Briefing: DISABLED (set BSMCP_BRIEFING_ENABLED=true to enable)");
-    }
     eprintln!("Settings: UI active at GET/POST /settings");
 
     // Staging upload endpoint for file uploads (50MB limit)
@@ -337,53 +270,6 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
-}
-
-/// HTTP handler for `POST /briefing/v1/read`. Resolves the caller's BookStack
-/// credentials via the same Bearer-token logic the MCP endpoints use, then
-/// dispatches into the briefing builder.
-async fn handle_briefing_http(
-    State(state): State<sse::AppState>,
-    headers: HeaderMap,
-    body: String,
-) -> impl IntoResponse {
-    let (token_id, token_secret) = match sse::resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await {
-        Ok(c) => c,
-        Err(resp) => return resp,
-    };
-
-    let body_value: serde_json::Value = if body.is_empty() {
-        serde_json::Value::Object(Default::default())
-    } else {
-        match serde_json::from_str(&body) {
-            Ok(v) => v,
-            Err(_) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"ok": false, "error": {"code": "invalid_argument", "message": "request body must be JSON"}})),
-                )
-                    .into_response();
-            }
-        }
-    };
-
-    let client = bsmcp_common::bookstack::BookStackClient::new(
-        &state.bookstack_url,
-        &token_id,
-        &token_secret,
-        state.http_client.clone(),
-    );
-
-    let envelope = briefing::read(
-        body_value,
-        &token_id,
-        &client,
-        state.db.clone(),
-        state.semantic.clone(),
-    )
-    .await;
-
-    (StatusCode::OK, Json(envelope)).into_response()
 }
 
 /// Webhook handler for BookStack page change events.

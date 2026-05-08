@@ -13,7 +13,7 @@ use zeroize::Zeroizing;
 use bsmcp_common::config::{access_token_ttl, refresh_token_ttl};
 use bsmcp_common::db::{DbBackend, IndexDb, SemanticDb};
 use bsmcp_common::index::*;
-use bsmcp_common::settings::{GlobalSettings, UserSettings};
+use bsmcp_common::settings::GlobalSettings;
 use bsmcp_common::types::*;
 use bsmcp_common::vector;
 
@@ -46,28 +46,12 @@ impl SqliteDb {
                  created_at INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_refresh_tokens_created ON refresh_tokens(created_at);
-             CREATE TABLE IF NOT EXISTS user_settings (
-                 token_id_hash TEXT PRIMARY KEY,
-                 settings_json TEXT NOT NULL,
-                 updated_at INTEGER NOT NULL
-             );
              CREATE TABLE IF NOT EXISTS global_settings (
                  id INTEGER PRIMARY KEY CHECK (id = 1),
                  hive_shelf_id INTEGER,
                  user_journals_shelf_id INTEGER,
-                 org_required_instructions_page_ids TEXT,
-                 org_ai_usage_policy_page_ids TEXT,
-                 org_identity_page_id INTEGER,
-                 org_domains TEXT,
                  set_by_token_hash TEXT,
-                 updated_at INTEGER NOT NULL DEFAULT 0,
-                 guide_page_id INTEGER,
-                 policies_scope TEXT,
-                 sops_scope TEXT,
-                 best_practices_scope TEXT,
-                 friendly_structure INTEGER NOT NULL DEFAULT 1,
-                 full_content_in_briefing INTEGER NOT NULL DEFAULT 0,
-                 strict_setup INTEGER NOT NULL DEFAULT 0
+                 updated_at INTEGER NOT NULL DEFAULT 0
              );
              INSERT OR IGNORE INTO global_settings (id, updated_at) VALUES (1, 0);
              DROP TABLE IF EXISTS registrations;
@@ -174,96 +158,39 @@ impl SqliteDb {
         )
         .expect("Failed to initialize database schema");
 
-        // Migrations: ALTER existing global_settings rows to gain new columns.
-        // SQLite doesn't support IF NOT EXISTS on ALTER ADD COLUMN; ignore the
-        // duplicate-column error.
-        // Note: org_*_chapter_ids columns were briefly added during this PR's
-        // development and then dropped in favour of page-IDs-only. Existing
-        // rows with values in those columns are simply ignored — the columns
-        // remain on disk but are not read by the application.
+        // v0.10.0 cleanup migrations — drop the briefing/per-user-settings
+        // surface stripped in #78. Idempotent on rerun: SQLite 3.35+
+        // supports `DROP COLUMN`; older builds silently no-op via `.ok()`.
         for sql in [
-            "ALTER TABLE global_settings ADD COLUMN org_required_instructions_page_ids TEXT",
-            "ALTER TABLE global_settings ADD COLUMN org_ai_usage_policy_page_ids TEXT",
-            "ALTER TABLE global_settings ADD COLUMN org_identity_page_id INTEGER",
-            "ALTER TABLE global_settings ADD COLUMN org_domains TEXT",
-            // v0.8.0 typed slots + org-wide booleans.
-            "ALTER TABLE global_settings ADD COLUMN guide_page_id INTEGER",
-            "ALTER TABLE global_settings ADD COLUMN policies_scope TEXT",
-            "ALTER TABLE global_settings ADD COLUMN sops_scope TEXT",
-            "ALTER TABLE global_settings ADD COLUMN best_practices_scope TEXT",
-            "ALTER TABLE global_settings ADD COLUMN friendly_structure INTEGER NOT NULL DEFAULT 1",
-            "ALTER TABLE global_settings ADD COLUMN full_content_in_briefing INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE global_settings ADD COLUMN strict_setup INTEGER NOT NULL DEFAULT 0",
-        ] {
-            conn.execute_batch(sql).ok();
-        }
-
-        // v0.8.0 cleanup migrations. SQLite 3.35+ supports `DROP COLUMN`;
-        // older builds will silently no-op via `.ok()` and leave the orphan
-        // column on disk — same end state as before this block existed.
-        // Idempotent on rerun: the second invocation hits "no such column"
-        // and is also swallowed.
-        for sql in [
-            // remember_audit + indexes — fully retired in v0.8.0; no consumers.
+            // user_settings table — entire surface gone (no per-user state).
+            "DROP TABLE IF EXISTS user_settings",
+            // user_role_cache table — fed the per-user role-level ACL filter
+            // that's gone with semantic search becoming user-anonymous.
+            "DROP TABLE IF EXISTS user_role_cache",
+            // remember_audit + leftover v1.0.0 surface (idempotent).
             "DROP INDEX IF EXISTS idx_audit_user_time",
             "DROP INDEX IF EXISTS idx_audit_resource_time",
             "DROP TABLE IF EXISTS remember_audit",
-            // default_ai_identity_* — orphaned when the personal-memory
-            // layer moved to memberberry.ai. Drop, don't preserve.
+            "DROP TABLE IF EXISTS token_bindings",
+            "DROP TABLE IF EXISTS sessions",
+            // Briefing-only global_settings columns dropped in v0.10.0.
+            "ALTER TABLE global_settings DROP COLUMN org_required_instructions_page_ids",
+            "ALTER TABLE global_settings DROP COLUMN org_ai_usage_policy_page_ids",
+            "ALTER TABLE global_settings DROP COLUMN org_identity_page_id",
+            "ALTER TABLE global_settings DROP COLUMN org_domains",
+            "ALTER TABLE global_settings DROP COLUMN guide_page_id",
+            "ALTER TABLE global_settings DROP COLUMN policies_scope",
+            "ALTER TABLE global_settings DROP COLUMN sops_scope",
+            "ALTER TABLE global_settings DROP COLUMN best_practices_scope",
+            "ALTER TABLE global_settings DROP COLUMN friendly_structure",
+            "ALTER TABLE global_settings DROP COLUMN full_content_in_briefing",
+            "ALTER TABLE global_settings DROP COLUMN strict_setup",
+            // v0.7.x default_ai_identity_* leftovers.
             "ALTER TABLE global_settings DROP COLUMN default_ai_identity_page_id",
             "ALTER TABLE global_settings DROP COLUMN default_ai_identity_name",
             "ALTER TABLE global_settings DROP COLUMN default_ai_identity_ouid",
         ] {
             conn.execute_batch(sql).ok();
-        }
-
-        // v0.9.0 cleanup migrations — drop the v1.0.0 memory-protocol
-        // surface that PR #66 reverted. Idempotent on rerun.
-        //
-        //   1. `token_bindings` (per-account-settings stable identity)
-        //      and `sessions` (Phase 2.8 session capture index) are
-        //      fully retired; consumers are gone, no data to preserve.
-        //   2. `user_settings` was reshaped between versions: v1.0.0
-        //      keyed by `stable_id` (FK to token_bindings.stable_id);
-        //      v0.9.0 reverts to PK `token_id_hash`. The earlier
-        //      `CREATE TABLE IF NOT EXISTS user_settings` was a no-op
-        //      on v1.0.0 instances (table already existed with the old
-        //      PK), so we detect the v1.0.0 column shape here and
-        //      rebuild from scratch.
-        //
-        // v1.0.0 deployments were mostly single-tenant test instances
-        // per the PR #66 rollback plan — wholesale reset of
-        // user_settings is acceptable; /settings reconfigures on first
-        // post-upgrade login.
-        for sql in [
-            "DROP TABLE IF EXISTS token_bindings",
-            "DROP TABLE IF EXISTS sessions",
-        ] {
-            conn.execute_batch(sql).ok();
-        }
-
-        let stable_id_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('user_settings') WHERE name = 'stable_id'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        if stable_id_count > 0 {
-            eprintln!(
-                "v0.9.0 migration: user_settings has v1.0.0 stable_id PK — \
-                 dropping and recreating with token_id_hash PK \
-                 (existing user_settings rows discarded; reconfigure via /settings)"
-            );
-            conn.execute_batch(
-                "DROP TABLE user_settings;
-                 CREATE TABLE user_settings (
-                     token_id_hash TEXT PRIMARY KEY,
-                     settings_json TEXT NOT NULL,
-                     updated_at INTEGER NOT NULL
-                 );",
-            )
-            .ok();
         }
 
         // Issue #54 — job lifecycle columns on index_jobs. The matching
@@ -526,78 +453,20 @@ impl DbBackend for SqliteDb {
         .map_err(|e| format!("Task failed: {e}"))?
     }
 
-    async fn get_user_settings(&self, token_id_hash: &str) -> Result<Option<UserSettings>, String> {
-        let conn = self.conn.clone();
-        let token_id_hash = token_id_hash.to_string();
-        tokio::task::spawn_blocking(move || -> Result<Option<UserSettings>, String> {
-            let conn = conn.lock().unwrap();
-            let json: Option<String> = conn.query_row(
-                "SELECT settings_json FROM user_settings WHERE token_id_hash = ?1",
-                params![token_id_hash],
-                |row| row.get(0),
-            ).ok();
-            match json {
-                Some(s) => serde_json::from_str(&s)
-                    .map(Some)
-                    .map_err(|e| format!("user_settings JSON parse: {e}")),
-                None => Ok(None),
-            }
-        })
-        .await
-        .map_err(|e| format!("Task failed: {e}"))?
-    }
-
-    async fn save_user_settings(&self, token_id_hash: &str, settings: &UserSettings) -> Result<(), String> {
-        let conn = self.conn.clone();
-        let token_id_hash = token_id_hash.to_string();
-        let json = serde_json::to_string(settings)
-            .map_err(|e| format!("user_settings serialize: {e}"))?;
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
-            conn.execute(
-                "INSERT INTO user_settings (token_id_hash, settings_json, updated_at)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(token_id_hash) DO UPDATE SET
-                    settings_json = excluded.settings_json,
-                    updated_at = excluded.updated_at",
-                params![token_id_hash, json, SqliteDb::now_secs()],
-            ).map_err(|e| format!("save_user_settings: {e}"))?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| format!("Task failed: {e}"))?
-    }
-
     async fn get_global_settings(&self) -> Result<GlobalSettings, String> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<GlobalSettings, String> {
             let conn = conn.lock().unwrap();
             let row = conn.query_row(
                 "SELECT hive_shelf_id, user_journals_shelf_id,
-                        org_required_instructions_page_ids,
-                        org_ai_usage_policy_page_ids,
-                        org_identity_page_id, org_domains,
-                        set_by_token_hash, updated_at,
-                        guide_page_id, policies_scope, sops_scope, best_practices_scope,
-                        friendly_structure, full_content_in_briefing, strict_setup
+                        set_by_token_hash, updated_at
                  FROM global_settings WHERE id = 1",
                 [],
                 |row| Ok(GlobalSettings {
                     hive_shelf_id: row.get::<_, Option<i64>>(0)?,
                     user_journals_shelf_id: row.get::<_, Option<i64>>(1)?,
-                    org_required_instructions_page_ids: decode_id_list(row.get::<_, Option<String>>(2)?),
-                    org_ai_usage_policy_page_ids: decode_id_list(row.get::<_, Option<String>>(3)?),
-                    org_identity_page_id: row.get::<_, Option<i64>>(4)?,
-                    org_domains: decode_str_list(row.get::<_, Option<String>>(5)?),
-                    set_by_token_hash: row.get::<_, Option<String>>(6)?,
-                    updated_at: row.get::<_, i64>(7)?,
-                    guide_page_id: row.get::<_, Option<i64>>(8)?,
-                    policies_scope: decode_kb_scope(row.get::<_, Option<String>>(9)?),
-                    sops_scope: decode_kb_scope(row.get::<_, Option<String>>(10)?),
-                    best_practices_scope: decode_kb_scope(row.get::<_, Option<String>>(11)?),
-                    friendly_structure: row.get::<_, i64>(12)? != 0,
-                    full_content_in_briefing: row.get::<_, i64>(13)? != 0,
-                    strict_setup: row.get::<_, i64>(14)? != 0,
+                    set_by_token_hash: row.get::<_, Option<String>>(2)?,
+                    updated_at: row.get::<_, i64>(3)?,
                 }),
             ).unwrap_or_default();
             Ok(row)
@@ -626,36 +495,14 @@ impl DbBackend for SqliteDb {
                 "UPDATE global_settings
                  SET hive_shelf_id = ?1,
                      user_journals_shelf_id = ?2,
-                     org_required_instructions_page_ids = ?3,
-                     org_ai_usage_policy_page_ids = ?4,
-                     org_identity_page_id = ?5,
-                     org_domains = ?6,
-                     set_by_token_hash = ?7,
-                     updated_at = ?8,
-                     guide_page_id = ?9,
-                     policies_scope = ?10,
-                     sops_scope = ?11,
-                     best_practices_scope = ?12,
-                     friendly_structure = ?13,
-                     full_content_in_briefing = ?14,
-                     strict_setup = ?15
+                     set_by_token_hash = ?3,
+                     updated_at = ?4
                  WHERE id = 1",
                 params![
                     s.hive_shelf_id,
                     s.user_journals_shelf_id,
-                    encode_id_list(&s.org_required_instructions_page_ids),
-                    encode_id_list(&s.org_ai_usage_policy_page_ids),
-                    s.org_identity_page_id,
-                    encode_str_list(&s.org_domains),
                     final_setter,
                     SqliteDb::now_secs(),
-                    s.guide_page_id,
-                    encode_kb_scope(s.policies_scope.as_ref()),
-                    encode_kb_scope(s.sops_scope.as_ref()),
-                    encode_kb_scope(s.best_practices_scope.as_ref()),
-                    if s.friendly_structure { 1i64 } else { 0i64 },
-                    if s.full_content_in_briefing { 1i64 } else { 0i64 },
-                    if s.strict_setup { 1i64 } else { 0i64 },
                 ],
             ).map_err(|e| format!("save_global_settings: {e}"))?;
             Ok(())
@@ -800,12 +647,6 @@ impl SemanticDb for SqliteDb {
                      PRIMARY KEY (page_id, role_id)
                  );
                  CREATE INDEX IF NOT EXISTS idx_page_view_acl_role ON page_view_acl(role_id, page_id);
-                 CREATE TABLE IF NOT EXISTS user_role_cache (
-                     token_id_hash TEXT PRIMARY KEY,
-                     bookstack_user_id INTEGER NOT NULL,
-                     role_ids TEXT NOT NULL,
-                     fetched_at INTEGER NOT NULL
-                 );
                  CREATE TABLE IF NOT EXISTS acl_reconcile_state (
                      scope TEXT PRIMARY KEY,
                      last_full_run INTEGER NOT NULL DEFAULT 0
@@ -1589,7 +1430,6 @@ impl SemanticDb for SqliteDb {
         limit: usize,
         threshold: f32,
         book_ids: Option<&[i64]>,
-        user_role_ids: Option<&[i64]>,
     ) -> Result<Vec<SearchHit>, String> {
         let conn = self.conn.clone();
         let query_embedding = query_embedding.to_vec();
@@ -1599,54 +1439,20 @@ impl SemanticDb for SqliteDb {
             Some(ids) if !ids.is_empty() => Some(ids.to_vec()),
             _ => None,
         };
-        let role_filter: Option<Vec<i64>> = match user_role_ids {
-            Some(ids) if !ids.is_empty() => Some(ids.to_vec()),
-            _ => None,
-        };
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
 
-            // Build the WHERE clause incrementally based on which filters are
-            // active. ACL semantics match Postgres: a chunk's page is kept iff
-            //   - its ACL hasn't been computed yet (HTTP fallback in semantic.rs), OR
-            //   - it's flagged default-open, OR
-            //   - the user's role list intersects page_view_acl.role_id.
-            let mut where_clauses: Vec<String> = Vec::new();
-            let mut params_dyn: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-            let need_pages_join = book_filter.is_some() || role_filter.is_some();
-
-            if let Some(ref ids) = book_filter {
+            let all_chunks: Vec<(i64, i64, Vec<u8>)> = if let Some(ref ids) = book_filter {
                 let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(",");
-                where_clauses.push(format!("p.book_id IN ({placeholders})"));
-                for id in ids {
-                    params_dyn.push(Box::new(*id));
-                }
-            }
-            if let Some(ref roles) = role_filter {
-                let placeholders = std::iter::repeat_n("?", roles.len()).collect::<Vec<_>>().join(",");
-                where_clauses.push(format!(
-                    "(p.acl_computed_at IS NULL
-                      OR COALESCE(p.acl_default_open, 0) = 1
-                      OR EXISTS (SELECT 1 FROM page_view_acl a
-                                 WHERE a.page_id = p.page_id AND a.role_id IN ({placeholders})))"
-                ));
-                for r in roles {
-                    params_dyn.push(Box::new(*r));
-                }
-            }
-
-            let all_chunks: Vec<(i64, i64, Vec<u8>)> = if need_pages_join {
-                let where_sql = if where_clauses.is_empty() { String::new() }
-                    else { format!("WHERE {}", where_clauses.join(" AND ")) };
                 let sql = format!(
                     "SELECT c.id, c.page_id, c.embedding
                      FROM chunks c JOIN pages p ON c.page_id = p.page_id
-                     {where_sql}"
+                     WHERE p.book_id IN ({placeholders})"
                 );
                 let mut stmt = conn.prepare(&sql).map_err(|e| format!("Prepare failed: {e}"))?;
                 let params_vec: Vec<&dyn rusqlite::ToSql> =
-                    params_dyn.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
+                    ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
                 let out: Vec<(i64, i64, Vec<u8>)> = stmt
                     .query_map(params_vec.as_slice(), |row| {
                         Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -1869,108 +1675,6 @@ impl SemanticDb for SqliteDb {
         .map_err(|e| format!("Task failed: {e}"))?
     }
 
-    async fn get_cached_user_roles(
-        &self,
-        token_id_hash: &str,
-        max_age_secs: i64,
-    ) -> Result<Option<(i64, Vec<i64>)>, String> {
-        let conn = self.conn.clone();
-        let key = token_id_hash.to_string();
-        tokio::task::spawn_blocking(move || {
-            let cutoff = SqliteDb::now_secs() - max_age_secs;
-            let conn = conn.lock().unwrap();
-            let row: Option<(i64, String, i64)> = conn.query_row(
-                "SELECT bookstack_user_id, role_ids, fetched_at
-                 FROM user_role_cache WHERE token_id_hash = ?1",
-                params![key],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            ).ok();
-            Ok(row.and_then(|(uid, json, fetched)| {
-                if fetched > cutoff {
-                    let roles: Vec<i64> = serde_json::from_str(&json).unwrap_or_default();
-                    Some((uid, roles))
-                } else {
-                    None
-                }
-            }))
-        })
-        .await
-        .map_err(|e| format!("Task failed: {e}"))?
-    }
-
-    async fn set_cached_user_roles(
-        &self,
-        token_id_hash: &str,
-        bookstack_user_id: i64,
-        role_ids: &[i64],
-    ) -> Result<(), String> {
-        let conn = self.conn.clone();
-        let key = token_id_hash.to_string();
-        let json = serde_json::to_string(role_ids).unwrap_or_else(|_| "[]".to_string());
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
-            conn.execute(
-                "INSERT OR REPLACE INTO user_role_cache
-                    (token_id_hash, bookstack_user_id, role_ids, fetched_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![key, bookstack_user_id, json, SqliteDb::now_secs()],
-            ).map_err(|e| format!("set_cached_user_roles: {e}"))?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| format!("Task failed: {e}"))?
-    }
-
-    async fn delete_user_role_cache_by_bs_id(&self, bookstack_user_id: i64) -> Result<(), String> {
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
-            conn.execute(
-                "DELETE FROM user_role_cache WHERE bookstack_user_id = ?1",
-                params![bookstack_user_id],
-            ).map_err(|e| format!("delete_user_role_cache_by_bs_id: {e}"))?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| format!("Task failed: {e}"))?
-    }
-}
-
-/// Encode a Vec<i64> as a JSON array string (or NULL when empty so the column
-/// reads back as Option::None and round-trips cleanly).
-fn encode_id_list(ids: &[i64]) -> Option<String> {
-    if ids.is_empty() { None } else { serde_json::to_string(ids).ok() }
-}
-
-fn decode_id_list(value: Option<String>) -> Vec<i64> {
-    match value {
-        Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_default(),
-        _ => Vec::new(),
-    }
-}
-
-fn encode_str_list(values: &[String]) -> Option<String> {
-    if values.is_empty() { None } else { serde_json::to_string(values).ok() }
-}
-
-fn decode_str_list(value: Option<String>) -> Vec<String> {
-    match value {
-        Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_default(),
-        _ => Vec::new(),
-    }
-}
-
-/// Encode a KbScope as a JSON object string. Returns None when scope is
-/// None so the column round-trips as NULL.
-fn encode_kb_scope(scope: Option<&bsmcp_common::settings::KbScope>) -> Option<String> {
-    scope.and_then(|s| serde_json::to_string(s).ok())
-}
-
-fn decode_kb_scope(value: Option<String>) -> Option<bsmcp_common::settings::KbScope> {
-    match value {
-        Some(s) if !s.is_empty() => serde_json::from_str(&s).ok(),
-        _ => None,
-    }
 }
 
 // --- IndexDb impl ---
@@ -2974,12 +2678,12 @@ mod lifecycle_tests {
         SqliteDb::open(&path, "test-encryption-key-thirty-two-chars-long")
     }
 
-    /// v1.0.0 → v0.9.0 migration: simulate a v1.0.0-shape database
-    /// (user_settings keyed by stable_id, plus token_bindings and sessions
-    /// tables) and assert that opening it under v0.9.0 drops the orphan
-    /// tables and rebuilds user_settings with the token_id_hash PK.
+    /// v0.10.0 migration: opening an existing v0.9.0 database drops the
+    /// briefing/per-user-settings surface (user_settings, user_role_cache,
+    /// briefing-only global_settings columns) without touching the surviving
+    /// tables.
     #[test]
-    fn v090_migration_drops_v100_orphans_and_rebuilds_user_settings() {
+    fn v0_10_0_migration_drops_briefing_surface() {
         let dir = env::temp_dir();
         let unique = format!(
             "bsmcp-test-mig-{}-{}.db",
@@ -2991,83 +2695,104 @@ mod lifecycle_tests {
         );
         let path = dir.join(&unique);
 
-        // Initial open creates the v0.9.0 schema.
-        let _ = SqliteDb::open(&path, "test-encryption-key-thirty-two-chars-long");
-
-        // Replace user_settings with the v1.0.0 shape and add the orphan
-        // companion tables to mimic what's on disk for a v1.0.0 deployer
-        // upgrading to v0.9.0.
+        // Pre-create the v0.9.0 shape (user_settings + user_role_cache +
+        // briefing-era global_settings columns) so the v0.10.0 open path
+        // exercises every drop branch.
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
-            "DROP TABLE user_settings;
-             CREATE TABLE user_settings (
-                 stable_id TEXT PRIMARY KEY,
-                 token_id_hash TEXT NOT NULL,
+            "CREATE TABLE user_settings (
+                 token_id_hash TEXT PRIMARY KEY,
                  settings_json TEXT NOT NULL,
                  updated_at INTEGER NOT NULL
              );
-             CREATE TABLE token_bindings (
-                 stable_id TEXT PRIMARY KEY,
-                 token_id_hash TEXT NOT NULL UNIQUE,
-                 created_at INTEGER NOT NULL
+             CREATE TABLE user_role_cache (
+                 token_id_hash TEXT PRIMARY KEY,
+                 bookstack_user_id INTEGER NOT NULL,
+                 role_ids TEXT NOT NULL,
+                 fetched_at INTEGER NOT NULL
              );
-             CREATE TABLE sessions (
-                 session_id TEXT PRIMARY KEY,
-                 stable_id TEXT NOT NULL,
-                 started_at INTEGER NOT NULL
+             CREATE TABLE global_settings (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 hive_shelf_id INTEGER,
+                 user_journals_shelf_id INTEGER,
+                 org_required_instructions_page_ids TEXT,
+                 org_ai_usage_policy_page_ids TEXT,
+                 org_identity_page_id INTEGER,
+                 org_domains TEXT,
+                 set_by_token_hash TEXT,
+                 updated_at INTEGER NOT NULL DEFAULT 0,
+                 guide_page_id INTEGER,
+                 policies_scope TEXT,
+                 sops_scope TEXT,
+                 best_practices_scope TEXT,
+                 friendly_structure INTEGER NOT NULL DEFAULT 1,
+                 full_content_in_briefing INTEGER NOT NULL DEFAULT 0,
+                 strict_setup INTEGER NOT NULL DEFAULT 0
              );
-             INSERT INTO user_settings VALUES ('stable-1', 'hash-1', '{}', 0);
-             INSERT INTO token_bindings VALUES ('stable-1', 'hash-1', 0);
-             INSERT INTO sessions VALUES ('sess-1', 'stable-1', 0);",
+             INSERT INTO user_settings VALUES ('hash-1', '{}', 0);
+             INSERT INTO user_role_cache VALUES ('hash-1', 42, '[1,2]', 0);
+             INSERT INTO global_settings (id, updated_at) VALUES (1, 0);",
         )
         .unwrap();
         drop(conn);
 
-        // Reopen — init runs the migration.
+        // Reopen — v0.10.0 init runs the cleanup migrations.
         let _ = SqliteDb::open(&path, "test-encryption-key-thirty-two-chars-long");
 
         let conn = rusqlite::Connection::open(&path).unwrap();
 
-        let token_bindings_exists: i64 = conn
+        let user_settings_exists: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='token_bindings'",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='user_settings'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(token_bindings_exists, 0, "token_bindings should be dropped");
+        assert_eq!(user_settings_exists, 0, "user_settings should be dropped");
 
-        let sessions_exists: i64 = conn
+        let user_role_cache_exists: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sessions'",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='user_role_cache'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(sessions_exists, 0, "sessions should be dropped");
+        assert_eq!(user_role_cache_exists, 0, "user_role_cache should be dropped");
 
-        let stable_id_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('user_settings') WHERE name = 'stable_id'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(stable_id_count, 0, "user_settings.stable_id column should be gone");
-
-        let pk_col: String = conn
-            .query_row(
-                "SELECT name FROM pragma_table_info('user_settings') WHERE pk > 0",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(pk_col, "token_id_hash", "user_settings PK should be token_id_hash");
-
-        let row_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM user_settings", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(row_count, 0, "wholesale reset: rows discarded per the migration contract");
+        // The briefing-only columns should be gone; the index-worker columns
+        // should remain.
+        for col in [
+            "org_required_instructions_page_ids",
+            "org_ai_usage_policy_page_ids",
+            "org_identity_page_id",
+            "org_domains",
+            "guide_page_id",
+            "policies_scope",
+            "sops_scope",
+            "best_practices_scope",
+            "friendly_structure",
+            "full_content_in_briefing",
+            "strict_setup",
+        ] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('global_settings') WHERE name = ?1",
+                    [col],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 0, "global_settings.{col} should be dropped");
+        }
+        for col in ["hive_shelf_id", "user_journals_shelf_id"] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('global_settings') WHERE name = ?1",
+                    [col],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "global_settings.{col} should be retained");
+        }
 
         drop(conn);
         std::fs::remove_file(&path).ok();

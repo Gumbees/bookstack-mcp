@@ -1,48 +1,20 @@
 use std::collections::HashMap;
 use std::env;
-use std::sync::Arc;
 
 use serde_json::{json, Value};
 
 use pulldown_cmark::{html, Options, Parser};
 
 use bsmcp_common::bookstack::{self, BookStackClient, ContentType, ExportFormat};
-use bsmcp_common::db::DbBackend;
-use crate::briefing;
 use crate::semantic::{trim_match, SemanticState};
-use crate::session::{self, SessionStore};
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
-
-/// Dependencies the `briefing` and other server-tier tools need beyond the
-/// BookStack client. Bundled into one struct to keep `handle_request` /
-/// `execute_tool` signatures from sprouting more positional args.
-pub struct BriefingDeps {
-    pub db: Arc<dyn DbBackend>,
-    pub semantic: Option<Arc<SemanticState>>,
-    /// Drives the `meta.briefing` auto-injection: tracks per-`(token_hash,
-    /// session_id)` state so the first tool call in a session gets the full
-    /// briefing payload and subsequent calls get sticky-only.
-    pub session_store: SessionStore,
-    pub token_id: String,
-    /// Token-hash for session-store lookups (avoids redundant SHA-256 work
-    /// on the meta-injection hot path).
-    pub token_id_hash: String,
-    /// Optional client-supplied session id. Streamable HTTP carries it in
-    /// the `Mcp-Session-Id` header; SSE carries it as the `?sessionId=`
-    /// query param. When absent, `session_key` falls back to a per-hour
-    /// bucket per token so the user still gets a coarse "first call this
-    /// hour" notion.
-    pub session_id: Option<String>,
-}
 
 pub async fn handle_request(
     request: &Value,
     client: &BookStackClient,
     semantic: Option<&SemanticState>,
-    summary_cache: &crate::summary::SummaryCache,
     staging: &crate::staging::StagingStore,
-    deps: &BriefingDeps,
 ) -> Option<Value> {
     let id = request.get("id");
 
@@ -58,8 +30,7 @@ pub async fn handle_request(
 
     match method {
         "initialize" => {
-            let summary = summary_cache.read().await.clone();
-            let instructions = build_instructions(client, semantic.is_some(), summary.as_deref()).await;
+            let instructions = build_instructions(client, semantic.is_some()).await;
             Some(json_rpc_result(id, json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": { "tools": {} },
@@ -75,13 +46,9 @@ pub async fn handle_request(
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let result = execute_tool(name, &args, client, semantic, staging, deps).await;
+            let result = execute_tool(name, &args, client, semantic, staging).await;
 
-            // Build the tool-result object first so we can decorate it with
-            // `meta.briefing`. The meta-injection runs for every tool except
-            // `briefing` itself (where the response IS the briefing — duplicating
-            // it under meta would be wasteful).
-            let mut tool_result = match result {
+            let tool_result = match result {
                 Ok(text) => json!({
                     "content": [{ "type": "text", "text": text }],
                 }),
@@ -91,54 +58,10 @@ pub async fn handle_request(
                 }),
             };
 
-            if name != "briefing" && briefing_enabled() {
-                // Calling `briefing` explicitly resets the session via task 5;
-                // for every other tool, record_call decides full-vs-sticky.
-                let key = session::session_key(&deps.token_id_hash, deps.session_id.as_deref());
-                let was_first = session::record_call(&deps.session_store, &key).await;
-                let body_for_briefing = build_briefing_meta_body(&args, id);
-                let meta_briefing = briefing::build_meta_briefing(
-                    body_for_briefing,
-                    &deps.token_id,
-                    client,
-                    deps.db.clone(),
-                    deps.semantic.clone(),
-                    was_first,
-                )
-                .await;
-
-                if let Value::Object(ref mut m) = tool_result {
-                    let meta_entry = m
-                        .entry("meta".to_string())
-                        .or_insert_with(|| json!({}));
-                    if let Value::Object(ref mut meta) = meta_entry {
-                        meta.insert("briefing".to_string(), meta_briefing);
-                    }
-                }
-            }
-
             Some(json_rpc_result(id, tool_result))
         }
         _ => Some(json_rpc_error(id, -32601, "Method not found")),
     }
-}
-
-/// Build the minimal body passed to `briefing::build_meta_briefing` for the
-/// auto-injection path. Forwards `client_timezone` if the caller happened to
-/// thread one through (so timezone refresh keeps working from any tool, not
-/// just the explicit `briefing` call) and a `trace_id` derived from the
-/// JSON-RPC request id — and nothing else; the full tool-call args would
-/// just bloat the briefing call.
-fn build_briefing_meta_body(args: &Value, request_id: Option<&Value>) -> Value {
-    let mut body = json!({});
-    if let Some(tz) = args.get("client_timezone").and_then(|v| v.as_str()) {
-        body["client_timezone"] = json!(tz);
-    }
-    let trace_id = request_id
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    body["trace_id"] = json!(trace_id);
-    body
 }
 
 fn json_rpc_result(id: Option<&Value>, result: Value) -> Value {
@@ -163,45 +86,7 @@ async fn execute_tool(
     client: &BookStackClient,
     semantic: Option<&SemanticState>,
     staging: &crate::staging::StagingStore,
-    deps: &BriefingDeps,
 ) -> Result<String, String> {
-    // The `briefing` tool is the only top-level entry into the briefing
-    // subsystem (besides auto-injection on every other tool's response meta).
-    if name == "briefing" {
-        if !briefing_enabled() {
-            return Err(
-                "Briefing disabled (BSMCP_BRIEFING_ENABLED=false on this server)".to_string(),
-            );
-        }
-        let mut body = args.clone();
-        let arg_session_id = body
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .filter(|s| !s.is_empty());
-        if let Value::Object(ref mut map) = body {
-            map.remove("action");
-        }
-        // Calling `briefing` explicitly resets the session for the next
-        // response — useful after the AI gets compacted by its harness.
-        // Honor the tool's own `session_id` arg if present (lets a client
-        // without HTTP-header session_id support still get sticky-vs-full
-        // behavior); otherwise fall back to the transport-layer id.
-        let effective_sid = arg_session_id.as_deref().or(deps.session_id.as_deref());
-        let key = session::session_key(&deps.token_id_hash, effective_sid);
-        session::mark_compacted(&deps.session_store, &key).await;
-
-        let envelope = briefing::read(
-            body,
-            &deps.token_id,
-            client,
-            deps.db.clone(),
-            deps.semantic.clone(),
-        )
-        .await;
-        return Ok(serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| envelope.to_string()));
-    }
-
     match name {
         // Semantic Search (conditional)
         "semantic_search" => {
@@ -212,11 +97,9 @@ async fn execute_tool(
             let default_threshold = if hybrid { 0.45 } else { 0.50 };
             let threshold = args.get("threshold").and_then(|v| v.as_f64()).unwrap_or(default_threshold) as f32;
             let verbose = args.get("verbose").and_then(|v| v.as_bool()).unwrap_or(false);
-            // ACL filter is left disabled at the raw `semantic_search` tool
-            // entry point — it has no UserSettings context to look up the
-            // caller's `bookstack_user_id`. The HTTP `filter_by_permission`
-            // fallback inside `sem.search` still enforces access control.
-            let mut result = sem.search(&query, limit, threshold, hybrid, verbose, client, None, None).await?;
+            // The HTTP `filter_by_permission` fallback inside `sem.search`
+            // enforces per-page access control via BookStack's API.
+            let mut result = sem.search(&query, limit, threshold, hybrid, verbose, client, None).await?;
             trim_semantic_search_payload(&mut result);
             format_json(&result)
         }
@@ -861,69 +744,6 @@ async fn execute_tool(
             format_json(&client.get_role(id).await?)
         }
 
-        // Session — let the AI signal session-level events (compaction, etc.)
-        "session_event" => {
-            if !briefing_enabled() {
-                return Err(
-                    "session_event is unavailable when the briefing surface is disabled \
-                     (BSMCP_BRIEFING_ENABLED=false on this server)"
-                        .to_string(),
-                );
-            }
-            let action = arg_str(args, "action")?;
-            match action.as_str() {
-                "compacted" => {
-                    let key = session::session_key(&deps.token_id_hash, deps.session_id.as_deref());
-                    session::mark_compacted(&deps.session_store, &key).await;
-                    format_json(&json!({
-                        "ok": true,
-                        "action": "compacted",
-                        "note": "Next tool response will inject the full briefing again.",
-                    }))
-                }
-                other => Err(format!(
-                    "Unknown session_event action: {other}. Supported: compacted"
-                )),
-            }
-        }
-
-        // Dismiss the briefing setup_nudge for N days
-        "dismiss_setup_nudge" => {
-            if !briefing_enabled() {
-                return Err(
-                    "dismiss_setup_nudge is unavailable when the briefing surface is disabled \
-                     (BSMCP_BRIEFING_ENABLED=false on this server)"
-                        .to_string(),
-                );
-            }
-            let days = arg_i64_required(args, "days")?.clamp(1, 365);
-            let now_unix = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let dismissed_until = now_unix + days * 86400;
-            let mut settings = deps
-                .db
-                .get_user_settings(&deps.token_id_hash)
-                .await
-                .map_err(|e| format!("get_user_settings failed: {e}"))?
-                .unwrap_or_default();
-            settings.settings_nudge_dismissed_until = Some(dismissed_until);
-            deps.db
-                .save_user_settings(&deps.token_id_hash, &settings)
-                .await
-                .map_err(|e| format!("save_user_settings failed: {e}"))?;
-            let until_human = chrono::DateTime::<chrono::Utc>::from_timestamp(dismissed_until, 0)
-                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                .unwrap_or_else(|| dismissed_until.to_string());
-            format_json(&json!({
-                "ok": true,
-                "dismissed_until": dismissed_until,
-                "until_human": until_human,
-                "days": days,
-            }))
-        }
-
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -1424,44 +1244,17 @@ fn replace_section_html(html: &str, heading: &str, new_content: &str, page_id: i
 
 // --- Dynamic instructions (sent on initialize) ---
 
-async fn build_instructions(client: &BookStackClient, semantic_enabled: bool, summary: Option<&str>) -> String {
+async fn build_instructions(client: &BookStackClient, semantic_enabled: bool) -> String {
     let instance_name = env::var("BSMCP_INSTANCE_NAME").unwrap_or_default();
     let instance_desc = env::var("BSMCP_INSTANCE_DESC").unwrap_or_default();
 
     let mut instructions = String::new();
-
-    // Briefing flow — surface this FIRST so it lands before any other guidance.
-    instructions.push_str(
-        "Call the `briefing` tool at session start with the user's opening message as \
-         `user_prompt`. It returns time, system_prompt_additions (guide page, org_identity, \
-         org_required_instructions, org_ai_usage_policy, user-supplied pages, owned-domains), \
-         kb_semantic_matches against the prompt, and a `setup_nudge` block when settings are \
-         incomplete. Equivalent to POST /briefing/v1/read.\n\n\
-         The briefing payload is also auto-injected as `meta.briefing` on every other tool \
-         response — full content on the first call per session, sticky-only (time + setup \
-         summary) thereafter. After your harness compacts you and you lose context, call \
-         `session_event { action: \"compacted\" }` to force the next tool response to carry \
-         the full briefing again.\n\n\
-         If `setup_nudge` is present, the user's Hive isn't fully configured. The settings \
-         live behind the `/settings` browser UI (token-gated) — point the user there and walk \
-         them through the pending fields. Use `search_content` + the briefing's `setup_nudge` \
-         block to help them locate existing structure. Per-user fields can be set by any \
-         authenticated user; global fields (org_identity, guide_page, scopes) require a \
-         BookStack admin. If the user wants the warnings to stop temporarily, call \
-         `dismiss_setup_nudge { days: N }` (1..=365).\n\n"
-    );
 
     if !instance_name.is_empty() {
         instructions.push_str(&instance_name);
         if !instance_desc.is_empty() {
             instructions.push_str(&format!(" - {instance_desc}"));
         }
-        instructions.push_str("\n\n");
-    }
-
-    // Include AI-generated instance summary if available
-    if let Some(summary) = summary {
-        instructions.push_str(summary);
         instructions.push_str("\n\n");
     }
 
@@ -2036,70 +1829,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             })));
     }
 
-    // Briefing tool — the only top-level briefing entry point. The briefing
-    // payload also auto-injects into `meta.briefing` on every other tool's
-    // response (full content first call per session, sticky bits thereafter).
-    // `session_event` and `dismiss_setup_nudge` ride alongside it — they only
-    // make sense when the briefing surface is enabled.
-    if briefing_enabled() {
-        tools.push(json!({
-            "name": "briefing",
-            "description": "Reconstitution shell — returns time, system_prompt_additions (guide page, org_identity, org_required_instructions, org_ai_usage_policy, user system_prompt_page_ids, owned-domains synthetic block), kb_semantic_matches against the user_prompt, setup_nudge when settings are incomplete, and a thin config echo. Auto-injected into meta.briefing on every MCP tool response (full content first call, sticky bits thereafter); call this tool explicitly after compaction to reset to first-call form.",
-            "inputSchema": json!({
-                "type": "object",
-                "properties": {
-                    "user_prompt": { "type": "string", "description": "First user message — drives semantic prioritization" },
-                    "client_timezone": { "type": "string", "description": "Optional IANA timezone (e.g. \"America/New_York\"). Cached server-side." },
-                    "session_id": { "type": "string", "description": "Optional client-supplied session id. Normally taken from the Mcp-Session-Id header; pass it here for clients that can't set the header." }
-                }
-            }),
-        }));
-        tools.push(tool(
-            "session_event",
-            "Signal a session-level event. Currently supported: `action: 'compacted'` resets the briefing-injection state so the next tool response includes the full briefing again. Useful after the AI gets compacted by its harness and loses context.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["compacted"],
-                        "description": "Event kind. Only 'compacted' is supported today."
-                    }
-                },
-                "required": ["action"]
-            }),
-        ));
-        tools.push(tool(
-            "dismiss_setup_nudge",
-            "Dismiss the briefing's setup_nudge for N days (1..=365). Useful when the user knows the configuration warnings and wants quiet sessions. Reappears automatically after N days.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "days": {
-                        "type": "integer",
-                        "description": "How many days to suppress the setup_nudge. Clamped to 1..=365.",
-                        "minimum": 1,
-                        "maximum": 365
-                    }
-                },
-                "required": ["days"]
-            }),
-        ));
-    }
-
     tools
-}
-
-/// Whether the briefing surface is enabled. Reads BSMCP_BRIEFING_ENABLED;
-/// defaults true.
-fn briefing_enabled() -> bool {
-    std::env::var("BSMCP_BRIEFING_ENABLED")
-        .ok()
-        .map(|v| {
-            let v = v.trim().to_lowercase();
-            !(v == "false" || v == "0" || v == "no" || v == "off")
-        })
-        .unwrap_or(true)
 }
 
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {
@@ -2154,4 +1884,107 @@ fn update_schema(id_name: &str, fields: &[&str]) -> Value {
         "properties": props,
         "required": [id_name]
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// v0.10.0 surface lock: 59 BookStack CRUD tools + 3 semantic tools = 62.
+    /// Anything extra means a briefing-era surface leaked back in.
+    #[test]
+    fn tools_list_count_is_62_with_semantic() {
+        let tools = tool_definitions(true);
+        assert_eq!(tools.len(), 62, "expected 59 CRUD + 3 semantic = 62 tools");
+    }
+
+    #[test]
+    fn tools_list_count_is_59_without_semantic() {
+        let tools = tool_definitions(false);
+        assert_eq!(tools.len(), 59, "expected 59 CRUD tools");
+    }
+
+    /// Locks the precise tool name set so a briefing/session/dismiss-style
+    /// addition trips this assertion before it ships.
+    #[test]
+    fn tools_list_names_match_expected_set() {
+        let tools = tool_definitions(true);
+        let names: HashSet<String> = tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        let expected: HashSet<String> = [
+            "search_content",
+            "list_shelves",
+            "get_shelf",
+            "create_shelf",
+            "update_shelf",
+            "delete_shelf",
+            "list_books",
+            "get_book",
+            "create_book",
+            "update_book",
+            "delete_book",
+            "list_chapters",
+            "get_chapter",
+            "create_chapter",
+            "update_chapter",
+            "delete_chapter",
+            "list_pages",
+            "get_page",
+            "create_page",
+            "update_page",
+            "edit_page",
+            "append_to_page",
+            "replace_section",
+            "insert_after",
+            "delete_page",
+            "move_page",
+            "move_chapter",
+            "move_book_to_shelf",
+            "list_attachments",
+            "get_attachment",
+            "create_attachment",
+            "update_attachment",
+            "delete_attachment",
+            "upload_attachment",
+            "export_page",
+            "export_chapter",
+            "export_book",
+            "list_comments",
+            "get_comment",
+            "create_comment",
+            "update_comment",
+            "delete_comment",
+            "list_recycle_bin",
+            "restore_recycle_bin_item",
+            "destroy_recycle_bin_item",
+            "list_users",
+            "get_user",
+            "list_audit_log",
+            "get_system_info",
+            "list_images",
+            "get_image",
+            "update_image",
+            "delete_image",
+            "upload_image",
+            "prepare_upload",
+            "get_content_permissions",
+            "update_content_permissions",
+            "list_roles",
+            "get_role",
+            "semantic_search",
+            "reembed",
+            "embedding_status",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let extra: Vec<&String> = names.difference(&expected).collect();
+        assert!(extra.is_empty(), "unexpected tools in tools/list: {extra:?}");
+        let missing: Vec<&String> = expected.difference(&names).collect();
+        assert!(missing.is_empty(), "missing tools from tools/list: {missing:?}");
+    }
 }

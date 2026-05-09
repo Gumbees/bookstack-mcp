@@ -260,6 +260,15 @@ impl SemanticState {
     /// just smaller from the outset, which proportionally shrinks the
     /// permission filter and per-result fan-out. `None` keeps the old
     /// whole-corpus behavior.
+    ///
+    /// `precision`: when `true`, the post-permission step is replaced with a
+    /// cross-encoder rerank against the embedder's `/rerank` endpoint. The
+    /// initial vector pass widens (`limit * 5`) to give the cross-encoder a
+    /// larger candidate pool. The `hybrid` flag is overridden to `false`
+    /// because precision relies on the cross-encoder for ordering, not the
+    /// keyword/blanket blend. Requires `BSMCP_RERANK_PROVIDER` to be set on
+    /// the embedder; otherwise the call returns a clear error and the caller
+    /// can retry without `precision`.
     #[allow(clippy::too_many_arguments)]
     pub async fn search(
         &self,
@@ -270,13 +279,21 @@ impl SemanticState {
         verbose: bool,
         client: &BookStackClient,
         book_filter: Option<&[i64]>,
+        precision: bool,
     ) -> Result<Value, String> {
         let start = Instant::now();
 
+        // Precision mode forces hybrid off. The cross-encoder is the ranker
+        // of record; mixing in keyword-rank scoring just dilutes its signal.
+        let hybrid = hybrid && !precision;
+
         // Run vector search and optional keyword search in parallel.
-        // Candidate over-fetch dropped from limit*5 → limit*2 — empirically
-        // sufficient headroom after permission filtering, and halves both the
-        // permission HTTP fan-out and the blanket DB fan-out.
+        // Candidate over-fetch is `limit * 2` for the standard path —
+        // empirically sufficient headroom after permission filtering. In
+        // precision mode we cast a wider net (`limit * 5`) because the
+        // cross-encoder benefits from seeing more candidates, and the rerank
+        // step itself caps the embedder side at 200 documents.
+        let candidate_multiplier: usize = if precision { 5 } else { 2 };
         let book_filter_owned: Option<Vec<i64>> = book_filter
             .filter(|s| !s.is_empty())
             .map(|s| s.to_vec());
@@ -285,7 +302,7 @@ impl SemanticState {
             self.db
                 .vector_search(
                     &query_vec,
-                    limit * 2,
+                    limit * candidate_multiplier,
                     threshold,
                     book_filter_owned.as_deref(),
                 )
@@ -389,6 +406,17 @@ impl SemanticState {
         let accessible_ids = self.filter_by_permission(&all_page_ids, client).await;
         let accessible_set: HashSet<i64> = accessible_ids.iter().copied().collect();
         page_scores.retain(|pid, _| accessible_set.contains(pid));
+
+        // PRECISION MODE: replace blanket+blend with cross-encoder rerank.
+        // The candidate set is `page_scores` post-ACL. We pick the best
+        // chunk per page, send `(query, [doc_per_page])` to the embedder's
+        // /rerank, and use the returned scores as the final ordering.
+        // Skips the blanket boost and hybrid blend below.
+        if precision {
+            return self
+                .precision_rerank(query, limit, &page_scores, verbose, start)
+                .await;
+        }
 
         // Blanket re-ranking: boost pages whose neighbors also appear in vector results.
         // Use the full set of pages from raw vector hits (not just final candidates),
@@ -605,6 +633,259 @@ impl SemanticState {
                 "total_chunks": stats.total_chunks,
                 "query_time_ms": query_time_ms,
                 "mode": if hybrid { "hybrid" } else { "vector" },
+            }
+        }))
+    }
+
+    /// Cross-encoder rerank step for precision mode. Replaces the blanket
+    /// boost + hybrid blend that the standard search path applies after the
+    /// permission filter. Picks one document per candidate page (the best-
+    /// scoring chunk's heading + content), POSTs `(query, [doc])` to the
+    /// embedder's `/rerank`, then renders the response in the same JSON
+    /// shape as the standard search so callers don't need to branch.
+    async fn precision_rerank(
+        &self,
+        query: &str,
+        limit: usize,
+        page_scores: &HashMap<i64, PageScore>,
+        verbose: bool,
+        start: Instant,
+    ) -> Result<Value, String> {
+        // One document per page = the highest-scoring chunk that contributed
+        // to this page's match. Pages with no chunks (keyword-only matches)
+        // are dropped — precision mode forces hybrid off, so this is rare,
+        // but it keeps the rerank input well-formed if anything slipped past.
+        let mut candidates: Vec<(i64, i64)> = page_scores
+            .iter()
+            .filter_map(|(pid, score)| {
+                score
+                    .chunks
+                    .iter()
+                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|c| (*pid, c.0))
+            })
+            .collect();
+
+        // Embedder caps per-request docs at 200. If we ever exceed that, keep
+        // the top-vector-scoring candidates so the cross-encoder still sees
+        // the strongest signal.
+        const MAX_RERANK_DOCS: usize = 200;
+        if candidates.len() > MAX_RERANK_DOCS {
+            candidates.sort_by(|(a, _), (b, _)| {
+                let sa = page_scores.get(a).map(|s| s.vector_score).unwrap_or(0.0);
+                let sb = page_scores.get(b).map(|s| s.vector_score).unwrap_or(0.0);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            candidates.truncate(MAX_RERANK_DOCS);
+        }
+
+        if candidates.is_empty() {
+            let stats = self.db.get_stats().await?;
+            return Ok(json!({
+                "results": [],
+                "stats": {
+                    "total_indexed": stats.total_pages,
+                    "total_chunks": stats.total_chunks,
+                    "query_time_ms": start.elapsed().as_millis(),
+                    "mode": "precision",
+                    "candidates_reranked": 0,
+                }
+            }));
+        }
+
+        let candidate_chunk_ids: Vec<i64> = candidates.iter().map(|(_, cid)| *cid).collect();
+        let candidate_page_ids: Vec<i64> = candidates.iter().map(|(pid, _)| *pid).collect();
+
+        let (chunk_details, metas) = tokio::try_join!(
+            self.db.get_chunk_details(&candidate_chunk_ids),
+            self.db.get_page_metas(&candidate_page_ids),
+        )?;
+
+        let chunk_by_id: HashMap<i64, &bsmcp_common::types::ChunkDetail> =
+            chunk_details.iter().map(|d| (d.chunk_id, d)).collect();
+        let meta_by_page: HashMap<i64, &bsmcp_common::types::PageMeta> =
+            metas.iter().map(|m| (m.page_id, m)).collect();
+
+        // Build documents and a parallel index → page_id map. Heading path +
+        // chunk content gives the cross-encoder enough surface to score; the
+        // page name is included so a query about a topic that appears only in
+        // a heading doesn't get penalized for content-body keyword absence.
+        let mut docs: Vec<String> = Vec::with_capacity(candidates.len());
+        let mut doc_to_page: Vec<i64> = Vec::with_capacity(candidates.len());
+        for (pid, cid) in &candidates {
+            let page_name = meta_by_page
+                .get(pid)
+                .map(|m| m.name.as_str())
+                .unwrap_or("");
+            let (heading, content) = chunk_by_id
+                .get(cid)
+                .map(|d| (d.heading_path.as_str(), d.content.as_str()))
+                .unwrap_or(("", ""));
+            let doc = if heading.is_empty() {
+                format!("{page_name}\n\n{content}")
+            } else {
+                format!("{page_name} — {heading}\n\n{content}")
+            };
+            docs.push(doc);
+            doc_to_page.push(*pid);
+        }
+
+        let url = format!("{}/rerank", self.embedder_url);
+        let resp = self
+            .http_client
+            .post(&url)
+            .json(&json!({
+                "query": query,
+                "documents": docs,
+                "top_k": limit,
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("Rerank request failed: {e}"))?;
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            return Err(
+                "Precision mode requires the embedder reranker. Set BSMCP_RERANK_PROVIDER \
+                 (local|voyage|openai) on the embedder, then retry."
+                    .to_string(),
+            );
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Rerank error {status}: {body}"));
+        }
+
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Rerank response parse error: {e}"))?;
+
+        let results_arr = body
+            .get("results")
+            .and_then(|v| v.as_array())
+            .ok_or("Rerank response missing 'results' array")?;
+        let rerank_provider = body
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let rerank_model = body
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let mut ranked: Vec<(i64, f32)> = Vec::with_capacity(results_arr.len());
+        for item in results_arr {
+            let idx = item
+                .get("index")
+                .and_then(|v| v.as_u64())
+                .ok_or("Rerank item missing 'index'")? as usize;
+            let score = item
+                .get("score")
+                .and_then(|v| v.as_f64())
+                .ok_or("Rerank item missing 'score'")? as f32;
+            let Some(&pid) = doc_to_page.get(idx) else {
+                return Err(format!(
+                    "Rerank index {idx} out of bounds (max {})",
+                    doc_to_page.len()
+                ));
+            };
+            ranked.push((pid, score));
+        }
+        // /rerank already sorted by score desc and truncated to top_k.
+
+        // Verbose: fetch blankets for the final result set only.
+        let mut blanket_cache: HashMap<i64, MarkovBlanket> = HashMap::new();
+        if verbose {
+            let final_pids: Vec<i64> = ranked.iter().map(|(pid, _)| *pid).collect();
+            let extras: Vec<(i64, MarkovBlanket)> = stream::iter(final_pids.into_iter())
+                .map(|pid| async move {
+                    self.db.get_markov_blanket(pid).await.ok().map(|b| (pid, b))
+                })
+                .buffer_unordered(20)
+                .filter_map(|x| async move { x })
+                .collect()
+                .await;
+            for (pid, b) in extras {
+                blanket_cache.insert(pid, b);
+            }
+        }
+
+        let mut chunks_by_page: HashMap<i64, Vec<&bsmcp_common::types::ChunkDetail>> =
+            HashMap::new();
+        for detail in &chunk_details {
+            chunks_by_page.entry(detail.page_id).or_default().push(detail);
+        }
+
+        let mut results = Vec::with_capacity(ranked.len());
+        for (page_id, rerank_score) in &ranked {
+            let (page_name, book_id, updated_at) = match meta_by_page.get(page_id) {
+                Some(m) => (m.name.clone(), m.book_id, m.updated_at.clone()),
+                None => ("Unknown".to_string(), 0, None),
+            };
+            let score_ref = page_scores.get(page_id);
+            let vector_score = score_ref.map(|s| s.vector_score).unwrap_or(0.0);
+
+            let mut chunks_json = Vec::new();
+            if let Some(details) = chunks_by_page.get(page_id) {
+                for detail in details {
+                    let chunk_score = score_ref
+                        .and_then(|s| s.chunks.iter().find(|c| c.0 == detail.chunk_id))
+                        .map(|c| c.1)
+                        .unwrap_or(0.0);
+                    chunks_json.push(json!({
+                        "heading_path": detail.heading_path,
+                        "content": detail.content,
+                        "score": (chunk_score * 1000.0).round() / 1000.0,
+                    }));
+                }
+            }
+
+            let mut result = json!({
+                "page_id": page_id,
+                "page_name": page_name,
+                "book_id": book_id,
+                "score": (rerank_score * 1000.0).round() / 1000.0,
+                "chunks": chunks_json,
+                "scoring": {
+                    "vector": (vector_score * 1000.0).round() / 1000.0,
+                    "rerank": (rerank_score * 1000.0).round() / 1000.0,
+                },
+            });
+
+            if let Some(ref ts) = updated_at {
+                result["updated_at"] = json!(ts);
+            }
+
+            if verbose {
+                if let Some(blanket) = blanket_cache.get(page_id) {
+                    result["blanket"] = json!({
+                        "linked_from": blanket.linked_from.iter().map(|p| json!({"page_id": p.page_id, "name": p.name})).collect::<Vec<_>>(),
+                        "links_to": blanket.links_to.iter().map(|p| json!({"page_id": p.page_id, "name": p.name})).collect::<Vec<_>>(),
+                        "co_linked": blanket.co_linked.iter().map(|p| json!({"page_id": p.page_id, "name": p.name})).collect::<Vec<_>>(),
+                        "siblings": blanket.siblings.iter().map(|p| json!({"page_id": p.page_id, "name": p.name})).collect::<Vec<_>>(),
+                    });
+                }
+            }
+
+            results.push(result);
+        }
+
+        let stats = self.db.get_stats().await?;
+        let query_time_ms = start.elapsed().as_millis();
+
+        Ok(json!({
+            "results": results,
+            "stats": {
+                "total_indexed": stats.total_pages,
+                "total_chunks": stats.total_chunks,
+                "query_time_ms": query_time_ms,
+                "mode": "precision",
+                "rerank_provider": rerank_provider,
+                "rerank_model": rerank_model,
+                "candidates_reranked": doc_to_page.len(),
             }
         }))
     }

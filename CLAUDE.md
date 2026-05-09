@@ -70,8 +70,9 @@ crates/
 2. Server POSTs query text to embedder's `/embed` endpoint → gets query embedding
 3. Server calls `db.vector_search()` → SQLite does brute-force cosine, PostgreSQL uses pgvector HNSW
 4. Server filters hits by per-page ACL via BookStack's API (`filter_by_permission`)
-5. Server calls `db.get_markov_blanket()` for contextual relationships
-6. Returns ranked results with content snippets and relationship context
+5. **Standard mode:** server calls `db.get_markov_blanket()` for contextual relationships and applies a vector + keyword + blanket-boost blend.
+   **Precision mode (`precision: true` or `mode: "precision"`):** server widens the candidate pool (5x limit), picks the best chunk per page, and POSTs `(query, [doc])` to the embedder's `/rerank` endpoint. The cross-encoder score replaces the blend. Requires `BSMCP_RERANK_PROVIDER` configured on the embedder; otherwise the call returns a clear error and the caller can retry without `precision`.
+6. Returns ranked results with content snippets, scoring breakdown, and (in verbose mode) full relationship context
 
 **Embedding flow:**
 1. `reembed` tool or webhook inserts a job into `embed_jobs` table

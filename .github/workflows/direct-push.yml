@@ -11,6 +11,15 @@ name: Direct Push (development)
 #   2. On a direct push, builds all three images full multi-arch and
 #      pushes them with stream tags. This is the rare path — most work
 #      goes through PRs.
+#   3. Also exposes `workflow_dispatch` so an operator can rebuild the
+#      stream tags on demand. This covers the GitHub Actions bootstrap
+#      gap: when a workflow file is introduced by a PR, that same PR's
+#      merge does not fire the new workflow (the `pull_request: closed`
+#      handler resolves against the base branch's pre-merge tree, where
+#      the file did not exist yet, and the corresponding `push` event
+#      to `development` has historically not picked up the new file
+#      either). Manual dispatch lets us recover `:dev` immediately
+#      without an unrelated trivial commit.
 #
 # On a direct push to `release` we intentionally do nothing here —
 # release.yml's release-stream jobs (github-release-on-merge,
@@ -27,6 +36,12 @@ name: Direct Push (development)
 on:
   push:
     branches: [development]
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Why are you dispatching this manually? (audit trail only)"
+        required: false
+        default: "manual recovery"
 
 env:
   REGISTRY: ghcr.io
@@ -57,6 +72,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          # Manual dispatch is an explicit operator override — never skip.
+          # The recovery path (rebuilding the stream tags after a workflow
+          # bootstrap gap) targets exactly the PR-merge commit that the
+          # push-event guard would otherwise filter out.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual dispatch; bypassing PR-merge guard and proceeding with build."
+            echo "is_pr_merge=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           # `gh api` returns the list of PRs associated with this commit
           # via merge_commit_sha. If any merged PR matches, this push is
           # a PR-merge — skip and let promote-on-merge.yml handle it.

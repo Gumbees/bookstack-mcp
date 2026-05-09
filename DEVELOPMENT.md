@@ -144,9 +144,10 @@ Both Dockerfiles use BuildKit `--mount=type=cache` for `target/`, `~/.cargo/regi
 | Same trigger | `generate-artifacts.yml` | regenerates `SBOM.md` + `STRUCTURE.md`, commits to PR source branch with `[skip ci]` |
 | `pull_request: closed` (merged: true) on `development` or `release` | `promote-on-merge.yml` | retags the PR head image as the appropriate stream tags via `imagetools create`. No rebuild. |
 | `push` to `development` that is **not** a PR-merge commit (rare; direct push) | `direct-push.yml` | full multi-arch build + stream tags. Authorized per Branching Strategy 1860. |
+| `workflow_dispatch` on `direct-push.yml` | `direct-push.yml` | manual recovery for the development stream — bypasses the PR-merge guard and rebuilds the four `:dev*` tags at the current `development` HEAD. Use after a workflow-bootstrap gap (workflow file introduced by the very PR whose merge would have run it). |
 | `push` to `release` (always a PR-merge from development) | `release.yml` (`github-release-on-merge` + `release-binaries-on-merge`) | creates the `v{version}` git tag (if missing) and the GitHub Release entry; builds `bsmcp-server` native binaries for 5 targets and attaches them. Image version tags were already moved by `promote-on-merge.yml` when the PR closed. |
 | `v*` tag push (emergency hotfix only) | `release.yml` (`tag-release` + `github-release-on-tag` + `release-binaries-on-tag`) | builds & pushes semver-tagged images directly in CI, creates the Release, attaches the server binaries. Use only when the normal PR flow isn't available. |
-| `workflow_dispatch` on `release.yml` | `release.yml` | manual recovery path |
+| `workflow_dispatch` on `release.yml` | `release.yml` | manual recovery path for the release stream |
 
 ### Why this shape
 

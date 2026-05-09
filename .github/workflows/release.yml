@@ -1,323 +1,48 @@
-name: Build and Release
+name: Release
 
-# Contributor-uploads-image, retag-only-in-CI model:
+# Release-stream concerns. Triggers:
 #
-#   1. Contributor runs scripts/publish-pr-image.sh BEFORE pushing any commit
-#      to ANY branch (PR work or direct-to-development/release). Script builds
-#      multi-arch images and pushes to GHCR with `{version}-{slug}-{sha}` and
-#      `{version}-{slug}`. CI never builds images.
+#   1. push: release          → after promote-on-merge.yml has retagged
+#                               the version tags, this workflow creates
+#                               the GitHub Release entry and attaches
+#                               native bsmcp-server binaries for 5
+#                               targets. No image rebuild — the version
+#                               tags already point at the right manifest.
 #
-#   2. PR opened/updated against development or release  ->  `build-*` jobs
-#      run lightweight verification: confirm the image manifest exists at the
-#      expected per-PR tag and is multi-arch (linux/amd64 + linux/arm64).
-#      Required status checks "build-server" and "build-embedder" gate the
-#      PR merge.
+#   2. push: tag v*           → emergency hotfix path. Builds and pushes
+#                               semver-tagged images directly, then
+#                               creates the matching GitHub Release.
+#                               Use only when the normal release flow
+#                               (PR development → release, then merge)
+#                               isn't available — typically because a
+#                               regression on `release` needs a bypass.
 #
-#   3. Push to development or release (PR squash-merge OR direct push) ->
-#      `push-retag` looks up the source image (via the GitHub API for PR
-#      merges; via the branch's own slug+SHA for direct pushes) and retags
-#      it with the appropriate stream tags. Pure manifest operation, no
-#      rebuild.
+#   3. workflow_dispatch       → manual recovery path.
 #
-#   4. Push to release  ->  `github-release-on-merge` creates the GitHub
-#      Release entry, then `release-binaries-on-merge` builds `bsmcp-server`
-#      native binaries for 5 targets and attaches them. The embedder is
-#      NOT released as a bare binary — Docker only.
+# build-pr.yml is the gating workflow for PRs. promote-on-merge.yml
+# moves the rolling tags. This workflow only handles the release stream.
 #
-#   5. v* tag push (emergency hotfix path)  ->  `tag-release` builds and
-#      pushes semver-tagged images directly in CI. Only build path that
-#      runs in CI; use only when the contributor cannot push images
-#      themselves.
-#
-# Tag map (after push to development, regardless of PR-merge or direct push):
-#   :dev                              rolling, latest dev
-#   :dev-{push_sha}                   immutable per-push
-#   :{version}-dev                    versioned dev rolling
-#   :{version}-dev-{push_sha}         versioned dev immutable per-push
-#
-# Tag map (after push to release):
-#   :{version}                        immutable semver
-#   :{version}-{push_sha}             immutable per-push
-#   :release, :latest                 rolling release pointers
-#
-# `{push_sha}` is the SHA of the commit on the target branch — for a PR
-# squash-merge this is the new merge commit, NOT the PR head SHA. The
-# source image being retagged was built against the PR head's tree, but
-# they're bit-identical (squash-merge preserves the working tree).
+# Canonical references:
+#   https://kb.beesroadhouse.com/books/developer-operations-devops/page/github-actions-workflow-template (1897)
+#   https://kb.beesroadhouse.com/books/developer-operations-devops/page/branching-strategy             (1860)
 
 on:
-  pull_request:
-    branches: [development, release]
-    types: [opened, synchronize, reopened, closed]
   push:
-    branches: [development, release]
+    branches: [release]
     tags:
       - 'v*'
-  # Manual trigger for push-retag — used when a push event drops (GitHub
-  # Actions occasionally fails to fire workflow runs for squash-merge
-  # commits). Run via `gh workflow run "Build and Release" --ref development`.
-  # Only push-retag respects this trigger; PR build-* jobs and tag-release
-  # gate on their own event types and stay no-ops.
   workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
 
 jobs:
-  build-server:
-    if: github.event_name == 'pull_request' && github.event.action != 'closed'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Resolve expected tag
-        id: vars
-        run: |
-          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
-          HEAD_SHA=${{ github.event.pull_request.head.sha }}
-          SHORT_SHA=${HEAD_SHA:0:7}
-          SLUG=$(printf '%s' "${{ github.event.pull_request.head.ref }}" | tr '/' '-' | tr -c 'a-zA-Z0-9._-' '-')
-          echo "tag=${VERSION}-${SLUG}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-          echo "image=${{ env.REGISTRY }}/bees-roadhouse/bsmcp-server" >> "$GITHUB_OUTPUT"
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Verify image exists and is multi-arch
-        run: |
-          REF="${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.tag }}"
-          echo "Inspecting $REF"
-          if ! docker buildx imagetools inspect --raw "$REF" > manifest.json 2>/tmp/err; then
-            echo "::error::Image not found at $REF"
-            echo "::error::Run scripts/publish-pr-image.sh on your branch to build and push it. See DEVELOPMENT.md."
-            cat /tmp/err
-            exit 1
-          fi
-          # Manifest list must include both linux/amd64 and linux/arm64.
-          ARCHES=$(jq -r '.manifests[]?.platform | "\(.os)/\(.architecture)"' manifest.json | sort -u | tr '\n' ' ')
-          echo "Found arches: $ARCHES"
-          for want in linux/amd64 linux/arm64; do
-            if ! echo " $ARCHES " | grep -q " $want "; then
-              echo "::error::Image is missing platform $want — manifest had: $ARCHES"
-              exit 1
-            fi
-          done
-          echo "OK: $REF is multi-arch (linux/amd64 + linux/arm64)"
-
-  build-embedder:
-    if: github.event_name == 'pull_request' && github.event.action != 'closed'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Resolve expected tag
-        id: vars
-        run: |
-          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
-          HEAD_SHA=${{ github.event.pull_request.head.sha }}
-          SHORT_SHA=${HEAD_SHA:0:7}
-          SLUG=$(printf '%s' "${{ github.event.pull_request.head.ref }}" | tr '/' '-' | tr -c 'a-zA-Z0-9._-' '-')
-          echo "tag=${VERSION}-${SLUG}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-          echo "image=${{ env.REGISTRY }}/bees-roadhouse/bsmcp-embedder" >> "$GITHUB_OUTPUT"
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Verify image exists and is multi-arch
-        run: |
-          REF="${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.tag }}"
-          echo "Inspecting $REF"
-          if ! docker buildx imagetools inspect --raw "$REF" > manifest.json 2>/tmp/err; then
-            echo "::error::Image not found at $REF"
-            echo "::error::Run scripts/publish-pr-image.sh on your branch to build and push it. See DEVELOPMENT.md."
-            cat /tmp/err
-            exit 1
-          fi
-          ARCHES=$(jq -r '.manifests[]?.platform | "\(.os)/\(.architecture)"' manifest.json | sort -u | tr '\n' ' ')
-          echo "Found arches: $ARCHES"
-          for want in linux/amd64 linux/arm64; do
-            if ! echo " $ARCHES " | grep -q " $want "; then
-              echo "::error::Image is missing platform $want — manifest had: $ARCHES"
-              exit 1
-            fi
-          done
-          echo "OK: $REF is multi-arch (linux/amd64 + linux/arm64)"
-
-  build-worker:
-    if: github.event_name == 'pull_request' && github.event.action != 'closed'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Resolve expected tag
-        id: vars
-        run: |
-          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
-          HEAD_SHA=${{ github.event.pull_request.head.sha }}
-          SHORT_SHA=${HEAD_SHA:0:7}
-          SLUG=$(printf '%s' "${{ github.event.pull_request.head.ref }}" | tr '/' '-' | tr -c 'a-zA-Z0-9._-' '-')
-          echo "tag=${VERSION}-${SLUG}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-          echo "image=${{ env.REGISTRY }}/bees-roadhouse/bsmcp-worker" >> "$GITHUB_OUTPUT"
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Verify image exists and is multi-arch
-        run: |
-          REF="${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.tag }}"
-          echo "Inspecting $REF"
-          if ! docker buildx imagetools inspect --raw "$REF" > manifest.json 2>/tmp/err; then
-            echo "::error::Image not found at $REF"
-            echo "::error::Run scripts/publish-pr-image.sh on your branch to build and push it. See DEVELOPMENT.md."
-            cat /tmp/err
-            exit 1
-          fi
-          ARCHES=$(jq -r '.manifests[]?.platform | "\(.os)/\(.architecture)"' manifest.json | sort -u | tr '\n' ' ')
-          echo "Found arches: $ARCHES"
-          for want in linux/amd64 linux/arm64; do
-            if ! echo " $ARCHES " | grep -q " $want "; then
-              echo "::error::Image is missing platform $want — manifest had: $ARCHES"
-              exit 1
-            fi
-          done
-          echo "OK: $REF is multi-arch (linux/amd64 + linux/arm64)"
-
-  # --- Push-to-stream retag ---
-  #
-  # Fires on every push to development or release — covers BOTH direct
-  # pushes AND PR-merge squash commits (which create a new commit on the
-  # target branch = a push event).
-  #
-  # NO CI rebuild. The contributor's `publish-pr-image.sh` already pushed a
-  # multi-arch image to GHCR for the source branch's commit; this job
-  # locates that image and retags it with the appropriate stream tags. If
-  # the source image doesn't exist (contributor forgot to publish before
-  # pushing), the job fails loudly so the contributor knows.
-  #
-  # Source resolution:
-  #   - Squash-merge of a PR onto development/release → look up the merged
-  #     PR via the GitHub API to recover the original head ref + sha. The
-  #     contributor's per-PR image lives at `{version}-{pr_slug}-{pr_sha}`.
-  #   - Direct push to development/release → the contributor must have run
-  #     publish-pr-image.sh on that branch beforehand, producing
-  #     `{version}-{branch_slug}-{push_sha}`.
-  push-retag:
-    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.ref == 'refs/heads/development' || github.ref == 'refs/heads/release')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-      pull-requests: read
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Resolve source image + stream tags
-        id: vars
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
-          PUSH_SHORT_SHA=${GITHUB_SHA:0:7}
-          BRANCH=${GITHUB_REF#refs/heads/}
-
-          # Try to find a merged PR whose merge_commit matches this push.
-          # The squash-merge case lands here: the contributor's image is at
-          # the PR head's slug+sha, not the merge commit's slug+sha.
-          PR_INFO=$(gh pr list \
-            --repo ${{ github.repository }} \
-            --state merged \
-            --base "$BRANCH" \
-            --search "merge:$GITHUB_SHA" \
-            --json headRefName,headRefOid \
-            --jq '.[0]')
-          if [ -n "$PR_INFO" ] && [ "$PR_INFO" != "null" ]; then
-            SRC_REF=$(echo "$PR_INFO" | jq -r '.headRefName')
-            SRC_FULL_SHA=$(echo "$PR_INFO" | jq -r '.headRefOid')
-            SRC_SHORT_SHA=${SRC_FULL_SHA:0:7}
-            echo "Resolved source from merged PR: ref=$SRC_REF sha=$SRC_SHORT_SHA"
-          else
-            # Direct push: source image was published by the contributor
-            # under the development/release branch's own slug + push SHA.
-            SRC_REF="$BRANCH"
-            SRC_SHORT_SHA="$PUSH_SHORT_SHA"
-            echo "Direct push: ref=$SRC_REF sha=$SRC_SHORT_SHA"
-          fi
-          SRC_SLUG=$(printf '%s' "$SRC_REF" | tr '/' '-' | tr -c 'a-zA-Z0-9._-' '-')
-
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "push_short_sha=$PUSH_SHORT_SHA" >> "$GITHUB_OUTPUT"
-          echo "src_slug=$SRC_SLUG" >> "$GITHUB_OUTPUT"
-          echo "src_short_sha=$SRC_SHORT_SHA" >> "$GITHUB_OUTPUT"
-          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Retag stream tags
-        run: |
-          set -euo pipefail
-          for IMAGE in bsmcp-server bsmcp-embedder bsmcp-worker; do
-            SRC="${{ env.REGISTRY }}/bees-roadhouse/${IMAGE}:${{ steps.vars.outputs.version }}-${{ steps.vars.outputs.src_slug }}-${{ steps.vars.outputs.src_short_sha }}"
-            echo "Source: $SRC"
-            if ! docker buildx imagetools inspect --raw "$SRC" >/dev/null 2>&1; then
-              echo "::error::Source image not found: $SRC"
-              echo "::error::The contributor must run scripts/publish-pr-image.sh on their branch BEFORE pushing the commit. See DEVELOPMENT.md."
-              exit 1
-            fi
-            if [ "${{ steps.vars.outputs.branch }}" = "development" ]; then
-              docker buildx imagetools create \
-                --tag "${{ env.REGISTRY }}/bees-roadhouse/${IMAGE}:dev" \
-                --tag "${{ env.REGISTRY }}/bees-roadhouse/${IMAGE}:dev-${{ steps.vars.outputs.push_short_sha }}" \
-                --tag "${{ env.REGISTRY }}/bees-roadhouse/${IMAGE}:${{ steps.vars.outputs.version }}-dev" \
-                --tag "${{ env.REGISTRY }}/bees-roadhouse/${IMAGE}:${{ steps.vars.outputs.version }}-dev-${{ steps.vars.outputs.push_short_sha }}" \
-                "$SRC"
-            else
-              docker buildx imagetools create \
-                --tag "${{ env.REGISTRY }}/bees-roadhouse/${IMAGE}:${{ steps.vars.outputs.version }}" \
-                --tag "${{ env.REGISTRY }}/bees-roadhouse/${IMAGE}:${{ steps.vars.outputs.version }}-${{ steps.vars.outputs.push_short_sha }}" \
-                --tag "${{ env.REGISTRY }}/bees-roadhouse/${IMAGE}:release" \
-                --tag "${{ env.REGISTRY }}/bees-roadhouse/${IMAGE}:latest" \
-                "$SRC"
-            fi
-          done
-
-  # `promote` removed — push-retag (above) covers both PR-merge and direct-
-  # push retagging. Squash-merge produces a push event on the target branch,
-  # which fires push-retag, which looks up the source PR via the GitHub API
-  # and retags from the contributor's per-PR image. Single mechanism, no
-  # dependence on `pull_request: closed` events firing.
-
-  # Triggered by the push that lands on `release` (PR squash-merge or
-  # direct push). Runs after push-retag so the released images are
-  # already tagged with the version when the GitHub Release entry is
-  # written.
+  # GitHub Release on push: release. Runs after promote-on-merge.yml
+  # has already retagged the version tags. Creates the v{version} git
+  # tag (if missing) and the GitHub Release entry; release-binaries-on-
+  # merge attaches native binaries.
   github-release-on-merge:
     if: github.event_name == 'push' && github.ref == 'refs/heads/release'
-    needs: [push-retag]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -363,6 +88,7 @@ jobs:
             ```
             docker pull ghcr.io/bees-roadhouse/bsmcp-server:${{ steps.vars.outputs.version }}
             docker pull ghcr.io/bees-roadhouse/bsmcp-embedder:${{ steps.vars.outputs.version }}
+            docker pull ghcr.io/bees-roadhouse/bsmcp-worker:${{ steps.vars.outputs.version }}
             ```
 
             Or pin to the rolling release tag:
@@ -370,6 +96,7 @@ jobs:
             ```
             docker pull ghcr.io/bees-roadhouse/bsmcp-server:release
             docker pull ghcr.io/bees-roadhouse/bsmcp-embedder:release
+            docker pull ghcr.io/bees-roadhouse/bsmcp-worker:release
             ```
 
             ## Native binaries (`bsmcp-server` only)
@@ -452,6 +179,9 @@ jobs:
           tag_name: ${{ needs.github-release-on-merge.outputs.tag }}
           files: ${{ env.ARCHIVE }}
 
+  # Emergency hotfix path: a `v*` tag was pushed directly. Build the
+  # semver-tagged images and create the GitHub Release. This is the
+  # only path in this workflow that builds images.
   tag-release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
@@ -459,6 +189,7 @@ jobs:
       contents: write
       packages: write
     strategy:
+      fail-fast: false
       matrix:
         include:
           - image: bsmcp-server
@@ -467,6 +198,9 @@ jobs:
           - image: bsmcp-embedder
             dockerfile: docker/Dockerfile.embedder
             scope: embedder
+          - image: bsmcp-worker
+            dockerfile: docker/Dockerfile.worker
+            scope: worker
     steps:
       - uses: actions/checkout@v4
 
@@ -518,6 +252,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      version: ${{ steps.vars.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -541,6 +277,7 @@ jobs:
             ```
             docker pull ghcr.io/bees-roadhouse/bsmcp-server:${{ steps.vars.outputs.version }}
             docker pull ghcr.io/bees-roadhouse/bsmcp-embedder:${{ steps.vars.outputs.version }}
+            docker pull ghcr.io/bees-roadhouse/bsmcp-worker:${{ steps.vars.outputs.version }}
             ```
 
             ## Native binaries (`bsmcp-server` only)

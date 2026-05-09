@@ -91,29 +91,33 @@ Direct pushes to `development` stay available — use them for small atomic chan
 
 ## CI/CD
 
-**Contributor-uploads-image.** Heavy multi-arch Docker builds run on the **contributor's machine**, not in CI. Before pushing a PR commit, run `scripts/publish-pr-image.sh` to build and push the per-PR images to GHCR. CI then runs lightweight verification jobs that confirm the images exist and are multi-arch — that's the merge gate. The SBOM/STRUCTURE auto-commit still runs on every PR commit (it's quick).
+The org-canonical PR-builds + post-merge-retag pattern. Reference docs:
 
-This trades CI minutes for a small contributor onboarding step. The gate is preserved (PRs cannot merge without verified images); the build cost moves to the engineer who actually edited the source.
+- BR DevOps [GitHub Actions Workflow Template (1897)](https://kb.beesroadhouse.com/books/developer-operations-devops/page/github-actions-workflow-template) — canonical trigger / tag / cache shape.
+- BR DevOps [Branching Strategy (1860)](https://kb.beesroadhouse.com/books/developer-operations-devops/page/branching-strategy) — branch model and direct-push authorization.
+
+**CI builds. Squash-merge retags.** Heavy multi-arch Docker builds run in CI on every push to a PR. Per-PR images are tagged immutably (`{version}-{slug}-{sha}`) and rolling (`{version}-{slug}`). After squash-merge, a separate workflow retags the PR head image as the stream tags via `docker buildx imagetools create` — pure manifest operation, no rebuild. The squash-merge commit's source tree is bit-identical to the PR head, so the image is the right artifact.
 
 ### Contributor flow (per PR)
 
 ```
 1. git checkout -b improvement/my-change
-2. ... commit work ...
-3. scripts/publish-pr-image.sh        # build + push multi-arch images to GHCR
-4. git push -u origin improvement/my-change
-5. Open PR; build-server / build-embedder / build-worker verify checks should pass
-6. On every subsequent commit, re-run scripts/publish-pr-image.sh before pushing
-7. Squash-merge into development; delete the work branch
+2. ... commit work, sign each commit ...
+3. git push -u origin improvement/my-change
+4. Open PR; build-server / build-embedder / build-worker run on every PR push
+5. Squash-merge into development; delete the work branch
+6. promote-on-merge.yml retags the PR head image as :dev / :{version}-dev
 ```
 
-If you push the commit before pushing the image, the verify check fails with a clear error pointing at the script. Run it, then re-trigger the check (push an empty commit or click "Re-run jobs" in GitHub Actions).
+No local image build needed. `scripts/publish-pr-image.sh` is still in the repo as an out-of-band escape hatch for emergency hotfixes when CI is unavailable, but it's not part of the normal flow.
 
-### Path-aware fast path (`scripts/publish-pr-image.sh`)
+### Path-aware fast path (CI)
 
-The publish script diffs your branch against `origin/development` and skips the rebuild for any binary whose dependency files didn't change. It retags the latest published `:dev` image as the per-PR tags instead — a manifest-only operation that takes seconds.
+`build-pr.yml` uses [`dorny/paths-filter@v3`](https://github.com/dorny/paths-filter) to detect which binaries' build deps were touched by the PR. When nothing relevant changed for a given binary, the job retags `:dev` (the latest published stream image) as the per-PR tags instead of doing the 15-min cross-arch build. ~2s vs ~15min.
 
-What counts as "changed paths":
+Falls back to a full build automatically when `:dev` doesn't exist (cold start or pre-first-release).
+
+What counts as "changed paths" per binary:
 
 | Binary | Paths that trigger a rebuild |
 |---|---|
@@ -121,65 +125,57 @@ What counts as "changed paths":
 | `bsmcp-embedder` | `crates/bsmcp-embedder/`, `crates/bsmcp-common/`, `crates/bsmcp-db-sqlite/`, `crates/bsmcp-db-postgres/`, `Cargo.toml`, `Cargo.lock`, `docker/Dockerfile.embedder`, `entrypoint.sh` |
 | `bsmcp-worker` | `crates/bsmcp-worker/`, `crates/bsmcp-common/`, `crates/bsmcp-db-sqlite/`, `crates/bsmcp-db-postgres/`, `Cargo.toml`, `Cargo.lock`, `docker/Dockerfile.worker`, `entrypoint.sh` |
 
-Note that PRs touching `crates/bsmcp-server/` only — typical for server-side work — skip the embedder rebuild entirely. That's the change that takes a typical PR from ~25 min of multi-arch build time down to ~10 min.
-
-Override with `scripts/publish-pr-image.sh both --force` if you need to force a full rebuild (e.g., to validate a Dockerfile change that the path filter would otherwise miss).
-
-**Direct push to `development` or `release` always forces a rebuild** regardless of path filter results. The path-aware retag-from-`:dev` shortcut is correct for PR work (the contributor's per-PR image already encodes the PR head's tree, which is bit-identical to the squash-merge commit). But for a direct push to a canonical branch, retagging an older image's manifest would leave `org.opencontainers.image.revision` pointing at the older commit, which drifts from the SHA actually being pushed. The script auto-forces the build in this case so the resulting image's revision label matches the push SHA.
+The same path-set is mirrored in `scripts/publish-pr-image.sh` (`SERVER_PATHS` / `EMBEDDER_PATHS` / `WORKER_PATHS`). Keep them in sync — the script is a manual fallback for the same logic.
 
 ### Cargo target / registry caching
 
-Both Dockerfiles use BuildKit `--mount=type=cache` for `target/`, `~/.cargo/registry`, and `~/.cargo/git`. The first build is still cold (~15 min on linux/arm64 via QEMU), but subsequent builds reuse the dep-tree compilation across PR pushes. Cache mount IDs include `$TARGETPLATFORM` so linux/amd64 and linux/arm64 don't poison each other's caches.
+Both Dockerfiles use BuildKit `--mount=type=cache` for `target/`, `~/.cargo/registry`, and `~/.cargo/git`. CI uses scoped GHA cache (`scope=server`, `scope=embedder`, `scope=worker`) so parallel jobs don't evict each other's layers. Cache mount IDs include `$TARGETPLATFORM` so linux/amd64 and linux/arm64 don't poison each other's caches.
 
 ### Embedder is opt-in for deployments
 
 `bsmcp-embedder` is required only when running the **built-in** embedder provider (the default `BSMCP_EMBED_PROVIDER=local` ONNX model). Deployments configured for external providers (`ollama`, `openai`) don't need the embedder container at all — `bsmcp-server` talks to the external endpoint directly.
-
-**One-time setup:**
-
-```bash
-# Multi-platform builder
-docker buildx create --name multiarch --use --bootstrap
-
-# GHCR login (PAT needs write:packages scope)
-echo $GHCR_PAT | docker login ghcr.io -u <gh-user> --password-stdin
-```
 
 ### What runs on what
 
 | Event | Workflow | What happens |
 |-------|----------|-------------|
 | Push to a work branch with **no open PR** | nothing | test locally |
-| `pull_request: opened/synchronize/reopened` against `development` or `release` | `release.yml` (`build-server`, `build-embedder`, `build-worker` verify jobs) | confirms the contributor's per-PR images exist on GHCR with both `linux/amd64` and `linux/arm64`. ~30 seconds. No build. |
+| `pull_request: opened/synchronize/reopened` against `development` or `release` | `build-pr.yml` (`build-server`, `build-embedder`, `build-worker`) | path-aware multi-arch build per image; tags `{version}-{slug}-{sha}` + `{version}-{slug}` |
 | Same trigger | `generate-artifacts.yml` | regenerates `SBOM.md` + `STRUCTURE.md`, commits to PR source branch with `[skip ci]` |
-| `push` to `development` (squash-merge or direct push) | `release.yml` (`push-retag`) | retags the contributor's per-PR image to `:dev`, `:dev-{push_sha}`, `:{version}-dev`, `:{version}-dev-{push_sha}`. No rebuild. |
-| `push` to `release` (squash-merge or direct push) | `release.yml` (`push-retag` + `github-release-on-merge` + `release-binaries-on-merge`) | retags to `:{version}`, `:{version}-{push_sha}`, `:release`, `:latest`; creates GitHub Release; builds `bsmcp-server` native binaries for 5 targets and attaches them to the Release. |
-| `v*` tag push (emergency hotfix only) | `release.yml` (`tag-release` + `github-release-on-tag` + `release-binaries-on-tag`) | builds & pushes semver-tagged images directly in CI (the only build path that still runs in CI), creates the Release, attaches the server binaries. Use only when the contributor cannot push images themselves. |
-| `workflow_dispatch` on `release.yml`, ref = `development` or `release` | `release.yml` (`push-retag`) | manual recovery path when a `push` event drops (GitHub Actions occasionally fails to fire workflow runs for squash-merge commits). Run via `gh workflow run "Build and Release" --ref development`. |
+| `pull_request: closed` (merged: true) on `development` or `release` | `promote-on-merge.yml` | retags the PR head image as the appropriate stream tags via `imagetools create`. No rebuild. |
+| `push` to `development` that is **not** a PR-merge commit (rare; direct push) | `direct-push.yml` | full multi-arch build + stream tags. Authorized per Branching Strategy 1860. |
+| `push` to `release` (always a PR-merge from development) | `release.yml` (`github-release-on-merge` + `release-binaries-on-merge`) | creates the `v{version}` git tag (if missing) and the GitHub Release entry; builds `bsmcp-server` native binaries for 5 targets and attaches them. Image version tags were already moved by `promote-on-merge.yml` when the PR closed. |
+| `v*` tag push (emergency hotfix only) | `release.yml` (`tag-release` + `github-release-on-tag` + `release-binaries-on-tag`) | builds & pushes semver-tagged images directly in CI, creates the Release, attaches the server binaries. Use only when the normal PR flow isn't available. |
+| `workflow_dispatch` on `release.yml` | `release.yml` | manual recovery path |
 
 ### Why this shape
 
-- **CI verifies, contributor builds.** The merge gate is preserved: a PR cannot merge unless its per-PR images exist on GHCR. The actual build work moves out of CI onto the engineer's machine, where it amortizes over the local build cache and saves ~15 min of CI minutes per PR push.
-- **Stable job names (`build-server`, `build-embedder`, `build-worker`).** Branch protection's required status checks reference these names; renaming them would silently disable the gate until the rule is updated. The job names lie a little — they verify, not build — but the trade-off is worth it.
-- **Retag instead of rebuild on merge.** A squash-merge to development produces a new commit SHA, but its source tree is identical to the PR head. The contributor's image is bit-identical to what a CI build would produce, so promote just moves the rolling tag.
+- **CI builds, not contributor.** Build work runs in CI on every PR push. Engineers don't need a local multi-arch builder or a GHCR PAT to get their PR through review. Cost: ~15 min of CI minutes per PR push (mitigated by the path-aware fast path for docs/config-only PRs, which retag in ~2s).
+- **Squash-merge retags, doesn't rebuild.** The squash-merge commit's source tree is bit-identical to the PR head, so the PR head image is the right artifact. `promote-on-merge.yml` moves the rolling tags atomically; the registry handles the cleanup of the old manifest.
+- **Direct push to development has its own workflow.** Page 1860 authorizes direct pushes for scaffolding and hotfixes; page 1897 doesn't explicitly cover that case (it documents the squash-merge path only). `direct-push.yml` fills that gap with a full build + stream-tag push, gated to skip PR-merge commits so promote-on-merge owns those.
 - **Native binaries: server only.** `bsmcp-server` is pure Rust + bundled SQLite and cross-compiles cleanly. `bsmcp-embedder` depends on `fastembed` → ONNX Runtime → a per-platform C++ shared library; bare binaries would need ONNX Runtime installed on the host. Container is the only supported distribution for the embedder.
-- **External fork PRs are not supported under this model.** Forks cannot push to `ghcr.io/bees-roadhouse/*`, so fork PRs cannot satisfy the verify gate. If outside contribution becomes a real workflow, a maintainer will need to manually build/push the contributor's branch (or use the emergency `v*` tag path).
+- **External fork PRs are skipped.** Forks cannot push to `ghcr.io/bees-roadhouse/*`. `build-pr.yml`, `promote-on-merge.yml`, and `generate-artifacts.yml` all gate on `head.repo.full_name == github.repository`.
 
 ### Tag conventions on GHCR
 
-Per-PR (pushed by the contributor via `scripts/publish-pr-image.sh`):
+Per-PR (pushed by `build-pr.yml` on every PR commit):
 - `{version}-{branch-slug}-{sha}` — pinnable to one specific commit
 - `{version}-{branch-slug}` — rolling, moves with each PR push
 
-Development stream (after merge to development):
+Development stream (set by `promote-on-merge.yml` on PR close, or `direct-push.yml` on direct push):
 - `dev` — rolling, latest dev build
-- `{version}-dev` — version-level dev tag
+- `dev-{merge_sha}` — immutable per-merge / per-push
+- `{version}-dev` — version-level dev rolling
+- `{version}-dev-{merge_sha}` — version-level dev immutable
 
-Release stream (after merge to release or `v*` tag):
+Release stream (set by `promote-on-merge.yml` on `development → release` PR close):
 - `latest` — rolling, latest release
 - `release` — alias for `latest`
-- `{version}` — pinned semver (e.g., `0.7.4`)
-- `{major}.{minor}`, `{major}` — broader semver pointers (only emitted on `v*` tag push)
+- `{version}` — pinned semver (e.g., `0.10.0`)
+- `{version}-{merge_sha}` — immutable per-release-merge
+
+Tag-push hotfix (`v*` tag → `release.yml` `tag-release`):
+- `{version}`, `{major}.{minor}`, `{major}` — full semver hierarchy
 
 Images are published to `ghcr.io/bees-roadhouse/bsmcp-server`, `ghcr.io/bees-roadhouse/bsmcp-embedder`, and `ghcr.io/bees-roadhouse/bsmcp-worker` for `linux/amd64` and `linux/arm64`.
 
@@ -199,15 +195,14 @@ Each archive contains the `bsmcp-server` (or `.exe`) binary plus `README.md` and
 
 ### Branch protection
 
-Protection lives at the **organization level** via a GitHub Ruleset (`Release Branch Protection`) targeting `refs/heads/release` on every repo in `bees-roadhouse`:
+Protection lives at the **organization level** via two GitHub Rulesets that apply to every repo in `bees-roadhouse`:
 
-- `pull_request` (0 required approvals — the gate is CI status, not approver count)
-- `non_fast_forward` (blocks force-push)
-- `deletion` (blocks branch delete)
+- `Default Branch Protection` (`~DEFAULT_BRANCH`) — `pull_request` (1 approval, thread resolution), `non_fast_forward`, `deletion`. Bypass: `OrganizationAdmin` in `pull_request` mode.
+- `Release Branch Protection` (`refs/heads/release`, `refs/heads/release/*`, `refs/heads/release-*`) — `pull_request` (1 approval, merge-commit only, thread resolution), `non_fast_forward`, `deletion`. Bypass: `OrganizationAdmin` in `pull_request` mode.
 
-`development` is **intentionally unprotected** — direct pushes stay authorized so scaffolding, hotfixes, and small atomic changes don't get stuck in PR ceremony. CI runs on every push regardless, so regressions are still caught.
+`development` rules trigger only on PR-merge — direct pushes stay authorized. CI runs on every PR push regardless, so regressions are caught before merge.
 
-Required status checks (`build-server`, `build-embedder`) gate the merge into `release` once the PR is open. They now verify rather than build, but the contract from the protection rule's perspective is unchanged.
+Required status checks for `build-server` / `build-embedder` / `build-worker` are **not** wired up yet. After this CI rework lands and the new check names stabilize, a follow-up will add them to both rulesets.
 
 ### Commit signing
 

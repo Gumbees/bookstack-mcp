@@ -96,7 +96,7 @@ The org-canonical PR-builds + post-merge-retag pattern. Reference docs:
 - BR DevOps [GitHub Actions Workflow Template (1897)](https://kb.beesroadhouse.com/books/developer-operations-devops/page/github-actions-workflow-template) — canonical trigger / tag / cache shape.
 - BR DevOps [Branching Strategy (1860)](https://kb.beesroadhouse.com/books/developer-operations-devops/page/branching-strategy) — branch model and direct-push authorization.
 
-**CI builds. Squash-merge retags.** Heavy multi-arch Docker builds run in CI on every push to a PR. Per-PR images are tagged immutably (`{version}-{slug}-{sha}`) and rolling (`{version}-{slug}`). After squash-merge, a separate workflow retags the PR head image as the stream tags via `docker buildx imagetools create` — pure manifest operation, no rebuild. The squash-merge commit's source tree is bit-identical to the PR head, so the image is the right artifact.
+**CI builds. Squash-merge retags.** Heavy multi-arch Docker builds run in CI on every push to a PR. The PR's image is published under a single rolling tag `{version}-{slug}` that moves with each push. After squash-merge, a separate workflow retags that PR-head image as the stream tags via `docker buildx imagetools create` — pure manifest operation, no rebuild. The squash-merge commit's source tree is bit-identical to the PR head, so the image is the right artifact. Commit-level pinning during PR review is via `image@sha256:digest` from `docker buildx imagetools inspect`, not a per-commit tag (see *Tag conventions on GHCR* below for why).
 
 ### Contributor flow (per PR)
 
@@ -140,13 +140,14 @@ Both Dockerfiles use BuildKit `--mount=type=cache` for `target/`, `~/.cargo/regi
 | Event | Workflow | What happens |
 |-------|----------|-------------|
 | Push to a work branch with **no open PR** | nothing | test locally |
-| `pull_request: opened/synchronize/reopened` against `development` or `release` | `build-pr.yml` (`build-server`, `build-embedder`, `build-worker`) | path-aware multi-arch build per image; tags `{version}-{slug}-{sha}` + `{version}-{slug}` |
+| `pull_request: opened/synchronize/reopened` against `development` or `release` | `build-pr.yml` (`build-server`, `build-embedder`, `build-worker`) | path-aware multi-arch build per image; tag `{version}-{slug}` (rolling per-PR) |
 | Same trigger | `generate-artifacts.yml` | regenerates `SBOM.md` + `STRUCTURE.md`, commits to PR source branch with `[skip ci]` |
 | `pull_request: closed` (merged: true) on `development` or `release` | `promote-on-merge.yml` | retags the PR head image as the appropriate stream tags via `imagetools create`. No rebuild. |
 | `push` to `development` that is **not** a PR-merge commit (rare; direct push) | `direct-push.yml` | full multi-arch build + stream tags. Authorized per Branching Strategy 1860. |
+| `workflow_dispatch` on `direct-push.yml` | `direct-push.yml` | manual recovery for the development stream — bypasses the PR-merge guard and rebuilds the four `:dev*` tags at the current `development` HEAD. Use after a workflow-bootstrap gap (workflow file introduced by the very PR whose merge would have run it). |
 | `push` to `release` (always a PR-merge from development) | `release.yml` (`github-release-on-merge` + `release-binaries-on-merge`) | creates the `v{version}` git tag (if missing) and the GitHub Release entry; builds `bsmcp-server` native binaries for 5 targets and attaches them. Image version tags were already moved by `promote-on-merge.yml` when the PR closed. |
 | `v*` tag push (emergency hotfix only) | `release.yml` (`tag-release` + `github-release-on-tag` + `release-binaries-on-tag`) | builds & pushes semver-tagged images directly in CI, creates the Release, attaches the server binaries. Use only when the normal PR flow isn't available. |
-| `workflow_dispatch` on `release.yml` | `release.yml` | manual recovery path |
+| `workflow_dispatch` on `release.yml` | `release.yml` | manual recovery path for the release stream |
 
 ### Why this shape
 
@@ -159,8 +160,9 @@ Both Dockerfiles use BuildKit `--mount=type=cache` for `target/`, `~/.cargo/regi
 ### Tag conventions on GHCR
 
 Per-PR (pushed by `build-pr.yml` on every PR commit):
-- `{version}-{branch-slug}-{sha}` — pinnable to one specific commit
 - `{version}-{branch-slug}` — rolling, moves with each PR push
+
+No per-commit immutable tag. Commit-level pinning is via `image@sha256:digest` from `docker buildx imagetools inspect`. Two reasons: (1) digest pinning is a strict superset of tag pinning, and (2) `generate-artifacts.yml` lands a `[skip ci]` SBOM/STRUCTURE auto-commit AFTER `build-pr.yml` runs — PR head moves to a SHA the gating build never built, so a per-PR `{sha}` immutable tag would be a footgun for `promote-on-merge.yml` (it'd look for a tag that doesn't exist). The rolling tag captures the most recent successful build regardless of head drift.
 
 Development stream (set by `promote-on-merge.yml` on PR close, or `direct-push.yml` on direct push):
 - `dev` — rolling, latest dev build

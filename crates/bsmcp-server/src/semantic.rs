@@ -16,6 +16,57 @@ use bsmcp_common::types::MarkovBlanket;
 
 const PERMISSION_CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
 
+/// Search ranking strategy. Selected per-call via the `mode` argument on
+/// `semantic_search`. All three modes return the same JSON shape so a
+/// caller can swap modes on the same query and diff the output.
+///
+/// - `Standard`: vector + optional keyword + blanket boost + blended sort.
+///   Free, known-good baseline. Default.
+/// - `Rerank`: standard pipeline produces the top-N, then a cross-encoder
+///   /rerank pass re-orders just those N results. Cheap refinement on top
+///   of what works (~10-30ms for N≤50 against a local cross-encoder).
+/// - `Precision`: wider initial vector pass (5× limit), permission filter,
+///   then cross-encoder /rerank as the ranker of record (replaces the
+///   blanket+blend). More expensive, more potential to rescue a hit the
+///   blend would have missed. `hybrid` is forced false in this mode.
+///
+/// `Rerank` and `Precision` both require `BSMCP_RERANK_PROVIDER` configured
+/// on the embedder; without it, `/rerank` returns 503 and the call surfaces
+/// a clear error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SearchMode {
+    Standard,
+    Rerank,
+    Precision,
+}
+
+impl SearchMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "" | "standard" | "default" => Some(Self::Standard),
+            "rerank" => Some(Self::Rerank),
+            "precision" => Some(Self::Precision),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Rerank => "rerank",
+            Self::Precision => "precision",
+        }
+    }
+}
+
+/// Result of a `/rerank` HTTP call to the embedder. Hits are in score-desc
+/// order, already truncated to `top_k`.
+struct RerankResponse {
+    hits: Vec<(usize, f32)>,
+    provider: String,
+    model: String,
+}
+
 /// Cap a single semantic-match's chunks and truncate each chunk's content.
 /// Shared by every caller that surfaces chunk previews to a model — the
 /// briefing (per-book + kb) and the `semantic_search` MCP tool — so the
@@ -252,7 +303,10 @@ impl SemanticState {
         accessible
     }
 
-    /// Hybrid search: vector + keyword + blanket re-ranking.
+    /// Hybrid search: vector + keyword + blanket re-ranking, with optional
+    /// cross-encoder rerank as either a refinement (`Rerank`) or a full
+    /// replacement of the blend (`Precision`). See [`SearchMode`] for the
+    /// per-mode contract.
     ///
     /// `book_filter`: when `Some(&[..])`, restricts the vector pass to chunks
     /// whose page lives in one of the supplied books. The keyword pass and
@@ -260,15 +314,6 @@ impl SemanticState {
     /// just smaller from the outset, which proportionally shrinks the
     /// permission filter and per-result fan-out. `None` keeps the old
     /// whole-corpus behavior.
-    ///
-    /// `precision`: when `true`, the post-permission step is replaced with a
-    /// cross-encoder rerank against the embedder's `/rerank` endpoint. The
-    /// initial vector pass widens (`limit * 5`) to give the cross-encoder a
-    /// larger candidate pool. The `hybrid` flag is overridden to `false`
-    /// because precision relies on the cross-encoder for ordering, not the
-    /// keyword/blanket blend. Requires `BSMCP_RERANK_PROVIDER` to be set on
-    /// the embedder; otherwise the call returns a clear error and the caller
-    /// can retry without `precision`.
     #[allow(clippy::too_many_arguments)]
     pub async fn search(
         &self,
@@ -279,21 +324,23 @@ impl SemanticState {
         verbose: bool,
         client: &BookStackClient,
         book_filter: Option<&[i64]>,
-        precision: bool,
+        mode: SearchMode,
     ) -> Result<Value, String> {
         let start = Instant::now();
 
         // Precision mode forces hybrid off. The cross-encoder is the ranker
         // of record; mixing in keyword-rank scoring just dilutes its signal.
-        let hybrid = hybrid && !precision;
+        // Rerank mode keeps hybrid intact — the rerank only re-orders the
+        // final top-N from the standard pipeline.
+        let hybrid = hybrid && mode != SearchMode::Precision;
 
         // Run vector search and optional keyword search in parallel.
-        // Candidate over-fetch is `limit * 2` for the standard path —
+        // Candidate over-fetch is `limit * 2` for the standard/rerank path —
         // empirically sufficient headroom after permission filtering. In
         // precision mode we cast a wider net (`limit * 5`) because the
         // cross-encoder benefits from seeing more candidates, and the rerank
         // step itself caps the embedder side at 200 documents.
-        let candidate_multiplier: usize = if precision { 5 } else { 2 };
+        let candidate_multiplier: usize = if mode == SearchMode::Precision { 5 } else { 2 };
         let book_filter_owned: Option<Vec<i64>> = book_filter
             .filter(|s| !s.is_empty())
             .map(|s| s.to_vec());
@@ -412,7 +459,7 @@ impl SemanticState {
         // chunk per page, send `(query, [doc_per_page])` to the embedder's
         // /rerank, and use the returned scores as the final ordering.
         // Skips the blanket boost and hybrid blend below.
-        if precision {
+        if mode == SearchMode::Precision {
             return self
                 .precision_rerank(query, limit, &page_scores, verbose, start)
                 .await;
@@ -544,6 +591,72 @@ impl SemanticState {
             chunks_by_page.entry(detail.page_id).or_default().push(detail);
         }
 
+        // RERANK MODE: refine the standard top-N ordering with a cross-encoder.
+        // Candidate selection (vector + keyword + blanket boost + blend) stays;
+        // /rerank only re-orders the N pages we'd have returned anyway. Cheap
+        // (~10-30ms for N≤50 against a local cross-encoder).
+        let chunk_by_id: HashMap<i64, &bsmcp_common::types::ChunkDetail> =
+            chunk_details.iter().map(|d| (d.chunk_id, d)).collect();
+        let mut rerank_provider = String::new();
+        let mut rerank_model = String::new();
+        let mut rerank_ms: u128 = 0;
+        let mut rerank_scores: HashMap<i64, f32> = HashMap::new();
+        if mode == SearchMode::Rerank && !page_results.is_empty() {
+            let mut docs: Vec<String> = Vec::with_capacity(page_results.len());
+            let mut doc_to_page: Vec<i64> = Vec::with_capacity(page_results.len());
+            for (pid, _, ps) in &page_results {
+                let best_chunk_id = ps
+                    .chunks
+                    .iter()
+                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|c| c.0);
+                let page_name = meta_by_page
+                    .get(pid)
+                    .map(|m| m.name.as_str())
+                    .unwrap_or("");
+                let (heading, content) = best_chunk_id
+                    .and_then(|cid| chunk_by_id.get(&cid))
+                    .map(|d| (d.heading_path.as_str(), d.content.as_str()))
+                    .unwrap_or(("", ""));
+                let doc = if heading.is_empty() {
+                    format!("{page_name}\n\n{content}")
+                } else {
+                    format!("{page_name} — {heading}\n\n{content}")
+                };
+                docs.push(doc);
+                doc_to_page.push(*pid);
+            }
+
+            let rerank_start = Instant::now();
+            let rr = self.invoke_rerank(query, docs, page_results.len()).await?;
+            rerank_ms = rerank_start.elapsed().as_millis();
+            rerank_provider = rr.provider;
+            rerank_model = rr.model;
+
+            // Cache rerank score per page for the JSON loop, then reorder.
+            // Build a (pid → &PageScore) lookup once so we can rebuild the
+            // page_results vec in rerank-score order without losing the
+            // PageScore reference (which the JSON loop reads from).
+            let ps_by_pid: HashMap<i64, &PageScore> = page_results
+                .iter()
+                .map(|(pid, _, ps)| (*pid, *ps))
+                .collect();
+            let mut reordered: Vec<(i64, f32, &PageScore)> = Vec::with_capacity(rr.hits.len());
+            for (idx, score) in &rr.hits {
+                let Some(&pid) = doc_to_page.get(*idx) else {
+                    return Err(format!(
+                        "Rerank index {idx} out of bounds (max {})",
+                        doc_to_page.len()
+                    ));
+                };
+                rerank_scores.insert(pid, *score);
+                if let Some(&ps) = ps_by_pid.get(&pid) {
+                    reordered.push((pid, *score, ps));
+                }
+            }
+            page_results = reordered;
+        }
+
         // For verbose mode, fetch any blankets we haven't already cached during
         // re-ranking. Most final results will hit the cache for free.
         let mut blanket_cache = blanket_cache;
@@ -590,17 +703,22 @@ impl SemanticState {
                 }
             }
 
+            let mut scoring = json!({
+                "vector": (score.vector_score * 1000.0).round() / 1000.0,
+                "keyword": (score.keyword_rank * 1000.0).round() / 1000.0,
+                "blanket_boost": (score.blanket_boost * 1000.0).round() / 1000.0,
+            });
+            if let Some(rs) = rerank_scores.get(page_id) {
+                scoring["rerank"] = json!((*rs * 1000.0).round() / 1000.0);
+            }
+
             let mut result = json!({
                 "page_id": page_id,
                 "page_name": page_name,
                 "book_id": book_id,
                 "score": (*final_score * 1000.0).round() / 1000.0,
                 "chunks": chunks_json,
-                "scoring": {
-                    "vector": (score.vector_score * 1000.0).round() / 1000.0,
-                    "keyword": (score.keyword_rank * 1000.0).round() / 1000.0,
-                    "blanket_boost": (score.blanket_boost * 1000.0).round() / 1000.0,
-                },
+                "scoring": scoring,
             });
 
             if let Some(ref ts) = updated_at {
@@ -626,18 +744,98 @@ impl SemanticState {
         let stats = self.db.get_stats().await?;
         let query_time_ms = start.elapsed().as_millis();
 
+        let mut stats_json = json!({
+            "total_indexed": stats.total_pages,
+            "total_chunks": stats.total_chunks,
+            "query_time_ms": query_time_ms,
+            "mode": mode.as_str(),
+            "hybrid": hybrid,
+        });
+        if mode == SearchMode::Rerank {
+            stats_json["rerank_ms"] = json!(rerank_ms);
+            stats_json["rerank_provider"] = json!(rerank_provider);
+            stats_json["rerank_model"] = json!(rerank_model);
+            stats_json["candidates_reranked"] = json!(rerank_scores.len());
+        }
+
         Ok(json!({
             "results": results,
-            "stats": {
-                "total_indexed": stats.total_pages,
-                "total_chunks": stats.total_chunks,
-                "query_time_ms": query_time_ms,
-                "mode": if hybrid { "hybrid" } else { "vector" },
-            }
+            "stats": stats_json,
         }))
     }
 
-    /// Cross-encoder rerank step for precision mode. Replaces the blanket
+    /// POST `(query, documents, top_k)` to the embedder's `/rerank` endpoint
+    /// and parse the response. Surfaces the embedder's 503 (reranker disabled)
+    /// as a clear, retry-friendly error so the caller can fall back to
+    /// standard mode without parsing HTTP details.
+    async fn invoke_rerank(
+        &self,
+        query: &str,
+        documents: Vec<String>,
+        top_k: usize,
+    ) -> Result<RerankResponse, String> {
+        let url = format!("{}/rerank", self.embedder_url);
+        let resp = self
+            .http_client
+            .post(&url)
+            .json(&json!({
+                "query": query,
+                "documents": documents,
+                "top_k": top_k,
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("Rerank request failed: {e}"))?;
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            return Err(
+                "Reranker is disabled on the embedder. Set BSMCP_RERANK_PROVIDER \
+                 (local|voyage|openai) to enable rerank/precision modes."
+                    .to_string(),
+            );
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Rerank error {status}: {body}"));
+        }
+
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Rerank response parse error: {e}"))?;
+
+        let results_arr = body
+            .get("results")
+            .and_then(|v| v.as_array())
+            .ok_or("Rerank response missing 'results' array")?;
+        let provider = body
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let model = body
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let mut hits = Vec::with_capacity(results_arr.len());
+        for item in results_arr {
+            let idx = item
+                .get("index")
+                .and_then(|v| v.as_u64())
+                .ok_or("Rerank item missing 'index'")? as usize;
+            let score = item
+                .get("score")
+                .and_then(|v| v.as_f64())
+                .ok_or("Rerank item missing 'score'")? as f32;
+            hits.push((idx, score));
+        }
+        Ok(RerankResponse { hits, provider, model })
+    }
+
+    /// Cross-encoder rerank step for **precision** mode. Replaces the blanket
     /// boost + hybrid blend that the standard search path applies after the
     /// permission filter. Picks one document per candidate page (the best-
     /// scoring chunk's heading + content), POSTs `(query, [doc])` to the
@@ -687,7 +885,8 @@ impl SemanticState {
                     "total_indexed": stats.total_pages,
                     "total_chunks": stats.total_chunks,
                     "query_time_ms": start.elapsed().as_millis(),
-                    "mode": "precision",
+                    "mode": SearchMode::Precision.as_str(),
+                    "hybrid": false,
                     "candidates_reranked": 0,
                 }
             }));
@@ -730,62 +929,12 @@ impl SemanticState {
             doc_to_page.push(*pid);
         }
 
-        let url = format!("{}/rerank", self.embedder_url);
-        let resp = self
-            .http_client
-            .post(&url)
-            .json(&json!({
-                "query": query,
-                "documents": docs,
-                "top_k": limit,
-            }))
-            .send()
-            .await
-            .map_err(|e| format!("Rerank request failed: {e}"))?;
+        let rerank_start = Instant::now();
+        let rr = self.invoke_rerank(query, docs, limit).await?;
+        let rerank_ms = rerank_start.elapsed().as_millis();
 
-        let status = resp.status();
-        if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-            return Err(
-                "Precision mode requires the embedder reranker. Set BSMCP_RERANK_PROVIDER \
-                 (local|voyage|openai) on the embedder, then retry."
-                    .to_string(),
-            );
-        }
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Rerank error {status}: {body}"));
-        }
-
-        let body: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("Rerank response parse error: {e}"))?;
-
-        let results_arr = body
-            .get("results")
-            .and_then(|v| v.as_array())
-            .ok_or("Rerank response missing 'results' array")?;
-        let rerank_provider = body
-            .get("provider")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let rerank_model = body
-            .get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        let mut ranked: Vec<(i64, f32)> = Vec::with_capacity(results_arr.len());
-        for item in results_arr {
-            let idx = item
-                .get("index")
-                .and_then(|v| v.as_u64())
-                .ok_or("Rerank item missing 'index'")? as usize;
-            let score = item
-                .get("score")
-                .and_then(|v| v.as_f64())
-                .ok_or("Rerank item missing 'score'")? as f32;
+        let mut ranked: Vec<(i64, f32)> = Vec::with_capacity(rr.hits.len());
+        for (idx, score) in rr.hits {
             let Some(&pid) = doc_to_page.get(idx) else {
                 return Err(format!(
                     "Rerank index {idx} out of bounds (max {})",
@@ -882,9 +1031,11 @@ impl SemanticState {
                 "total_indexed": stats.total_pages,
                 "total_chunks": stats.total_chunks,
                 "query_time_ms": query_time_ms,
-                "mode": "precision",
-                "rerank_provider": rerank_provider,
-                "rerank_model": rerank_model,
+                "rerank_ms": rerank_ms,
+                "mode": SearchMode::Precision.as_str(),
+                "hybrid": false,
+                "rerank_provider": rr.provider,
+                "rerank_model": rr.model,
                 "candidates_reranked": doc_to_page.len(),
             }
         }))

@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use pulldown_cmark::{html, Options, Parser};
 
 use bsmcp_common::bookstack::{self, BookStackClient, ContentType, ExportFormat};
-use crate::semantic::{trim_match, SemanticState};
+use crate::semantic::{trim_match, SearchMode, SemanticState};
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
 
@@ -97,15 +97,19 @@ async fn execute_tool(
             let default_threshold = if hybrid { 0.45 } else { 0.50 };
             let threshold = args.get("threshold").and_then(|v| v.as_f64()).unwrap_or(default_threshold) as f32;
             let verbose = args.get("verbose").and_then(|v| v.as_bool()).unwrap_or(false);
-            // Accept either `precision: true` or `mode: "precision"`. The
-            // boolean is the canonical knob; `mode` is sugar for callers that
-            // think in named modes.
-            let precision = args.get("precision").and_then(|v| v.as_bool()).unwrap_or(false)
-                || args.get("mode").and_then(|v| v.as_str()) == Some("precision");
+            let mode_str = args
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("standard");
+            let mode = SearchMode::parse(mode_str).ok_or_else(|| {
+                format!(
+                    "invalid mode '{mode_str}' (expected: standard, rerank, precision)"
+                )
+            })?;
             // The HTTP `filter_by_permission` fallback inside `sem.search`
             // enforces per-page access control via BookStack's API.
             let mut result = sem
-                .search(&query, limit, threshold, hybrid, verbose, client, None, precision)
+                .search(&query, limit, threshold, hybrid, verbose, client, None, mode)
                 .await?;
             trim_semantic_search_payload(&mut result);
             format_json(&result)
@@ -1808,17 +1812,21 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
 
     if semantic_enabled {
         tools.push(tool("semantic_search",
-            "Hybrid search combining vector embeddings with keyword matching. Finds pages by meaning AND exact terms. Results are re-ranked using graph relationships (Markov blanket). IMPORTANT: Include related terms, synonyms, and domain-specific vocabulary in your query for better recall. For example, instead of 'office gets hacked', search 'security breach incident response ransomware compromise recovery'. The richer the query, the better the vector matching. Set hybrid=false for pure vector search only. Set precision=true (or mode='precision') to replace the blanket+blend ranker with a cross-encoder rerank — wider initial vector pass, then the embedder's /rerank scores each candidate against the query directly. Higher quality, slightly slower; requires BSMCP_RERANK_PROVIDER configured on the embedder.",
+            "Hybrid search combining vector embeddings with keyword matching. Finds pages by meaning AND exact terms. IMPORTANT: Include related terms, synonyms, and domain-specific vocabulary in your query for better recall. For example, instead of 'office gets hacked', search 'security breach incident response ransomware compromise recovery'. \
+             \n\nMode controls the ranking strategy: \
+             'standard' (default) = vector + keyword + Markov-blanket boost + blended sort, no cross-encoder. Free, known-good baseline. \
+             'rerank' = same candidate selection as standard, but the final top-N is re-ordered by a cross-encoder rerank pass. Cheap refinement (~10-30ms for top-10 against a local cross-encoder); requires BSMCP_RERANK_PROVIDER on the embedder. \
+             'precision' = cross-encoder is the ranker of record. Wider initial vector pass (5x limit), no keyword/blanket blend, /rerank scores each candidate directly. More expensive, can rescue hits the blend would miss; also requires BSMCP_RERANK_PROVIDER. \
+             \n\nAll three modes return the same JSON shape so you can A/B by swapping the mode value on the same query.",
             json!({
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Natural language search query. Include synonyms and related terms for better results." },
                     "limit": { "type": "integer", "description": "Max number of page results to return", "default": 10 },
                     "threshold": { "type": "number", "description": "Minimum cosine similarity score (0.0-1.0). Default: 0.45 for hybrid, 0.50 for pure vector.", "default": 0.45 },
-                    "hybrid": { "type": "boolean", "description": "Combine vector + keyword search (default true). Set false for pure vector. Forced to false when precision is true.", "default": true },
+                    "hybrid": { "type": "boolean", "description": "Combine vector + keyword search (default true). Set false for pure vector. Forced to false when mode='precision'.", "default": true },
                     "verbose": { "type": "boolean", "description": "Include full Markov blanket data in results. Default false returns slim results (scores, chunks, scoring breakdown). Set true for full graph context.", "default": false },
-                    "precision": { "type": "boolean", "description": "Cross-encoder rerank mode. Vector pass widens to 5x limit, then the embedder's /rerank scores each candidate against the query. Replaces the blanket+blend ranker. Requires BSMCP_RERANK_PROVIDER on the embedder. Default false.", "default": false },
-                    "mode": { "type": "string", "description": "Convenience alias: 'precision' is equivalent to precision=true. Other values are ignored.", "enum": ["precision"] }
+                    "mode": { "type": "string", "description": "Ranking strategy. 'standard' (default), 'rerank' (refinement), or 'precision' (cascade). Both rerank and precision require BSMCP_RERANK_PROVIDER configured on the embedder.", "enum": ["standard", "rerank", "precision"], "default": "standard" }
                 },
                 "required": ["query"]
             })));

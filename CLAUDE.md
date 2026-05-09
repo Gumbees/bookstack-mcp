@@ -66,13 +66,20 @@ crates/
 - Server selects backend at startup via `BSMCP_DB_BACKEND` env var
 
 **Semantic search flow:**
-1. Server receives `semantic_search` tool call
-2. Server POSTs query text to embedder's `/embed` endpoint → gets query embedding
-3. Server calls `db.vector_search()` → SQLite does brute-force cosine, PostgreSQL uses pgvector HNSW
-4. Server filters hits by per-page ACL via BookStack's API (`filter_by_permission`)
-5. **Standard mode:** server calls `db.get_markov_blanket()` for contextual relationships and applies a vector + keyword + blanket-boost blend.
-   **Precision mode (`precision: true` or `mode: "precision"`):** server widens the candidate pool (5x limit), picks the best chunk per page, and POSTs `(query, [doc])` to the embedder's `/rerank` endpoint. The cross-encoder score replaces the blend. Requires `BSMCP_RERANK_PROVIDER` configured on the embedder; otherwise the call returns a clear error and the caller can retry without `precision`.
-6. Returns ranked results with content snippets, scoring breakdown, and (in verbose mode) full relationship context
+
+`semantic_search` accepts `mode: "standard" | "rerank" | "precision"` (default `"standard"`). All three return the same JSON shape so a caller can A/B by swapping the mode value on the same query.
+
+1. Server receives `semantic_search` tool call.
+2. Server POSTs query text to embedder's `/embed` endpoint → query embedding.
+3. Server calls `db.vector_search()` → SQLite does brute-force cosine, PostgreSQL uses pgvector HNSW. Candidate pool is `limit*2` for standard/rerank, `limit*5` for precision.
+4. Server filters hits by per-page ACL via BookStack's API (`filter_by_permission`).
+5. Mode-specific ranking step:
+   - **Standard:** `db.get_markov_blanket()` for contextual relationships → vector + keyword + blanket-boost blend → top-N.
+   - **Rerank:** standard pipeline produces the top-N, then a cross-encoder pass via `/rerank` re-orders just those N. Cheap refinement (~10-30ms for N≤50). The candidate selection is unchanged; only the final ordering changes.
+   - **Precision:** wider pool, no blend. The cross-encoder is the ranker of record — picks the best chunk per page, POSTs `(query, [doc])` to `/rerank`, uses the score directly. `hybrid` is forced false in this mode.
+6. Returns ranked results with content snippets, per-result `scoring` breakdown (`vector` / `keyword` / `blanket_boost` / `rerank` when applicable), and (in verbose mode) full Markov-blanket context.
+
+Both `rerank` and `precision` modes require `BSMCP_RERANK_PROVIDER` configured on the embedder. Without it, `/rerank` returns 503 and the call surfaces a clear error so the caller can retry with `mode: "standard"`.
 
 **Embedding flow:**
 1. `reembed` tool or webhook inserts a job into `embed_jobs` table

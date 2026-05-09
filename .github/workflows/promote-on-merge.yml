@@ -55,15 +55,12 @@ jobs:
           VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
           MERGE_SHA=${{ github.event.pull_request.merge_commit_sha }}
           MERGE_SHORT_SHA=${MERGE_SHA:0:7}
-          HEAD_SHA=${{ github.event.pull_request.head.sha }}
-          HEAD_SHORT_SHA=${HEAD_SHA:0:7}
           SLUG=$(printf '%s' "${{ github.event.pull_request.head.ref }}" | tr '/' '-' | tr -c 'a-zA-Z0-9._-' '-')
           BASE=${{ github.event.pull_request.base.ref }}
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "merge_short_sha=$MERGE_SHORT_SHA" >> "$GITHUB_OUTPUT"
           echo "src_slug=$SLUG" >> "$GITHUB_OUTPUT"
-          echo "src_short_sha=$HEAD_SHORT_SHA" >> "$GITHUB_OUTPUT"
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
 
       - uses: docker/login-action@v3
@@ -79,16 +76,23 @@ jobs:
           set -euo pipefail
           VERSION=${{ steps.vars.outputs.version }}
           SRC_SLUG=${{ steps.vars.outputs.src_slug }}
-          SRC_SHA=${{ steps.vars.outputs.src_short_sha }}
           MERGE_SHA=${{ steps.vars.outputs.merge_short_sha }}
           BASE=${{ steps.vars.outputs.base }}
 
+          # Source = per-PR ROLLING tag, not the immutable per-commit tag.
+          # build-pr.yml moves the rolling tag on every push it processes;
+          # generate-artifacts.yml pushes a `[skip ci]` SBOM/STRUCTURE
+          # commit AFTER build-pr.yml runs, which moves PR head past the
+          # SHA build-pr.yml just stamped. The rolling tag captures the
+          # most recent successful Build PR run regardless of head drift.
+          # Once the PR closes the source branch is gone, so the rolling
+          # tag is frozen at the right artifact.
           for IMAGE in bsmcp-server bsmcp-embedder bsmcp-worker; do
-            SRC="${{ env.REGISTRY }}/bees-roadhouse/${IMAGE}:${VERSION}-${SRC_SLUG}-${SRC_SHA}"
+            SRC="${{ env.REGISTRY }}/bees-roadhouse/${IMAGE}:${VERSION}-${SRC_SLUG}"
             echo "Source: $SRC"
             if ! docker buildx imagetools inspect --raw "$SRC" >/dev/null 2>&1; then
               echo "::error::Source image not found: $SRC"
-              echo "::error::Expected build-pr.yml to have published this image during PR review."
+              echo "::error::Expected build-pr.yml to have published this rolling tag during PR review."
               exit 1
             fi
             if [ "$BASE" = "development" ]; then

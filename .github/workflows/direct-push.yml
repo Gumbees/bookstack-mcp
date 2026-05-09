@@ -31,7 +31,7 @@ name: Direct Push (development)
 #
 # Canonical references:
 #   https://kb.beesroadhouse.com/books/developer-operations-devops/page/branching-strategy             (1860)
-#   https://kb.beesroadhouse.com/books/developer-operations-devops/page/github-actions-workflow-template (1897)
+#   https://kb.beesroadhouse.com/books/developer-operations-devops/page/docker-image-build-workflows (1905)
 
 on:
   push:

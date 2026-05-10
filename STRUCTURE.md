@@ -1,6 +1,6 @@
 # Repository Structure
 
-_Auto-generated on 2026-05-09 22:37 UTC from commit `3d9e5b6`._
+_Auto-generated on 2026-05-10 00:49 UTC from commit `255b837`._
 
 ```
 .
@@ -31,7 +31,8 @@ _Auto-generated on 2026-05-09 22:37 UTC from commit `3d9e5b6`._
 │   │   ├── src
 │   │   │   ├── embed.rs
 │   │   │   ├── main.rs
-│   │   │   └── pipeline.rs
+│   │   │   ├── pipeline.rs
+│   │   │   └── rerank.rs
 │   │   └── Cargo.toml
 │   ├── bsmcp-server
 │   │   ├── src
@@ -66,5 +67,5 @@ _Auto-generated on 2026-05-09 22:37 UTC from commit `3d9e5b6`._
 ├── STRUCTURE.md
 └── entrypoint.sh
 
-16 directories, 46 files
+16 directories, 47 files
 ```

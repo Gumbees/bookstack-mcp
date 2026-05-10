@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fastembed::{
-    EmbeddingModel, InitOptions, InitOptionsUserDefined, Pooling, TextEmbedding,
-    TokenizerFiles, UserDefinedEmbeddingModel,
+    EmbeddingModel, InitOptions, InitOptionsUserDefined, Pooling, RerankInitOptions,
+    RerankerModel, TextEmbedding, TextRerank, TokenizerFiles, UserDefinedEmbeddingModel,
 };
 
 use bsmcp_common::acl::{build_role_context, reconcile_all_pages, resolve_page_acl, RoleContext};
@@ -93,6 +93,84 @@ impl EmbedModel {
     pub fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
         let mut m = self.model.lock().map_err(|e| format!("Model lock poisoned: {e}"))?;
         m.embed(texts, None).map_err(|e| format!("{e}"))
+    }
+}
+
+/// Resolve a reranker model name to its fastembed enum variant.
+fn resolve_reranker(name: &str) -> Option<RerankerModel> {
+    match name {
+        "BAAI/bge-reranker-base" | "bge-reranker-base" => Some(RerankerModel::BGERerankerBase),
+        "BAAI/bge-reranker-v2-m3" | "rozgo/bge-reranker-v2-m3" | "bge-reranker-v2-m3" => {
+            Some(RerankerModel::BGERerankerV2M3)
+        }
+        "jinaai/jina-reranker-v1-turbo-en" | "jina-reranker-v1-turbo-en" => {
+            Some(RerankerModel::JINARerankerV1TurboEn)
+        }
+        "jinaai/jina-reranker-v2-base-multilingual" | "jina-reranker-v2-base-multilingual" => {
+            Some(RerankerModel::JINARerankerV2BaseMultiligual)
+        }
+        _ => None,
+    }
+}
+
+/// Thread-safe wrapper around fastembed's `TextRerank` cross-encoder.
+pub struct RerankModel {
+    model: std::sync::Mutex<TextRerank>,
+    model_name: String,
+}
+
+impl RerankModel {
+    pub fn new(model_name: &str, cache_dir: &str) -> Result<Self, String> {
+        let reranker = resolve_reranker(model_name).ok_or_else(|| {
+            format!(
+                "Unknown reranker model: {model_name}. Supported: \
+                 BAAI/bge-reranker-base, BAAI/bge-reranker-v2-m3, \
+                 jinaai/jina-reranker-v1-turbo-en, \
+                 jinaai/jina-reranker-v2-base-multilingual"
+            )
+        })?;
+
+        let options = RerankInitOptions::new(reranker)
+            .with_cache_dir(cache_dir.into())
+            .with_show_download_progress(true);
+        let model = TextRerank::try_new(options)
+            .map_err(|e| format!("Reranker model init failed: {e}"))?;
+
+        eprintln!("Reranker loaded: {model_name}");
+        Ok(Self {
+            model: std::sync::Mutex::new(model),
+            model_name: model_name.to_string(),
+        })
+    }
+
+    pub fn model_name(&self) -> &str {
+        &self.model_name
+    }
+
+    /// Score `documents` against `query`. Thread-safe (locks internally).
+    pub fn rerank(
+        &self,
+        query: &str,
+        documents: Vec<String>,
+    ) -> Result<Vec<crate::rerank::RerankHit>, String> {
+        let mut m = self
+            .model
+            .lock()
+            .map_err(|e| format!("Reranker lock poisoned: {e}"))?;
+        // fastembed's `rerank` shares one generic `S: AsRef<str>` between
+        // query and documents — owning the query as `String` lets `S = String`
+        // match `&Vec<String>: AsRef<[String]>`.
+        let q = query.to_string();
+        let results = m
+            .rerank(q, &documents, false, None)
+            .map_err(|e| format!("{e}"))?;
+        Ok(results
+            .into_iter()
+            .map(|r| crate::rerank::RerankHit {
+                index: r.index,
+                score: r.score,
+            })
+            .collect())
     }
 }
 

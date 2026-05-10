@@ -23,7 +23,7 @@ name: Release
 # moves the rolling tags. This workflow only handles the release stream.
 #
 # Canonical references:
-#   https://kb.beesroadhouse.com/books/developer-operations-devops/page/github-actions-workflow-template (1897)
+#   https://kb.beesroadhouse.com/books/developer-operations-devops/page/docker-image-build-workflows (1905)
 #   https://kb.beesroadhouse.com/books/developer-operations-devops/page/branching-strategy             (1860)
 
 on:

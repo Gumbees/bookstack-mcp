@@ -22,7 +22,7 @@ name: Promote on Merge
 # entry on `push: release` and the v* tag emergency hotfix path.
 #
 # Canonical reference:
-#   https://kb.beesroadhouse.com/books/developer-operations-devops/page/github-actions-workflow-template (1897, §Tag Promotion)
+#   https://kb.beesroadhouse.com/books/developer-operations-devops/page/docker-image-build-workflows (1905, §Tag Promotion)
 
 on:
   pull_request:

@@ -56,8 +56,8 @@ docker compose -f docker/docker-compose.sqlite.yml up -d
 
 The canonical reference for the org-wide branching standard is the [Branching Strategy](https://kb.beesroadhouse.com/books/developer-operations-devops/page/branching-strategy) page in the Bee's Roadhouse DevOps book. This file mirrors the policy that applies to this repo specifically.
 
-- `development` — default branch; all active work lands here. Direct pushes are **authorized** (small touchups, scaffolding, emergency hotfixes). Pushes trigger CI build/package.
-- `release` — stable/production; merged from development when ready to ship. The **only** protected branch (org-level ruleset blocks force-push and deletion; PR required).
+- `development` — default branch; all active work lands here. **PR required** (org-level `Default Branch Protection` ruleset: 1 approving review, thread resolution, no force-push, no deletion). PR merges trigger CI build/package.
+- `release` — stable/production; merged from development when ready to ship. PR required (org-level `Release Branch Protection` ruleset: 1 approving review, merge-commit only, no force-push, no deletion).
 - Work branches use the four-prefix taxonomy below.
 
 No `main` or `master` branches exist.
@@ -87,7 +87,7 @@ Breaking changes are orthogonal to type — prefix the **PR title** with `BREAKI
 9. When ready to ship: open PR from development -> release
 ```
 
-Direct pushes to `development` stay available — use them for small atomic changes, scaffolding, or emergency hotfixes. The PR flow is the team norm for anything else.
+All changes go through a PR — direct pushes are blocked by the org ruleset (returns `GH013`). For CI emergencies (workflow-bootstrap gap, broken build), use `workflow_dispatch` on `direct-push.yml` rather than bypassing the ruleset. Org admins can `gh pr merge --admin` for bootstrap PRs and small docs touchups, but `--admin` still routes through the PR machinery (CI runs, audit trail preserved) — it is not a direct push.
 
 ## CI/CD
 
@@ -143,7 +143,7 @@ Both Dockerfiles use BuildKit `--mount=type=cache` for `target/`, `~/.cargo/regi
 | `pull_request: opened/synchronize/reopened` against `development` or `release` | `build-pr.yml` (`build-server`, `build-embedder`, `build-worker`) | path-aware multi-arch build per image; tag `{version}-{slug}` (rolling per-PR) |
 | Same trigger | `generate-artifacts.yml` | regenerates `SBOM.md` + `STRUCTURE.md`, commits to PR source branch with `[skip ci]` |
 | `pull_request: closed` (merged: true) on `development` or `release` | `promote-on-merge.yml` | retags the PR head image as the appropriate stream tags via `imagetools create`. No rebuild. |
-| `push` to `development` that is **not** a PR-merge commit (rare; direct push) | `direct-push.yml` | full multi-arch build + stream tags. Authorized per Branching Strategy 1860. |
+| `push` to `development` that is **not** a PR-merge commit | `direct-push.yml` (`workflow_dispatch` only) | manual recovery — full multi-arch build + stream tags. The ruleset blocks ad-hoc direct pushes; this workflow runs on demand for CI emergencies (e.g. workflow-bootstrap gap). |
 | `workflow_dispatch` on `direct-push.yml` | `direct-push.yml` | manual recovery for the development stream — bypasses the PR-merge guard and rebuilds the four `:dev*` tags at the current `development` HEAD. Use after a workflow-bootstrap gap (workflow file introduced by the very PR whose merge would have run it). |
 | `push` to `release` (always a PR-merge from development) | `release.yml` (`github-release-on-merge` + `release-binaries-on-merge`) | creates the `v{version}` git tag (if missing) and the GitHub Release entry; builds `bsmcp-server` native binaries for 5 targets and attaches them. Image version tags were already moved by `promote-on-merge.yml` when the PR closed. |
 | `v*` tag push (emergency hotfix only) | `release.yml` (`tag-release` + `github-release-on-tag` + `release-binaries-on-tag`) | builds & pushes semver-tagged images directly in CI, creates the Release, attaches the server binaries. Use only when the normal PR flow isn't available. |
@@ -153,7 +153,7 @@ Both Dockerfiles use BuildKit `--mount=type=cache` for `target/`, `~/.cargo/regi
 
 - **CI builds, not contributor.** Build work runs in CI on every PR push. Engineers don't need a local multi-arch builder or a GHCR PAT to get their PR through review. Cost: ~15 min of CI minutes per PR push (mitigated by the path-aware fast path for docs/config-only PRs, which retag in ~2s).
 - **Squash-merge retags, doesn't rebuild.** The squash-merge commit's source tree is bit-identical to the PR head, so the PR head image is the right artifact. `promote-on-merge.yml` moves the rolling tags atomically; the registry handles the cleanup of the old manifest.
-- **Direct push to development has its own workflow.** Page 1860 authorizes direct pushes for scaffolding and hotfixes; page 1897 doesn't explicitly cover that case (it documents the squash-merge path only). `direct-push.yml` fills that gap with a full build + stream-tag push, gated to skip PR-merge commits so promote-on-merge owns those.
+- **`direct-push.yml` is the CI-emergency escape hatch, not an authorized push path.** Page 1860 (BR Branching Strategy) blocks ad-hoc direct pushes via the org ruleset. `direct-push.yml` runs on `workflow_dispatch` for manual recovery (workflow-bootstrap gap, broken CI) and is gated to skip PR-merge commits so `promote-on-merge.yml` owns those.
 - **Native binaries: server only.** `bsmcp-server` is pure Rust + bundled SQLite and cross-compiles cleanly. `bsmcp-embedder` depends on `fastembed` → ONNX Runtime → a per-platform C++ shared library; bare binaries would need ONNX Runtime installed on the host. Container is the only supported distribution for the embedder.
 - **External fork PRs are skipped.** Forks cannot push to `ghcr.io/bees-roadhouse/*`. `build-pr.yml`, `promote-on-merge.yml`, and `generate-artifacts.yml` all gate on `head.repo.full_name == github.repository`.
 
@@ -164,7 +164,7 @@ Per-PR (pushed by `build-pr.yml` on every PR commit):
 
 No per-commit immutable tag. Commit-level pinning is via `image@sha256:digest` from `docker buildx imagetools inspect`. Two reasons: (1) digest pinning is a strict superset of tag pinning, and (2) `generate-artifacts.yml` lands a `[skip ci]` SBOM/STRUCTURE auto-commit AFTER `build-pr.yml` runs — PR head moves to a SHA the gating build never built, so a per-PR `{sha}` immutable tag would be a footgun for `promote-on-merge.yml` (it'd look for a tag that doesn't exist). The rolling tag captures the most recent successful build regardless of head drift.
 
-Development stream (set by `promote-on-merge.yml` on PR close, or `direct-push.yml` on direct push):
+Development stream (set by `promote-on-merge.yml` on PR close, or `direct-push.yml` via `workflow_dispatch`):
 - `dev` — rolling, latest dev build
 - `dev-{merge_sha}` — immutable per-merge / per-push
 - `{version}-dev` — version-level dev rolling
@@ -202,7 +202,7 @@ Protection lives at the **organization level** via two GitHub Rulesets that appl
 - `Default Branch Protection` (`~DEFAULT_BRANCH`) — `pull_request` (1 approval, thread resolution), `non_fast_forward`, `deletion`. Bypass: `OrganizationAdmin` in `pull_request` mode.
 - `Release Branch Protection` (`refs/heads/release`, `refs/heads/release/*`, `refs/heads/release-*`) — `pull_request` (1 approval, merge-commit only, thread resolution), `non_fast_forward`, `deletion`. Bypass: `OrganizationAdmin` in `pull_request` mode.
 
-`development` rules trigger only on PR-merge — direct pushes stay authorized. CI runs on every PR push regardless, so regressions are caught before merge.
+Both rulesets enforce on every ref update on the targeted branches — direct pushes are rejected with `GH013`. CI runs on every PR push, so regressions are caught before merge. The `OrganizationAdmin` bypass uses `bypass_mode: pull_request` (skip review on a PR via `gh pr merge --admin`), not `repository` (which would allow direct push) — direct push is intentionally not configured.
 
 Required status checks for `build-server` / `build-embedder` / `build-worker` are **not** wired up yet. After this CI rework lands and the new check names stabilize, a follow-up will add them to both rulesets.
 

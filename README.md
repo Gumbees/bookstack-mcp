@@ -6,11 +6,11 @@ An MCP (Model Context Protocol) server that gives Claude full access to a [BookS
 
 - Full CRUD on all core BookStack resources (shelves, books, chapters, pages, attachments)
 - Full-text search with BookStack query operators
-- **Semantic vector search** — natural language search across all content via embeddings (optional). Hybrid (vector + keyword) with Markov-blanket re-ranking. Per-page access control is enforced via BookStack's API on every result.
+- **Semantic vector search** — natural language search across all content via embeddings (optional). Three modes on `semantic_search`: `standard` (default, vector + keyword + Markov-blanket blend), `rerank` (standard pool, cross-encoder refines top-N), `precision` (wider pool, cross-encoder replaces the blend). Per-page access control enforced via BookStack's API on every result.
 - **Settings UI (`/settings`)** — browser-based admin configuration page (token-gated via the same `/authorize` flow). Surfaces only the global server fields the index worker needs (`hive_shelf_id`, `user_journals_shelf_id`).
 - **Pluggable database** — SQLite for simple deployments, PostgreSQL + pgvector for production
 - **Separate embedder** — background embedding service with pluggable backends (local ONNX, Ollama, OpenAI, Voyage)
-- **Cross-encoder reranker (optional)** — embedder exposes `POST /rerank` when `BSMCP_RERANK_PROVIDER` is configured. Three providers: `local` (in-process ONNX cross-encoder via fastembed, default `BAAI/bge-reranker-v2-m3`), `voyage` (Voyage's `/v1/rerank`), `openai` (any OpenAI-shape rerank endpoint — covers Voyage/Jina/Cohere-via-shim/self-hosted). Off by default; consumed by the `semantic_search` tool's opt-in `mode: "precision"` cascade.
+- **Cross-encoder reranker (optional)** — embedder exposes `POST /rerank` when `BSMCP_RERANK_PROVIDER` is configured. Three providers: `local` (in-process ONNX cross-encoder via fastembed, default `BAAI/bge-reranker-v2-m3`), `voyage` (Voyage's `/v1/rerank`), `openai` (any OpenAI-shape rerank endpoint — covers Voyage/Jina/Cohere-via-shim/self-hosted). Off by default; consumed by `semantic_search`'s `mode: "rerank"` (refinement) and `mode: "precision"` (cascade) modes.
 - **Server-side markdown to HTML conversion** — send markdown, server converts before sending to BookStack
 - **Staging upload flow** — upload local images and attachments through a two-step staging endpoint without exposing local paths to the container ([see below](#uploading-local-files-images--attachments))
 - **OAuth 2.1 support** — use as a Claude.ai or Claude Desktop custom connector without config files
@@ -29,16 +29,18 @@ crates/
   bsmcp-db-sqlite/    SQLite backend (rusqlite, bundled)
   bsmcp-db-postgres/  PostgreSQL + pgvector backend (sqlx)
   bsmcp-server/       MCP server binary (axum, no ONNX dependency)
-  bsmcp-embedder/     Embedder binary (local ONNX / Ollama / OpenAI, job queue worker + HTTP /embed)
+  bsmcp-embedder/     Embedder binary (local ONNX / Ollama / OpenAI / Voyage, job queue worker + HTTP /embed + optional /rerank)
+  bsmcp-worker/       Reconciliation worker (initial walk + webhook/cron-driven delta walk; same DB as the server)
 
 docker/
   Dockerfile.server       Lightweight server image (~35MB)
   Dockerfile.embedder     Embedder image with ONNX Runtime (~45MB)
+  Dockerfile.worker       Reconciliation worker image
   docker-compose.yml      PostgreSQL deployment (production)
   docker-compose.sqlite.yml  SQLite deployment (simple)
 ```
 
-The MCP server handles all client-facing protocol, OAuth, and search. The embedder runs separately, polling a database-backed job queue to embed pages and serving a `/embed` HTTP endpoint for query-time embedding. The embedder supports three backends: local ONNX models (fastembed), Ollama, or OpenAI-compatible APIs.
+The MCP server handles all client-facing protocol, OAuth, and search. The embedder runs separately, polling a database-backed job queue to embed pages and serving a `/embed` HTTP endpoint for query-time embedding (and `/rerank` when a reranker provider is configured). The embedder supports four embedding backends: local ONNX models (fastembed), Ollama, OpenAI-compatible APIs, and Voyage. The worker owns the `index_jobs` queue — runs the initial full walk on cold start, then consumes webhook + cron jobs and the periodic delta walk.
 
 ## Available Tools (59 BookStack + 3 semantic = 62)
 
@@ -65,7 +67,7 @@ The MCP server handles all client-facing protocol, OAuth, and search. The embedd
 
 Semantic tools (`semantic_search`, `reembed`, `embedding_status`) only appear when `BSMCP_SEMANTIC_SEARCH=true` and an embedder is running. Without semantic search: 59 BookStack tools.
 
-The server is a thin BookStack CRUD facade plus semantic-search enrichment, OAuth, audit, and the reconciliation worker. Personal-memory primitives (journals, identities, reminders) and the v0.8.0/v0.9.0 briefing surface have been removed in v0.10.0 — see the migration notes below.
+The server is a thin BookStack CRUD facade plus semantic-search enrichment, OAuth, audit, and the reconciliation worker. Personal-memory primitives (journals, identities, reminders) and the v0.8.0/v0.9.0 briefing surface were removed in v0.10.0; v0.11.0 adds the optional cross-encoder reranker on the embedder side and the three-mode `semantic_search` shape on the server side. See the migration notes below.
 
 ## Setup
 
@@ -145,7 +147,7 @@ The server is pure Rust + bundled SQLite and builds cleanly on any target the Ru
 |----------|----------|---------|-------------|
 | `BSMCP_EMBED_TOKEN_ID` | Yes | - | BookStack API token ID for crawling |
 | `BSMCP_EMBED_TOKEN_SECRET` | Yes | - | BookStack API token secret |
-| `BSMCP_EMBED_PROVIDER` | No | `local` | Embedding backend: `local`, `ollama`, `openai` |
+| `BSMCP_EMBED_PROVIDER` | No | `local` | Embedding backend: `local`, `ollama`, `openai`, `voyage` |
 | `BSMCP_EMBED_MODEL` | No | (per provider) | Model name (see [Embedding Providers](#embedding-providers)) |
 | `BSMCP_EMBED_API_KEY` | If openai | - | API key for OpenAI embedding provider |
 | `BSMCP_EMBED_API_URL` | No | (per provider) | Base URL for Ollama or OpenAI-compatible endpoint |
@@ -264,9 +266,31 @@ The token ID and secret come from your BookStack API token (created under **My A
 
 All schema migrations are automatic on startup (CREATE TABLE IF NOT EXISTS, ALTER TABLE for new columns). No manual SQL is needed.
 
-> **Heads up.** v0.10.0 strips the briefing layer + per-user settings — the server is now a thin BookStack CRUD facade plus semantic search, OAuth, audit, and the reconciliation worker. Older entries describe functionality that no longer ships and are kept only for upgrade-path archaeology.
+> **Heads up.** v0.10.0 stripped the briefing layer + per-user settings; v0.11.0 (this release) adds the optional cross-encoder reranker. Older entries describe functionality that no longer ships and are kept only for upgrade-path archaeology.
 
-### From v0.9.0 to v0.10.0 (this release)
+### From v0.10.0 to v0.11.0 (this release)
+
+#### What's new
+
+- **Cross-encoder reranker on the embedder.** New `POST /rerank` endpoint when `BSMCP_RERANK_PROVIDER` is set on the embedder. Three providers: `local` (in-process ONNX cross-encoder via fastembed; default `BAAI/bge-reranker-v2-m3`), `voyage` (Voyage's `/v1/rerank`), `openai` (any OpenAI-shape rerank endpoint). Off by default — `BSMCP_RERANK_PROVIDER=none` (or unset) leaves the endpoint disabled and returns 503.
+- **Three-mode `semantic_search`.** Replaces the prior single-shape behavior with `mode: "standard" | "rerank" | "precision"`, defaulting to `"standard"`:
+  - `standard` — vector + keyword + Markov-blanket blend (the v0.10.0 default behavior).
+  - `rerank` — same candidate pool as standard, but the final top-N is re-ordered by the cross-encoder. Cheap refinement (~10–30 ms for top-10 against a local cross-encoder).
+  - `precision` — wider initial vector pool (5× limit), no keyword/blanket blend, cross-encoder is the ranker of record. More expensive, can rescue hits the blend would miss.
+- **Per-result `scoring.rerank` and `stats.rerank_*`** in the search response when either rerank-enabled mode fires (`mode`, `hybrid`, `rerank_ms`, `rerank_provider`, `rerank_model`, `candidates_reranked`).
+
+#### What's automatic
+
+- No schema changes. Drop-in at the database layer.
+- Existing `semantic_search` callers keep working unchanged — `mode` defaults to `"standard"` and reproduces v0.10.0 behavior.
+
+#### What you must do (only to use the new modes)
+
+1. Pull new images: `ghcr.io/bees-roadhouse/bsmcp-server:0.11.0` + `ghcr.io/bees-roadhouse/bsmcp-embedder:0.11.0` + `ghcr.io/bees-roadhouse/bsmcp-worker:0.11.0`.
+2. Set `BSMCP_RERANK_PROVIDER` (and the matching `BSMCP_RERANK_MODEL` / `BSMCP_RERANK_API_KEY` / `BSMCP_RERANK_API_URL`) on the embedder.
+3. Pass `mode: "rerank"` or `mode: "precision"` on `semantic_search` calls. If the reranker is disabled, the embedder returns 503 and the server surfaces a clear error pointing at `BSMCP_RERANK_PROVIDER` so callers can drop back to `mode: "standard"`.
+
+### From v0.9.0 to v0.10.0
 
 #### What's removed
 

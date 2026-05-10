@@ -261,4 +261,8 @@ docker buildx build --builder multiarch --platform linux/amd64,linux/arm64 \
 docker buildx build --builder multiarch --platform linux/amd64,linux/arm64 \
   -f docker/Dockerfile.embedder \
   -t ghcr.io/bees-roadhouse/bsmcp-embedder:VERSION --push .
+
+docker buildx build --builder multiarch --platform linux/amd64,linux/arm64 \
+  -f docker/Dockerfile.worker \
+  -t ghcr.io/bees-roadhouse/bsmcp-worker:VERSION --push .
 ```

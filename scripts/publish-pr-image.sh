@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
-# Build & push multi-arch images for the current branch's HEAD commit.
-# CI's verify-on-PR step expects these to exist before it will pass.
+# Optional. CI now builds images on every PR push (.github/workflows/
+# build-pr.yml). Use this script when you need to publish out-of-band:
+#   - Emergency hotfixes when CI is unavailable.
+#   - Local pre-PR experimentation against a non-PR branch.
+#   - Reproducing a specific PR head image locally for debugging.
 #
-# Path-aware fast path: when the PR's diff against `origin/development`
+# For the normal PR flow, just push your branch — build-pr.yml takes
+# over from there. See DEVELOPMENT.md for the canonical CI/CD shape.
+#
+# Path-aware fast path: when the branch's diff against `origin/development`
 # (or `origin/release` when targeting that) doesn't touch any file that
 # affects a given binary, we skip the rebuild and instead retag the
-# latest published `:dev` image as the per-PR tags. The CI verify step
-# only checks tag existence + multi-arch manifest shape — it doesn't
-# care whether the image was newly-built or retagged. Tag-only ops are
-# free; full builds on linux/arm64 take 15+ minutes.
+# latest published `:dev` image as the per-PR tags. Mirrors the same
+# logic build-pr.yml runs in CI via dorny/paths-filter@v3 — keep the
+# SERVER_PATHS / EMBEDDER_PATHS / WORKER_PATHS arrays here in sync with
+# the filter blocks in build-pr.yml. Tag-only ops are free; full builds
+# on linux/arm64 take 15+ minutes.
 #
 # Prerequisites:
 #   - docker + docker buildx with a multi-platform builder configured

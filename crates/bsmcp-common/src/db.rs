@@ -3,10 +3,10 @@ use std::path::Path;
 use async_trait::async_trait;
 
 use crate::index::*;
-use crate::settings::{GlobalSettings, UserSettings};
+use crate::settings::GlobalSettings;
 use crate::types::*;
 
-/// Core database operations (auth tokens, backups, user settings).
+/// Core database operations (auth tokens, backups, global settings).
 #[async_trait]
 pub trait DbBackend: Send + Sync + 'static {
     /// Atomically insert an access token if under the 10k limit.
@@ -31,17 +31,6 @@ pub trait DbBackend: Send + Sync + 'static {
 
     /// Create a database backup. SQLite: VACUUM INTO. Postgres: no-op (use pg_dump).
     async fn backup(&self, path: &Path) -> Result<(), String>;
-
-    // --- User settings (Hive memory flow config) ---
-
-    /// Load user settings keyed by `token_id_hash` (SHA-256 of raw token_id).
-    /// Returns Ok(None) when no row exists for this user. Default settings are
-    /// applied by the caller (UserSettings::default()) so v1 callers and
-    /// pre-existing users behave identically.
-    async fn get_user_settings(&self, token_id_hash: &str) -> Result<Option<UserSettings>, String>;
-
-    /// Upsert user settings for `token_id_hash`. Replaces the entire row.
-    async fn save_user_settings(&self, token_id_hash: &str, settings: &UserSettings) -> Result<(), String>;
 
     // --- Global settings (server-instance-wide) ---
 
@@ -170,20 +159,12 @@ pub trait SemanticDb: Send + Sync + 'static {
     /// `book_ids`: when `Some(&[..])`, restrict candidates to chunks whose
     /// parent page lives in one of those books. When `None` or an empty slice,
     /// search across the entire embedded corpus.
-    ///
-    /// `user_role_ids`: when `Some(&[..])`, additionally restrict candidates
-    /// to pages whose `page_view_acl` row matches one of the user's roles.
-    /// Pages with no ACL row are always included (the HTTP fallback path
-    /// in `semantic.rs` still verifies them) so search recall stays correct
-    /// while the embedded ACL eliminates fan-out for pages we already know
-    /// the user can or cannot access.
     async fn vector_search(
         &self,
         query_embedding: &[f32],
         limit: usize,
         threshold: f32,
         book_ids: Option<&[i64]>,
-        user_role_ids: Option<&[i64]>,
     ) -> Result<Vec<SearchHit>, String>;
 
     /// Look up the `book_id` for each requested page in one roundtrip.
@@ -234,30 +215,6 @@ pub trait SemanticDb: Send + Sync + 'static {
     /// List page IDs that have a stored ACL. Used by the daily reconciliation
     /// job to know which pages to refresh.
     async fn list_acl_page_ids(&self) -> Result<Vec<i64>, String>;
-
-    // --- User role cache (token → BookStack user id → role IDs) ---
-
-    /// Look up cached roles for a token-user. Returns `None` when the
-    /// cache entry is missing or older than `max_age_secs`.
-    async fn get_cached_user_roles(
-        &self,
-        token_id_hash: &str,
-        max_age_secs: i64,
-    ) -> Result<Option<(i64, Vec<i64>)>, String>;
-
-    /// Cache the roles list for a token-user. `bookstack_user_id` is stored
-    /// alongside so callers can use it for per-user permission overrides.
-    async fn set_cached_user_roles(
-        &self,
-        token_id_hash: &str,
-        bookstack_user_id: i64,
-        role_ids: &[i64],
-    ) -> Result<(), String>;
-
-    /// Drop every cached entry for the given BookStack user. Called by the
-    /// webhook handler on `user_update` (role assignments may have changed)
-    /// and `user_delete` (account is gone).
-    async fn delete_user_role_cache_by_bs_id(&self, bookstack_user_id: i64) -> Result<(), String>;
 }
 
 /// v1.0.0 reconciliation index — structural mirror of every BookStack item we
@@ -329,9 +286,7 @@ pub trait IndexDb: Send + Sync + 'static {
         book_id: i64,
     ) -> Result<Vec<IndexedPage>, String>;
     /// Most-recently-updated pages within a book, sorted by `page_updated_at`
-    /// descending. Used by the briefing's recent-pages list (Phase 5
-    /// read-path cutover) to replace the live BookStack `get_book` traversal
-    /// with a local indexed lookup.
+    /// descending.
     async fn list_indexed_pages_recent(
         &self,
         book_id: i64,

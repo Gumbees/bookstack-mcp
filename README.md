@@ -6,18 +6,16 @@ An MCP (Model Context Protocol) server that gives Claude full access to a [BookS
 
 - Full CRUD on all core BookStack resources (shelves, books, chapters, pages, attachments)
 - Full-text search with BookStack query operators
-- **Semantic vector search** — natural language search across all content via embeddings (optional). Hybrid (vector + keyword) with Markov-blanket re-ranking; ACL-filtered when the caller's BookStack user ID is configured.
-- **Briefing flow (`POST /briefing/v1/read` + `briefing` MCP tool)** — server-side per-session reconstitution. Returns time, `system_prompt_additions` (guide page, org identity, org required instructions, AI-usage policy, user system_prompt_page_ids, owned-domains block), `setup_nudge` when settings are incomplete, and `kb_semantic_matches` against the user prompt. Auto-injected as `meta.briefing` on every other tool response — full content first call per session, sticky bits thereafter. **No personal-memory primitives** (journals, identities, etc.) — this server is a BookStack bridge, not a memory backend.
-- **Settings UI (`/settings`)** — browser-based admin/user configuration page (token-gated via the same `/authorize` flow). Per-user fields for label/role/timezone/owned-domains/system_prompt_page_ids; admin globals for guide page, org identity, org_required_instructions / org_ai_usage_policy page lists, typed scope slots (policies/sops/best_practices), and org domains.
+- **Semantic vector search** — natural language search across all content via embeddings (optional). Three modes on `semantic_search`: `standard` (default, vector + keyword + Markov-blanket blend), `rerank` (standard pool, cross-encoder refines top-N), `precision` (wider pool, cross-encoder replaces the blend). Per-page access control enforced via BookStack's API on every result.
+- **Settings UI (`/settings`)** — browser-based admin configuration page (token-gated via the same `/authorize` flow). Surfaces only the global server fields the index worker needs (`hive_shelf_id`, `user_journals_shelf_id`).
 - **Pluggable database** — SQLite for simple deployments, PostgreSQL + pgvector for production
-- **Separate embedder** — background embedding service with pluggable backends (local ONNX, Ollama, OpenAI)
+- **Separate embedder** — background embedding service with pluggable backends (local ONNX, Ollama, OpenAI, Voyage)
+- **Cross-encoder reranker (optional)** — embedder exposes `POST /rerank` when `BSMCP_RERANK_PROVIDER` is configured. Three providers: `local` (in-process ONNX cross-encoder via fastembed, default `BAAI/bge-reranker-v2-m3`), `voyage` (Voyage's `/v1/rerank`), `openai` (any OpenAI-shape rerank endpoint — covers Voyage/Jina/Cohere-via-shim/self-hosted). Off by default; consumed by `semantic_search`'s `mode: "rerank"` (refinement) and `mode: "precision"` (cascade) modes.
 - **Server-side markdown to HTML conversion** — send markdown, server converts before sending to BookStack
 - **Staging upload flow** — upload local images and attachments through a two-step staging endpoint without exposing local paths to the container ([see below](#uploading-local-files-images--attachments))
-- **Time-aware responses** — every briefing response (and every other MCP tool response, via `meta.briefing`) carries a `meta.time` block (now_unix/now_utc/now_local/now_human/timezone) sourced from a per-user cached IANA timezone. Lets agents reason about "yesterday" / "this morning" without re-deriving it.
 - **OAuth 2.1 support** — use as a Claude.ai or Claude Desktop custom connector without config files
 - **Encrypted token storage** — OAuth tokens encrypted at rest with AES-256-GCM
 - **Dual transport** — SSE (MCP 2024-11-05) and Streamable HTTP (MCP 2025-03-26)
-- **AI instance summary** — optional LLM-generated summary of your knowledge base included in MCP context
 - **Dynamic structure discovery** — AI automatically learns your BookStack hierarchy on connect
 - **Auto-migration** — seamlessly migrate from SQLite to PostgreSQL on startup
 - Multi-user support via per-session BookStack API tokens
@@ -31,24 +29,25 @@ crates/
   bsmcp-db-sqlite/    SQLite backend (rusqlite, bundled)
   bsmcp-db-postgres/  PostgreSQL + pgvector backend (sqlx)
   bsmcp-server/       MCP server binary (axum, no ONNX dependency)
-  bsmcp-embedder/     Embedder binary (local ONNX / Ollama / OpenAI, job queue worker + HTTP /embed)
+  bsmcp-embedder/     Embedder binary (local ONNX / Ollama / OpenAI / Voyage, job queue worker + HTTP /embed + optional /rerank)
+  bsmcp-worker/       Reconciliation worker (initial walk + webhook/cron-driven delta walk; same DB as the server)
 
 docker/
   Dockerfile.server       Lightweight server image (~35MB)
   Dockerfile.embedder     Embedder image with ONNX Runtime (~45MB)
+  Dockerfile.worker       Reconciliation worker image
   docker-compose.yml      PostgreSQL deployment (production)
   docker-compose.sqlite.yml  SQLite deployment (simple)
 ```
 
-The MCP server handles all client-facing protocol, OAuth, and search. The embedder runs separately, polling a database-backed job queue to embed pages and serving a `/embed` HTTP endpoint for query-time embedding. The embedder supports three backends: local ONNX models (fastembed), Ollama, or OpenAI-compatible APIs.
+The MCP server handles all client-facing protocol, OAuth, and search. The embedder runs separately, polling a database-backed job queue to embed pages and serving a `/embed` HTTP endpoint for query-time embedding (and `/rerank` when a reranker provider is configured). The embedder supports four embedding backends: local ONNX models (fastembed), Ollama, OpenAI-compatible APIs, and Voyage. The worker owns the `index_jobs` queue — runs the initial full walk on cold start, then consumes webhook + cron jobs and the periodic delta walk.
 
-## Available Tools (59 BookStack + 1 briefing + 3 semantic = 63)
+## Available Tools (59 BookStack + 3 semantic = 62)
 
 | Category | Tools |
 |----------|-------|
 | **Search** | `search_content` |
 | **Semantic** | `semantic_search`, `reembed`, `embedding_status` |
-| **Briefing** | `briefing` (single tool — per-session reconstitution + auto-injected as `meta.briefing` on every other tool response) |
 | **Shelves** | `list_shelves`, `get_shelf`, `create_shelf`, `update_shelf`, `delete_shelf` |
 | **Books** | `list_books`, `get_book`, `create_book`, `update_book`, `delete_book` |
 | **Chapters** | `list_chapters`, `get_chapter`, `create_chapter`, `update_chapter`, `delete_chapter` |
@@ -66,9 +65,9 @@ The MCP server handles all client-facing protocol, OAuth, and search. The embedd
 | **Permissions** | `get_content_permissions`, `update_content_permissions` |
 | **Roles** | `list_roles`, `get_role` |
 
-Semantic tools (`semantic_search`, `reembed`, `embedding_status`) only appear when `BSMCP_SEMANTIC_SEARCH=true` and an embedder is running. Without semantic search: 60 tools (59 BookStack + 1 briefing).
+Semantic tools (`semantic_search`, `reembed`, `embedding_status`) only appear when `BSMCP_SEMANTIC_SEARCH=true` and an embedder is running. Without semantic search: 59 BookStack tools.
 
-The `briefing` tool returns a `setup_nudge` listing pending settings fields with the exact path to fix them; configure via the `/settings` UI. Personal-memory primitives (journals, identities, reminders, events, sessions) are intentionally NOT in scope and live in dedicated downstream tools.
+The server is a thin BookStack CRUD facade plus semantic-search enrichment, OAuth, audit, and the reconciliation worker. Personal-memory primitives (journals, identities, reminders) and the v0.8.0/v0.9.0 briefing surface were removed in v0.10.0; v0.11.0 adds the optional cross-encoder reranker on the embedder side and the three-mode `semantic_search` shape on the server side. See the migration notes below.
 
 ## Setup
 
@@ -141,13 +140,6 @@ The server is pure Rust + bundled SQLite and builds cleanly on any target the Ru
 | `BSMCP_REFRESH_TOKEN_TTL` | No | `7776000` | Refresh token TTL in seconds (90d) |
 | `BSMCP_BACKUP_INTERVAL` | No | - | Hours between backups (0 = disabled) |
 | `BSMCP_BACKUP_PATH` | No | `/data/backups` | Backup directory |
-| `BSMCP_LLM_PROVIDER` | No | - | LLM for instance summary: `openrouter`, `anthropic`, `openai`, `ollama` |
-| `BSMCP_LLM_API_KEY` | No | - | API key for LLM provider (not needed for ollama) |
-| `BSMCP_LLM_MODEL` | No | (per provider) | Model ID for summary generation |
-| `BSMCP_LLM_API_URL` | No | (per provider) | Base URL for LLM API (useful for ollama on different host) |
-| `BSMCP_SUMMARY_INTERVAL` | No | `0` | Hours between summary regeneration (0 = only on first startup) |
-| `BSMCP_SUMMARY_TOKEN_ID` | No | - | BookStack token for summary (falls back to `BSMCP_EMBED_TOKEN_*`) |
-| `BSMCP_SUMMARY_TOKEN_SECRET` | No | - | BookStack token secret for summary |
 
 #### Embedder Variables
 
@@ -155,7 +147,7 @@ The server is pure Rust + bundled SQLite and builds cleanly on any target the Ru
 |----------|----------|---------|-------------|
 | `BSMCP_EMBED_TOKEN_ID` | Yes | - | BookStack API token ID for crawling |
 | `BSMCP_EMBED_TOKEN_SECRET` | Yes | - | BookStack API token secret |
-| `BSMCP_EMBED_PROVIDER` | No | `local` | Embedding backend: `local`, `ollama`, `openai` |
+| `BSMCP_EMBED_PROVIDER` | No | `local` | Embedding backend: `local`, `ollama`, `openai`, `voyage` |
 | `BSMCP_EMBED_MODEL` | No | (per provider) | Model name (see [Embedding Providers](#embedding-providers)) |
 | `BSMCP_EMBED_API_KEY` | If openai | - | API key for OpenAI embedding provider |
 | `BSMCP_EMBED_API_URL` | No | (per provider) | Base URL for Ollama or OpenAI-compatible endpoint |
@@ -169,6 +161,10 @@ The server is pure Rust + bundled SQLite and builds cleanly on any target the Ru
 | `BSMCP_EMBED_ON_STARTUP` | No | `false` | `true` = auto-embed on startup, `clean` = clear all embeddings first |
 | `BSMCP_EMBED_HOST` | No | `0.0.0.0` | Embedder listen address |
 | `BSMCP_EMBED_PORT` | No | `8081` | Embedder listen port |
+| `BSMCP_RERANK_PROVIDER` | No | (unset) | Cross-encoder rerank provider: `local`, `voyage`, `openai`, `none`. Off by default; enables `POST /rerank` on the embedder. |
+| `BSMCP_RERANK_MODEL` | If reranker on | (per provider) | Reranker model. Defaults: `BAAI/bge-reranker-v2-m3` (local), `rerank-2` (voyage). Required for `openai`. |
+| `BSMCP_RERANK_API_KEY` | If voyage/openai | - | API key for external rerank provider. |
+| `BSMCP_RERANK_API_URL` | If openai | (per provider) | Base URL. Voyage defaults to `https://api.voyageai.com`; openai requires explicit URL. |
 
 See `.env.example` for the full list with comments.
 
@@ -270,9 +266,70 @@ The token ID and secret come from your BookStack API token (created under **My A
 
 All schema migrations are automatic on startup (CREATE TABLE IF NOT EXISTS, ALTER TABLE for new columns). No manual SQL is needed.
 
-> **Heads up about the historical entries below.** v0.8.0 removed the `/remember` protocol and its 12 `remember_*` MCP tools (the personal-memory layer moved to memberberry.ai); v0.9.0 reverted v1.0.0's brief re-introduction of those primitives. The pre-v0.8.0 entries (v0.7.x and earlier) describe functionality that no longer ships — they're kept for upgrade-path archaeology, not as a current feature list.
+> **Heads up.** v0.10.0 stripped the briefing layer + per-user settings; v0.11.0 (this release) adds the optional cross-encoder reranker. Older entries describe functionality that no longer ships and are kept only for upgrade-path archaeology.
 
-### From v0.8.0 to v0.9.0 (this release)
+### From v0.10.0 to v0.11.0 (this release)
+
+#### What's new
+
+- **Cross-encoder reranker on the embedder.** New `POST /rerank` endpoint when `BSMCP_RERANK_PROVIDER` is set on the embedder. Three providers: `local` (in-process ONNX cross-encoder via fastembed; default `BAAI/bge-reranker-v2-m3`), `voyage` (Voyage's `/v1/rerank`), `openai` (any OpenAI-shape rerank endpoint). Off by default — `BSMCP_RERANK_PROVIDER=none` (or unset) leaves the endpoint disabled and returns 503.
+- **Three-mode `semantic_search`.** Replaces the prior single-shape behavior with `mode: "standard" | "rerank" | "precision"`, defaulting to `"standard"`:
+  - `standard` — vector + keyword + Markov-blanket blend (the v0.10.0 default behavior).
+  - `rerank` — same candidate pool as standard, but the final top-N is re-ordered by the cross-encoder. Cheap refinement (~10–30 ms for top-10 against a local cross-encoder).
+  - `precision` — wider initial vector pool (5× limit), no keyword/blanket blend, cross-encoder is the ranker of record. More expensive, can rescue hits the blend would miss.
+- **Per-result `scoring.rerank` and `stats.rerank_*`** in the search response when either rerank-enabled mode fires (`mode`, `hybrid`, `rerank_ms`, `rerank_provider`, `rerank_model`, `candidates_reranked`).
+
+#### What's automatic
+
+- No schema changes. Drop-in at the database layer.
+- Existing `semantic_search` callers keep working unchanged — `mode` defaults to `"standard"` and reproduces v0.10.0 behavior.
+
+#### What you must do (only to use the new modes)
+
+1. Pull new images: `ghcr.io/bees-roadhouse/bsmcp-server:0.11.0` + `ghcr.io/bees-roadhouse/bsmcp-embedder:0.11.0` + `ghcr.io/bees-roadhouse/bsmcp-worker:0.11.0`.
+2. Set `BSMCP_RERANK_PROVIDER` (and the matching `BSMCP_RERANK_MODEL` / `BSMCP_RERANK_API_KEY` / `BSMCP_RERANK_API_URL`) on the embedder.
+3. Pass `mode: "rerank"` or `mode: "precision"` on `semantic_search` calls. If the reranker is disabled, the embedder returns 503 and the server surfaces a clear error pointing at `BSMCP_RERANK_PROVIDER` so callers can drop back to `mode: "standard"`.
+
+### From v0.9.0 to v0.10.0
+
+#### What's removed
+
+- **`briefing` MCP tool, `POST /briefing/v1/read` HTTP route, and the auto-injected `meta.briefing` envelope** are all gone. The single-call reconstitution shell from v0.8.0 / v0.9.0 turned out to fan out 5+ parallel BookStack page fetches per request and fail open on stale `system_prompt_page_ids` config. Removed wholesale.
+- **Per-user `UserSettings`** struct and the `user_settings` table (both Postgres and SQLite) — every consumer was the briefing path or related setup nudges. No per-user state to persist after the cut.
+- **Per-user role-level ACL filtering on semantic search and `tools/list`** — depended on `UserSettings.bookstack_user_id`. Semantic search becomes user-anonymous on the embedder side; per-page access control still runs through BookStack's API on every result.
+- **`user_role_cache` table** — fed only the per-user role-level filter.
+- **Briefing-only `GlobalSettings` fields** (`org_required_instructions_page_ids`, `org_ai_usage_policy_page_ids`, `org_identity_page_id`, `org_domains`, `guide_page_id`, `policies_scope`, `sops_scope`, `best_practices_scope`, `friendly_structure`, `full_content_in_briefing`, `strict_setup`) and the matching `/settings` UI sections.
+- **Instance summary subsystem** (Ollama caller + the `Summary: …` log lines + `BSMCP_LLM_*` / `BSMCP_SUMMARY_*` env vars).
+- **`session_event` and `dismiss_setup_nudge` MCP tools** (briefing-only).
+- **`try_auto_populate_bookstack_user_id` in the OAuth flow** — no settings row to populate.
+- **v0.7.x `extras` migration shims.**
+
+#### What survives
+
+- 59 BookStack CRUD tools (`create_*` / `update_*` / `delete_*` / `get_*` / `list_*` + `search_content`).
+- `semantic_search`, `reembed`, `embedding_status`.
+- `bsmcp-embedder` + `bsmcp-worker` images and the reconciler.
+- Rate limiter + audit log (#54 infra).
+- OAuth 2.1 / `/authorize` flow.
+- `/settings` admin UI for the surviving global server config (`hive_shelf_id`, `user_journals_shelf_id`).
+
+#### Tool count
+
+- With semantic search: **62 tools** (59 CRUD + 3 semantic). Without semantic: 59.
+
+#### What's automatic
+
+- `user_settings`, `user_role_cache`, `remember_audit`, `token_bindings`, `sessions` tables are dropped on first startup (idempotent).
+- Briefing-only `global_settings` columns are dropped via `ALTER TABLE DROP COLUMN` (Postgres native; SQLite ≥ 3.35).
+- Existing org-level page-id config is discarded — re-enter via the trimmed `/settings` page if any of the surviving fields apply.
+
+#### Breaking changes
+
+- Clients calling `briefing` or `/briefing/v1/read` get `tool not found` / `404`.
+- Tool responses no longer carry `meta.briefing`.
+- `tools/list` no longer filters by role.
+
+### From v0.8.0 to v0.9.0
 
 #### What's new
 

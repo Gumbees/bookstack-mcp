@@ -13,8 +13,6 @@ use zeroize::Zeroize;
 
 use bsmcp_common::bookstack::BookStackClient;
 use bsmcp_common::config::access_token_ttl;
-use bsmcp_common::db::DbBackend;
-use bsmcp_common::settings::hash_token_id;
 
 use crate::sse::AppState;
 
@@ -318,59 +316,6 @@ pub async fn handle_authorize(
     Html(render_login_form(&params, &state.bookstack_url, None)).into_response()
 }
 
-/// Best-effort: probe BookStack for the calling token's user row and store the
-/// numeric `bookstack_user_id` on the user's settings. Skipped silently if
-/// already set, the probe fails, or persistence fails — login still succeeds.
-///
-/// This restores the v0.7.x auto-populate (lost in the v0.8.0 refactor) so a
-/// freshly authorized user doesn't see a permanent `setup_nudge` for
-/// `bookstack_user_id`. Tokens without `/api/users` access fall back to the
-/// existing manual `/settings` path.
-async fn try_auto_populate_bookstack_user_id(
-    db: &dyn DbBackend,
-    client: &BookStackClient,
-    token_id: &str,
-) {
-    let token_id_hash = hash_token_id(token_id);
-
-    let mut settings = match db.get_user_settings(&token_id_hash).await {
-        Ok(Some(s)) => s,
-        Ok(None) => Default::default(),
-        Err(e) => {
-            eprintln!("oauth: bookstack_user_id auto-populate failed (non-fatal): load settings: {e}");
-            return;
-        }
-    };
-
-    // Idempotent: skip if already set.
-    if settings.bookstack_user_id.is_some() {
-        return;
-    }
-
-    let identity = match client.whoami().await {
-        Ok(Some(id)) => id,
-        Ok(None) => {
-            // Brand-new account with no content yet; nothing to introspect.
-            return;
-        }
-        Err(e) => {
-            eprintln!("oauth: bookstack_user_id auto-populate failed (non-fatal): whoami: {e}");
-            return;
-        }
-    };
-
-    settings.bookstack_user_id = Some(identity.bookstack_user_id);
-    if let Err(e) = db.save_user_settings(&token_id_hash, &settings).await {
-        eprintln!("oauth: bookstack_user_id auto-populate failed (non-fatal): save settings: {e}");
-        return;
-    }
-
-    eprintln!(
-        "oauth: auto-populated bookstack_user_id={} for new authorization",
-        identity.bookstack_user_id
-    );
-}
-
 pub async fn handle_authorize_submit(
     State(state): State<AppState>,
     Form(form): Form<AuthorizeFormSubmit>,
@@ -419,10 +364,6 @@ pub async fn handle_authorize_submit(
         ))
         .into_response();
     }
-
-    // Best-effort: stamp `bookstack_user_id` on user_settings now that we know
-    // the token is valid. Idempotent and silent on failure — never blocks login.
-    try_auto_populate_bookstack_user_id(state.db.as_ref(), &bs_client, &form.token_id).await;
 
     // Browser settings flow: skip the OAuth code dance entirely. Issue a settings
     // session, set the cookie, and redirect to the return path.

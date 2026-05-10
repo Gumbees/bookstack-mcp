@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "bsmcp-common"
-version = "0.9.0"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -332,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "bsmcp-db-postgres"
-version = "0.9.0"
+version = "0.11.0"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -348,7 +348,7 @@ dependencies = [
 
 [[package]]
 name = "bsmcp-db-sqlite"
-version = "0.9.0"
+version = "0.11.0"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -363,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "bsmcp-embedder"
-version = "0.9.0"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -382,15 +382,13 @@ dependencies = [
 
 [[package]]
 name = "bsmcp-server"
-version = "0.9.0"
+version = "0.11.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
  "bsmcp-common",
  "bsmcp-db-postgres",
  "bsmcp-db-sqlite",
- "chrono",
- "chrono-tz",
  "futures",
  "pgvector",
  "pulldown-cmark",
@@ -411,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "bsmcp-worker"
-version = "0.9.0"
+version = "0.11.0"
 dependencies = [
  "bsmcp-common",
  "bsmcp-db-postgres",
@@ -494,16 +492,6 @@ dependencies = [
  "iana-time-zone",
  "num-traits",
  "windows-link",
-]
-
-[[package]]
-name = "chrono-tz"
-version = "0.10.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6139a8597ed92cf816dfb33f5dd6cf0bb93a6adc938f11039f371bc5bcd26c3"
-dependencies = [
- "chrono",
- "phf",
 ]
 
 [[package]]
@@ -2403,24 +2391,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "phf"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "913273894cec178f401a31ec4b656318d95473527be05c0752cc41cdc32be8b7"
-dependencies = [
- "phf_shared",
-]
-
-[[package]]
-name = "phf_shared"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06005508882fb681fd97892ecff4b7fd0fee13ef1aa569f8695dae7ab9099981"
-dependencies = [
- "siphasher",
-]
-
-[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3160,12 +3130,6 @@ checksum = "95890f873bec569a0362c235787f3aca6e1e887302ba4840839bcc6459c42da6"
 dependencies = [
  "quote",
 ]
-
-[[package]]
-name = "siphasher"
-version = "1.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2aa850e253778c88a04c3d7323b043aeda9d3e30d5971937c1855769763678e"
 
 [[package]]
 name = "slab"

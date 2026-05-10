@@ -14,44 +14,11 @@ use zeroize::Zeroizing;
 use bsmcp_common::config::{access_token_ttl, refresh_token_ttl};
 use bsmcp_common::db::{DbBackend, IndexDb, SemanticDb};
 use bsmcp_common::index::*;
-use bsmcp_common::settings::{GlobalSettings, UserSettings};
+use bsmcp_common::settings::GlobalSettings;
 use bsmcp_common::types::*;
 
 const BASE64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::STANDARD;
-
-fn encode_id_list(ids: &[i64]) -> Option<String> {
-    if ids.is_empty() { None } else { serde_json::to_string(ids).ok() }
-}
-
-fn decode_id_list(value: Option<String>) -> Vec<i64> {
-    match value {
-        Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_default(),
-        _ => Vec::new(),
-    }
-}
-
-fn encode_str_list(values: &[String]) -> Option<String> {
-    if values.is_empty() { None } else { serde_json::to_string(values).ok() }
-}
-
-fn decode_str_list(value: Option<String>) -> Vec<String> {
-    match value {
-        Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_default(),
-        _ => Vec::new(),
-    }
-}
-
-fn encode_kb_scope(scope: Option<&bsmcp_common::settings::KbScope>) -> Option<String> {
-    scope.and_then(|s| serde_json::to_string(s).ok())
-}
-
-fn decode_kb_scope(value: Option<String>) -> Option<bsmcp_common::settings::KbScope> {
-    match value {
-        Some(s) if !s.is_empty() => serde_json::from_str(&s).ok(),
-        _ => None,
-    }
-}
 
 pub struct PostgresDb {
     pool: PgPool,
@@ -107,107 +74,43 @@ impl PostgresDb {
             .ok();
 
         sqlx::query(
-            "CREATE TABLE IF NOT EXISTS user_settings (
-                token_id_hash TEXT PRIMARY KEY,
-                settings_json TEXT NOT NULL,
-                updated_at BIGINT NOT NULL
-            )"
-        )
-        .execute(&pool)
-        .await
-        .map_err(|e| format!("Failed to create user_settings table: {e}"))?;
-
-        sqlx::query(
             "CREATE TABLE IF NOT EXISTS global_settings (
                 id INT PRIMARY KEY CHECK (id = 1),
                 hive_shelf_id BIGINT,
                 user_journals_shelf_id BIGINT,
-                org_required_instructions_page_ids TEXT,
-                org_ai_usage_policy_page_ids TEXT,
-                org_identity_page_id BIGINT,
-                org_domains TEXT,
                 set_by_token_hash TEXT,
-                updated_at BIGINT NOT NULL DEFAULT 0,
-                guide_page_id BIGINT,
-                policies_scope TEXT,
-                sops_scope TEXT,
-                best_practices_scope TEXT,
-                friendly_structure BOOLEAN NOT NULL DEFAULT TRUE,
-                full_content_in_briefing BOOLEAN NOT NULL DEFAULT FALSE,
-                strict_setup BOOLEAN NOT NULL DEFAULT FALSE
+                updated_at BIGINT NOT NULL DEFAULT 0
             )"
         )
         .execute(&pool)
         .await
         .map_err(|e| format!("Failed to create global_settings table: {e}"))?;
 
-        // Migrations for older deployments — ADD COLUMN IF NOT EXISTS is supported in PG 9.6+.
+        // v0.10.0 cleanup migrations — drop the briefing/per-user-settings
+        // surface stripped in #78, plus leftovers from earlier reverts.
+        // Idempotent via IF EXISTS.
         for sql in [
-            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS org_required_instructions_page_ids TEXT",
-            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS org_ai_usage_policy_page_ids TEXT",
-            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS org_identity_page_id BIGINT",
-            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS org_domains TEXT",
-            // v0.8.0 typed slots + org-wide booleans.
-            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS guide_page_id BIGINT",
-            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS policies_scope TEXT",
-            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS sops_scope TEXT",
-            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS best_practices_scope TEXT",
-            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS friendly_structure BOOLEAN NOT NULL DEFAULT TRUE",
-            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS full_content_in_briefing BOOLEAN NOT NULL DEFAULT FALSE",
-            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS strict_setup BOOLEAN NOT NULL DEFAULT FALSE",
-        ] {
-            sqlx::query(sql).execute(&pool).await.ok();
-        }
-
-        // v0.8.0 cleanup migrations — fully idempotent via IF EXISTS.
-        for sql in [
-            // remember_audit + indexes — fully retired in v0.8.0; no consumers.
+            "DROP TABLE IF EXISTS user_settings CASCADE",
+            "DROP TABLE IF EXISTS user_role_cache CASCADE",
             "DROP TABLE IF EXISTS remember_audit CASCADE",
-            // default_ai_identity_* — orphaned when the personal-memory
-            // layer moved to memberberry.ai. Drop, don't preserve.
+            "DROP TABLE IF EXISTS token_bindings CASCADE",
+            "DROP TABLE IF EXISTS sessions CASCADE",
+            "ALTER TABLE global_settings DROP COLUMN IF EXISTS org_required_instructions_page_ids",
+            "ALTER TABLE global_settings DROP COLUMN IF EXISTS org_ai_usage_policy_page_ids",
+            "ALTER TABLE global_settings DROP COLUMN IF EXISTS org_identity_page_id",
+            "ALTER TABLE global_settings DROP COLUMN IF EXISTS org_domains",
+            "ALTER TABLE global_settings DROP COLUMN IF EXISTS guide_page_id",
+            "ALTER TABLE global_settings DROP COLUMN IF EXISTS policies_scope",
+            "ALTER TABLE global_settings DROP COLUMN IF EXISTS sops_scope",
+            "ALTER TABLE global_settings DROP COLUMN IF EXISTS best_practices_scope",
+            "ALTER TABLE global_settings DROP COLUMN IF EXISTS friendly_structure",
+            "ALTER TABLE global_settings DROP COLUMN IF EXISTS full_content_in_briefing",
+            "ALTER TABLE global_settings DROP COLUMN IF EXISTS strict_setup",
             "ALTER TABLE global_settings DROP COLUMN IF EXISTS default_ai_identity_page_id",
             "ALTER TABLE global_settings DROP COLUMN IF EXISTS default_ai_identity_name",
             "ALTER TABLE global_settings DROP COLUMN IF EXISTS default_ai_identity_ouid",
         ] {
             sqlx::query(sql).execute(&pool).await.ok();
-        }
-
-        // v0.9.0 cleanup migrations — drop the v1.0.0 memory-protocol
-        // surface that PR #66 reverted. Same logic as the SQLite backend;
-        // see the comment block there for the rationale. Idempotent.
-        for sql in [
-            "DROP TABLE IF EXISTS token_bindings CASCADE",
-            "DROP TABLE IF EXISTS sessions CASCADE",
-        ] {
-            sqlx::query(sql).execute(&pool).await.ok();
-        }
-
-        let stable_id_exists: bool = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_name = 'user_settings' AND column_name = 'stable_id'
-            )",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap_or(false);
-
-        if stable_id_exists {
-            eprintln!(
-                "v0.9.0 migration: user_settings has v1.0.0 stable_id PK — \
-                 dropping and recreating with token_id_hash PK \
-                 (existing user_settings rows discarded; reconfigure via /settings)"
-            );
-            for sql in [
-                "DROP TABLE user_settings",
-                "CREATE TABLE user_settings (
-                    token_id_hash TEXT PRIMARY KEY,
-                    settings_json TEXT NOT NULL,
-                    updated_at BIGINT NOT NULL
-                )",
-            ] {
-                sqlx::query(sql).execute(&pool).await.ok();
-            }
         }
 
         sqlx::query("INSERT INTO global_settings (id, updated_at) VALUES (1, 0) ON CONFLICT (id) DO NOTHING")
@@ -530,51 +433,10 @@ impl DbBackend for PostgresDb {
         Ok(())
     }
 
-    async fn get_user_settings(&self, token_id_hash: &str) -> Result<Option<UserSettings>, String> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT settings_json FROM user_settings WHERE token_id_hash = $1"
-        )
-        .bind(token_id_hash)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| format!("get_user_settings: {e}"))?;
-
-        match row {
-            Some((json,)) => serde_json::from_str(&json)
-                .map(Some)
-                .map_err(|e| format!("user_settings JSON parse: {e}")),
-            None => Ok(None),
-        }
-    }
-
-    async fn save_user_settings(&self, token_id_hash: &str, settings: &UserSettings) -> Result<(), String> {
-        let json = serde_json::to_string(settings)
-            .map_err(|e| format!("user_settings serialize: {e}"))?;
-        sqlx::query(
-            "INSERT INTO user_settings (token_id_hash, settings_json, updated_at)
-             VALUES ($1, $2, $3)
-             ON CONFLICT (token_id_hash) DO UPDATE SET
-                settings_json = EXCLUDED.settings_json,
-                updated_at = EXCLUDED.updated_at"
-        )
-        .bind(token_id_hash)
-        .bind(&json)
-        .bind(Self::now_secs())
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("save_user_settings: {e}"))?;
-        Ok(())
-    }
-
     async fn get_global_settings(&self) -> Result<GlobalSettings, String> {
         let row = sqlx::query(
             "SELECT hive_shelf_id, user_journals_shelf_id,
-                    org_required_instructions_page_ids,
-                    org_ai_usage_policy_page_ids,
-                    org_identity_page_id, org_domains,
-                    set_by_token_hash, updated_at,
-                    guide_page_id, policies_scope, sops_scope, best_practices_scope,
-                    friendly_structure, full_content_in_briefing, strict_setup
+                    set_by_token_hash, updated_at
              FROM global_settings WHERE id = 1"
         )
         .fetch_optional(&self.pool)
@@ -584,19 +446,8 @@ impl DbBackend for PostgresDb {
         Ok(row.map(|r| GlobalSettings {
             hive_shelf_id: r.get("hive_shelf_id"),
             user_journals_shelf_id: r.get("user_journals_shelf_id"),
-            org_required_instructions_page_ids: decode_id_list(r.get("org_required_instructions_page_ids")),
-            org_ai_usage_policy_page_ids: decode_id_list(r.get("org_ai_usage_policy_page_ids")),
-            org_identity_page_id: r.get("org_identity_page_id"),
-            org_domains: decode_str_list(r.get("org_domains")),
             set_by_token_hash: r.get("set_by_token_hash"),
             updated_at: r.get("updated_at"),
-            guide_page_id: r.get("guide_page_id"),
-            policies_scope: decode_kb_scope(r.get("policies_scope")),
-            sops_scope: decode_kb_scope(r.get("sops_scope")),
-            best_practices_scope: decode_kb_scope(r.get("best_practices_scope")),
-            friendly_structure: r.get("friendly_structure"),
-            full_content_in_briefing: r.get("full_content_in_briefing"),
-            strict_setup: r.get("strict_setup"),
         }).unwrap_or_default())
     }
 
@@ -618,36 +469,14 @@ impl DbBackend for PostgresDb {
             "UPDATE global_settings
              SET hive_shelf_id = $1,
                  user_journals_shelf_id = $2,
-                 org_required_instructions_page_ids = $3,
-                 org_ai_usage_policy_page_ids = $4,
-                 org_identity_page_id = $5,
-                 org_domains = $6,
-                 set_by_token_hash = $7,
-                 updated_at = $8,
-                 guide_page_id = $9,
-                 policies_scope = $10,
-                 sops_scope = $11,
-                 best_practices_scope = $12,
-                 friendly_structure = $13,
-                 full_content_in_briefing = $14,
-                 strict_setup = $15
+                 set_by_token_hash = $3,
+                 updated_at = $4
              WHERE id = 1"
         )
         .bind(settings.hive_shelf_id)
         .bind(settings.user_journals_shelf_id)
-        .bind(encode_id_list(&settings.org_required_instructions_page_ids))
-        .bind(encode_id_list(&settings.org_ai_usage_policy_page_ids))
-        .bind(settings.org_identity_page_id)
-        .bind(encode_str_list(&settings.org_domains))
         .bind(&final_setter)
         .bind(Self::now_secs())
-        .bind(settings.guide_page_id)
-        .bind(encode_kb_scope(settings.policies_scope.as_ref()))
-        .bind(encode_kb_scope(settings.sops_scope.as_ref()))
-        .bind(encode_kb_scope(settings.best_practices_scope.as_ref()))
-        .bind(settings.friendly_structure)
-        .bind(settings.full_content_in_briefing)
-        .bind(settings.strict_setup)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("save_global_settings: {e}"))?;
@@ -756,18 +585,6 @@ impl SemanticDb for PostgresDb {
             .map_err(|e| format!("Failed to create page_view_acl: {e}"))?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_page_view_acl_role ON page_view_acl(role_id, page_id)")
             .execute(&self.pool).await.ok();
-
-        // Cache: BookStack user id + role IDs per token. Refreshed lazily by
-        // semantic.rs on first vector_search per session, ~15 min TTL.
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS user_role_cache (
-                token_id_hash TEXT PRIMARY KEY,
-                bookstack_user_id BIGINT NOT NULL,
-                role_ids TEXT NOT NULL,
-                fetched_at BIGINT NOT NULL
-            )"
-        ).execute(&self.pool).await
-            .map_err(|e| format!("Failed to create user_role_cache: {e}"))?;
 
         // Reconciliation tracker — single-row table for the daily ACL refresh job.
         sqlx::query(
@@ -1421,7 +1238,6 @@ impl SemanticDb for PostgresDb {
         limit: usize,
         threshold: f32,
         book_ids: Option<&[i64]>,
-        user_role_ids: Option<&[i64]>,
     ) -> Result<Vec<SearchHit>, String> {
         // Sanity check: detect garbage embeddings (all zeros, NaN, etc.)
         let magnitude: f32 = query_embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -1445,43 +1261,9 @@ impl SemanticDb for PostgresDb {
             Some(ids) if !ids.is_empty() => Some(ids.to_vec()),
             _ => None,
         };
-        // Optional ACL filter. The predicate keeps chunks whose page is either:
-        //   - default-open (no explicit role restrictions anywhere in the
-        //     inheritance chain; HTTP fallback resolves system-level perms),
-        //   - has no ACL row computed yet (HTTP fallback in semantic.rs),
-        //   - has a `page_view_acl` row matching one of the user's roles.
-        // This eliminates pages we already know the user can't view from the
-        // candidate pool without losing recall on as-yet-uncomputed pages.
-        let role_filter: Option<Vec<i64>> = match user_role_ids {
-            Some(ids) if !ids.is_empty() => Some(ids.to_vec()),
-            _ => None,
-        };
 
-        let rows = match (book_filter, role_filter) {
-            (Some(books), Some(roles)) => sqlx::query(
-                "SELECT c.id, c.page_id, (1 - (c.embedding <=> $1::vector))::FLOAT4 AS score
-                 FROM chunks c
-                 JOIN pages p ON c.page_id = p.page_id
-                 WHERE 1 - (c.embedding <=> $1::vector) > $2::FLOAT8
-                   AND p.book_id = ANY($4)
-                   AND (
-                        p.acl_computed_at IS NULL
-                        OR COALESCE(p.acl_default_open, FALSE) = TRUE
-                        OR EXISTS (
-                            SELECT 1 FROM page_view_acl a
-                            WHERE a.page_id = p.page_id AND a.role_id = ANY($5)
-                        )
-                   )
-                 ORDER BY c.embedding <=> $1::vector
-                 LIMIT $3"
-            )
-            .bind(&vec)
-            .bind(threshold)
-            .bind(limit as i64)
-            .bind(&books)
-            .bind(&roles)
-            .fetch_all(&mut *tx).await,
-            (Some(books), None) => sqlx::query(
+        let rows = match book_filter {
+            Some(books) => sqlx::query(
                 "SELECT c.id, c.page_id, (1 - (c.embedding <=> $1::vector))::FLOAT4 AS score
                  FROM chunks c
                  JOIN pages p ON c.page_id = p.page_id
@@ -1495,28 +1277,7 @@ impl SemanticDb for PostgresDb {
             .bind(limit as i64)
             .bind(&books)
             .fetch_all(&mut *tx).await,
-            (None, Some(roles)) => sqlx::query(
-                "SELECT c.id, c.page_id, (1 - (c.embedding <=> $1::vector))::FLOAT4 AS score
-                 FROM chunks c
-                 JOIN pages p ON c.page_id = p.page_id
-                 WHERE 1 - (c.embedding <=> $1::vector) > $2::FLOAT8
-                   AND (
-                        p.acl_computed_at IS NULL
-                        OR COALESCE(p.acl_default_open, FALSE) = TRUE
-                        OR EXISTS (
-                            SELECT 1 FROM page_view_acl a
-                            WHERE a.page_id = p.page_id AND a.role_id = ANY($4)
-                        )
-                   )
-                 ORDER BY c.embedding <=> $1::vector
-                 LIMIT $3"
-            )
-            .bind(&vec)
-            .bind(threshold)
-            .bind(limit as i64)
-            .bind(&roles)
-            .fetch_all(&mut *tx).await,
-            (None, None) => sqlx::query(
+            None => sqlx::query(
                 "SELECT id, page_id, (1 - (embedding <=> $1::vector))::FLOAT4 AS score
                  FROM chunks
                  WHERE 1 - (embedding <=> $1::vector) > $2::FLOAT8
@@ -1717,62 +1478,6 @@ impl SemanticDb for PostgresDb {
         Ok(rows.into_iter().map(|r| r.0).collect())
     }
 
-    async fn get_cached_user_roles(
-        &self,
-        token_id_hash: &str,
-        max_age_secs: i64,
-    ) -> Result<Option<(i64, Vec<i64>)>, String> {
-        let cutoff = Self::now_secs() - max_age_secs;
-        let row: Option<(i64, String, i64)> = sqlx::query_as(
-            "SELECT bookstack_user_id, role_ids, fetched_at
-             FROM user_role_cache WHERE token_id_hash = $1"
-        )
-        .bind(token_id_hash)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| format!("get_cached_user_roles: {e}"))?;
-        match row {
-            Some((uid, json, fetched)) if fetched > cutoff => {
-                let roles: Vec<i64> = serde_json::from_str(&json).unwrap_or_default();
-                Ok(Some((uid, roles)))
-            }
-            _ => Ok(None),
-        }
-    }
-
-    async fn set_cached_user_roles(
-        &self,
-        token_id_hash: &str,
-        bookstack_user_id: i64,
-        role_ids: &[i64],
-    ) -> Result<(), String> {
-        let json = serde_json::to_string(role_ids).unwrap_or_else(|_| "[]".to_string());
-        sqlx::query(
-            "INSERT INTO user_role_cache (token_id_hash, bookstack_user_id, role_ids, fetched_at)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (token_id_hash) DO UPDATE SET
-                bookstack_user_id = EXCLUDED.bookstack_user_id,
-                role_ids = EXCLUDED.role_ids,
-                fetched_at = EXCLUDED.fetched_at"
-        )
-        .bind(token_id_hash)
-        .bind(bookstack_user_id)
-        .bind(&json)
-        .bind(Self::now_secs())
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("set_cached_user_roles: {e}"))?;
-        Ok(())
-    }
-
-    async fn delete_user_role_cache_by_bs_id(&self, bookstack_user_id: i64) -> Result<(), String> {
-        sqlx::query("DELETE FROM user_role_cache WHERE bookstack_user_id = $1")
-            .bind(bookstack_user_id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| format!("delete_user_role_cache_by_bs_id: {e}"))?;
-        Ok(())
-    }
 }
 
 // --- IndexDb impl (closes #36) ---

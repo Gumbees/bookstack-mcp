@@ -111,7 +111,7 @@ jobs:
   build:
     needs: [guard]
     if: needs.guard.outputs.is_pr_merge == 'false'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, nate-wsl]
     permissions:
       contents: read
       packages: write

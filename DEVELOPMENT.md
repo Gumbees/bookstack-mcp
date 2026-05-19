@@ -141,7 +141,7 @@ Both Dockerfiles use BuildKit `--mount=type=cache` for `target/`, `~/.cargo/regi
 |-------|----------|-------------|
 | Push to a work branch with **no open PR** | nothing | test locally |
 | `pull_request: opened/synchronize/reopened` against `development` or `release` | `build-pr.yml` (`build-server`, `build-embedder`, `build-worker`) | path-aware multi-arch build per image; tag `{version}-{slug}` (rolling per-PR) |
-| Same trigger | `generate-artifacts.yml` | regenerates `SBOM.md` + `STRUCTURE.md`, commits to PR source branch with `[skip ci]` |
+| Same trigger | `generate-artifacts.yml` | regenerates `SBOM.md` + `STRUCTURE.md`, commits to PR source branch (re-fire loop broken by `paths-ignore`, not `[skip ci]`, so squash-merge bodies stay clean) |
 | `pull_request: closed` (merged: true) on `development` or `release` | `promote-on-merge.yml` | retags the PR head image as the appropriate stream tags via `imagetools create`. No rebuild. |
 | `push` to `development` that is **not** a PR-merge commit | `direct-push.yml` (`workflow_dispatch` only) | manual recovery — full multi-arch build + stream tags. The ruleset blocks ad-hoc direct pushes; this workflow runs on demand for CI emergencies (e.g. workflow-bootstrap gap). |
 | `workflow_dispatch` on `direct-push.yml` | `direct-push.yml` | manual recovery for the development stream — bypasses the PR-merge guard and rebuilds the four `:dev*` tags at the current `development` HEAD. Use after a workflow-bootstrap gap (workflow file introduced by the very PR whose merge would have run it). |
@@ -162,7 +162,7 @@ Both Dockerfiles use BuildKit `--mount=type=cache` for `target/`, `~/.cargo/regi
 Per-PR (pushed by `build-pr.yml` on every PR commit):
 - `{version}-{branch-slug}` — rolling, moves with each PR push
 
-No per-commit immutable tag. Commit-level pinning is via `image@sha256:digest` from `docker buildx imagetools inspect`. Two reasons: (1) digest pinning is a strict superset of tag pinning, and (2) `generate-artifacts.yml` lands a `[skip ci]` SBOM/STRUCTURE auto-commit AFTER `build-pr.yml` runs — PR head moves to a SHA the gating build never built, so a per-PR `{sha}` immutable tag would be a footgun for `promote-on-merge.yml` (it'd look for a tag that doesn't exist). The rolling tag captures the most recent successful build regardless of head drift.
+No per-commit immutable tag. Commit-level pinning is via `image@sha256:digest` from `docker buildx imagetools inspect`. Two reasons: (1) digest pinning is a strict superset of tag pinning, and (2) `generate-artifacts.yml` lands an SBOM/STRUCTURE auto-commit AFTER `build-pr.yml` runs — PR head moves to a SHA the gating build never built, so a per-PR `{sha}` immutable tag would be a footgun for `promote-on-merge.yml` (it'd look for a tag that doesn't exist). The rolling tag captures the most recent successful build regardless of head drift.
 
 Development stream (set by `promote-on-merge.yml` on PR close, or `direct-push.yml` via `workflow_dispatch`):
 - `dev` — rolling, latest dev build

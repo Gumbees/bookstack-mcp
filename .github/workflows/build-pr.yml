@@ -104,7 +104,7 @@ jobs:
   build-server:
     needs: [guard]
     if: github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, nate-wsl]
     permissions:
       contents: read
       packages: write
@@ -176,7 +176,7 @@ jobs:
   build-embedder:
     needs: [guard]
     if: github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, nate-wsl]
     permissions:
       contents: read
       packages: write
@@ -244,7 +244,7 @@ jobs:
   build-worker:
     needs: [guard]
     if: github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, nate-wsl]
     permissions:
       contents: read
       packages: write
